@@ -1,0 +1,16 @@
+#!/bin/bash
+
+bed=$1
+gtf=${bed##*/}
+gtf=${gtf%.bed}
+gtf="$gtf.gtf"
+
+cat $bed | awk 'BEGIN{OFS="\t"} {print $1,"Ensembl","exon",$2,$3,".",$6,".","gene_id \"",$4,"\"; transcript_id \"",$4,"\";"}' > $gtf
+perl -i -pe 's/(gene_id ")\t/$1/' $gtf
+perl -i -pe 's/(transcript_id ")\t/$1/' $gtf
+perl -i -pe 's/\t";/";/g' $gtf
+perl -i -pe 's/:[^"]+//g' $gtf
+
+
+
+

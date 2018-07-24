@@ -1,0 +1,908 @@
+#!/usr/bin/env perl
+
+=pod
+
+=head1 SYNOPSIS
+
+Analyzes fastq/a files for potential problems, including contaminants, high prevalence of sequencing adapters, low complexity reads, and Ns.
+    
+contaminantAnalysis -f <input_fq> -o <output_dir> -n <analyze_N_most-prevalent_sequences> -r <Genus_species> -c <blast_cores>
+
+=head1 OPTIONS
+
+=over
+
+=item B<-f>
+
+Input fastq or fasta file.
+
+=item B<-o, -oc>
+
+Output directory; -oc enables clobbering of existing directory.
+
+=item B<-t>
+
+Optional file type = 'fastq' or 'fasta', if not detectable from extension.
+
+=item B<-n>
+
+Analyze N unique sequences with highest copy count, default 10000; use '0' to analyze entire input file.
+
+=item B<-r>
+
+The default organism (source of these sequencing reads), as Genus_species, e.g. Homo_sapiens.
+
+=item B<-c>
+
+Cores for megablast, default 1.
+
+=item B<-a>
+
+Optional adapter sequence fasta, if adapters not already in /home/apa/local/bin/scriptutils/adapter_collection.fa
+
+=item B<-p>
+
+Length of homopolymer tract before read is classified as an homopolymer artifact; default 10.
+
+=item B<-l>
+
+1-3, the maximum number of unique non-N bases a read may be composed of and still be considered low-complexity.  The default is 2, thus any read composed of only 1 or 2 non-N nucleotides will be considered low-complexity.  Example, ACACAC.... or NACACAC....  Cannot exceed 3, for obvious reasons.
+
+=item B<-d>
+
+Minimum bp of adapter match to classify the read as an adapter, default 15.
+
+=item B<-b>
+
+Batch size for NCBI querying, default 100 (records per query).
+
+=item B<-i>
+
+Minimum end-to-end percent identity for a blast match to be assigned to the sequence, default 75.
+
+=item B<--keep> 
+
+Keep intermediate datasets instead of deleting them.
+
+=item B<--noloco> 
+
+Skip low-complexity filtering.
+
+=item B<--noblast> 
+
+Skip blast analysis.
+
+=item B<--help> 
+
+Display this help screen.
+
+=back
+
+=cut
+
+require '/home/apa/apa_routines.pm';
+use Data::Dumper;
+use Getopt::Long;
+use LWP::UserAgent;
+use Pod::Usage;
+use strict;
+
+
+
+## Inputs with no Defaults
+my $file;     # fastq/fasta file
+my $type;     # fastq/fasta, if not detectable from filename (NOT SPECIFIABLE AT THE MOMENT)
+my $outdir;   # output dir; die if exists
+my $clobber;  # output dir; clobber
+my $deforg;   # default organism (as "Genus_species")
+my $keep;     # keep intermediate data?
+my $noloco;   # skip homopolymer/low-complexity filtering?
+my $noblast;  # just separate read groups, no blast analysis?
+my $help;     # show POD and exit
+
+
+
+## Inputs with Defaults
+my $topN = 10000;     # top N unique sequences to analyze
+my $cores = 1;        # megablast cores
+my $polybp = 10;      # minimum number of consecutive bases of single type to call a homopolymer run
+my $minN = 2;         # min number of Ns in read, consecutive or not, to declare 'too many Ns'
+my $locoB = 2;        # maximum number of unique non-N bases present in read for read to be flaggable as 'low-complexity' (may be 1-3, obviously not 4)
+my $adapN = 15;       # minimum adapter match length to flag as adapter
+my $batchsize = 100;  # size of blast-subject query batches to send to NCBI
+my $idtmin = 75;      # minimum identity percent to believe a blast hit
+my $adapters = '/home/apa/local/bin/scriptutils/adapter_collection.fa';  # default fasta for adapter identification
+
+
+
+## Get, test args
+GetOptions(
+    "f=s" => \$file,
+    "t=i" => \$topN,
+    "o=s" => \$outdir,
+    "oc=s" => \$clobber,
+    "r=s" => \$deforg,
+    "c=i" => \$cores,
+    "a=s" => \$adapters,
+    "p=i" => \$polybp,
+    "n=i" => \$minN,
+    "l=i" => \$locoB,
+    "d=i" => \$adapN,
+    "b=i" => \$batchsize,
+    "i=i" => \$idtmin,
+    "keep" => \$keep,
+    "noloco" => \$noloco,
+    "noblast" => \$noblast,
+    "help"=>\$help 
+	) or pod2usage(2);
+
+pod2usage(1) if $help;
+
+$deforg =~ s/_/ /g;
+$outdir = &create_writedir($outdir, $clobber, 'output dir');
+
+unless ($type) {
+    $type = 'fasta' if $file =~ /(fa|fsta|fasta)(\.gz)?$/i;
+    $type = 'fastq' if $file =~ /(fq|fastq)(\.gz)?$/i;
+}
+my $ingz = $file =~ /\.gz$/ ? '.gz' : '';
+die "$0: Unknown file type '$type': must be 'fastq' or 'fastq'\n" unless $type =~ /^fast[aq]$/;
+
+
+
+## Globals
+my @order;          # read input order
+my %headercount;    # counts per read header
+my %iseq;           # input read sequences
+my %seq;            # filtered read sequences
+my %seqstats;       # summary stats for sequence
+my %maxruns;        # longest homopolymer run per read
+my %seqcomp;        # sequence complexity per read, in terms of # unique non-N bases present (thus will be 1, 2, 3, or 4)
+my %adaphits;       # hits to adapters
+my %blast;          # blast results
+my %catheaders;     # headers per read category "type" (e.g. adapter, low-comp, polyA, good, etc)
+my @ACC;            # accessions for top blast subjects
+my %accHeader;      # read headers per accession
+my %headerAcc;      # accessions per read header
+my %accOrg;         # organism for each accession
+my %foundAcc;       # accession recovered from annot search? (1|0)
+my %annot;          # NCBI annotations
+my %noannot;        # ACCs that should have had NCBI annotations, but didn't
+my @batchres;       # NCBI query-batch result files
+my %sortorg;        # results by organism type (default vs others)
+my %subjhits;       # results by subject
+my %nopassdata;     # report data for non-passing blast queries
+my %noanndata;      # report data for psssing but unannotatable blast queries
+my $filtblasthead;  # filtered blast output file header line
+my @bases = qw/ A C G T N /;  # DNA bases
+my @fates = qw/ ADAP POLYA POLYC POLYG POLYT POLYN LOCO MISCN GOOD NOBLAST NOPASS NOANN ANNOT /;  # read assignment fates (GOOD is the superset of all following assignments)
+my %post_blast = map {($_=>1)} qw/ NOBLAST NOPASS NOANN ANNOT /;  # post-blast fates
+my %fatenames = ('ADAP'=>'ADAPTER', 'POLYA'=>'POLY-A', 'POLYC'=>'POLY-C', 'POLYG'=>'POLY-G', 'POLYT'=>'POLY-T', 'POLYN'=>'POLY-N', 'LOCO'=>'LOW-COMP', 'MISCN'=>"MISC-N", 'GOOD'=>'GOOD', 'NOBLAST'=>'NO-BLAST', 'NOPASS'=>'NO-PASS', 'NOANN'=>'NO-ANNOT', 'ANNOT'=>'ANNOT');
+my %counts = map {($_=>0)} @fates;  # read counts per category
+
+
+
+## Paths and Files
+my $log = "$outdir/run.log";
+my $tmp = "$outdir/contaminantAnalysis.$$.tmp";
+my $fadir = "$outdir/fastas";
+system "mkdir $fadir";
+my $inpfa = "$outdir/input.$type$ingz";   # symlink only, for reference
+my $adfa = "$outdir/adapters_tested.fa";  # symlink only, for reference
+my $filtfa = "$fadir/input_selected.fa";
+my $polyAfa = "$fadir/polyA.fa";
+my $polyCfa = "$fadir/polyC.fa";
+my $polyGfa = "$fadir/polyG.fa";
+my $polyTfa = "$fadir/polyT.fa";
+my $polyNfa = "$fadir/polyN.fa";
+my $miscNfa = "$fadir/misc_N.fa";
+my $locofa = "$fadir/low_complexity.fa";
+my $adapfa = "$fadir/adapter.fa";
+my $goodfa = "$fadir/good.fa";
+my $noblastfa = "$fadir/good_non-blastable.fa";
+my $nopassfa = "$fadir/good_blastable_non-passing.fa";
+my $noannfa = "$fadir/good_blastable_passing_non-annotatable.fa";
+my $annotfa = "$fadir/good_blastable_passing_annotatable.fa";
+my $nopassrep = "$outdir/good_blastable_non-passing.txt";
+my $noannrep = "$outdir/good_blastable_passing_non-annotatable.txt";
+my $subjectrepS = "$outdir/subject_report_summary.txt";
+my $subjectrepD = "$outdir/subject_report_detail.txt";
+my $seqstatsrep = "$outdir/seqstats_report.txt";
+my $finalrep = "$outdir/final_report.txt";
+my $blatxtmp = "$tmp/blatx";
+my $megatemp = "$tmp/good.megablast";
+
+
+
+## Prep temp dir and log file, symlink in input files
+my $LOG = &open2('W', $log, 'Log file');
+chomp(my $now = `date`);
+&logreport("$0 Initialized: $now\n", 1, $LOG);
+
+&execute("mkdir -p $tmp", 1, $LOG, 2);
+die &logreport("$0: Failed to create temp directory '$tmp'\n", 1, $LOG) unless -d $tmp;
+&execute("bash -c 'ln -sf \$(readlink -f $file) $inpfa'", 1, $LOG, 2);
+&execute("bash -c 'ln -sf \$(readlink -f $adapters) $adfa'", 1, $LOG, 2);
+
+
+
+## Main
+
+## Filter input fastq/a
+chomp(my $now = `date`);
+&logreport("Reading input sequences: $now\n", 1, $LOG);
+my $IN = &open2('R', $file, "Input $type file");
+my $OUT = &open2('W', $filtfa, "Filtered fasta file");
+my ($i, $tmpseq);
+if ($type eq 'fasta') {
+    while (<$IN>) {
+        $_ =~ s/[\n\r]+$//;
+        if ($_ =~ /^>/) {
+            if ($tmpseq) {
+                $iseq{$tmpseq}++;
+                $tmpseq = '';
+            }
+        } else {
+            $tmpseq .= $_;
+        }
+    }
+} elsif ($type eq 'fastq') {
+    while (<$IN>) {
+        $_ =~ s/[\n\r]+$//;
+        $i++;
+        if ($i == 2) {
+            $iseq{$_}++;
+        } elsif ($i == 4) {
+            $i = 0;
+        }
+    }
+}
+
+## Extract top-N highest-frequency sequences
+chomp(my $now = `date`);
+&logreport("Extracting top $topN input sequences: $now\n", 1, $LOG);
+my %topcopy;
+my ($singletons, $totalreads, $unqseqs, $topseqreads) = (0,0,0,0);
+my @seqByCopy = sort { $iseq{$b} <=> $iseq{$a} } keys %iseq;
+foreach my $s (@seqByCopy) {
+    ## %iseq: sequence => copy-count
+    $unqseqs++;
+    $singletons++ if $iseq{$s} == 1;
+    $totalreads += $iseq{$s};
+    if (!$topN || $unqseqs <= $topN) {
+        $topseqreads += $iseq{$s};
+        my $header = "${unqseqs}_$iseq{$s}";  # header is uniqueSequenceNumber_copyCount
+        print $OUT ">$header\n$s\n";
+        push @order, $header;
+        $headercount{$header} = $iseq{$s};
+        $topcopy{ $iseq{$s} }++;   # %topcopy: copy-count => N sequences @ copy-count
+        $seq{$header} = $s;
+    }
+}
+close $OUT;
+%iseq = ();
+$topN = $unqseqs unless $topN;  # if $topN was 0, give it the actual unique-seq-count now
+
+if ($unqseqs == 0) {
+    die "$0: input had no reads!\n";
+} elsif ($unqseqs < $topN) {
+    &logreport("$0: WARNING: $topN top sequences requested, but only $unqseqs exist!  Changing to $unqseqs.\n", 2, $LOG);
+    $topN = $unqseqs;
+}
+
+## Report some initial selection statistics
+my $fatewd = (sort {$b<=>$a} map {length($_)} values %fatenames)[0];
+my $topNwd = length($topN);
+my $fatefmt = "%-${fatewd}s %${topNwd}i";  # sprintf
+
+my @sortcopy = (sort {$b <=> $a} keys %topcopy);
+my $maxcopy = $sortcopy[0];   # highest copy-count
+my $mincopy = $sortcopy[-1];  # lowest copy-count
+my $maxseqs = $topcopy{$maxcopy};  # N sequences (NOT reads) tied for highest copy-count
+my $minseqs = $topcopy{$mincopy};  # N sequences (NOT reads) tied for lowest copy-count
+my $maxreads = $maxcopy*$topcopy{$maxcopy};  # N reads from highest copy-count sequence
+my $minreads = $mincopy*$topcopy{$mincopy};  # N reads from lowest copy-count sequence
+my $maxseqpct = sprintf("%0.2f", 100*$maxseqs/$topN);  # % total sequences (NOT reads) tied for highest copy-count
+my $minseqpct = sprintf("%0.2f", 100*$minseqs/$topN);  # % total sequences (NOT reads) tied for lowest copy-count
+my $maxreadspct = sprintf("%0.2f", 100*$maxreads/$totalreads);  # % of total reads coming from highest copy-count sequence
+my $minreadspct = sprintf("%0.2f", 100*$minreads/$totalreads);  # % of total reads coming from lowest copy-count sequence
+my $unqseqspct = sprintf("%0.2f", 100*$unqseqs/$totalreads);
+my $singletonpct = sprintf("%0.2f", 100*$singletons/$totalreads);
+my $topseqreadspct = sprintf("%0.2f", 100*$topseqreads/$totalreads);
+my $maxblurb = $maxcopy > 1 ? ' each' : '';
+my $xsplur = $maxseqs > 1 ? 's' : '';
+my $nsplur = $minseqs > 1 ? 's' : '';
+my $xcplur = $maxreads > 1 ? 's' : '';
+my $ncplur = $minreads > 1 ? 's' : '';
+
+my $msg = "\n";
+$msg .= "TOTAL: $unqseqs/$totalreads ($unqseqspct%) sequences were unique\n";
+$msg .= "       $singletons/$totalreads ($singletonpct%) were singletons\n";
+$msg .= "SELECTED: top $topN unique sequences comprise $topseqreads total reads ($topseqreadspct% of input)\n";
+$msg .= "          of these, the $maxseqs highest-copy sequence$xsplur had $maxcopy read$xcplur each ($maxreads total | $maxreadspct% of input)\n";
+$msg .= "                    the $minseqs lowest-copy sequence$nsplur had $mincopy read$ncplur each ($minreads total | $minreadspct% of input)\n\n";
+&logreport($msg, 1, $LOG);
+
+## Calculate some base-frequency stats for each sequence
+chomp(my $now = `date`);
+&logreport("Filtering top sequences: $now\n", 1, $LOG);
+unless ($noloco) {
+    ## homopolymer quantitation per read
+    foreach my $header (keys %seq) {
+        my (%temp, %maxbaserun);
+        ## base frequencies
+        $temp{$_}++ foreach split //, $seq{$header};
+        $seqstats{$header} = join "\t", map { $temp{$_}||0 } @bases;
+        ## largest homopolymer run per base, and per sequence
+        ## putting N first, since this is the 'most defective' state, thus should get priority in %maxruns (and thus read fate assignment)
+        foreach my $base (qw/ N A C G T /) {
+            my @runs = map { length($_) } split /[^$base]/, $seq{$header};
+            $maxbaserun{$base} = (sort {$b <=> $a} @runs)[0];
+            $maxruns{$header} = [$maxbaserun{$base}, $base] if $maxbaserun{$base} > $maxruns{$header}->[0];
+            next if $base eq 'N';
+            $seqcomp{$header}++;
+        }
+        $seqstats{$header} .= join "\t", ('', map { $maxbaserun{$_}||0 } @bases);
+        push @{ $maxruns{$header} }, $maxruns{$header}->[0] > $polybp;  # exceeds limit?
+    }
+}
+
+## At this point, we could blast everything, but that could be a colossal waste of cores and time.
+## Many of the top sequences could be blast-unworthy junk; find and remove all obvious junk.
+## "Junk" sequences types are everything in the @fates array, before 'GOOD'.
+
+## Junk removal 1: Detect adapters
+&execute("blat -extendThroughN $adapters $filtfa $blatxtmp", 1, $LOG, 2);
+open my $IN2, '<', $blatxtmp or die &logreport("$0: Cannot read adapter blat results '$blatxtmp': $!\n", 1, $LOG);
+while (<$IN2>) {
+    next if $. < 6;  # header lines
+    my @data = split /\t/, $_;
+    $adaphits{$data[9]} = 1 if $data[0] >= $adapN;  # must have >= $adapN matches versus adapter
+}
+close $IN2;
+
+## Junk removal 2: Fractionate sequences
+open my $ADAP, '>', $adapfa;     # Adapter-bearing sequences
+open my $POLYA, '>', $polyAfa;   # Homopolymer-bearing sequences, longest run is of As
+open my $POLYC, '>', $polyCfa;   # Homopolymer-bearing sequences, longest run is of Cs
+open my $POLYG, '>', $polyGfa;   # Homopolymer-bearing sequences, longest run is of Gs
+open my $POLYT, '>', $polyTfa;   # Homopolymer-bearing sequences, longest run is of Ts
+open my $POLYN, '>', $polyNfa;   # Homopolymer-bearing sequences, longest run is of Ns
+open my $LOCO, '>', $locofa;     # Low-complexity, homopolymer-free sequences.
+open my $MISCN, '>', $miscNfa;   # High-complexity, homopolymer-free seqs with too many Ns.
+open my $GOOD, '>', $goodfa;     # Blastable sequences.
+foreach my $header (@order) {
+    my ($maxrun, $maxbase, $overlimit) = @{ $maxruns{$header} };
+    if ($adaphits{$header}) {
+        print $ADAP ">$header\n$seq{$header}\n";
+        $counts{ADAP}++;
+        $catheaders{ADAP}{$header} = $headercount{$header};
+    } elsif ($overlimit && $maxbase eq 'A') {
+        print $POLYA ">$header\n$seq{$header}\n";
+        $counts{POLYA}++;
+        $catheaders{POLYA}{$header} = $headercount{$header};
+    } elsif ($overlimit && $maxbase eq 'C') {
+        print $POLYC ">$header\n$seq{$header}\n";
+        $counts{POLYC}++;
+        $catheaders{POLYC}{$header} = $headercount{$header};
+    } elsif ($overlimit && $maxbase eq 'G') {
+        print $POLYG ">$header\n$seq{$header}\n";
+        $counts{POLYG}++;
+        $catheaders{POLYG}{$header} = $headercount{$header};
+    } elsif ($overlimit && $maxbase eq 'T') {
+        print $POLYT ">$header\n$seq{$header}\n";
+        $counts{POLYT}++;
+        $catheaders{POLYT}{$header} = $headercount{$header};
+    } elsif ($overlimit && $maxbase eq 'N') {
+        print $POLYN ">$header\n$seq{$header}\n";
+        $counts{POLYN}++;
+        $catheaders{POLYN}{$header} = $headercount{$header};
+    } else {
+        
+        ## Otherwise-low-complexity filter is SECOND TO LAST, unless deactivated by $noloco.
+        ## Only the final misc-N filter has lower priority.
+        my $locopass = 1;
+        unless ($noloco) {
+            if ($seqcomp{$header} <= $locoB) {
+                print $LOCO ">$header\n$seq{$header}\n";
+                $counts{LOCO}++;
+                $catheaders{LOCO}{$header} = $headercount{$header};
+                $locopass = 0;
+            }
+        }
+        
+        ## Put this misc-N filter LAST.  It is only to save megablast from wasting time with problematic sequences.
+        if ($locopass) {
+            if ($seq{$header} =~ /N[^N]*N/) {
+                ## IF not polyN: then only one N isn't enough, we want at least two, consecutive or otherwise.
+                print $MISCN ">$header\n$seq{$header}\n";
+                $counts{MISCN}++;
+                $catheaders{MISCN}{$header} = $headercount{$header};
+            } else {
+                print $GOOD ">$header\n$seq{$header}\n";
+                $counts{GOOD}++;
+            }
+        }
+        
+    }
+}
+close $_ foreach ($ADAP, $POLYA, $POLYC, $POLYG, $POLYT, $POLYN, $LOCO, $MISCN, $GOOD);
+
+foreach my $fate (@fates) {
+    next if $post_blast{$fate};  # haven't got here yet
+    my $subj = 'NA';
+    my $tseqs = my $useqs = 0;
+    foreach my $header (keys %{ $catheaders{$fate} }) {
+        $tseqs += $headercount{$header};
+        $useqs++;
+    }
+    $sortorg{E}{$fate} = [$subj, $tseqs, $useqs];
+}
+
+## Report on fractionation results
+my $msg = "\nPRE-BLAST TOTALS:\n";
+my $wgood;
+foreach (0..$#fates) {
+    $wgood = $_ if $fates[$_] eq 'GOOD';
+}
+$msg .= sprintf("$fatefmt\n", $fatenames{$_}, $counts{$_}) foreach @fates[0..$wgood];  # ADAP-GOOD
+&logreport("$msg\n", 1, $LOG);
+
+## If not blasting -- finalize and exit here
+&finalize_and_exit if $noblast;
+
+## If blasting -- start blasting
+chomp(my $now = `date`);
+&logreport("Searching for annotations: $now\n", 1, $LOG);
+## megablast "good" reads against nt
+#my $cmd = "megablast -F F -a $cores -m 8 -d /n/data1/blast/db/nt -i $goodfa > $megatemp";  # original
+my $cmd = "blastall -p blastn -F F -a $cores -m 8 -d /n/data1/blast/db/nt -i $goodfa -X 20 -f 0 -W 28 -y 10 -Z 50 -n T -A 0 > $megatemp";  # blastn emulating megablast, since blastall is parallelized and megablast is not...
+&execute($cmd, 1, $LOG, 2) unless -e $megatemp;
+
+## Prefilter blast output; take only highest-scoring alignment(s) per sequence
+my $cmd = "/home/apa/local/bin/filterAligns -f $megatemp -q $goodfa -t blast --best --lost --more";
+&execute($cmd, 1, $LOG, 2) unless -e "$megatemp.best";
+
+## Process prefiltered megablast results
+open my $IN3, '<', "$megatemp.best" or die &logreport("$0: Cannot read '$megatemp.best': $!\n", 1, $LOG);
+while (my $line = <$IN3>) {
+    if ($. == 1) {
+        $filtblasthead = $line;
+        next;
+    }
+    chomp($line);
+    my @data = split /\t/, $line;  # ($header, $subj, $idt, $mlen, $mms, $Ngaps, $qpos1, $qpos2, $spos1, $spos2, $eval, $score, $strand, $IdtBp, $QLen, $QLenPct, $AQIdtPct, $TQIdtPct, $SLen, $SLenPct, $ASIdtPct, $TSIdtPct)
+    my ($header, $subj, $TQIdtPct) = @data[0,1,17];
+    $catheaders{BLAST}{$header} = $headercount{$header};
+    if ($TQIdtPct >= $idtmin) {  # passing end-to-end identity %
+        $catheaders{PASS}{$header} = $headercount{$header};
+#        my $acc = (split /\|/, $subj)[1];   # megablast -- had GI
+        (my $acc = $subj) =~ s/\.\d+$//;   # blastn -- accession.version only -- strip version, too variable
+        $accHeader{$acc}{$header} = 1;  #$subj;
+        $headerAcc{$header}{$acc} = 1;  #$subj;
+    } else {
+        push @{ $nopassdata{$header} }, "$line\n";
+    }
+}
+close $IN3;
+@ACC = sort keys %accHeader;
+
+## Account for unblastable sequences
+&execute("mv $megatemp.lost $noblastfa", 1, $LOG, 2);
+open my $IN4, '<', $noblastfa or die &logreport("$0: Cannot read '$noblastfa': $!\n", 1, $LOG);
+while (<$IN4>) {
+    chomp;
+    $catheaders{NOBLAST}{$1} = $headercount{$1} if $_ =~ /^>(.*)/;
+}
+close $IN4;
+
+## Query NCBI for annotations for best-blast-subject accessions
+my $EUTILS  = 'http://eutils.ncbi.nlm.nih.gov/entrez/eutils';
+my $ESEARCH = "$EUTILS/esearch.fcgi";
+my $EFETCH  = "$EUTILS/efetch.fcgi";
+my $ua = LWP::UserAgent->new;
+
+my $nAcc = scalar(@ACC);
+my $nbatch = $nAcc % $batchsize == 0 ? $nAcc/$batchsize : int($nAcc/$batchsize)+1;
+&logreport("$nAcc terms | Running $nbatch NCBI queries of $batchsize terms each.\n", 1, $LOG);
+my ($i, $j) = (0, -1);
+foreach my $n (1..$nbatch) {
+    &logreport(" Batch $n/$nbatch\n", 1, $LOG);
+    my $gbfile = "$tmp/batch.$n.gb";
+    push @batchres, $gbfile;
+    
+    ## get GB file, if doesn't already exist
+    ## intended with restartability in mind, although restartability not yet a feature
+    unless (-e $gbfile) {
+        $i = $j + 1;
+        $j = $i + $batchsize - 1 > $#ACC ? $#ACC : $i + $batchsize - 1;
+        my @batch = @ACC[$i..$j];
+        my $efetch = "$EFETCH?db=nucleotide&rettype=gb&retmode=text&id=".join(',', @batch);
+        &logreport("$efetch\n", 1, $LOG);
+        my $retries = 0;
+        {
+            print STDERR "Re-trying download: $retries\n" if $retries;
+            system "wget -nv -O - \"$efetch\" | grep -vP \"^\\s+\\d+ [acgtnACGTN]\" > $gbfile";  # strip sequence lines
+            my $gbsize = -s $gbfile;
+            if ($gbsize==0 && $retries<=10) {
+                $retries++;
+                sleep 60;
+                redo;
+            }
+        }
+    }
+    
+    ## process Genbank records
+    my ($acc, $def, $src, $org);  # values from corresponding Genbank fields
+    open my $IN5, '<', $gbfile or die &logreport("$0: Cannot open Genbank data file '$gbfile': $!\n", 1, $LOG);
+    while (<$IN5>) {
+        if ($_ =~ /^\/\//) {
+            $acc = $org = undef;
+        } elsif ($_ =~ /^ACCESSION\s+(\S+)/) {
+            $acc = $1;  # accession only, NOT version
+            $foundAcc{ACC}{$acc}++;
+            $catheaders{ANNOT}{$_} = $headercount{$_} foreach keys %{ $accHeader{$acc} };
+        } elsif ($_ =~ /^DEFINITION\s+(.*)/) {
+            ($def = $1) =~ s/\s*$//;
+        } elsif ($_ =~ /^SOURCE\s+(.*)/) {
+            ($src = $1) =~ s/\s*$//;
+        } elsif ($_ =~ /^\s+ORGANISM\s+(.*)/) {
+            ($org = $1) =~ s/\s*$//;
+            $org = 'NO ORGANISM' unless $org;
+            $annot{$org}{TOT}++;  # total hits per organism
+            $annot{$org}{ACC}{$acc} = 1;  # unique organism-accession pairs
+            $accOrg{$acc} = [$org, $src, $def];
+            my $nkeys = scalar keys %{ $accHeader{$acc} };
+            foreach my $header (keys %{ $accHeader{$acc} }) {
+                $annot{$org}{HEADER}{$header} = 1;   # unique organism-header pairs
+                $subjhits{$org}{$acc}{$header} = 1;  # unique organism-accession-header sets
+                $accHeader{$acc}{$header} = $org;    # overwrite subject with organism where available
+                $headerAcc{$header}{$acc} = $org;
+            }
+            $def = $src = '';  # ZAP
+        }
+    }
+    close $IN5;
+    sleep 1;
+}
+
+## Filter multiple annotations by organism.  Per sequence:
+## If only one annotated org, that is the org.
+## If default-org is among annots, assign to default-org; ignore all others.
+## If multi-org without default-org, pick the most-frequently-seen org (or randomly among multiple-most-frequent).
+
+chomp(my $now = `date`);
+&logreport("Summarizing annotations: $now\n", 1, $LOG);
+my (%orgStats, %voucher);
+
+## First, filter annotations for best-of-many, and drop non-default-org annots when default-org is present
+foreach my $header (keys %headerAcc) {
+    ## first reduce annots to only one organism
+    my %allAcc = %{ $headerAcc{$header} };
+    my %allOrg = map {($accOrg{$_}->[0]=>1)} keys %allAcc;
+    my $ftype;
+    my $accstr = join(",", sort keys %allAcc);
+    if (scalar (keys %allOrg) == 1) {  
+        ## only annotated to one org
+        $ftype = 'Single-Org';
+        my $org = (keys %allOrg)[0];
+        $voucher{$org}{AH}{$_}{$header} = 1 foreach keys %allAcc;
+        $voucher{$org}{H}{$header} = 1;
+    } elsif (exists $allOrg{$deforg}) {  
+        ## annotated to > 1 org, including the default org: remove all non-default orgs
+        $ftype = 'Default-Org';
+        foreach my $acc (keys %allAcc) {
+            my $org = $accOrg{$acc}->[0];
+            if ($org eq $deforg) {
+                $voucher{$org}{AH}{$acc}{$header} = 1;
+                $voucher{$org}{H}{$header} = 1;
+                next;
+            }
+        }
+    } else {
+        ## annotated to > 1 org, but not the default org: retain only the most-supported org
+        $ftype = 'Multi-Org';
+        my %allhits = map {($annot{$_}{TOT}=>$_)} keys %allOrg;  # built-in tiebreaking; 'keys' sort effectively chooses one at random
+        my $tophit = (sort {$b <=> $a} keys %allhits)[0];
+        my $toporg = $allhits{$tophit};
+        foreach my $acc (keys %allAcc) {
+            my $org = $accOrg{$acc}->[0];
+            if ($org eq $toporg) {
+                $voucher{$org}{AH}{$acc}{$header} = 1;
+                $voucher{$org}{H}{$header} = 1;
+                next;
+            }
+        }
+    }
+    $orgStats{T}{$ftype}++;
+    $orgStats{H}{$header} = $ftype;
+}
+
+## Second, eliminate org->acc, org->header, and org->acc->header associations which have not been 'vouched' for above.
+foreach my $org (keys %annot) {
+    foreach my $acc (keys %{ $annot{$org}{ACC} }) {
+        foreach my $header (keys %{ $accHeader{$acc} }) {
+            unless (exists $voucher{$org}{AH}{$acc} && exists $voucher{$org}{AH}{$acc}{$header}) {  # double test to prevent {$acc} from auto-vivifying
+                delete $headerAcc{$header}{$acc};
+                delete $accHeader{$acc}{$header};
+                delete $subjhits{$org}{$acc}{$header};
+            }
+        }
+        delete $annot{$org}{ACC}{$acc} unless exists $voucher{$org}{AH}{$acc};
+    }
+    foreach my $header (keys %{ $annot{$org}{HEADER} }) {
+        delete $annot{$org}{HEADER}{$header} unless exists $voucher{$org}{H}{$header};
+    }
+    
+    ## Make sure cleanup was complete
+    my $Naccs = scalar keys %{ $annot{$org}{ACC} };
+    my $Nhead = scalar keys %{ $annot{$org}{HEADER} };
+    if ($Naccs && !$Nhead) {
+        my $accstr = join(",", sort keys %{ $annot{$org}{ACC} });
+        print STDERR "WARNING: $org has $Naccs accessions but 0 headers!  ($accstr)\n";
+    } elsif ($Nhead && !$Naccs) {
+        my $headstr = join(",", sort keys %{ $annot{$org}{HEADER} });
+        print STDERR "WARNING: $org has $Nhead headers but 0 accessions!  ($headstr)\n";
+    } elsif (!$Naccs || !$Nhead) {
+        delete $annot{$org};  # nothing left, remove
+    } else {
+        # normal annotated org, continue
+    }
+}
+
+## Third, eliminate any un-queryable subjects from annotations (as long as header is otherwise annotated)
+foreach my $header (keys %headerAcc) {
+    my $vouched;
+    foreach my $org (keys %voucher) {
+        $vouched = 1 if exists $voucher{$org}{H}{$header};
+    }
+    foreach my $acc (keys %{ $headerAcc{$header} }) {
+        delete $headerAcc{$header}{$acc} if $headerAcc{$header}{$acc} eq '1' && $vouched;
+    }
+}
+
+## Fourth, re-test headers for singularity of organism annotations
+my $nha = scalar keys %headerAcc;
+foreach my $header (keys %headerAcc) {
+    my %allAcc2 = %{ $headerAcc{$header} };
+    my %allOrg2 = map {($accOrg{$_}->[0]=>1)} keys %allAcc2;
+    my $orgs2 = scalar keys %allOrg2;
+    $orgStats{N}{$orgs2}++;
+    my $msg = "$header\t$orgStats{H}{$header}\t$orgs2 subjects\n".Dumper($headerAcc{$header})."\n";
+    &logreport($msg, 1, $LOG) if $orgs2 > 1;
+}
+#my $doubles = "DOUBLES: ".scalar(keys %doubles)."\n"
+#&logreport($doubles, 1, $LOG);
+my $msg = "\nBLAST ASSIGNMENTS:\nBlastAnn\tSeqs\tPct\n";
+$msg .= sprintf("$_\t".($orgStats{T}{$_}||0)."\t%0.2f\n", 100*$orgStats{T}{$_}/$nha) foreach qw/ Default-Org Single-Org Multi-Org /;
+$msg .= "\nORGS PER SEQUENCE:\nOrgs\tSeqs\tPct\n";
+$msg .= sprintf("$_\t".($orgStats{N}{$_}||0)."\t%0.2f\n", 100*$orgStats{N}{$_}/$nha) foreach sort {$b <=> $a} keys %{ $orgStats{N} };
+&logreport("$msg\n", 1, $LOG);
+
+## Annotations should now be singularized, such that each sequence header is assigned to only one organism.
+## Of course, there may be multi equal-best accessions that connect a header to an organism,
+##  but as long as header->org relations are 1:1, that is all that is necessary.
+
+## Report on reads which failed blast quality filters
+open my $NOPASS, '>', $nopassfa;
+open my $NOPASSREP, '>', $nopassrep;
+print $NOPASSREP $filtblasthead;
+foreach my $header (keys %{ $catheaders{BLAST} }) {
+    unless (exists $catheaders{PASS}{$header}) {
+        $catheaders{NOPASS}{$header} = $headercount{$header};  # best blast hit was still sub-par
+        print $NOPASS ">$header\n$seq{$header}\n";
+        print $NOPASSREP @{ $nopassdata{$header} };
+    }
+}
+close $NOPASS;
+close $NOPASSREP;
+
+## Report on unannotated reads
+## Also write out annotated reads
+open my $ANNOT, '>', $annotfa;
+open my $NOANN, '>', $noannfa;
+open my $NOANNREP, '>', $noannrep;
+print $NOANNREP "Subjects\tUnqSeq\tTotRds\tUnqSeq%TopN\tTotRds%TopN\tUnqSeq%Total\tTotRds%Total\n";
+foreach my $header (sort { $catheaders{PASS}{$b} <=> $catheaders{PASS}{$a} } keys %{ $catheaders{PASS} }) {
+    if (exists $catheaders{ANNOT}{$header}) {
+        print $ANNOT ">$header\n$seq{$header}\n";
+        ## only print fasta here, annotations get their own report later
+    } else {
+        $catheaders{NOANN}{$header} = $headercount{$header};  # no Genbank data for best-subject accession
+        print $NOANN ">$header\n$seq{$header}\n";
+        foreach my $acc (keys %{ $headerAcc{$header} }) {
+            unless (exists $accOrg{$acc}) {
+                my $tseqs = my $useqs = 0;
+                foreach my $header (keys %{ $accHeader{$acc} }) {
+                    $tseqs += $headercount{$header};
+                    $useqs++;
+                }
+                my $subj = $accHeader{$acc}{$header};
+                my $upct_N = sprintf("%0.2f", 100*$useqs/$topN);
+                my $upct_T = sprintf("%0.2f", 100*$useqs/$unqseqs);
+                my $tpct_N = sprintf("%0.2f", 100*$tseqs/$topseqreads);
+                my $tpct_T = sprintf("%0.2f", 100*$tseqs/$totalreads);
+                print $NOANNREP "$subj\t$useqs\t$tseqs\t$upct_N\t$tpct_N\t$upct_T\t$tpct_T\n";
+            }
+        }
+    }
+}
+close $ANNOT;
+close $NOANN;
+close $NOANNREP;
+
+## Report on some post-blast statistics
+foreach my $acc (@ACC) {
+    $counts{GLOST}++ unless $foundAcc{ACC}{$acc};  # accessions with no Genbank data
+}
+$counts{QNOBLAST} = scalar keys %{ $catheaders{NOBLAST} };  # unblastable reads
+$counts{QBLAST} = scalar keys %{ $catheaders{BLAST} };      # blastable reads
+$counts{QPASS} = scalar keys %{ $catheaders{PASS} };        # blastable reads with high-quality alignments
+$counts{QANNOT} = scalar keys %{ $catheaders{ANNOT} };      # annotated reads
+$counts{SANNOT0} = scalar keys %accHeader;                  # unique accessions providing annotation (in)
+$counts{SANNOT1} = scalar keys %{ $foundAcc{ACC} };         # unique accessions providing annotation (out)
+
+&logreport("QUERIES: BLASTED $counts{QBLAST} | PASSED $counts{QPASS} | ANNOTATED $counts{QANNOT} | UNBLASTABLE $counts{QNOBLAST}\n", 1, $LOG);
+&logreport("SUBJECTS: $counts{SANNOT0} subjects queried | $counts{SANNOT1} subjects returned\n", 1, $LOG);
+#&logreport("ACCS : $counts{} | : $counts{} | : $counts{}\n", 1, $LOG);
+
+## Prepare summarized "final" report objects
+my (%hittotals, $allsubj);
+foreach my $org (keys %annot) {
+    my $subj = scalar keys %{ $annot{$org}{ACC} };  # number of independent subjects for this organism
+    $allsubj += $subj;  # total number of independent blast subjects from all organisms
+    my $tseqs = my $useqs = 0;
+    foreach my $header (keys %{ $annot{$org}{HEADER} }) {
+        $tseqs += $headercount{$header};
+        $useqs++;
+    }
+    $sortorg{O}{$org} = [$subj, $tseqs, $useqs];
+    $hittotals{$org}{ALL}{ALL} = $tseqs;
+}
+
+foreach my $fate (@fates) {
+    next unless $post_blast{$fate};  # tallied the others previously
+    my $subj = $fate eq 'ANNOT' ? $allsubj : 'NA';
+    my $tseqs = my $useqs = 0;
+    foreach my $header (keys %{ $catheaders{$fate} }) {
+        $tseqs += $headercount{$header};
+        $useqs++;
+    }
+    $sortorg{E}{$fate} = [$subj, $tseqs, $useqs];
+}
+
+## Translate unique-seq-count to actual-read-count for every subject 
+my (%defout, %srcout);
+foreach my $org (keys %subjhits) {
+    ## recompile per-acc data as per-org-src, per-org-src-def
+    my (%subjhitsS, %subjhitsSD);
+    foreach my $acc (keys %{ $subjhits{$org} }) {
+        my $tseqs = my $useqs = 0;
+        my ($src, $def) = @{ $accOrg{$acc} }[1,2];
+        my $srcdef = "$src\t$def";
+        foreach my $header (keys %{ $subjhits{$org}{$acc} }) {
+            $subjhitsS{$src}{H}{$header} = 1;
+            $subjhitsS{$src}{T} += $headercount{$header};
+            $subjhitsS{$src}{U}++;
+            $subjhitsSD{$srcdef}{H}{$header} = 1;
+            $subjhitsSD{$srcdef}{T} += $headercount{$header};
+            $subjhitsSD{$srcdef}{U}++;
+        }
+    }
+    foreach my $src (sort keys %subjhitsS) {
+        my ($useqs, $tseqs) = ($subjhitsS{$src}{U}, $subjhitsS{$src}{T});
+        my $upct_N = sprintf("%0.2f", 100*$useqs/$topN);
+        my $upct_T = sprintf("%0.2f", 100*$useqs/$unqseqs);
+        my $tpct_N = sprintf("%0.2f", 100*$tseqs/$topseqreads);
+        my $tpct_T = sprintf("%0.2f", 100*$tseqs/$totalreads);
+        push @{ $srcout{$org}{$tseqs} }, "$org\t$src\tALL SUBJECTS\t$useqs\t$tseqs\t$upct_N\t$tpct_N\t$upct_T\t$tpct_T\n" if $useqs;
+        $hittotals{$org}{$src}{ALL} = $tseqs;
+    }
+    foreach my $srcdef (sort keys %subjhitsS) {
+        my ($src, $def) = split /\t/, $srcdef;
+        my ($useqs, $tseqs) = ($subjhitsSD{$srcdef}{U}, $subjhitsSD{$srcdef}{T});
+        my $upct_N = sprintf("%0.2f", 100*$useqs/$topN);
+        my $upct_T = sprintf("%0.2f", 100*$useqs/$unqseqs);
+        my $tpct_N = sprintf("%0.2f", 100*$tseqs/$topseqreads);
+        my $tpct_T = sprintf("%0.2f", 100*$tseqs/$totalreads);
+        push @{ $defout{$org}{$src}{$tseqs} }, "$org\t$src\t$def\t$useqs\t$tseqs\t$upct_N\t$tpct_N\t$upct_T\t$tpct_T\n" if $useqs;
+        $hittotals{$org}{$src}{$def} = $tseqs;
+    }
+}
+
+## Write reads-per-organism (summary) report
+open my $OUT4, '>', $subjectrepS;
+print $OUT4 "Organism\tSource\tDefinition\tUnqSeq\tTotRds\tUnqSeq%TopN\tTotRds%TopN\tUnqSeq%Total\tTotRds%Total\n";
+
+## Write reads-per-subject (detail) report
+open my $OUT5, '>', $subjectrepD;
+print $OUT5 "Organism\tSource\tDefinition\tUnqSeq\tTotRds\tUnqSeq%TopN\tTotRds%TopN\tUnqSeq%Total\tTotRds%Total\n";
+
+foreach my $org (sort { $hittotals{$b}{ALL}{ALL} <=> $hittotals{$a}{ALL}{ALL} } keys %hittotals) {
+    
+    foreach my $src (sort { $hittotals{$org}{$b}{ALL} <=> $hittotals{$org}{$a}{ALL} } keys %{ $hittotals{$org} }) {
+        print $OUT4 @{ $srcout{$org}{$_} } foreach (sort {$b <=> $a} keys %{ $srcout{$org} });
+    }
+
+    foreach my $src (sort { $hittotals{$org}{$b}{ALL} <=> $hittotals{$org}{$a}{ALL} } keys %{ $hittotals{$org} }) {
+        foreach my $def (sort { $hittotals{$org}{$src}{$b} <=> $hittotals{$org}{$src}{$a} } keys %{ $hittotals{$org}{$src} }) {
+            my $nlines = 0;
+            foreach my $tseqs (sort {$b <=> $a} keys %{ $defout{$org}{$src} }) {
+                next if $nlines > 10;
+                $nlines += scalar @{ $defout{$org}{$src}{$tseqs} };
+                print $OUT5 @{ $defout{$org}{$src}{$tseqs} };
+            }
+        }
+    }
+    
+}
+close $OUT4;
+close $OUT5;
+
+## If blasting, finalize and exit here
+&finalize_and_exit;
+
+
+
+#############################################
+###############  END OF MAIN  ###############
+#############################################
+
+
+
+#############################################
+############  SUBROUTINES BELOW  ############
+#############################################
+
+
+
+
+
+
+sub finalize_and_exit {
+    
+    ## write hits-per-organism summary
+    open my $OUT3, '>', $finalrep;
+    print $OUT3 "Fate/Org\tSubjects\tUnqSeq\tTotRds\tUnqSeq%TopN\tTotRds%TopN\tUnqSeq%Total\tTotRds%Total\n";
+    ## pre-blast fraction stats
+    foreach my $fate (@fates) {
+        next if $noblast && $post_blast{$fate};
+        my ($subj, $tseqs, $useqs) = @{ $sortorg{E}{$fate} };
+        my $upct_N = sprintf("%0.2f", 100*$useqs/$topN);
+        my $upct_T = sprintf("%0.2f", 100*$useqs/$unqseqs);
+        my $tpct_N = sprintf("%0.2f", 100*$tseqs/$topseqreads);
+        my $tpct_T = sprintf("%0.2f", 100*$tseqs/$totalreads);
+        print $OUT3 "$fatenames{$fate}\t$subj\t$useqs\t$tseqs\t$upct_N\t$tpct_N\t$upct_T\t$tpct_T\n";
+    }
+    ## annotated-organism stats, if annotation was sought
+    if (!$noblast) {
+        foreach my $org (sort { $hittotals{$b}{ALL}{ALL} <=> $hittotals{$a}{ALL}{ALL} } keys %{ $sortorg{O} }) {
+            my ($subj, $tseqs, $useqs) = @{ $sortorg{O}{$org} };
+            my $upct_N = sprintf("%0.2f", 100*$useqs/$topN);
+            my $upct_T = sprintf("%0.2f", 100*$useqs/$unqseqs);
+            my $tpct_N = sprintf("%0.2f", 100*$tseqs/$topseqreads);
+            my $tpct_T = sprintf("%0.2f", 100*$tseqs/$totalreads);
+            print $OUT3 "$org\t$subj\t$useqs\t$tseqs\t$upct_N\t$tpct_N\t$upct_T\t$tpct_T\n";
+        }
+        close $OUT3;
+    }
+    
+    ## write bp-level behavior summary per sequence
+    open my $OUT5, '>', $seqstatsrep;
+    print $OUT5 "Type\tHeader\tA\tC\tG\tT\tN\tmaxRunA\tmaxRunC\tmaxRunG\tmaxRunT\tmaxRunN\n";
+    foreach my $fate (@fates) {
+        print $OUT5 "$fatenames{$fate}\t$_\t$seqstats{$_}\n" foreach sort { $catheaders{$fate}{$b} <=> $catheaders{$fate}{$a} } keys %{ $catheaders{$fate} };
+    }
+    close $OUT5;
+    
+    ## compress fastas for storage
+    &logreport("Compressing fastas...\n", 1, $LOG);
+    &execute("gzip $fadir/*.fa", 1, $LOG, 2);
+    
+    ## exit!
+    system "rm -rf $tmp" unless $keep;
+    chomp(my $now = `date`);
+    &logreport("$0 Complete: $now\n", 1, $LOG);
+    exit;
+    
+}

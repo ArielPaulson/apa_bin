@@ -1,0 +1,13 @@
+#!/bin/bash
+
+txt=$1
+echo $txt
+
+idr=${txt%/best*}
+fname=${txt##*/}
+fname=${fname//.txt/.narrowPeak}
+np=$idr/peaks/$fname
+
+tail -n +2 $txt | cut -f15-24 | grep -v ^NA | /home/apa/local/bin/sortBedCoord - > $np
+
+

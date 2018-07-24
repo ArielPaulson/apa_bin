@@ -1,0 +1,138 @@
+#!/usr/bin/env perl
+require '/home/apa/local/bin/apa_routines.pm';
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+
+### Dependencies
+my $samtools = 'samtools';
+
+
+
+### Inputs
+my ($bam, $out, $map) = @ARGV;  # $map is NOT READY YET -- will be optional and remaps coords; currently only accepts DoveTail's HiRise map table format
+die "No input specified!\n" unless $bam;
+($out = $bam) =~ s/\.bam$/.matePairTable.txt/i unless $out;
+$out .= '.gz' unless $out =~ /\.gz$/;  # output is always compressed
+
+
+
+### Globals
+my %data;
+my %map;
+my @blank = map {'NA'} (1..6);  # for missing ends
+
+
+
+### Temp location
+my $tmp = "matePairTable.$$.tmp";
+$tmp = &validate('dir', $tmp, 'Temp location');
+my $tmp1 = "$tmp/out";
+my $tmp2 = "$tmp/sorted";
+
+
+
+### Process Map
+if ($map) {
+    my $MAP = &open2('R', $map, 'Map file');
+    while (<$MAP>) {
+	s/[\n\r]+$//;
+	my ($assembly_id, $input_id, $input_start, $input_end, $strand, $assembly_start, $assembly_end) = split /\t/, $_;
+	$map{$input_id}{$input_start} = [$input_end, $strand, $assembly_id, $assembly_start, $assembly_end];
+    }
+    close $MAP;
+}
+
+
+### Process Bam
+print "Reading Bam: ",`date`;
+open my $BAM, '-|', "$samtools view -F 4 $bam | cut -f1-6,10" or die "$0: Failed to open read pipe from 'samtools view $bam': $!\n";
+my $TMP = &open2('W', $tmp1, 'Temp file 1');
+while (<$BAM>) {
+    chomp;
+    print " $. lines\n" if $. % 1E7 == 0;
+    my ($header, $flags, $chr, $start, $score, $cigar, $seq) = split;
+    my $read_end = $flags & 128 ? 2 : 1;
+    my ($str, $ori);
+    if ($flags & 16) {
+	($str, $ori) = (-1, 'R');
+    } else {
+	($str, $ori) = (1, 'F');
+    }
+    my $len = length($seq);
+    $len -= $1 if $cigar =~ /^(\d+)S/;  # 5' clipping
+    $len -= $1 if $cigar =~ /(\d+)S$/;  # 3' clipping
+    my $end = $start+$len-1;
+    print $TMP join("\t", $header, $read_end, $chr, $start, $end, $str, $score, $len, $ori), "\n";
+}
+close $TMP;
+close $BAM;
+
+print "Sorting temp file: ",`date`;
+system "sort -k1,1d -k2,2n $tmp1 > $tmp2";  ## SORT BY READ HEADER IN COL 1 -- THAT WAY PAIRS OCCUR IN PAIRS
+
+
+### Read sorted temp file and write output
+print "Writing output: ",`date`;
+my $IN = &open2('R', $tmp2, 'Temp file 2');
+open my $OUT, '|-', "gzip > $out" or die "$0: Failed to open write pipe to 'gzip > $out': $!\n";
+print $OUT "Header\t";
+foreach my $i (1, 2) {
+    print $OUT join("\t", map {"${_}$i"} qw/ Chr Start End Strand Score Length Aligns /), "\t";
+}
+print $OUT "Orient\tDistance\n";
+## How to read 'Orient' and 'Distance':
+## 'Orient' is going to be one of { FR RF FF RR NA } depending on mate-pair alignments.  NA means an unpaired alignment.
+## 'Distance' is going to be the distance between reads, regardless of orientation, for cis-aligned pairs.  NA indicates a trans-aligned pair, or unpaired alignment.
+
+my (%data, $prev_header);
+while (<$IN>) {
+    chomp;
+    my ($header, $read_end, $chr, $start, $end, $str, $score, $len, $ori) = split;
+    
+    if ($. > 1 && $header ne $prev_header) {
+	
+	if (exists $data{$prev_header}{1} && exists $data{$prev_header}{2}) {
+	    my $a1 = scalar @{ $data{$prev_header}{1} };
+	    my $a2 = scalar @{ $data{$prev_header}{2} };
+	    foreach my $rec1 (@{ $data{$prev_header}{1} }) {
+		foreach my $rec2 (@{ $data{$prev_header}{2} }) {
+		    my $orient = join('', $$rec1[6], $$rec2[6]);
+		    my $dist;
+		    if ($$rec1[0] eq $$rec2[0]) {
+			$dist = ($$rec1[1] < $$rec2[1]) ? ($$rec2[2]-$$rec1[1]+$$rec2[5]-1) : -1*($$rec1[1]-$$rec2[2]+$$rec1[5]-1);  # MP outer distance, i.e. fragment length, but signed to indicate if pair aligned in reverse
+		    } else {
+			$dist = 'NA';  # trans-connecting MP; distance not definable
+		    }
+		    print $OUT join("\t", $prev_header, @$rec1[0..5], $a1, @$rec2[0..5], $a2, $orient, $dist), "\n";
+		}
+	    }
+	} elsif (exists $data{$prev_header}{1}) {
+	    my $a1 = scalar @{ $data{$prev_header}{1} };
+	    foreach my $rec1 (@{ $data{$prev_header}{1} }) {
+		print $OUT join("\t", $prev_header, @$rec1[0..5], $a1, @blank, 'NA', $$rec1[6].'N', 0), "\n";  # giving orphans a distance of 0 to distinguish from trans-MP
+	    }
+	} elsif (exists $data{$prev_header}{2}) {
+	    my $a2 = scalar @{ $data{$prev_header}{2} };
+	    foreach my $rec2 (@{ $data{$prev_header}{2} }) {
+		print $OUT join("\t", $prev_header, @blank, 'NA', @$rec2[0..5], $a2, 'N'.$$rec2[6], 0), "\n";  # giving orphans a distance of 0 to distinguish from trans-MP
+	    }
+	} else {
+	    print "Lost header '$prev_header'!\n";
+	}
+	%data = ();
+	
+    }
+    
+    push @{ $data{$header}{$read_end} }, [$chr, $start, $end, $str, $score, $len, $ori];
+    $prev_header = $header;
+}
+close $IN;
+close $OUT;
+
+system "rm -rf $tmp";
+print "$0 complete!\n";
+system "kill $$";  # hashes too large for exit()
+

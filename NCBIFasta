@@ -1,0 +1,129 @@
+#!/usr/bin/env perl
+require '/home/apa/local/bin/apa_routines.pm';   # &translate, &blockify
+use LWP::Simple;
+use Getopt::Long;
+use strict;
+
+
+## Pulls fasta sequences from NCBI for a list of identifiers
+## Also can translate and return all or only the best frame(s)
+
+
+## Inputs
+my $IDfile;       # list of IDs, in file
+my $stdio;        # list of IDs, piped
+my $annotDB;      # the NCBI database from which to annotate hits (e.g. 'nucleotide', 'protein', etc)
+my $outfile;      # an output file
+my $translate;    # if specified: 1,3,6 indicating translation mode.  Output will be "translated_$outfile".
+my $bestframe;    # if translating, return only the frame(s) with fewest stop codons
+my $verbose;      # print results to screen (as well as to file)
+
+## Globals
+my %records;      # input blast records
+my %terms;        # NCBI query terms (currently GI numbers)
+my %annots;       # queried NCBI records
+my @output;       # output
+my $eutils = 'http://eutils.ncbi.nlm.nih.gov/entrez/eutils';  # NCBI eutils URL
+my %dbTypes = map {($_=>1)} qw/ nucleotide nuccore nucest nucgss protein /;  # NCBI databases that one could query using blast results (later: gene genome unigene)
+my $batchsize = 200;  # query ID batch size for elink; http://www.ncbi.nlm.nih.gov/books/NBK25497/ claims "several hundred records can be downloaded using one EFetch request"
+
+GetOptions("i=s" => \$IDfile, "d=s" => \$annotDB, "o=s" => \$outfile, "verbose" => \$verbose, "t=i" => \$translate, "bestframe" => \$bestframe, "" => \$stdio);
+$outfile = $IDfile.'.annotated' unless $outfile;
+die "NCBI annotation DB '$annotDB' not recognized!  Must be one of: ",join(", ",map {"'$_'"} sort keys %dbTypes),"\n" unless $dbTypes{$annotDB};
+
+
+## get IDs
+my (%terms, %allids, $Nids);
+my $nbatch = 1;
+if ($stdio) {
+    foreach (<>) {
+	$_ =~ s/[\n\r]+$//;
+	$terms{$nbatch}{$_} = 1;
+	$allids{$_} = 1;
+	$Nids++;
+	$nbatch++ if $Nids % $batchsize == 0;
+    }
+} else {
+    open IN, $IDfile or die "$0: Failed to open ID file '$IDfile' for reading: $!\n";
+    while (<IN>) {
+	$_ =~ s/[\n\r]+$//;
+	$terms{$nbatch}{$_} = 1;
+	$allids{$_} = 1;
+	$nbatch++ if $. % $batchsize == 0;
+    }
+    $Nids = $.;
+    close IN;
+}
+
+my $Nunq = scalar keys %allids;
+print "$Nids IDs read | $Nunq unique.\n";
+
+chomp(my $start_time = `date`);  # query start time
+
+# query NCBI; write results to disk in real time
+open OUT, "> $outfile" or die "$0: Cannot write to output file '$outfile': $!\n";
+
+my $effbatch = $Nids > $batchsize ? $batchsize : $Nids;
+print "Running $nbatch queries of $effbatch terms each.\n";
+
+my (%seq, %headers, $header, $I);
+foreach my $batch (1..$nbatch) {
+    my $allterm = 'id=' . (join ',', keys %{ $terms{$batch} });
+    my $srchstring = shift;
+    my $esumm = "$eutils/efetch.fcgi?db=$annotDB&retType=fasta&$allterm";
+    print "BATCH $batch: $esumm\n";
+    my $esumm_result = get($esumm);
+    print "$esumm_result\n" if $verbose;
+    foreach my $line (split /\n/, $esumm_result) {
+	next unless $line;
+	print OUT "$line\n";
+	next unless $translate;
+	if ($line =~ /^>/) {
+	    $I++;
+	    $headers{$I} = $line;
+	} else {
+	    $seq{$I} .= $line;
+	}
+    }
+    sleep 1;
+}
+close OUT;
+
+if ($translate) {
+    
+    my %framelist = ( 1 => ['+0'], 3 => ['+0','+1','+2'], 6 => ['+0','+1','+2','-0','-1','-2'] );
+    
+    open OUT, "> translated_$outfile" or die "$0: Cannot write to output file 'translated_$outfile': $!\n";
+    foreach my $i (1..$I) {
+	my %peptide = %{ &translate($seq{$i}, $translate) };
+	if ($translate == 1) {
+	    my $pepblock = ${ &blockify($peptide{'+0'}, 50) };
+	    print OUT "$headers{$i}\n$pepblock\n";
+	} else {
+	    my (%holding, %framestops);
+	    my $minstop = 9E9;  # initialize impossibly high
+	    foreach my $frame (@{ $framelist{$translate} }) {
+		my $pepblock = ${ &blockify($peptide{$frame}, 50) };
+		my $stops;
+		$stops++ while $pepblock =~ /\*/g;
+		$minstop = $stops if $stops < $minstop;
+		$framestops{$frame} = $stops;
+		$holding{$frame} = "$headers{$i}|Frame $frame|$stops Stops\n$pepblock\n";
+	    }
+	    foreach my $frame (@{ $framelist{$translate} }) {
+		if ($bestframe) {
+		    print OUT $holding{$frame} if $framestops{$frame} == $minstop;
+		} else {
+		    print OUT $holding{$frame};
+		}
+	    }
+	}
+    }
+    close OUT;
+}
+
+chomp(my $end_time = `date`);
+print "Start Time: $start_time\nEnd Time:   $end_time\nNCBIQuery Complete!\n";
+exit;
+
+

@@ -1,0 +1,97 @@
+#!/usr/bin/env perl
+require '/home/apa/local/bin/apa_routines.pm';  # chrsort
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+use Cwd;
+
+my $inbed;      # input bed file
+my $outbed;     # output bed file
+my $orient;     # correct coords where start > end?
+my $fliporient; # $orient, and switch strand for corrected coords?
+my $nochrsort;  # do not sort chromosomes?   ### DEFAULT: lexico sorted
+my $apachrsort; # sort chromosomes with &chrsort from apa_routines.pm? 
+my $chrlist;    # any file with ordered chromosomes in column 1 (e.g. fasta.fai or chrom.sizes files); will adopt this chrom ordering
+my $overwrite;  # overwrite input file?
+my $headerN;    # ignore N header lines?
+my %otherstrand = ('+','-', '-','+');  # for strand reversal
+my @headers;    # headers from input file
+my %data;       # records from input file
+my $gtf;        # input is GTF
+my $stdio;      # piped input
+
+GetOptions("i=s" => \$inbed, "o=s" => \$outbed, "c=s" => \$chrlist, "h=i" => \$headerN, "orient" => \$orient, "orient-flip" => \$fliporient, "no-chr-sort" => \$nochrsort, "apa-chr-sort" => \$apachrsort, "overwrite" => \$overwrite, "gtf" => \$gtf, "" => \$stdio);
+
+die "$0: Cannot use '--overwrite' on stdio!\n" if $stdio && $overwrite;
+if ($inbed && $inbed eq $outbed) {
+    $outbed = undef;
+    $overwrite = 1;
+}
+
+my @fields = $gtf ? (0,3,4,6) : (0,1,2,5);
+
+my $IN;
+if ($inbed) {
+    open $IN, '<', $inbed or die "$0: Failed to open bed file '$inbed' for reading: $!\n";
+} elsif ($stdio) {
+    open $IN, '<-';
+} else {
+    die "$0: No input specified!\n";
+}
+my ($i, $maxcol);
+while (<$IN>) {
+    if ($_ =~ /^track/ || $_ =~ /^#/) {
+	push @headers, $_;
+    } elsif ($headerN && $. <= $headerN) {
+	push @headers, $_;
+    } else {
+	$i++;
+	$_ =~ s/[\n\r]+$//;
+	my @data = split /\t/, $_;
+	$maxcol = $#data if $i == 1;
+	my ($chr, $pos1, $pos2, $strand) = @data[@fields];
+	my ($start, $end);
+	if ($maxcol > 2) {
+	    if ($orient) {
+		($start, $end) = ($pos1 < $pos2) ? ($pos1, $pos2) : ($pos2, $pos1);
+	    } elsif ($fliporient) {
+		($start, $end, $strand) = ($pos1 < $pos2) ? ($pos1, $pos2, $strand) : ($pos2, $pos1, $otherstrand{$strand});
+	    } else {
+		($start, $end) = ($pos1, $pos2);
+	    }
+	} else {
+	    ($start, $end) = ($pos1, $pos2);
+	}
+	@data[@fields] = ($chr, $start, $end, $strand);
+	push @{ $data{$chr}{"$start\t$end"} }, (join "\t", @data[0..$maxcol]);
+    }
+}
+close $IN;
+
+my @ordchr;
+if ($chrlist) {
+    chomp(@ordchr = split /\n/, `cut -f1 $chrlist`);
+} elsif ($nochrsort) {
+    @ordchr = keys %data;
+} elsif ($apachrsort) {
+    @ordchr = @{ &chrsort([keys %data], 0) };
+} else {
+    @ordchr = sort {$a cmp $b} keys %data;
+}
+my $OUT;
+if ($outbed) {
+    open $OUT, '>', $outbed;
+} elsif ($overwrite) {
+    unlink $inbed;
+    open $OUT, '>', $inbed;
+} else {
+    open $OUT, '>-';
+}
+print $OUT @headers;
+foreach my $chr (@ordchr) {
+    foreach my $coord (sort {$a <=> $b} keys %{ $data{$chr} }) {
+	print $OUT "$_\n" foreach @{ $data{$chr}{$coord} };
+    }
+}
+exit;
+

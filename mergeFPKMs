@@ -1,0 +1,67 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+# Deps:
+
+## Inputs
+my $gbed;      # relevant genes bed file, if any
+my $prefix;    # file name -> sample name prefix to remove (regexp)
+my $suffix;    # file name -> sample name suffix to remove (regexp)
+my @inputs;    # list of dataset files (arguments left over from GetOptions)
+
+GetOptions(
+    "g=s" => \$gbed, 
+    "p=s" => \$prefix, 
+    "s=s" => \$suffix
+    );
+
+@inputs = @ARGV;
+
+## Globals
+my @names;     # filenames for the header
+my %allgenes;  # all observed gene IDs
+my %matrix;    # data matrix
+
+
+## Main
+
+if ($gbed) {
+    open my $GB, '-|', "cut -f4 $gbed";
+    chomp(my @genes = (<$GB>));
+    close $GB;
+    $allgenes{$_} = 1 foreach @genes;
+}
+
+foreach my $file (@inputs) {
+    
+    if (open my $IN, '-|', "cut -f1,10 $file") {
+	
+	# decide on sample name
+	my $name = $file;  # file's path as given
+	$name =~ s/^$prefix//;
+	$name =~ s/$suffix$//;
+	push @names, $name;
+	
+	# read matrix; extract key=>value pairs
+	while (<$IN>) {
+	    next if $. == 1;
+	    $_ =~ s/[\n\r]+$//;
+	    my ($gene, $FPKM) = split /\t/, $_;
+	    $matrix{$gene}{$name} += $FPKM;  # Cufflinks can output > 1 value per gene; add
+	    $allgenes{$gene} = 1;
+	}
+	close $IN;
+	
+    } else {
+	print "$0: Cannot read Cufflinks FPKMs file '$file': $!\n";
+    }
+}
+
+# write all-sample matrix
+print join("\t", ('Gene', @names)), "\n";
+foreach my $gene (sort keys %allgenes) {
+    print join("\t", ($gene, map {$matrix{$gene}{$_}||0} @names)), "\n";
+}
+exit;

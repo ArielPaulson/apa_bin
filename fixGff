@@ -1,0 +1,59 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use strict;
+
+die;    # STILL IN DEVELOPMENT
+
+my ($gxf, $fai, $type, $prefix);
+GetOptions("g=s" => \$gxf, "f=s" => \$fai, "t=s" => \$type, "p=s" => \$prefix);
+
+my $gff = $type eq 'gff' ? 1 : 0;
+my %strands = map {($_=>1)} ('+','-');
+my %phases = map {($_=>1)} (0,1,2);
+
+open IN, $fai or die "Cannot open '$fai': $!\n";
+while (<IN>) {
+    my ($chr, $len, $else) = split /\t/, $_, 3;
+    $lens{$chr} = $len;
+}
+close IN;
+
+my (%chrs, %features, %ranges, %storage);
+
+open IN, $gxf or die "Cannot open '$gxf': $!\n";
+
+while (<IN>) {
+    next if $_ =~ /^\#/;			# random header junk
+    next if scalar (split /\t/, $_) == 1;	# not a tab-delimited line -- probably sequence
+    (my $line = $_) =~ s/[\n\r]+$//;
+    my @data = split /\t/, $line;
+    $chrs{$data[0]}++;
+    $features{$data[2]}++;
+    if ($data[3] < 1) {
+	print $_ "Line $. | Start < 1 | $line\n" foreach @handles;
+    }
+    if ($data[4] > $lens{$data[0]}) {
+	print "Line $. | End exceeds chr len $lens{$data[0]} | $line\n";
+    }
+    unless ($strands{$data[6]}) {
+	print "Line $. | Bad strand | $line\n";
+    }
+    unless ($phases{$data[7]}) {
+	print "Line $. | Bad phase | $line\n";
+    }
+    if ($data[8]) {
+	if ($gff) {
+	    ($id) = ($data[8] =~ /ID=([^";]+);/i);
+	    ($parent) = ($data[8] =~ /Parent=([^";]+);/i);
+	} else {
+	}
+	$storage{}
+    } else {
+	print "Line $. | No annots | $line\n";
+    }
+}
+close OUT;
+
+
+
+exit;

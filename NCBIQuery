@@ -1,0 +1,274 @@
+#!/usr/bin/env perl
+use LWP::Simple;
+use Getopt::Long;
+use strict;
+
+## To Do: tool/email, ESummary
+
+my %dbtypes = (
+    'nucleotide' => { 'full'=>'text', 'native'=>'xml', 'fasta'=>'text', 'gb'=>'text' }, 
+    'nuccore' => { 'native'=>'xml', 'fasta'=>'text', 'gb'=>'text', 'ft'=>'text' }, 
+    'nucest' => { 'native'=>'xml', 'fasta'=>'text', 'gb'=>'text' }, 
+    'nucgss' => { 'native'=>'xml', 'fasta'=>'text', 'gb'=>'text' }, 
+    'mesh' => { 'full'=>'text' },
+    'protein' => { 'native'=>'xml', 'fasta'=>'text', 'gp'=>'text', 'ft'=>'text' }, 
+    'gene' => { ''=>'xml', 'gene_table'=>'text' }, 
+    'genome' => {  }, 
+    'pubmed' => { ''=>'xml', 'medline'=>'text', 'uilist'=>'text', 'abstract'=>'text' }, 
+    'unigene' => {  } );
+
+my %notypes = map {($_=>1)} qw/ links summary /;  # 'type' values which are not 'dbtypes' above
+
+my ($db, $linkdb, $type, $mode, $idsingle, $idfile, $outfile, $search, $test, $noseq, $batch);
+
+GetOptions("d=s" => \$db, "l=s" => \$linkdb, "t=s" => \$type, "m=s" => \$mode, "i=s" => \$idsingle, "f=s" => \$idfile, "o=s" => \$outfile, "batch" => \$batch, "search" => \$search, "test" => \$test, "noseq" => \$noseq);
+
+my $batchsize = 100 if $batch;  # query ID batch size for elink; http://www.ncbi.nlm.nih.gov/books/NBK25497/ claims "several hundred records can be downloaded using one EFetch request"
+my $retmax = 1000;  # records to return per fetch call
+
+die "No output file specified!\n" unless $outfile;
+die "database '$db' not supported: must be one of: " . (join ', ', map { "'$_'" } sort keys %dbtypes) . "\n" unless $dbtypes{$db};
+die "link-to database '$linkdb' not supported: must be one of: " . (join ', ', map { "'$_'" } sort keys %dbtypes) . "\n" if ($linkdb && !$dbtypes{$linkdb});
+($type, $batchsize, $batch) = ('links', 100, 1) if $linkdb;
+die "type '$type' not supported for db '$db': must be one of: " . (join ', ', map { "'$_'" } sort keys %{ $dbtypes{$db} }) . "\n" unless ($notypes{$type} || $dbtypes{$db}{$type});
+my $mode = $dbtypes{$db}{$type} unless $mode;
+
+my $eutils = 'http://eutils.ncbi.nlm.nih.gov/entrez/eutils';
+
+my @terms;
+if ($idsingle) {
+    
+    @terms = ($idsingle);
+    
+} elsif ($idfile) {
+    
+    open IN, $idfile or die "Cannot read ID file '$idfile': $!\n";
+    while (<IN>) {
+	$_ =~ s/[\n\r]+$//;
+	push @terms, $_;
+    }
+    close IN;
+    
+} else {
+    
+#   die "No query terms specified!\n";
+    @terms = qw/ AB001425 AB004048 AB005662 AB010088 AB012393 AB012808 /;  # test set
+    
+}
+
+my @output;
+chomp(my $start_time = `date`);
+
+if ($test) {  ##
+    
+    foreach my $term (@terms) {
+	
+	my $esearch_result = get("$eutils/egquery.fcgi?db=$db&usehistory=y&term=$term");
+	print "\nESEARCH RESULT: $esearch_result\n";
+	my ($count, $key, $web) = ($esearch_result =~ m|<Count>(\d+)</Count>.*<QueryKey>(\d+)</QueryKey>.*<WebEnv>(\S+)</WebEnv>|s);
+	print "Count = $count; QueryKey = $key; WebEnv = $web\n";
+	
+	for (my $retstart = 0; $retstart < $count; $retstart += $retmax) {
+	    my $efetch = "$eutils/efetch.fcgi?db=nucleotide&WebEnv=$web&query_key=$key&retstart=$retstart&retmax=$retmax&rettype=$type";
+	    $efetch .= "&retmode=$mode" if $mode;
+#	    print "EFETCH: $efetch\n";
+	    my $efetch_result = get($efetch);
+	    push @output, $efetch_result;
+	    sleep 1;  
+	}
+	
+#	my $efetch = "$eutils/efetch.fcgi?rettype=$type&db=$db&query_key=$QueryKey&WebEnv=$WebEnv";
+#	$efetch .= "&retmode=$mode" if $mode;
+#	print "EFETCH: $efetch\n";
+#	my $efetch_result = get($efetch);
+#	print "$efetch_result\n";
+#	push @output, "\n\\ QUERY TERM:$term\n$efetch_result\n";
+#	$i++;
+#	if ($i == 2) {
+#	    sleep 1;  
+#	    $i = 0;
+#	}
+	
+    }
+    
+} elsif ($type eq 'links') {  ## use IDs from one DB to query related entries in another DB
+    
+    my $nbatch = scalar(@terms) % $batchsize == 0 ? scalar(@terms)/$batchsize : int(scalar(@terms)/$batchsize)+1;
+    print "Running $nbatch queries of $batchsize terms each.\n";
+    
+    my ($i, $j, $k) = (0, -1, 0);
+    foreach (1..$nbatch) {
+	$i = $j + 1;
+	$j = $i + $batchsize - 1 > $#terms ? $#terms : $i + $batchsize - 1;
+	my @batch = @terms[$i..$j];
+	
+	my $UIDs = join '&', map { "id=$_" } @batch;
+	my $elink = "$eutils/elink.fcgi?dbfrom=$db&db=$linkdb&$UIDs";
+#	my $UIDs = join ',', @batch;
+#	my $elink = "$eutils/elink.fcgi?dbfrom=$linkdb&db=$db&id=$UIDs";
+	print "ELINK: $elink\n";
+	my $elink_result = get($elink);
+#	print $elink_result;
+	push @output, "$elink_result\n";
+	
+	$k++;
+	if ($k == 2) {
+	    sleep 1;
+	    $k = 0;
+	}
+    }
+    
+} elsif ($type eq 'summary') {  ## get summaries
+    
+    if ($batch) {
+	
+	my $nbatch = scalar(@terms) % $batchsize == 0 ? scalar(@terms)/$batchsize : int(scalar(@terms)/$batchsize)+1;
+	print "Running $nbatch queries of $batchsize terms each.\n";
+	
+	my ($i, $j) = (0, -1);
+	foreach (1..$nbatch) {
+	    $i = $j + 1;
+	    $j = $i + $batchsize - 1 > $#terms ? $#terms : $i + $batchsize - 1;
+	    my @batch = @terms[$i..$j];
+	    
+#	    my $UIDs = join '&', map { "id=$_" } @batch;
+	    my $allterm = 'id=' . (join ',', @batch);
+	    &summary_query($allterm);
+	    sleep 1;
+	}
+
+    } else {
+	
+	foreach my $term (@terms) {
+	    &summary_query("id=$term");
+	}
+    }
+   
+    
+    
+    
+} elsif ($search) {  ## search DB for term
+    
+    if ($batch) {
+	
+	my $nbatch = scalar(@terms) % $batchsize == 0 ? scalar(@terms)/$batchsize : int(scalar(@terms)/$batchsize)+1;
+	print "Running $nbatch queries of $batchsize terms each.\n";
+	
+	my ($i, $j) = (0, -1);
+	foreach (1..$nbatch) {
+	    $i = $j + 1;
+	    $j = $i + $batchsize - 1 > $#terms ? $#terms : $i + $batchsize - 1;
+	    print "Summary Batch $_: $i-$j\n";
+	    my @batch = @terms[$i..$j];
+	    
+#	    my $UIDs = join '&', map { "id=$_" } @batch;
+	    my $allterm = 'term=' . (join ',', @batch);
+	    &search_query($allterm);
+	    sleep 1;
+	}
+
+    } else {
+	
+	foreach my $term (@terms) {
+	    &search_query("id=$term");
+#	    &search_query("term=$term");
+	}
+    }
+    
+} else {  ## direct query by id, no search
+    
+    my $i;
+    foreach my $term (@terms) {
+	my $efetch = "$eutils/efetch.fcgi?db=$db&id=$term&rettype=$type";
+#	$efetch .= "&retmode=$mode" if $mode;
+	
+#	print "EFETCH: $efetch\n";
+	if ($noseq) {
+	    my ($origin, $transl);
+	    push @output, "\nQUERY TERM:$term\n";
+	    foreach my $efetch_line (split /\n/, get($efetch)) {
+		$origin = 1 if $efetch_line =~ /^ORIGIN/;    # start of sequence
+		$origin = undef if $efetch_line =~ /^\/\//;  # end of record
+		$transl = 1 if $efetch_line =~ /^\s+\/translation="/;    # start of translation
+		next if ($origin || $transl);
+		$transl = undef if $efetch_line =~ /"\s*$/;      # end of translation
+#		print "$efetch_line\n";
+		push @output, "$efetch_line\n";
+	    }
+	    push @output, "\n";
+	} else {
+	    my $efetch_result = get($efetch);
+#	    print "$efetch_result\n";
+	    push @output, "\nQUERY TERM:$term\n$efetch_result\n";
+	}
+	$i++;
+	if ($i == 2) {
+	    sleep 1;
+	    $i = 0;
+	}
+    }
+}
+
+open OUT, "> $outfile" or die "Cannot write to output file '$outfile': $!\n";
+print OUT @output;
+close OUT;
+
+chomp(my $end_time = `date`);
+print "Start Time: $start_time\nEnd Time:   $end_time\nNCBIQuery Complete!\n";
+
+
+
+
+sub search_query {
+    
+    my $srchstring = shift;
+    
+    my $esearch = "$eutils/esearch.fcgi?db=$db&usehistory=y&$srchstring";
+    my $esearch_result = get($esearch);
+    my ($count, $key, $web) = ($esearch_result =~ m|<Count>(\d+)</Count>.*<QueryKey>(\d+)</QueryKey>.*<WebEnv>(\S+)</WebEnv>|s);
+    print "\nESEARCH: $esearch\nESEARCH RESULT: $esearch_result\nCount = $count; QueryKey = $key; WebEnv = $web\n";
+    
+    for (my $retstart = 0; $retstart < $count; $retstart += $retmax) {
+	my $efetch = "$eutils/efetch.fcgi?db=nucleotide&WebEnv=$web&query_key=$key&retstart=$retstart&retmax=$retmax&rettype=$type";
+	$efetch .= "&retmode=$mode" if $mode;
+	sleep 1;  
+	
+	push @output, "\nQUERY TERM:$srchstring\n" unless $batch;
+	if ($noseq) {
+	    my ($origin, $transl);
+	    foreach my $efetch_line (split /\n/, get($efetch)) {
+		$origin = 1 if $efetch_line =~ /^ORIGIN/;    # start of sequence; will not print
+		$origin = undef if $efetch_line =~ /^\/\//;  # end of record; WILL print
+		$transl = 1 if $efetch_line =~ /^\s+\/translation="/;    # start of translation; will not print
+		if ($efetch_line =~ /"\s*$/) {      # end of translation; will not print
+		    $transl = undef;
+		    next;
+		}
+		next if ($origin || $transl);
+		push @output, "$efetch_line\n";
+	    }
+	    push @output, "\n";
+	} else {
+	    my $efetch_result = get($efetch);
+	    push @output, "$efetch_result\n";
+	}
+    }
+
+}
+
+
+
+sub direct_query {
+
+}
+
+
+sub summary_query {
+    
+    my $srchstring = shift;
+    my $esumm = "$eutils/esummary.fcgi?db=$db&$srchstring";
+#    print "$esumm\n";
+    my $esumm_result = get($esumm);
+    push @output, "$esumm_result\n";
+   
+}

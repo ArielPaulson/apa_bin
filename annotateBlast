@@ -1,0 +1,166 @@
+#!/usr/bin/env perl
+use LWP::Simple;
+use Getopt::Long;
+use strict;
+
+
+## Appends a standard set of annotation columns (from Genbank records) to a tabular (-m 8) NCBI blast output file
+## Those columns being: LOCUS LENGTH DEFINITION GENE GENEID ACCESSION VERSION GI SOURCE KEYWORDS
+## Requires script: genbank2tab
+
+
+## Inputs
+my $blastFile;    # tabular (-m 8) blast output file, from any NCBI blast program
+my $annotDB;      # the NCBI database from which to annotate hits (e.g. 'nucleotide', 'protein', etc)
+my $outfile;      # an output file
+my $annotTmp;     # if restarting from a run that died, specify the temp genbank file it was writing
+my $verbose;      # print results to screen (as well as to file)
+
+## Globals
+my %records;      # input blast records
+my %terms;        # NCBI query terms (currently GI numbers)
+my %annots;       # queried NCBI records
+my @output;       # output
+my $blastHeader;  # file header for blast columns
+my $annotHeader;  # file header for annotation columns 
+my $deletes;      # temp files to be deleted
+my $gbtmp = "annotateBlast.$$.gb.tmp";   # TEMP: downloaded genbank records
+my $gitmp = "annotateBlast.$$.gi.tmp";   # TEMP: GI numbers for downloaded genbank records
+my $bin = '/home/apa/local/bin';         # script locations
+my $eutils = 'http://eutils.ncbi.nlm.nih.gov/entrez/eutils';  # NCBI eutils URL
+my %dbTypes = map {($_=>1)} qw/ nucleotide nuccore nucest nucgss protein /;  # NCBI databases that one could query using blast results (later: gene genome unigene)
+
+
+GetOptions("b=s" => \$blastFile, "d=s" => \$annotDB, "o=s" => \$outfile, "t=s" => \$annotTmp, "verbose" => \$verbose);
+$outfile = $blastFile.'.annotated' unless $outfile;
+die "NCBI annotation DB '$annotDB' not recognized!  Must be one of: ",join(", ",map {"'$_'"} sort keys %dbTypes),"\n" unless $dbTypes{$annotDB};
+
+
+## parse blast records
+open my $IN1, '<', $blastFile or die "$0: Failed to open blast file '$blastFile' for reading: $!\n";
+while (<$IN1>) {
+    $_ =~ s/[\n\r]+$//;
+    if ($. == 1) {
+	if ( (split /\t/, $_)[2] == 0) {  # blast ident% field == 0 -> probably text, since 0 is unreportably low -> first line is a header?
+	    $blastHeader = $_;
+	    next;
+	} else {
+	    $blastHeader = "Query\tSubject\tIdtPct\tAlnLen\tMismatch\tGaps\tQStart\tQEnd\tSStart\tSEnd\tEval\tScore";
+	    # do NOT next
+	}
+    }
+    my @fields = split /\t/, $_;
+    $records{$.}{INPUT} = \@fields;
+    my ($gi) = ($fields[1] =~ /^gi\|(\d+)/);
+    $terms{$gi} = 1;
+    $records{$.}{GI} = $gi;
+}
+close $IN1;
+
+my $NGI = scalar keys %terms;
+print "$NGI unique GI numbers.\n";
+
+chomp(my $start_time = `date`);  # query start time
+
+if ($annotTmp =~ /tsv$/) {
+    
+    ($gbtmp = $annotTmp) =~ s/\.tsv$//;    # reloading from temp file from failed run
+    
+} elsif ($annotTmp =~ /tmp$/) {
+    
+    $gbtmp = $annotTmp;
+    system "$bin/genbank2tab $gbtmp";    # reloading from temp file from failed run, at a different stage
+    $deletes = "$gbtmp.tsv";
+    
+} else {
+    
+    # query NCBI; write results to disk in real time
+    open my $GB, '>', $gbtmp or die "$0: Cannot write to Genbank temp file '$gbtmp': $!\n";
+    open my $GI, '>', $gitmp or die "$0: Cannot write to finished-GI temp file '$gitmp': $!\n";
+    my ($i, $n);
+    print "Querying $NGI UIDs from NCBI '$annotDB'...\n";
+    foreach my $term (keys %terms) {
+	
+	my $efetch = "$eutils/efetch.fcgi?db=$annotDB&id=$term&rettype=gp";
+	print "EFETCH: $efetch\n" if $verbose;
+	my ($origin, $transl);
+	print $GB "\nQUERY TERM:$term\n";
+	foreach my $efetch_line (split /\n/, get($efetch)) {
+	    $origin = 1 if $efetch_line =~ /^ORIGIN/;    # start of sequence
+	    $origin = undef if $efetch_line =~ /^\/\//;  # end of record
+	    $transl = 1 if $efetch_line =~ /^\s+\/translation="/;    # start of translation
+	    next if ($origin || $transl);
+	    $transl = undef if $efetch_line =~ /"\s*$/;      # end of translation
+	    print "$efetch_line\n" if $verbose;
+	    print $GB "$efetch_line\n";
+	}
+	print $GB "\n";
+	print $GI "$term\n";  # already downloaded this term -- in case we have to re-start
+	
+	$i++;
+	$n++;
+	print " $n/$NGI\n" if $n % 1000 == 0;
+	if ($i == 2) {
+	    sleep 1;
+	    $i = 0;
+	}
+    }
+    close $GB;
+    close $GI;
+    
+    system "$bin/genbank2tab $gbtmp";   # convert Genbank/Genpept records to tabular
+    $deletes = "$gitmp $gbtmp $gbtmp.tsv";
+}
+
+# read tabular annotations
+open my $IN2, '<', "$gbtmp.tsv" or die "$0: Failed to open Genbank tabular file '$gbtmp.tsv' for reading: $!\n";
+while (<$IN2>) {
+    $_ =~ s/[\n\r]+$//;
+    if ($. == 1) {
+	$annotHeader = $_;
+	next;
+    }
+    my @fields = split /\t/, $_;
+    $fields[7] =~ s/^GI://;
+    $annots{$fields[7]} = \@fields;
+}
+close $IN2;
+
+system "rm -f $deletes";  # cleanup
+
+# write results; append annotations to each record, keyed on GI number
+open my $OUT1, '>', $outfile or die "$0: Failed to open output file '$outfile' for writing: $!\n";
+print $OUT1 "$blastHeader\t$annotHeader\n";
+my %fails;
+foreach my $i (sort {$a <=> $b} keys %records) {
+    my $gi = $records{$i}{GI};
+    unless ($gi) {
+	print "Record $i has no GI number!  Cannot annotate.\n";
+	next;
+    }
+    my @annot;
+    if ($annots{$gi}) {
+	@annot = @{ $annots{$gi} };
+    } else {
+	$fails{$gi} = 1;
+	print "Record $i GI $gi not found at NCBI!  Cannot annotate.\n" if $verbose;
+    }
+    print $OUT1 join("\t",(@{ $records{$i}{INPUT} },@annot)),"\n";
+}
+close $OUT1;
+
+# unannotatable blast subjects
+if (%fails) {
+    print scalar(keys %fails), " GI numbers were not found in database '$annotDB'!  See '$outfile.lost'\n";
+    open my $OUT2, '>', "$outfile.lost" or die "$0: Failed to open lost GI file '$outfile.lost' for writing: $!\n";
+    print $OUT2 "$_\n" foreach sort {$a <=> $b} keys %fails;
+    close $OUT2;
+}
+
+chomp(my $end_time = `date`);
+print "Start Time: $start_time\nEnd Time:   $end_time\nNCBIQuery Complete!\n";
+
+
+
+
+

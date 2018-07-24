@@ -1,0 +1,170 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+#$Id$
+
+# Copyright © 2016, Stowers Institute for Medical Research.  All rights reserved.
+
+# c.f. attached LICENSE
+
+
+
+
+
+=pod
+
+=head1 SYNOPSIS
+
+bigWigHeaders -d repo_dir files 
+
+bigWigHeaders takes a list of bigWig, bigBed, or BAM files and returns a table of UCSC track headers.
+
+Files must be uploaded to tracks.stowers.org, under the repository path /r/.
+
+=head1 OPTIONS
+
+=over
+
+=item B<-d repo_dir>
+
+The subdirectory(s) of /r/ where the files are located on tracks.stowers.org.  If tracks are in /r/my_tracks/project_1/, then give "-d my_tracks/project_1".
+
+=item B<--stranded>
+
+Files occur in stranded pairs; order output lines so that + strand comes first and - second.  Filenames must contain ".strand." strings, where "strand" is one of the following recognized strand terms: plus, minus, pos, neg, W, C, +, -, tested for in that order.  Filenames for each pair must differ ONLY by these strings, i.e., if the strand-strings are removed, the two filenames are identical.
+
+=item B<-c color_table>
+
+color_table may be either an RGB triplet (default 0,0,0), or a file containing a table with column 1 = sample name and column 2 = RGB triplet.  
+If a table is given, track files must be named like /path/to/<sample_name>.<ext>, where <ext> is either "bw", "bb", or "bam".
+
+=back
+
+=head1 VERSION
+
+$Revision:  1.0$
+
+=head1 AUTHOR
+
+Ariel Paulson (apa@stowers.org)
+
+=head1 DEPENDENCIES
+
+perl
+
+=head1 AVAILABILITY
+
+Download at will.
+
+=cut
+
+
+
+
+
+my ($repodir, $color, $stranded, $paired, $help, $man);
+GetOptions(
+    "d=s" => \$repodir, 
+    "c|color=s" => \$color,
+    "stranded" => \$stranded,
+    
+    "help|?" => \$help,
+    "man!" => \$man
+    ) or pod2usage(2);
+
+pod2usage(1) if $help;
+pod2usage(-exitstatus => 0, -verbose => 2) if $man;
+
+my @BW = @ARGV;
+
+die "No tracks specified!\n" unless @BW;
+die "No 'tracks' subdirectory specified! (-d)\n" unless $repodir;
+
+my @strnames = qw/ plus minus pos neg W C \+ \- /;
+my %posnames = map {($_=>1)} qw/ plus pos W + /;
+my %negnames = map {($_=>1)} qw/ minus neg C - /;
+
+my (%coltable, $usetable);
+if (-e $color) {
+    ## Given color is actually (hopefully) a color table file, with sample names in col 1 and UCSC-ready RGB triplets in col 2
+    open my $IN, '<', $color or die "$0: Failed to open color file '$color': $!\n";
+    while (<$IN>) {
+        s/[\n\r]+$//;
+        my ($samp, $col) = split /\t/, $_;
+        $coltable{$samp} = $col;
+    }
+    close $IN;
+    $usetable = 1;
+}
+
+my (@output, %pairs);
+foreach my $path (@BW) {
+    my ($file) = ($path =~ /([^\/]+)$/);
+    my $name = $file;
+    my ($type, $args);
+    if ($name =~ s/\.bw$//) {
+        $type = 'bigWig';
+        $args = 'visibility=full alwaysZero=On';
+    } elsif ($name =~ s/\.bb$//) {
+        $type = 'bigBed';
+        $args = 'visibility=pack';
+    } elsif ($name =~ s/\.bam$//) {
+        $type = 'bam';
+        $args = 'visibility=squish pairEndsByName=On';
+    } else {
+        print STDERR "Unknown track extension for '$file': skipping.\n";
+        next;
+    }
+    my $usecol;
+    if ($usetable) {
+        if (exists $coltable{$name}) {
+            $usecol = $coltable{$name};
+        } else {
+            print STDERR "Failed to find color for sample '$name' in color table file!  Getting default '0,0,0'.\n";
+            $usecol = '0,0,0';
+        }
+    } elsif ($color) {
+        $usecol = $color;
+    } else {
+        $usecol = '0,0,0';
+    }
+    $args .= " color=$usecol";
+    if ($stranded) {
+        my $str_match;
+        foreach my $strname (@strnames) {
+            my $file2 = $file;
+            if ($file2 =~ s/\.$strname\././) {
+                (my $strname2 = $strname) =~ s/^\\//;  # \+ -> +, e.g.
+                if (exists $posnames{$strname2}) {
+                    $pairs{$file2}{POS} = "track type=$type name=$name description=\"$name\" $args bigDataUrl=http://tracks.stowers.org/microarray/repo/$repodir/$file\n";
+                } elsif (exists $negnames{$strname2}) {
+                    $pairs{$file2}{NEG} = "track type=$type name=$name description=\"$name\" $args bigDataUrl=http://tracks.stowers.org/microarray/repo/$repodir/$file\n";
+                } else {
+                    die "$0: strand names list and hashes are not matched!\n";
+                }
+                $str_match = 1;
+                last;
+            }
+        }
+        unless ($str_match) {
+            print STDERR "WARNING: strand could not be determined for file '$file'!\n";
+            push @output, "track type=$type name=$name description=\"$name\" $args bigDataUrl=http://tracks.stowers.org/microarray/repo/$repodir/$file\n";
+        }
+    } else {
+        push @output, "track type=$type name=$name description=\"$name\" $args bigDataUrl=http://tracks.stowers.org/microarray/repo/$repodir/$file\n";
+    }
+}
+
+if ($stranded) {
+    foreach my $file2 (sort keys %pairs) {
+        push @output, $pairs{$file2}{POS};
+        push @output, $pairs{$file2}{NEG};
+    }
+}
+
+print @output;
+exit;
+

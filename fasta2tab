@@ -1,0 +1,19 @@
+#!/usr/bin/env perl
+use strict; 
+
+# converts a fasta to tab-delim format (col 1 = header, col 2 = seq)
+# streaming only
+
+my ($header, $block);
+
+while (<>) {
+    s/[\n\r]+$//;
+    if (/^>(.*)/) {
+	print "$header\t$block\n" if $block;	# so, won't print on first header
+	($header, $block) = ($1, '');
+    } else {
+	$block .= $_;
+    }
+}
+print "$header\t$block\n";
+exit;

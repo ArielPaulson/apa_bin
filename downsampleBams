@@ -1,0 +1,70 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my @bams = @ARGV;
+
+## up-front consistency check
+foreach my $bam (@bams) {
+    die "$0: Failed to locate bam file '$bam'!\n" unless -e $bam;
+    die "$0: Bam file '$bam' is empty!\n" unless -s $bam;
+}
+
+## get alignment counts per bam
+my (%data, @sizes);
+foreach my $bam (@bams) {
+    
+    my ($name) = ($bam =~ /([^\/]+)\.bam/i);
+    $data{$name}{FILE} = $bam;
+    
+    chomp(my $now = `date`);
+    print "Counting $name.bam: $now\n";
+    chomp(my $aligns = `samtools view $bam | wc -l`);
+    print " $aligns alignments\n";
+    
+    $data{$name}{SIZE} = $aligns;
+    push @sizes, $aligns;
+}
+
+## minimum alignments per bam = downsampling size
+my $minsize = (sort {$a <=> $b} @sizes)[0];
+
+## downsample bams
+foreach my $name (keys %data) {
+    
+    my $tmp = "downsampleBams.$$.$name";
+
+    if ($data{$name}{SIZE} == $minsize) {
+	
+	chomp(my $now = `date`);
+	print "$name.bam is already at $minsize reads: copying: $now\n";
+	system "cp $data{$name}{FILE} $name.downsampled.bam";
+	
+    } else {
+	
+	print "Downsampling $name.bam to $minsize reads...\n";
+	
+	chomp(my $now = `date`);
+	print " Generating random line filter: $now\n";
+	system "/home/apa/local/bin/randomArray.old $minsize 0 $data{$name}{SIZE} > $tmp.idx.tmp";
+	
+	chomp(my $now = `date`);
+	print " BAM->SAM conversion: $now\n";
+	system "samtools view -h $data{$name}{FILE} > $tmp.sam.tmp";
+	chomp (my $H = `samtools view -H $data{$name}{FILE} | wc -l`);
+	
+	chomp(my $now = `date`);
+	print " Downsampling: $now\n";
+	system "/home/apa/local/bin/extractLines -i $tmp.sam.tmp -o $tmp.dns.tmp -l $tmp.idx.tmp -s $H";
+	
+	chomp(my $now = `date`);
+	print " SAM->BAM conversion: $now\n";
+	system "samtools view -bS $tmp.dns.tmp > $name.downsampled.bam";
+	
+    }
+    
+    system "rm -f $tmp.*.tmp";
+}
+exit;
+

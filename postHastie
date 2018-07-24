@@ -1,0 +1,6 @@
+#!/bin/bash
+
+## MUST BE RUN INSIDE A HASTIE 'code' SUBDIR
+
+rm -rf ../data/input
+for dir in fastq bigWig output; do mkdir ../data/$dir; done

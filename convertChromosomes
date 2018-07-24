@@ -1,0 +1,142 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+## Uses /n/data1/genomes/indexes-style chromosome data files to convert chromosome IDs from one provider to another, in one column of a file.
+
+
+## Inputs
+my $input;      # file in which to convert chromosome IDs
+my $column;     # column number (1-based) in which chrom IDs reside (default: 1)
+my $header;     # N header lines in file $input to ignore (default: 0)
+my $genome;     # genome, as a directory from /n/data1/genomes/bowtie-index (e.g. 'mm10')
+my $from;       # column name in chrom_data file with current chrom names   (e.g. 'UCSC.Name')
+my $to;         # column name in chrom_data file with converted chrom names (e.g. 'Ensembl.Name')
+my $stdio;      # for streaming data
+my $output;     # output file, or STDOUT if blank
+my $keepfail;   # leave unconvertable chrom IDs in place, instead of erasing them
+my $overwrite;  # overwrite input file with converted data
+
+
+## Get/test arguments
+GetOptions("i=s"=>\$input, "c=i"=>\$column, "h=i"=>\$header, "g=s"=>\$genome, "f=s"=>\$from, "t=s"=>\$to, ""=>\$stdio, "o=s"=>\$output, "keep-failed"=>\$keepfail, "overwrite"=>\$overwrite);
+
+$column = 1 unless $column;
+$header = 0 unless $header;
+die "$0: No genome specified!\n" unless $genome;
+my $chrdat = "/n/data1/genomes/indexes/$genome/$genome.chrom_data.txt";
+die "$0: Failed to resolve chrom_data file '$chrdat'!\n" unless -e $chrdat;
+
+
+## Input handle
+my $IN;
+if ($input) {
+    open $IN, '<', $input or die "$0: Failed to open '$input' for reading: $!\n";
+} elsif ($stdio) {
+    open $IN, '-';
+} else {
+    die "$0: No input!\n";
+}
+
+
+## Output handle
+my $OUT;
+if ($output) {
+    open $OUT, '>', $output or die "$0: Failed to open '$output' for writing: $!\n";
+} elsif ($overwrite) {
+    ## do nothing at this moment
+} else {
+    $OUT = *STDOUT;
+}
+
+
+## Other globals
+my @output;   # data to write, if $overwrite
+my %aliases;  # chromosome aliases
+my %stats;    # chromosome IDs converted
+my %failed;   # chromosome IDs not converted
+
+
+## Read aliases
+open my $CA, $chrdat or die "$0: Failed to read '$chrdat': $!\n";
+my (@anames, $fromN, $toN, %already);
+while (<$CA>) {
+    my @fields = split /\t/, $_;
+    $fields[$#fields] =~ s/[\n\r]+$//;
+    if ($. == 1) {
+        @anames = @fields;
+        foreach my $i (0..$#anames) {
+            if ($anames[$i] eq $from) {
+                if ($fromN) {
+                    die "More than one ID column of type '$from' found in chrom_data file '$chrdat'.\n" if defined $fromN;
+                } else {
+                    $fromN = $i;  # 0-BASED
+                }
+            } elsif ($anames[$i] eq $to) {
+                if ($toN) {
+                    die "More than one ID column of type '$to' found in chrom_data file '$chrdat'.\n" if defined $toN;
+                } else {
+                    $toN = $i;  # 0-BASED
+                }
+            }
+        }
+        die "Could not find 'from' ID type '$from' in chrom_data file '$chrdat'.\n" unless defined $fromN;
+        die "Could not find 'to' ID type '$to' in chrom_data file '$chrdat'.\n" unless defined $toN;
+    } else {
+        die "Malformed line $. in chrom_data file '$chrdat': expecting ",scalar(@anames)," fields, got ",scalar(@fields),".\n" if $#fields != $#anames;
+        if (defined $aliases{$fields[$fromN]}) {
+            die "Malformed chrom_data file '$chrdat': $from chromosome '$fields[$fromN]' exists on multiple lines!\n";
+        } elsif (defined $already{$fields[$toN]}) {
+            die "Malformed chrom_data file '$chrdat': $to chromosome '$fields[$toN]' exists on multiple lines!\n";
+        } elsif ($fields[$fromN] && $fields[$toN]) {
+            $aliases{$fields[$fromN]} = $fields[$toN];
+            $already{$fields[$toN]} = 1;
+        } else {
+            ## one of these chroms has no equivalent; ignore
+        }
+    }
+    
+}
+close $CA;
+
+
+## Read data
+while (<$IN>) {
+    $_ =~ s/[\n\r]+$//;
+    my $line;
+    if ($. <= $header) {
+        $line = $_;
+    } else {
+        my @fields = split /\t/, $_;
+        my $oldchr = $fields[$column-1];
+        my $newchr = $aliases{$oldchr};
+        $newchr ? $stats{$oldchr}++ : $failed{$oldchr}++;
+        $fields[$column-1] = !$newchr && $keepfail ? $oldchr : $newchr;
+        $line = join("\t", @fields);
+    }
+    if ($overwrite) {
+        push @output, "$line\n";
+    } else {
+        print $OUT "$line\n";
+    }
+}
+close $IN;
+
+
+## Write, if $overwrite
+if ($overwrite) {
+    open $OUT, '>', $input;
+    print $OUT @output;
+    close $OUT;
+}
+
+
+## Exit
+close $OUT;
+print STDERR "\nConverted chrom IDs:\nOLD\tNEW\tN\n";
+print STDERR "$_\t$aliases{$_}\t$stats{$_}\n" foreach sort keys %stats;
+print STDERR "\nFailed chrom IDs:\nOLD\tNEW\tN\n";
+print STDERR "$_\t\t$failed{$_}\n" foreach sort keys %failed;
+exit;

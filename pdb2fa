@@ -1,0 +1,224 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Data::Dumper;
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+
+## Extracts sequence from PDB and CIF files
+
+
+
+## Inputs
+my $pdb;
+my $out;
+my $atom;
+my $empty;
+
+
+## Get options
+GetOptions("p=s"=>\$pdb, "o=s"=>\$out, "atom"=>\$atom, "empty"=>\$empty);
+
+
+## Globals
+my $cif = $pdb =~ /\.cif$/i ? 1 : 0;
+my ($IN, $OUT);
+my %data;
+my %any;
+my %mono = (
+    'ALA' => 'A',
+    'CYS' => 'C',
+    'ASP' => 'D',
+    'GLU' => 'E',
+    'PHE' => 'F',
+    'GLY' => 'G',
+    'HIS' => 'H',
+    'ILE' => 'I',
+    'LYS' => 'K',
+    'LEU' => 'L',
+    'MET' => 'M',
+    'ASN' => 'N',
+    'PRO' => 'P',
+    'GLN' => 'Q',
+    'ARG' => 'R',
+    'SER' => 'S',
+    'THR' => 'T',
+    'VAL' => 'V',
+    'TRP' => 'W',
+    'TYR' => 'Y',
+    'DA' => 'A',
+    'DC' => 'C',
+    'DG' => 'G',
+    'DT' => 'T',
+    'A' => 'A',
+    'C' => 'C',
+    'G' => 'G',
+    'U' => 'U'
+    );
+
+
+if ($atom) {
+    
+    open $IN, '-|', "grep \"^ATOM \" $pdb";
+    while (<$IN>) {
+	chomp;
+	my @data = split;
+	$data[3] =~ s/"//g;
+#	if ($data[3] =~ /^$data[2]/ && $data[4] eq '.') {
+	if ($cif) {
+	    ## CIF format
+	    $data{$data[6]}{SEQ}{$data[8]} = length($data[5])==3 ? $mono{$data[5]} : length($data[5])==1 ? $data[5] : "_$data[5]_";
+	    $any{SEQ} = 1;
+	} else {
+	    ## PDB format
+	    $data{$data[4]}{SEQ}{$data[5]} = length($data[3])==3 ? $mono{$data[3]} : length($data[3])==1 ? $data[3] : "_$data[3]_";
+	    $any{SEQ} = 1;
+	}
+    }
+    
+} elsif ($cif) {
+    
+    my ($stage, $i);
+    my %column;
+    
+    open $IN, '<', $pdb;
+    while (<$IN>) {
+	chomp;
+	if (/^_entity.id/) {
+	    $stage = 1;   ## molecule metadata
+	    $column{1}{ID} = $i++;
+#	    print "1: ID = $i\n";
+	} elsif (/^_entity.pdbx_description\s*/) {
+	    $stage = 1;   ## molecule metadata
+	    $column{1}{DESC} = $i++;
+#	    print "1: DESC = $i\n";
+	} elsif (/^_entity_poly_seq.entity_id\s*/) {
+	    $stage = 2;   ## sequence
+	    $column{2}{ID} = $i++;
+#	    print "2: ID = $i\n";
+	} elsif (/^_entity_poly_seq.num\s*/) {
+	    $stage = 2;   ## sequence
+	    $column{2}{POS} = $i++;
+#	    print "2: POS = $i\n";
+	} elsif (/^_entity_poly_seq.mon_id\s*/) {
+	    $stage = 2;   ## sequence
+	    $column{2}{SEQ} = $i++;
+#	    print "2: SEQ = $i\n";
+	} elsif (/^_struct_asym.id\s*/) {
+	    $stage = 3;   ## chain->entity mapping
+	    $column{3}{CHAIN} = $i++;
+#	    print "3: CHAIN = $i\n";
+	} elsif (/^_struct_asym.entity_id\s*/) {
+	    $stage = 3;   ## chain->entity mapping
+	    $column{3}{ID} = $i++;
+#	    print "3: ID = $i\n";
+	} elsif (/^_/ && $stage) {
+	    $i++;
+	} elsif (/^#\s*/) {
+	    $stage = 0;
+	    $i = 0;
+	} elsif ($stage == 1) {
+	    (my $line = $_) =~ s/('[^']+')/clarify($1,"'")/eg;
+	    $line =~ s/("[^"]+")/clarify($1,'"')/eg;
+	    my ($entity, $desc) = (split /\s+/, $line)[$column{1}{ID},$column{1}{DESC}];
+	    $data{$entity}{NAME} = $desc;
+	    $data{$entity}{TYPE} = 'Entity';
+	} elsif ($stage == 2) {
+	    my ($entity, $pos, $char) = (split /\s+/, $_)[$column{2}{ID},$column{2}{POS},$column{2}{SEQ}];
+	    $data{$entity}{SEQ}{$pos} = $mono{$char};
+	    $data{$entity}{LEN} = $pos;
+	    $any{SEQ} = 1;
+	} elsif ($stage == 3) {
+	    my ($chain, $entity) = (split /\s+/, $_)[$column{3}{CHAIN},$column{3}{ID}];
+	    $data{$entity}{CHAIN}{$chain} = 1;   ##### do we even need this?
+	}
+    }
+    
+} else {
+    
+    my ($mol, $name, $chain, $i);
+    open $IN, '<', $pdb;
+    while (<$IN>) {
+	chomp;
+	if (/^COMPND\s+.*\s+MOL_ID:\s+(\d+)/) {
+	    $mol = $1;
+	} elsif (/^COMPND\s+\d+\s+MOLECULE:\s+([^;]+\S)/) {
+	    $name = $1;
+	} elsif (/^COMPND\s+\d+\s+CHAIN:\s+([\w\s,]+)/) {
+	    (my $chains = $1) =~ s/ //g;
+	    foreach my $chain (split /,/, $chains) {
+		$data{$chain}{MOL} = $mol;
+		($data{$chain}{NAME} = $name) =~ s/ /_/g;
+		$data{$chain}{TYPE} = 'Chain';
+		print "Molecule $mol | Chain $chain | $name\n";
+	    }
+	    $mol = $name = undef;
+	} elsif (/^SEQRES\s+(\d+)\s+(\w+)\s+(\d+)\s+([A-Z\s]+)/) {
+	    $any{SEQ} = 1;
+	    my ($n, $chain, $length, $seq) = ($1, $2, $3, $4);
+	    foreach my $word (split /\s+/, $seq) {
+		$i++;
+		my $char = $mono{$word};
+		$data{$chain}{SEQ}{$i} = $char ? $char : "_${word}_";
+		$data{$chain}{LEN} = $length;
+		$i = 0 if $i == $length;
+	    }
+	}
+    }
+}
+print STDERR "$. lines read\n";
+close $IN;
+
+die "No sequences found!\n" unless $any{SEQ};
+
+if ($out) {
+    open $OUT, '>', $out;
+} else {
+    $OUT = *STDOUT;
+}
+
+my @sortobj;
+if ($cif) {
+    @sortobj = sort { $a <=> $b } keys %data;  # entities are numeric
+} else {
+    @sortobj = sort { length($a) <=> length($b) || $a cmp $b } keys %data;  # chains are single- or double-letters
+}
+foreach my $obj (@sortobj) {
+    my %test;
+    $test{ $data{$obj}{SEQ}{$_} }++ foreach (keys %{ $data{$obj}{SEQ} })[0..50];
+    my $seqtype = scalar(keys %test)>5 ? 'AA' : 'NT';   # 5 bases, not 4, allowing for perhaps N or some modified base.  At any rate, most AA chains should have N>5 residue types in the first 50 ???
+    my $null = $seqtype eq 'AA' ? 'X' : 'N';
+    my $max = $data{$obj}{LEN};
+    my $name = $data{$obj}{NAME};
+    my $type = $data{$obj}{TYPE};
+    my $label = "${type}_$obj";
+    my $chains = join(",",sort keys %{ $data{$obj}{CHAIN} });
+    $label .= "|Chain_$chains" if $cif;
+    my $header = ">$label|$max$seqtype|$name";
+    if ($max) {
+	print $OUT "$header\n";
+	my $j;
+	foreach my $i (1..$max) {
+	    $j++;
+	    print $OUT $data{$obj}{SEQ}{$i}||$null;
+	    if ($j == 50) {
+		print "\n";
+		$j = 0;
+	    }
+	}
+	print $OUT "\n";
+    } elsif ($empty) {
+	print $OUT "$header\nNo Sequence!\n";
+    }
+}
+exit;
+
+
+sub clarify {
+    my ($match, $quot) = @_;
+    $match =~ s/\s/_/g;
+    $match =~ s/$quot//g;
+    return $match;
+}

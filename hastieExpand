@@ -1,0 +1,205 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## ADD SECUNDO LINKS UNDER h2. QC -> h3. Secundo
+
+## requires Linux, won't run on Mac
+
+## takes a hastie report textile file, WHICH HAS ORDER NUMBERS, and:
+## 1. converts pi, researcher, order numbers into paths and scrapes Sample_Report.csv files to create a sample table
+##   A. sample table contains: sample, library, order, flowcell(s), lane(s), barcode, paired/single, machine type, total reads, read length, protocol
+##   B. injects table into "Data" section
+## 2. adds /n/analysis link, LIMS link, fastqc links to "Data" section
+## 3. creates "QC" section
+##   A. if any images in report/data/cbio.xxx.yyy, links each image into "QC" section.  Also adds a blank image_grid tag 
+
+## NO ARGS NECESSARY if run in report directory, and only one textile file exists.
+my ($textile, $noqc, $notable, $byorder, $test);
+
+GetOptions("t=s" => \$textile, "no-qc" => \$noqc, "no-table" => \$notable, "by-order" => \$byorder, "test" => \$test);
+
+chomp(my $wdir = `readlink -f .`);  # fails on Mac.  Require fully qualified root path with no symlinks
+(my $cbiopath = $wdir) =~ s/\/report.*//;  # /path/to/cbio.xxx.yyy
+(my $cbio = $cbiopath) =~ s/^.*\///;       # 'cbio.xxx.yyy'
+
+my (@report, %orders, %headers, $hrank);
+my (@orders, $res, $pi);
+my $tablefile = "$wdir/hastieExpand.sample_table.txt";  # writes a filesystem copy as well
+
+unless ($textile) {
+    my @tex = glob "*.textile";
+    die "More than one textile file detected!\n" if $#tex > 0;
+    $textile = "$wdir/$tex[0]";
+}
+print STDERR "\nWorking dir: $wdir\nTextile file: $textile\n";
+
+open my $IN, '<', $textile;
+while (my $line = <$IN>) {
+    push @report, $line;
+    if ($line =~ /^order: (.*)/) {
+        (my $orders = $1) =~ s/\s*$//;
+        @orders = split /,/, $orders;
+        print STDERR "ORDERS: @orders\n";
+    } elsif ($line =~ /^researcher: (.*)/) {
+        ($res = $1) =~ s/\s*$//;
+    } elsif ($line =~ /^pi: (.*)/) {
+        ($pi = $1) =~ s/\s*$//;
+    } elsif ($line =~ /^h2. (.*)/) {
+        (my $header = $1) =~ s/\s*$//;
+        $headers{I}{$header} = $.-1;  # position of this header name in @report
+        $headers{H2R}{$header} = ++$hrank;  # lookup rank of header in report
+        $headers{R2H}{$hrank} = $header;    # lookup header by rank in report
+    }
+}
+close $IN;
+
+my $datarank = $headers{H2R}{Data};  # which header is 'Data'
+my $nextheader = $headers{R2H}{$datarank+1};  # what header is next after 'Data'
+my $nextline = $headers{I}{$nextheader};  # which line does this next header reside on
+print "DR: $datarank\nDL: $headers{I}{Data}\nNH: $nextheader\nNL: $nextline\n";
+
+
+
+
+
+unless ($notable) {
+    
+    my (%data, %links);
+    my $all_fc_links = "h3. Flowcell Data\n";
+    my $all_ord_links = "h3. Order Data\n";
+    my $ana_dir_links = "h3. Analysis Location\n";
+    
+    foreach my $molng (@orders) {
+        chomp(my $ordir = `ls -d /n/analysis/$pi/*/$molng | head -1`);
+        #print STDERR "Searching: $ordir\n";
+        foreach my $fcdir (glob "$ordir/*") {
+            #print STDERR "Searching: $fcdir\n";
+            my $csv = "$fcdir/Sample_Report.csv";
+            (my $flowcell = $fcdir) =~ s!^.*\/!!;
+            (my $flowcell1 = $flowcell) =~ s/[a-z]$//;
+            next unless -e $csv;  # possible for $flowcell to be a file, or dir which is not a flowcell dir
+            print STDERR "Reading: $csv\n";
+            open my $CSV, '<', $csv or print "Failed to read sample report csv '$csv': $!\n";
+            while (my $line = <$CSV>) {
+                next if $. == 1;
+                $line =~ s/[\n\r]+$//;
+                my ($fastq, $order, $protocol, $lane, $sample, $library, $barcode, $X, $end, $genome, $lab, $treads, $pfreads, $pfpct, $alnpct, $ends, $readlen) = split /,/, $line;
+                if ($order eq $molng && $end == 1) {  # note if sequencing was PE, but don't need stats from end-2 lines
+                    my $machine = $fastq =~ /^n/ ? 'NextSeq' : $fastq =~ /^s/ ? (length($flowcell1) == 9 ? 'HiSeq' : (length($flowcell1) == 5 ? 'MiSeq' : 'unknown')) : 'unknown';
+                    $protocol =~ s!(\S)/(\S)!$1 / $2!g;
+                    my $ID = "$sample\t$library\t$order";
+                    $orders{$order}{$ID} = 1;
+                    $data{$ID}{reads} += $pfreads;
+                    $data{$ID}{machine}{$machine} = 1;
+                    $data{$ID}{pairing}{$ends} = 1;
+                    $data{$ID}{protocol}{$protocol} = 1;
+                    $data{$ID}{length}{$readlen} = 1;
+                    $data{$ID}{lanes}{$lane} = 1;
+                    $data{$ID}{flowcells}{$flowcell} = 1;
+                    $data{$ID}{barcode}{$barcode} = 1;
+                }
+            }
+            close $CSV;
+            
+            (my $mnum = $molng) =~ s/MOLNG-//;
+            my $webfc = "http://bioinfo$fcdir";
+            my $secundo = "http://bioinfo/n/core/Bioinformatics/secondary/$pi/$res/MOLNG-1896";
+            $all_fc_links .= "* *$flowcell:* \"Directory\":$webfc, \"FastQC Summary\":$webfc/fastqc/fastqc_summary.html, \"FastQC Plots\":$webfc/fastqc/fastqc_plots.html\n";
+            $all_ord_links .= "* *MOLNG-$mnum:* \"LIMS\":http://limskc01/zanmodules/molbio/ngs_editOrder.php?o=$mnum, \"Secundo Report\":$secundo/analysis_rnaseq.html, \"Secundo Directory\":$secundo\n";
+            $ana_dir_links .= "\"$cbio\":http://bioinfo$cbiopath/\n";
+        }
+    }
+    
+    my @fields = qw/ flowcells lanes barcode pairing machine reads length protocol /;
+    my $table = join("\t", qw/ sample library order /, @fields, 'comments') . "\n";
+    my @sorted;
+    if ($byorder) {
+        push @sorted, (sort keys %{ $orders{$_} }) foreach sort keys %orders;
+    } else {
+        @sorted = sort keys %data;
+    }
+    foreach my $SLO (@sorted) {
+        $table .= $SLO;
+        foreach my $field (@fields) {
+            if ($field eq 'reads') {
+                $table .= "\t$data{$SLO}{reads}";
+            } else {
+                my $value = join(',', sort keys %{ $data{$SLO}{$field} });  # ideally, each will only have one key (except for flowcells & lanes); if not, errors or weird sequencing handling?
+                $table .= "\t$value";
+            }
+        }
+        $table .= "\t \n";  # extra "\t " is for 'comments' column
+    }
+    $table =~ s/\n$//;
+    
+    my $textable = join("\n",'*Sample Table:*','{% table tsv %}',$table,'{% endtable %}','');   # final '' effectively ends string with "\n"
+    $textable .= "\n$all_fc_links\n$all_ord_links\n$ana_dir_links\n";  # LIMS orders already linked at top of new bioreports  ## NOT -- sometimes this works, sometimes not
+    #$textable .= "\n$all_fc_links\n";
+    
+    splice(@report, $nextline, 0, ($textable));  # inject table+links one line before next header line
+    
+    open my $TAB, '>', $tablefile or die "$0: Failed to write to 'tablefile': $!\n";
+    print $TAB $table;
+    close $TAB;
+}
+
+
+
+
+
+unless ($noqc) {
+    
+    my (%pdfs, %updfs);
+    my $links = "h2. QC\n";    
+    
+    print STDERR "Searching: data/$cbio/*.pdf\n";
+    foreach my $pdf (glob "data/$cbio/*.pdf") {
+        print STDERR "PDF: $pdf\n";
+        (my $name = $pdf) =~ s!data/$cbio/!!;
+        $name =~ s/.pdf$//;
+        $pdfs{$name} = $updfs{$name} = "http://bioinfo$wdir/$pdf";
+    }
+    
+    foreach my $ext (qw/ png svg gif jpg jpeg tif tiff /) {
+        print STDERR "Searching: data/$cbio/*.$ext\n";
+        foreach my $img (glob "data/$cbio/*.$ext") {
+            print STDERR "IMAGE: $img\n";
+            $img =~ s!data/$cbio/!!;
+            $links .= "\n{% image_link $img class = medium %}\n";
+            (my $name = $img) =~ s/.$ext$//;
+            if (exists $pdfs{$name}) {  # PDF version exists too
+                $links .= "\n\"PDF\":$pdfs{$name}\n";
+                delete $updfs{$name};
+            }
+        }
+    }
+    
+    $links .= "\n\n{% image_grid 2 class = medium %}\n{% endimage_grid %}\n\n";
+    $links .= "\n\n\"Results\":http://bioinfo$cbiopath/results/\n\n";
+    
+    foreach my $name (sort keys %updfs) {   # PDFs which are NOT PDF-versions of other images
+        $links .= "\n\"$name\":$updfs{$name}\n";
+    }
+    
+    splice(@report, $nextline+1, 0, ("$links"));  # inject QC section one line before next header line (if table+links previously injected, this will appear after them)
+}
+
+
+
+
+
+my $OUT;
+if ($test) {
+    open $OUT, '>-';
+    print $OUT "\n\n########################################\n                DOCUMENT                \n########################################\n\n";
+} else {
+    system "mv -f $textile $textile.bak";
+    open $OUT, '>', $textile;
+}
+print $OUT @report;
+close $OUT;
+exit;
+
+## what was this?? file:///n/core/Bioinformatics/secondary/Piotrowski/heb/MOLNG-1896/analysis_rnaseq.html

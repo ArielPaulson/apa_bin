@@ -1,0 +1,58 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my ($fasta, $minK, $maxK, $minN, $mincov, $minpct, $revcomp);  # $optimize?
+
+GetOptions("f=s"=>\$fasta, "min=i"=>\$minK, "max=i"=>\$maxK, "N=i"=>\$minN, "cov=i"=>\$mincov, "pct=f"=>\$minpct, "rc"=>\$revcomp);
+
+die "minimum-K and maximum-K must both be integers > 0!" unless $minK>0 && $maxK>0;
+
+my ($header, @headers, %seq, %kmers);
+
+open my $IN, '<', $fasta or die "Cannot open fasta file '$fasta': $!\n";
+while (<$IN>) {
+    s/[\n\r]+$//;
+    if (/^>(.*)/) {
+	$header = $1;
+	push @headers, $header;
+    } else {
+	$seq{$header} .= $_;
+    }
+}
+close $IN;
+
+print "SEQUENCE\tK\tKMER\tN\tCOV.BP\tCOV.PCT\n";
+foreach my $k ($minK..$maxK) {
+    my $last = 1; # initialize: this is last iteration
+    foreach my $header (@headers) {
+	my $seqlen = length($seq{$header});
+	$seqlen *= 2 if $revcomp;
+#	print STDERR "$k : $header\n";
+	next if $seqlen < $k;
+	for (my $i = 0; $i <= $seqlen-$k; $i++) {
+	    my $kmer = substr($seq{$header},$i,$k);
+	    next unless $kmer;  # why is this an issue??
+	    $kmers{$header}{$k}{$kmer}++;
+	    if ($revcomp) {
+		(my $rc = reverse $kmer) =~ tr/ACGTacgt/TGCAtgca/;
+		$kmers{$header}{$k}{$rc}++;
+	    }
+	}
+	my @output;
+	my $printable = 0; # initialize: output not worth printing
+	foreach my $kmer (sort { $kmers{$header}{$k}{$b} <=> $kmers{$header}{$k}{$a} } keys %{ $kmers{$header}{$k} }) {
+	    my $N = $kmers{$header}{$k}{$kmer};
+	    my $covbp = $k * $N;
+	    $covbp *= 2 if $revcomp;
+	    my $covpct = sprintf("%0.02f", 100 * $covbp / $seqlen);
+	    push @output, "$header\t$k\t$kmer\t$N\t$covbp\t$covpct\n" if ($N >= $minN || $covbp >= $mincov || $covpct >= $minpct);
+	}
+	print @output;
+	$last = 0 if @output;
+    }
+    last if $last;
+}
+print "kmerCount complete!\n";
+system "kill $$";  # so much faster than exit

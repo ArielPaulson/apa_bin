@@ -1,0 +1,207 @@
+#!/usr/bin/env perl
+
+#$Id$
+
+# Copyright © 2005, Stowers Institute for Medical Research.  All
+# rights reserved.
+
+# c.f. attached LICENSE
+
+
+=pod
+
+=head1 SYNOPSIS
+
+TrackSlicerRNA [region file] [sample ids file]
+
+This script extracts specified coordinates of .wig files from the JBZ3 database on mysql-dev.
+
+=head1 OPTIONS
+
+=over
+
+=item B<--help>
+
+Display command line usage with options.
+
+=item B<--man>
+
+Display complete manual page and exit.
+
+=item B<--verbose>
+
+Provides a trace of processing on STDERR.
+
+=item B<--version> 
+
+Display the scripts version number and exit.
+
+=back
+
+=head1 DESCRIPTION
+
+TrackSlicer is designed to take sets of sample ids (short) and export specific regions into a tab-delimited 
+output file, where rows correspond to probes/bp in the region and columns to samples.
+
+=over
+
+=item [region file]: regions are given as a list file, it must have 3 tab-delimited columns, no header:
+
+=item Chr	Start	End
+
+=item ...
+
+=item Any columns after 3 will be treated as annotation.
+
+=item S< >                                                                                       
+
+=item [sample ids] is a file containing entries like <projectID>, <samplename> where <projectID> 
+is a microarray project DB ID, like AJK3, EMO9, JADO2 and <samplename> is a track name.  
+You can look them up in mysql-dev, DB=RNAseq_depths, where table names = project IDs and column names = track names.  
+Some example entries:
+
+=item AJK3, depth
+
+=item EMO9, wt_avg
+
+=item EMO9, mut_avg
+
+=item ...
+
+=back
+
+=head1 VERSION
+
+$Revision:  1.00$
+
+=head1 AUTHOR
+
+Ariel Paulson (apa@stowers-institute.org)
+
+=head1 DEPENDENCIES
+
+=over
+
+=item perl
+
+=item DBI
+
+=item Getopt::Long
+
+=item Pod::Usage
+
+=item FindBin
+
+=back
+
+=head1 AVAILABILITY
+
+Email the author for sources.
+
+=cut
+
+#use warnings;
+use strict;
+use DBI;
+use Cwd;
+#use vars qw($VERSION $VC_DATE);
+
+#BEGIN {
+our $VERSION =  qw$Revision: 0.01 $[-1];
+our $VC_DATE =  qw$Date: $[-2];
+#}
+
+use Getopt::Long;
+use Pod::Usage;
+use FindBin;
+#use UNIVERSAL::require;
+
+my $man = 0;
+my $help = 0;
+my $verbose;
+my $version;
+
+#use File::Spec; ... other modules
+
+GetOptions('help|?'        => \$help,
+	   'man!'           => \$man,
+	   'verbose!'       => \$verbose,
+           'version!'       => \$version,
+) or pod2usage(2);
+
+pod2usage(1) if $help;
+pod2usage(-exitstatus => 0, -verbose => 2) if $man;
+if ($version) {print "$FindBin::Script: $VERSION\n"; exit(0)};
+
+###########################################################  ACTUAL CODE
+###########################################################  ACTUAL CODE
+###########################################################  ACTUAL CODE
+
+die "Bad arguments!  Use TrackSlicerDB -m for help\n" if (scalar @ARGV != 2);
+
+my ($coordfile, $samplefile) = @ARGV;
+my ($coordfilename, $samplefilename);
+my $dbh = DBI->connect("DBI:mysql:database=RNAseq_depths:host=mysql-dev",'anonymous','guy#fawkes',{RaiseError=>1}) or die "Cannot connect to RNAseq_depths on mysql-dev! $DBI::err() $DBI::errstr()\n";
+($coordfile =~ /\/([^\/]+)$/) ? ($coordfilename = $1) : ($coordfilename = $coordfile);
+($samplefile =~ /\/([^\/]+)$/) ? ($samplefilename = $1) : ($samplefilename = $samplefile);
+
+my (%alpha, %numeric, %tempregions, %samples, @coords);
+open IN1, $coordfile;
+while (<IN1>) {
+	$_ =~ s/[\n\r]//g;
+	my @fields = split /\t/, $_;
+	my ($chr, $start, $end, $else);
+	if (scalar @fields == 3) {
+		($chr, $start, $end) = @fields;
+		$else = '';
+	} elsif (scalar @fields > 3) {
+		($chr, $start, $end) = @fields[0..2];
+		$else = join "\t", @fields[3..$#fields];
+	} else {
+		die "Bad coordinate description! minimum 3 tab-delimited fields: Chr, Start, End.  Other fields for optional annotation\n";
+	}
+	$chr =~ s/^chr//;	# just in case
+	die "Bad coordinate description! Chr: $chr | Start: $start | End: $end\n" unless ($chr && $start && $end);
+#	print "$chr, $start, $end, $else\n";
+	push @coords, [$chr, $start, $end, $else];
+}
+close IN1;
+
+open IN2, $samplefile;
+while (<IN2>) {
+	$_ =~ s/[\n\r\s]//g;
+	my ($table, $col) = split ',', $_;
+	push @{ $samples{$table} }, $col;
+}
+close IN2;
+
+my $wdir = cwd();
+print "\nWrite directory: $wdir\n";
+
+foreach my $table (keys %samples) {
+	my @output;
+	my $cols = join ', ', @{ $samples{$table} };
+	my $header = join "\t", ('Chrom','Pos',@{ $samples{$table} });
+	my $sth = $dbh->prepare("SELECT chrom, position, $cols FROM $table WHERE chrom = ? AND position >= ? AND position <= ?");
+	foreach my $coord (@coords) {
+		my ($chr, $start, $end, $else) = @$coord;
+		print "Extracting $chr:$start-$end\n";
+		push @output, "REGION: $chr:$start-$end\t$else\n$header\n";
+		$sth->bind_param(1,$chr);
+		$sth->bind_param(2,$start);
+		$sth->bind_param(3,$end);
+		$sth->execute();
+		my $ref = $sth->fetchall_arrayref();
+		my %found = map { ($$ref[$_][1] => join "\t", @{$$ref[$_]}) } (0..$#{$ref});
+		foreach my $i ($start..$end) {
+			($found{$i}) ? (push @output, "$found{$i}\n") : (push @output, "$chr\t$i\n");
+		}
+		warn "Error retrieving slice '$chr:$start-$end' for '$cols': $sth->errstr()" if $sth->err();
+		push @output, "\n";
+	}
+	my $filename = "TrackSlicerRNA_Results_${coordfilename}_${samplefilename}_$table.txt";
+	open OUT, "> $wdir/$filename" or die "Cannot create output $filename: $!";
+	print OUT @output;
+	close OUT;
+}
+exit;

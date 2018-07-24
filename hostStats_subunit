@@ -1,0 +1,20 @@
+#!/bin/bash
+set -e
+
+RAMKB=$(grep "^MemTotal:" /proc/meminfo | awk '{ print $2 }')
+RAMGB=$(printf "%0.0f" $(echo "scale=1; $RAMKB/1024/1024" | bc))
+SWAPKB=$(grep "^SwapTotal:" /proc/meminfo | awk '{ print $2 }')
+SWAPGB=$(printf "%0.0f" $(echo "scale=1; $SWAPKB/1024/1024" | bc))
+NCPU=$(grep "^processor" /proc/cpuinfo | tail -1 | awk '{ print $3 }')
+((NCPU=NCPU+1))
+ntmp=$(df /tmp | wc -l)
+if [ $ntmp -eq 2 ]; then field1=2; else field1=1; fi
+TMPKB=$(df /tmp | tail -1 | awk -v f=$field1 '{ print $f }')
+TMPGB=$(printf "%0.0f" $(echo "scale=1; $TMPKB/1024/1024" | bc))
+if [ -d "/scratch" ]; then 
+    SCRATCHKB=$(df /scratch | tail -1 | awk '{ print $1 }')
+    SCRATCHGB=$(printf "%0.0f" $(echo "scale=1; $SCRATCHKB/1024/1024" | bc))
+else
+    SCRATCHGB="NA"
+fi
+echo -e "$NCPU\t$RAMGB\t$SWAPGB\t$TMPGB\t$SCRATCHGB"

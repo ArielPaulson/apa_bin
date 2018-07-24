@@ -1,0 +1,11 @@
+#!/bin/bash
+
+PID=$1
+
+kill $1
+kill -STOP $1
+kill -KILL $1
+kill -ABRT $1
+kill -QUIT $1
+kill -HUP $1
+

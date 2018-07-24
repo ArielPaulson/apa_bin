@@ -1,0 +1,40 @@
+#!/usr/bin/env Rscript
+
+
+## This calls 'basecall_mutation_table' under the hood, and returns elaborated outputs.
+## 
+## Input: an output table from 'basecall' ('ngsutils basecall' wrapper script)
+## Output: an Excel file with multiple ACGTNxACGTN matrices of ref base (rows) -> called base (cols) counts:
+##   1. The observed counts table
+##   2. The expected counts table (variant of the typical expectation table, which preserves the diagonal)
+##   3. Both obs and exp as percents (of matrix sum)
+##   4. Log2(obs/exp), adjusted to prevent infinities.
+
+
+source("/home/apa/apa_tools.R")   # expectation()
+
+basecalls <- commandArgs(trailing=TRUE)[1]
+
+system(paste("/home/apa/local/bin/basecall_mutation_table",basecalls))
+bc.file <- paste0(basecalls,".mutation_table.txt")  # output of the above
+bc <- as.matrix(read.delim(bc.file, row.names=1))
+
+bc.table.o <- bc[1:4,1:4]   # drop Ns
+bc.table.op <- bc.table.o/sum(bc.table.o)
+
+bc.table.x <- expectation(bc.table.o, round=0, preserve.diagonal=TRUE)
+bc.table.xp <- bc.table.x/sum(bc.table.x)
+
+titles <- rep("",14)
+titles[c(1,6,11)] <- c("OBS","EXP","LOG2(O/E)")
+
+init <- cbind(bc.table.o,NA,bc.table.x,NA,log2((bc.table.o+1)/(bc.table.x+1)))
+pct <- cbind(bc.table.op,NA,bc.table.xp,NA,NA,NA,NA,NA)
+header <- colnames(init)
+
+bc.table.ox <- rbind2( titles, header, init, rep(NA, 14), pct )
+WriteXLS2(bc.table.ox, paste0(basecalls,".mutation_tables.xls"), row.names=TRUE, col.names=FALSE)
+
+quit()
+
+

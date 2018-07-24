@@ -1,0 +1,566 @@
+#!/usr/bin/env Rscript
+
+## Takes a list of txt files and writes out an Excel .xls file, with one txt file per tab.
+
+## FIXME: intergenic SNPs tab fails all "transcript IDs" because they aren't IDs.  Detect ignorables or limit errors if 100% rows fail.
+
+ca <- commandArgs(trailing=TRUE)
+if (length(ca)<2) stop("Not enough arguments to run this command!  Must specify at least output, input.")
+
+##ca=c("/n/core/Bioinformatics/analysis/Piotrowski/heb/cbio.heb.100/data/output/analyze/degen_C116/degen_C116.merged.typed.annot.snpEff.analyzed.mut_hom-nr_wt_het.xlsx","/n/core/Bioinformatics/analysis/Piotrowski/heb/cbio.heb.100/data/output/analyze/degen_C116/degen_C116.merged.typed.annot.snpEff.analyzed.mut_hom-nr_wt_het.1.high-priority-exonic.txt.gz","/n/core/Bioinformatics/analysis/Piotrowski/heb/cbio.heb.100/data/output/analyze/degen_C116/degen_C116.merged.typed.annot.snpEff.analyzed.mut_hom-nr_wt_het.2.low-priority-exonic.txt.gz","/n/core/Bioinformatics/analysis/Piotrowski/heb/cbio.heb.100/data/output/analyze/degen_C116/degen_C116.merged.typed.annot.snpEff.analyzed.mut_hom-nr_wt_het.3.misc-exonic.txt.gz","--skip=1","--mode=GATK-MW","--geno-anno=danRer10,Ens_84","--no-cell-formatting","--names=\"\\.[0-9]\\.([^\\.]+)\"")
+
+##ca=c( "/n/core/Bioinformatics/analysis/Piotrowski/heb/cbio.heb.100/data/output/analyze_new/degen_C76/degen_C76.DNS010.analyzed.mut_hom-alt_wt_het.hom_windows.xlsx","vcf2xlsx.29316.tmp/temp.1.high-priority-exonic.txt.gz","vcf2xlsx.29316.tmp/temp.2.low-priority-exonic.txt.gz","vcf2xlsx.29316.tmp/temp.3.misc-exonic.txt.gz","--skip=1","--no-cell-formatting","--names=\"\\\\.[0-9]\\\\.([^\\\\.]+)\"","--mode=GATK-MW","--geno-anno=danRer10,Ens_84" )
+
+buildroot <- paste0(system("echo $SIMR_BUILDROOT",intern=TRUE),"/")
+if (buildroot=="/") stop("Required envar $SIMR_BUILDROOT is not set!\n")
+apabin <- paste0(system("echo $SIMR_APA_BIN",intern=TRUE),"/")
+if (apabin=="/") stop("Required envar $SIMR_APA_BIN is not set!\n")
+idxroot <- "/n/data1/genomes/indexes/"
+
+source(paste0(apabin,"apa_tools.R"))
+
+output <- ca[1]
+inputs <- expr <- windows <- c()
+mode <- naming <- kegg.key <- readme.txt <- ""
+skip <- 0             # header lines (in input) to skip, passed to read.delim(skip=skip)
+CopyFormat <- TRUE    # initially
+split.on.depth <- 0   # initially
+list.file <- have.meta <- have.expr <- have.wins <- split.on.cluster <- split.on.id <- FALSE
+for (string in ca[2:length(ca)]) {
+    if (grepl("^--mode=",string)) {
+        mode <- sub("^--mode=","",string)
+    } else if (grepl("^--names=",string)) {
+        naming <- sub("^--names=","",string)
+    } else if (grepl("^--kegg-key=",string)) {
+        kegg.key <- read.delim(sub("^--kegg-key=","",string), as.is=TRUE)[,1:2]  # expecting col 1 = gene ID, col 2 = symbol
+    } else if (grepl("^--geno-anno=",string)) {
+        geno.anno <- unlist(strsplit(sub("^--geno-anno=","",string),","))  # expecting an indexed geno,anno pair
+        geno <- geno.anno[1]; anno <- geno.anno[2]
+        have.meta <- TRUE
+    } else if (grepl("^--skip=",string)) {
+        skip <- as.numeric(sub("^--skip=","",string))
+    } else if (grepl("^--expr=",string)) {
+        have.expr <- TRUE
+        expr <- read.delim(sub("^--expr=","",string), as.is=TRUE)  # expecting col 1 = gene ID, cols 2-N = whatever
+    } else if (grepl("^--windows1?=",string)) {
+        have.wins <- TRUE
+        win.header <- grepl("^--windows1=",string)   # "--windows" = bed file, "--windows1" = bed-like file with 1 header line
+        windows <- read.delim(sub("^--windows1?=","",string), as.is=TRUE, header=win.header)[,1:4]  # expecting first 4 cols = chr start end name; NO HEADER
+        windows <- mat.split(windows, windows[,1])   # may have > 1 window per chrom; here get 1 elem per chrom with all chrom windows
+    } else if (string=="--no-cell-formatting") {
+        CopyFormat <- FALSE
+    } else if (grepl("^--split-on-depth=",string)) {
+        split.on.depth <- as.numeric(sub("^--split-on-depth=","",string))
+    } else if (string=="--split-on-cluster") {
+        split.on.cluster <- TRUE
+    } else if (string=="--split-on-id") {
+        split.on.id <- TRUE
+    } else if (string=="--list-file") {
+        list.file <- TRUE
+    } else {
+        inputs <- c(inputs, string)
+    }
+}
+
+
+GATK.mode <- grepl("^GATK",mode)
+GATK.haplo <- mode=="GATK-hap"
+if (split.on.id & !GATK.mode) stop("Use of '--split-on-id' requires '--mode=GATK*'!\n")
+if (split.on.depth>0 & !GATK.mode) stop("Use of '--split-on-depth' requires '--mode=GATK*'!\n")
+if (split.on.cluster & mode != "FatiClone") stop("Use of '--split-on-cluster' requires '--mode=FatiClone'!\n")
+
+
+if (have.meta) {
+    message(paste0("Loading metadata for genome '",geno,"' transcriptome '",anno,"'"))
+    ga.pref <- paste0(idxroot,geno,"/",anno,"/",geno,".",anno,".")
+    ## Load files
+    gdat <- read.delim(paste0(ga.pref,"genedata.txt"), as.is=TRUE)
+    tdat <- read.delim(paste0(ga.pref,"transdata.txt"), as.is=TRUE)
+    gvar <- scan(paste0(buildroot,"preps/",geno,"/_VARIABLES"), what="", sep="\n")
+    tvar <- scan(paste0(buildroot,"preps/",geno,"/",anno,"/_TVARIABLES"), what="", sep="\n")
+    dburls <- sub("^ +","",scan(paste0(buildroot,"code/data/_DATABASES_AND_URLS"), what="", sep="\n"))
+    ## Extract variables
+    org <- sub(" ","_",sub("\".*","",sub("^org=\"","",gvar[grep("^org=",gvar)])))
+    ensbr <- sub(" .*","",sub("ensdiv=","",gvar[grep("^ensdiv=",gvar)]))
+    hdb <- sub(" .*","",sub("^home_db=","",tvar[grep("^home_db=",tvar)]))
+    Hdb <- paste0(toupper(substr(hdb,1,1)), sub("^.","",hdb))  # first letter capitalized
+    ## Extract/modify base URLs
+    if (ensbr=="core") {
+        epage.g <- sub(" .*","",sub("^ensembl_core_page_g=","",dburls[grep("^ensembl_core_page_g=",dburls)]))      # should always exist
+        epage.t <- sub(" .*","",sub("^ensembl_core_page_t=","",dburls[grep("^ensembl_core_page_t=",dburls)]))      # should always exist
+        epage.g <- gsub("~ORG~",org,epage.g)
+        epage.t <- gsub("~ORG~",org,epage.t)
+    } else {
+        epage.g <- sub(" .*","",sub("^ensembl_branch_page_g=","",dburls[grep("^ensembl_branch_page_g=",dburls)]))  # should always exist
+        epage.t <- sub(" .*","",sub("^ensembl_branch_page_t=","",dburls[grep("^ensembl_branch_page_t=",dburls)]))  # should always exist
+        epage.g <- gsub("~BRANCH~",ensbr,gsub("~ORG~",org,epage.g))
+        epage.t <- gsub("~BRANCH~",ensbr,gsub("~ORG~",org,epage.t))
+    }
+    hpage.g <- sub(" .*","",sub(paste0("^",hdb,"_page_g="),"",dburls[grep(paste0("^",hdb,"_page_g="),dburls)]))    # should always exist
+    ## Entrez IDs, if any
+    ent.file <- paste0(ga.pref,"entrez_ids.txt")
+    have.ent <- file.exists(ent.file)
+    if (have.ent) entrez <- read.delim(ent.file, as.is=TRUE)
+    ## Home Base IDs, if any
+    hbid.file <- paste0(ga.pref,hdb,"_ids.txt")
+    have.hbids <- file.exists(hbid.file)
+    if (have.hbids) hbids <- read.delim(hbid.file, as.is=TRUE)
+    
+    if (have.expr) {
+        ## ensure it has correct IDs
+        m.gdat <- match(gdat$GeneID,expr[,1])
+        if (all(is.na(m.gdat))) stop("Rownames of the 'expr' table did not match any metadata gene IDs!\n")
+    }
+} else {
+    if (have.expr) stop("Cannot use expression data without transcript metadata!\n")   # must have metadata to match gene expr -> transcript IDs
+}
+
+
+listfile <- readme <- FALSE
+readme.file <- paste0(apabin,"scriptutils/README/xls.readme.",mode,".txt")
+if (file.exists(readme.file)) {
+    readme <- TRUE
+    readme.txt <- scan(readme.file, what="", sep="\n", blank.lines.skip=FALSE)
+    rt <- strsplit(readme.txt,"\t")
+    mc <- max(listLengths(rt))
+    readme.txt <- as.data.frame(do.call(rbind, lapply(rt, function(x) x[1:mc] )))
+}
+
+
+if (list.file) {
+    if (length(inputs)==1) {
+        ## input was a file, containing a list of inputs
+        dat <- read.delim(inputs[1], as.is=TRUE, header=FALSE)
+        labels <- dat[,1]
+        files <- dat[,2]
+    } else {
+        stop("Must have exactly one input file if using '--list-file'!\n")
+    }
+} else {
+    if (grepl("=",inputs[1])) {
+        message("NAME=FILE MODE")
+        ## using "name"=file pairs
+        dat <- sapply(inputs, function(x) gsub("\"","",unlist(strsplit(x,"="))) )
+        labels <- dat[1,]
+        files <- dat[2,]
+    } else {
+        ## bare list of files
+        message("FILE LIST MODE")
+        files <- inputs
+        if (naming == "") {
+            labels <- files  # often a bad choice...
+        } else if (naming == "directory") {
+            labels <- sub(".*/","",sub("/[^/]+$","",files))  # parent directory of file
+        } else if (naming == "file") {
+            labels <- sub(".*/","",sub(".[^.]+$","",files))  # file base name
+        } else if (naming != "") {
+            ## Assuming "naming" is a quoted regexp with ONE pair of memory parentheses which extract the desired name from the file string
+            naming <- gsub('"','',naming)
+            labels <- sub(paste0(".*",naming,".*"),"\\1",files)
+            message("LABELS:")
+            print(labels)
+        } else {
+            labels <- gsub("/","_",files)
+            if (naming != "") warning(paste0("Names location '",naming,"' is not recognized!"))
+        }
+    }
+}
+
+for (i in 1:length(files)) {
+    if (!file.exists(files[i]) & grepl("\\*",files[i])) {   # a targeted glob that returned nothing; make like it never existed
+        message("IGNORING FAILED GLOB: ",files[i])
+        files[i] <- labels[i] <- NA
+    }
+}
+if (sum(is.na(files))!=sum(is.na(labels))) stop("'files' and 'labels' have differing number of NAs!\n")
+files <- files[!is.na(files)]
+labels <- labels[!is.na(labels)]
+
+txt.exists <- sapply(files,file.exists)
+if (!all(txt.exists)) {
+    no.exist <- paste(files[!txt.exists], collapse=" \n")
+    stop(paste0("The following input files do not exist!\n",no.exist))
+}
+
+txt <- new.list(labels)
+F <- length(files)
+if (F==0) stop("No files found; cannot proceed!\n")
+if (F>1 & split.on.cluster) stop("Cannot only use --split-on-cluster with a single input file!\n")
+
+
+for (i in 1:F) {
+    if (grepl("\\.gz$",files[i])) {
+        txt[[i]] <- read.delim(gzfile(files[i]), as.is=TRUE, skip=skip)
+    } else {
+        txt[[i]] <- read.delim(files[i], as.is=TRUE, skip=skip)
+    }
+}
+if (split.on.cluster) {
+    txt <- mat.split(txt[[1]], txt[[1]][,2])  # cluster is column 2 (expecting UNMODIFIED FatiClone outputs)
+    F <- length(txt)
+}
+
+
+pct.cols <- c()
+drop.cols <- c()
+col.names <- c()
+
+#save.image(paste0(output,".txt2xls.RData"))
+
+if (mode == "IDR") {
+    
+    
+    
+    
+    
+    #### FIXME: Now need IDR1/2, raw vs expanded, etc.
+    
+    message("Running in IDR mode")
+    pct.cols <- c(10,12)
+    
+    
+    
+    
+    
+} else if (mode == "FatiClone") {
+    
+    
+    
+    
+    
+    message("Running in FatiClone mode")
+    ## ORIGINAL COLUMN POSITIONS OF KEY COLUMN SETS
+    txt <- lapply(txt, function(x) x[,!grepl("^Input_",colnames(x))] )   # immediately drop columns "Input_*" for multi-version compatibility
+    pct.cols <- c(7,8,10)
+    id.cols <- c(22,23,24)
+    drop.cols <- c(14:16)
+    ## INSERT NEW COLUMN 14, "nLogFDR"
+    txt <- lapply(txt, function(x) x[,c(1:13,13:ncol(txt[[i]]))] )
+    ## UPDATE COLUMN POSITIONS AFTER COL 14
+    id.cols <- id.cols+1
+    drop.cols <- drop.cols+1
+    url.cols <- 5  # not used yet...
+    
+    col.names <- c("Map","Cluster","DB","Level","Term Acc","Term Name","Clust Term %","Bkg Term %","% Ratio","DB Term %","Enrich","Raw P","FDR","nLogFDR","Odds","0.95 CI Lo","0.95 CI Up","Clust With","Clust Without","Bkg With","Bkg Without","DB With","Mapped_Symbols","Mapped_Names","Mapped_Xrefs")
+    
+    if (all(sapply(txt, function(x) length(unique(x[,1]))==1 ))) {  # generally 'Map' columns have only one value; if so, drop -- not informative
+        drop.cols <- c(1, drop.cols)
+        readme.txt <- readme.txt[!grepl("^Map\\t",readme.txt[,1]),]
+    }
+    
+    for (i in 1:F) {
+        GO.unpref <- which(txt[[i]][,3] %in% c("BP","CC","MF"))
+        txt[[i]][GO.unpref,3] <- paste0("GO-",txt[[i]][GO.unpref,3])
+        db <- txt[[i]][,3]
+        urls <- rep("",nrow(txt[[i]]))
+        urls[db=="KEGG"] <- paste0('HYPERLINK("http://www.genome.jp/kegg-bin/show_pathway?',txt[[i]][db=="KEGG",5],'","',txt[[i]][db=="KEGG",5],'")')   # LATER: add entrez IDs
+        urls[grep("^GO-",db)] <- paste0('HYPERLINK("http://amigo.geneontology.org/amigo/term/',txt[[i]][grep("^GO-",db),5],'","',txt[[i]][grep("^GO-",db),5],'")')
+        urls[urls==""] <- txt[[i]][urls=="",5]  # other DBs: no hyperlink, just original accession
+        txt[[i]][,5] <- urls
+        txt[[i]][,14] <- -log10(txt[[i]][,13])
+        no.symb <- which(is.na(txt[[i]][,id.cols[2]])|txt[[i]][,id.cols[2]]=="")
+        if (length(no.symb)>0) {
+            test.ids <- unlist(strsplit(txt[[i]][no.symb[1],id.cols[1]],"; "))
+            if (kegg.key!="") {
+                ## User-specified kegg.key
+                if (any(test.ids %in% kegg.key[,1])) txt[[i]][no.symb,id.cols[2]] <- FatiClone.KEGG.convert(kegg.key, txt[[i]][no.symb,id.cols[1]])
+            } else {
+                if (have.meta) {
+                    ## auto-select one of two possible conversions (Ensembl Gene ID, Entrez Gene ID)
+                    if (any(test.ids %in% gdat[,1])) {
+                        ## were Ensembl IDs; convert
+                        txt[[i]][no.symb,id.cols[2]] <- FatiClone.KEGG.convert(gdat[,1:2], txt[[i]][no.symb,id.cols[1]])
+                    } else if (have.ent) {
+                        if (any(test.ids %in% entrez[,2])) {
+                            ## were Entrez IDs; convert
+                            x <- FatiClone.KEGG.convert(entrez[,2:1], txt[[i]][no.symb,id.cols[1]])  # Entrez -> Ensembl
+                            txt[[i]][no.symb,id.cols[2]] <- FatiClone.KEGG.convert(gdat[,1:2], x)    # Ensembl -> Symbol
+                        } else {
+                            ## weren't Ensembl or Entrez IDs?
+                        }
+                    } else {
+                        ## may have been Entrez, but we don't have a conversion file...
+                    }
+                } else {
+                    ## nothing to convert IDs with...
+                }
+            }
+        }
+    }
+    
+    
+    
+    
+    
+} else if (GATK.mode) {
+##} else if (mode == "GATK-MW") {   # in future, will have some variants, like "GATK-MW", "GATK-hap", etc.
+
+    
+    
+    
+    
+    if (have.meta) {
+        gmeta <- match(c("Description"), colnames(gdat))
+        tmeta <- match(c("TransID"), colnames(tdat))  ## TRANSID MUST COME FIRST!!!!  ALL OTHERS AFTER.
+        if (have.expr) {
+            meta <- cbind( tdat[,tmeta,drop=FALSE], expr[match(tdat$GeneID,expr[,1]),-1,drop=FALSE], gdat[match(tdat$GeneID,gdat$GeneID),gmeta,drop=FALSE] )
+        } else {
+            meta <- cbind( tdat[,tmeta,drop=FALSE], gdat[match(tdat$GeneID,gdat$GeneID),gmeta,drop=FALSE] )
+        }
+        ncm <- ncol(meta)
+        for (i in 1:ncm) meta[[i]][is.na(meta[[i]])|meta[[i]]==""] <- " "
+    }
+    igvflank <- 50
+    
+    for (i in 1:F) {
+        
+        message("Processing: ",labels[i])
+        snp.no <- 1  # the first column in vcf2tab output (will be dropped)
+        core <- 2:8  # core 7 VCF fields
+        chr <- txt[[i]][,core[1]]
+        pos <- txt[[i]][,core[2]]
+        
+        if (have.wins) {
+            comp.win <- windows[match(chr, names(windows))]   # a list
+            in.win <- lapply(1:nrow(txt[[i]]), function(j){ w=which(comp.win[[j]][[2]]<=pos[j] & comp.win[[j]][[3]]>=pos[j]); ifelse(length(w)==0,"",comp.win[[j]][[4]][w]) })
+            rm(comp.win)
+            txt[[i]] <- cbind(txt[[i]][,1:8], WINDOW=in.win, txt[[i]][,9:ncol(txt[[i]])])
+            txt[[i]] <- txt[[i]][falsify(in.win!=""),]   # drop rows not inside windows
+            core <- 2:9   # extend 'core' to include matched-window column
+        }
+        allele <- core[length(core)] + 1  # allele number column (and start of non-core columns) 
+        nr <- nrow(txt[[i]])
+        if (nr==0) next   # nothing left, or nothing to start with...
+        
+        ## Add reference-pct columns (these are all at or after 'allele' column above)
+        w.AD <- grep("\\.AD$",colnames(txt[[i]]))
+        for (j in rev(w.AD)) {   #### MODIFY RIGHT TO LEFT -- do not mess up downstream w.AD column positions
+            txt[[i]] <- txt[[i]][,c(1:j,j:ncol(txt[[i]]))]
+            colnames(txt[[i]])[(j+1)] <- sub("AD$","RP",colnames(txt[[i]])[j])
+            ad.lst <- lapply(strsplit(txt[[i]][,j],","), function(x) suppressWarnings(zerofy(as.numeric(x))) )
+            txt[[i]][,(j+1)] <- round(100*zerofy(sapply(ad.lst, function(x) x[1]/sum(x) )),0)  # reference percent (of depth), rounded to integer
+            if (GATK.haplo) {
+                ## while we're at it, zero out these should-be-zero haploid-call values
+                txt[[i]][txt[[i]][,j]==".",j] <- 0          # AD field
+                txt[[i]][txt[[i]][,(j-1)]==".",(j-1)] <- 0  # j-1 should be associated GT field
+            }
+        }
+        #stop(paste(colnames(txt[[i]]),collapse=", "))
+        
+        ## Identify other columns, choose depth field, etc
+        nc <- ncol(txt[[i]])
+        dpmin <- which(colnames(txt[[i]])=="DPmin")
+        if (length(dpmin)==0) {
+            message("WARNING: 'DPmin' field not found in info!  Filtering on 'DP' instead, but this is much less reliable!\n")
+            dpmin <- which(colnames(txt[[i]])=="DP")
+        }
+        #geno <- grep("\\.(GT|AD|RP)$",colnames(txt[[i]]))  # IGNORING DP, GQ, PL, HH
+        geno <- grep("\\.(GT|AD|DP|GQ|PL|RP|HH)$",colnames(txt[[i]]))  # take all
+        eff <- which(colnames(txt[[i]])%in%c("Effect","Consequence"))[1]  # take first, if > 1 
+        eff <- eff:ncol(txt[[i]])  # ASSUME ALL COLUMNS PAST 'EFFECT' ARE EFFECT COLUMNS
+        urls <- matrix("", nr, 4, FALSE, list(c(),c("IGV_Link","EnsTrans_Link","EnsGene_Link",paste0(Hdb,"_Link"))))
+        urls[,1] <- paste0("http://localhost:60151//goto?locus=",chr,":",pos-igvflank,"-",pos+igvflank)
+        ## the below score cols may not exist (but hopefully they do)
+        GDS <- which(colnames(txt[[i]])=="GenoDiffScore")
+        AFP <- which(colnames(txt[[i]])=="AlleleFETp")
+        HWS <- which(colnames(txt[[i]])=="HomWinScore")
+        STS <- which(colnames(txt[[i]])=="SnpTrackScore")
+        STH <- which(colnames(txt[[i]])=="SnpTrackHMM")
+        SO  <- grep("SnpOrtho",colnames(txt[[i]]))
+        
+        ## for Excel: convert AFP to -log10
+        for (j in AFP) txt[[i]][,j] <- round(-log10(txt[[i]][,j]),2)   # had better only be 0|1 AFP columns, but just in case??
+        
+        ## designate columns that will be kept/dropped
+        drop.cols <- setdiff(1:ncol(txt[[i]]), c(core,allele,dpmin,GDS,AFP,HWS,STS,STH,SO,geno,eff))  # this will not affect metadata columns, which will appear after ncol(txt[[i]])
+        ##IM("DROP.COLS:\n ",paste(drop.cols,collapse=", "),"\n ",paste(colnames(txt[[i]])[drop.cols],collapse=", "))
+        
+        
+        if (have.meta) {
+            w.trans <- which(colnames(txt[[i]])=="Transcript_ID")[1]  # take first, if > 1
+            if (is.na(w.trans)) w.trans <- which(colnames(txt[[i]])=="Feature_ID")[1]  # take first, if > 1
+            trans <- txt[[i]][,w.trans]
+            m.trans <- match(trans,meta[,1])
+            if (any(is.na(m.trans))) {
+                test.trans <- sub("\\.[0-9]+$","",trans[is.na(m.trans)])
+                if (any(test.trans %in% meta[,1])) trans[is.na(m.trans)] <- test.trans  # apparently only some had croppable version numbers?
+            }
+            w.gene <- which(colnames(txt[[i]])=="Gene_ID")[1]  # take first, if > 1
+            gene <- if (is.na(w.gene)) { tdat$GeneID[match(trans,tdat$TransID)] } else { txt[[i]][,w.gene] }
+            m.trans <- match(trans,meta[,1])
+            if (all(is.na(m.trans))) m.trans <- match(sub("\\.[0-9]+$","",trans),meta[,1])
+            if (all(is.na(m.trans))) message(paste0("WARNING: ",files[i],": failed to match any transcript IDs!"))
+            if (any(is.na(m.trans))) {
+                lost.tids <- paste(trans[is.na(m.trans)],collapse="\n ")
+                message(paste0("WARNING: ",sum(is.na(m.trans)),"/",length(m.trans)," transcript IDs were not found in metadata!\n ",lost.tids))
+            }
+            urls[,2] <- sapply(1:nr, function(i) gsub("~GENE~",gene[i],gsub("~TRANS~",trans[i],epage.t)) )
+            urls[,3] <- sapply(1:nr, function(i) gsub("~GENE~",gene[i],epage.g) )
+            if (have.hbids) {
+                ##hbid <- lapply(gene, function(x) hbids[hbids[,1]==x,2] )
+                hbid <- hbids[match(gene,hbids[,1]),2]  # TAKES ONLY FIRST MATCHING HBID ID
+                urls[,4] <- sapply(1:nr, function(i) gsub("~HBID~",hbid[i],hpage.g) )
+                urls[hbid=="",4] <- ""
+            }
+            for (u in 1:4) urls[is.na(urls[,u])|urls[,u]=="",u] <- " "
+            
+            ## merge subset of columns with new metadata columns
+            this.meta <- meta[m.trans,2:ncm,drop=FALSE]
+            txt[[i]] <- cbind(txt[[i]], urls, this.meta)
+            
+            ## unique rows on chrom, pos, alt, consequence, gene_id (and combine all transcript IDs into transcript_id field)
+            pre.dup <- apply(txt[[i]][,c(core[c(1,2,5)],allele,eff,w.gene)],1,paste,collapse=":")
+            is.unq <- !duplicated(pre.dup)
+            for (r in which(is.unq)) {
+                w.dup <- which(pre.dup==pre.dup[r])
+                dup.trans <- txt[[i]][w.dup,w.trans]
+                txt[[i]][r,w.trans] <- paste(dup.trans, collapse="; ")
+            }
+            txt[[i]] <- txt[[i]][is.unq,]
+            
+        } else {
+            
+            txt[[i]] <- cbind(txt[[i]], urls)
+            
+        }
+        
+        ## Blocks in need of separation
+        is.low <- txt[[i]][,dpmin] < split.on.depth
+        low.split <- any(is.low)
+        has.id <- !(is.na(txt[[i]][,core[3]]) | txt[[i]][,core[3]] %in% c(""," ","."))
+        id.split <- split.on.id & any(has.id)
+        
+        ## Drop any droppable columns before proceeding
+        txt[[i]] <- txt[[i]][,-drop.cols]  # MUST DROP HERE, INSIDE LOOP -- DROP.COLS VARIES PER PAGE
+        drop.cols <- c()                   # THEN ZAP IT, SO NO FURTHER DROPS OCCUR BELOW
+        
+        ## Block separator
+        N.blank.rows <- 5
+        blank.row <- txt[[i]][1,]
+        for (j in 1:length(blank.row)) blank.row[[j]] <- NA
+        blank.rows <- blank.row[rep(1,N.blank.rows),]
+        
+        ## Separate and re-join blocks, if needed
+        if (low.split & id.split) {
+            
+            if (any(!has.id & !is.low)) {
+                tmp <- txt[[i]][!has.id & !is.low,]
+            } else {
+                tmp <- txt[[i]][0,]
+            }
+            if (any(!has.id &  is.low)) {
+                blank <- blank.rows; blank[N.blank.rows,1] <- "Novel Variants, Low Depth"
+                tmp <- rbind( tmp, blank, txt[[i]][!has.id &  is.low,] )
+            }
+            if (any( has.id & !is.low)) {
+                blank <- blank.rows; blank[N.blank.rows,1] <- "Known Variants, High Depth"
+                tmp <- rbind( tmp, blank, txt[[i]][ has.id & !is.low,] )
+            }
+            if (any( has.id &  is.low)) {
+                blank <- blank.rows; blank[N.blank.rows,1] <- "Known Variants, Low Depth"
+                tmp <- rbind( tmp, blank, txt[[i]][ has.id &  is.low,] )
+            }
+            txt[[i]] <- tmp
+            
+        } else if (low.split) {
+            
+            if (any(!is.low)) {
+                tmp <- txt[[i]][!is.low,]
+            } else {
+                tmp <- txt[[i]][0,]
+            }
+            if (any(is.low)) {
+                blank <- blank.rows; blank[N.blank.rows,1] <- "Low-Depth Variants"
+                tmp <- rbind( tmp, blank, txt[[i]][is.low,] )
+            }
+            txt[[i]] <- tmp
+            
+        } else if (id.split) {
+            
+            if (any(!has.id)) {
+                tmp <- txt[[i]][!has.id,]
+            } else {
+                tmp <- txt[[i]][0,]
+            }
+            if (any(has.id)) {
+                blank <- blank.rows; blank[N.blank.rows,1] <- "Known Variants"
+                tmp <- rbind( tmp, blank, txt[[i]][has.id,] )
+            }
+            txt[[i]] <- tmp
+            
+        }
+        
+    }
+    
+    
+    
+    
+    
+} else {
+    
+    
+    
+    
+    
+    if (mode != "") stop(paste0("Mode '",mode,"' is not a known mode!"))
+    
+    
+    
+    
+    
+}
+
+
+
+nchar.lim <- 32000
+supercell <- rep(FALSE, F)
+txt.nc <- lapply(txt, as.list)
+for (i in 1:F) {
+    if (length(pct.cols)>0) for (p in pct.cols) txt[[i]][,p] <- txt[[i]][,p]/100
+    if (length(col.names)>0) colnames(txt[[i]]) <- col.names
+    if (length(drop.cols)>0) txt[[i]] <- txt[[i]][,-drop.cols]   ### DROPS GO VERY LAST
+    for (j in 1:ncol(txt[[i]])) {
+        if (mode(txt[[i]])=="character") {
+            txt.nc[[i]][[j]] <- nchar(txt[[i]][,j])
+            mnc <- max(txt.nc[[i]][[j]])
+            if (is.na(mnc)) mnc <- 0
+            if (mnc>nchar.lim) {
+                supercell[i] <- TRUE
+                message("Sheet ",names(txt)[i]," Col ",j," Max Cell Size: ",mnc," !")
+            }
+        } else {
+            txt.nc[[i]][[j]] <- 0
+        }
+    }
+}
+
+if (readme) {
+    txt <- c(README=list(readme.txt), txt)
+    txt.nc <- c(README=list(nchar(readme.txt)), txt.nc)
+    supercell <- c(FALSE, supercell)
+    F <- F + 1
+}
+
+##IM(names(txt))
+
+if (any(supercell)) {
+    message("Oversized cell content detected; trimming cells...")
+    save.image(paste0(output,".RData"))
+    IM(paste0(output,".RData"))
+    for (i in which(supercell)) {
+        txti <- txt[[i]]
+        for (j in 1:ncol(txt[[i]])) {
+            ncj <- txt.nc[[i]][[j]]
+            over <- falsify(ncj>nchar.lim)
+            if (any(over)) txt[[i]][over,j] <- substr(txt[[i]][over,j], 1, nchar.lim)
+        }
+        txti.file <- paste0(output,".sheet-",i,".txt")
+        write.table(txti, txti.file, sep="\t", quote=FALSE, row.names=FALSE)
+        message("Wrote: ",txti.file,".  Please convert xls to xlsx and replace this page manually.")
+    }
+}
+
+WriteXLS2(txt, output, FreezeRow=1, BoldHeaderRow=TRUE, AdjWidth=TRUE, CopyFormat=CopyFormat, nolim=TRUE)
+quit()
+
+

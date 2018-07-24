@@ -1,0 +1,44 @@
+#!/usr/bin/env perl
+use strict;
+
+my (@inputs, %allmsg, %data, $anyrange);
+foreach my $file (@ARGV) {
+    my $IN;
+    unless (open $IN, '<', $file) {
+	print "$0: Cannot open input file '$file': $!\n";
+	next;
+    }
+    while (my $line = <$IN>) {
+	$line =~ s/[\n\r]+$//;
+	(my $fasta) = ($line =~ /^(\S+)\s+/);
+	$line =~ s/^(\S+)\s+//;
+	push @inputs, $fasta;
+	if ($line =~ s/(abort|failure)\s+(\S+\([^\(\)]+\))//) {
+	    $data{$fasta}{$1} = $2;
+	    $allmsg{$1} = 1;
+	}
+	if ($line =~ s/(max_score\(decibans\))\s+([\d.-]+)//) {
+	    $data{$fasta}{$1} = $2;
+	    $allmsg{$1} = 1;
+	}
+	if ($line =~ s/(\d+)\s+(\d+)\s*$//) {
+	    $data{$fasta}{"START\tEND"} = "$1\t$2";
+	    $anyrange = 1;
+	}
+	if ($line =~ /\S/) {  # something left over?
+	    print STDERR "MISSED: $file: $line\n";
+	}
+    }
+    close $IN;
+}
+
+print "Input";
+print "\t$_" foreach sort keys %allmsg;
+print "\tSTART\tEND" if $anyrange;
+print "\n";
+foreach my $fasta (@inputs) {
+    print $fasta;
+    print "\t$data{$fasta}{$_}" foreach sort keys %allmsg;
+    print "\t".$data{$fasta}{"START\tEND"} if $anyrange;
+    print "\n";
+}

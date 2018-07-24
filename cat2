@@ -1,0 +1,12 @@
+#!/usr/bin/env perl
+use strict;
+
+my $header = 1;
+if ($ARGV[0] =~ /^--header=(\d+)/) {
+    $header = $1;
+    shift @ARGV;
+}
+my $first = shift @ARGV;
+system "cat $first";  # includes header
+$header++;
+system "tail -n +$header $_" foreach @ARGV;  # subsequents lack header

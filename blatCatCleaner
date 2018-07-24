@@ -1,0 +1,25 @@
+#!/usr/bin/perl
+use strict;
+
+## Takes a PSL file catted together from many smaller PSL files -- e.g. cluster-blat outputs -- and strips out the internal header lines
+
+my ($input, $output) = @ARGV;
+$output = "$input.clean" unless $output;
+
+open IN, $input or die "$0: Failed to open '$input' for reading: $!\n";
+open OUT, "> $output" or die "$0: Failed to open '$output' for writing: $!\n";
+while (<IN>) {
+    if ($. < 6) {
+	print OUT $_;
+    } else {
+	next if $_ =~ /^psLayout/;        # header line 1
+	next if $_ !~ /\S/;               # header line 2
+	next if $_ =~ /^match	mis-/;    # header line 3
+	next if $_ =~ /^     	match/;   # header line 4
+	next if $_ =~ /^-----/;           # header line 5
+	print OUT $_;
+    }
+}
+close OUT;
+close IN;
+exit;

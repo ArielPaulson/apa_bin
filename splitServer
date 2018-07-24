@@ -1,0 +1,17 @@
+#!/bin/bash
+
+exit;    # UNDER CONSTRUCTION
+
+script=$1
+servs=$2
+simul=$3
+
+total=$($servs \* $simul)
+
+servers=(mango hickory cypress maple genekc03 rho)
+
+tmp="splitServer.$$.tmp";
+mkdir $tmp
+cp $script $tmp/input
+cd $tmp
+split -l $total $input

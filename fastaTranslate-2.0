@@ -1,0 +1,998 @@
+#!/usr/bin/env perl
+require '/home/apa/local/bin/apa_routines.pm';
+use Data::Dumper;
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+no strict 'refs';
+
+
+die;  # UNDER CONSTRUCTION
+
+
+## Translates DNA fasta to AA, detects ORFs.
+## All snpEff_4_3 codon tables are available.
+## 
+## Default method:
+## 1. Translate all sequences in $tmode frames, using the indicated codon table(s) (otherwise, 'Standard').
+## 2. 5'-trim all ORFs such that they start with M.
+## 3. Retain only largest ORF(s) per frame, so long as they exceed $minorf AA.
+## 4. Select frame(s) with globally-largest ORF length.
+## 5. Write only the ORF(s) from these frame(s).
+## 
+## If $incomplete: process as above, with two exceptions:
+## 1. 5'-most ORF: do not 5'-trim up to first M, if ORF extends to the beginning of the NT sequence (assume incomplete).
+## 2. 3'-most ORF: If no stop codon, and NT sequence in frame was cropped (not an even multiple of 3), then add 1 to reported ORF length (assume incomplete, make more competitive on max-orf test).
+
+
+## TO DO:
+## Finish handling-table controls
+## Enable --all-sequences, --report modes
+
+#my @FLAG = qw/ ENSMUST00000176398 +2 /;
+
+
+## Inputs:
+my $fasta;         # assembled contig fasta, e.g.
+my $stopnames;     # will use (o,a,p) to distinguish (ochre,amber,opal) stop codons (APPLIES TO STANDARD CODON TABLE ONLY!!)
+my $prefix;        # a prefix for all output files
+my $tmode = 1;     # translation mode: 1, 3, or 6 (-frame) ** OR ** 0 for in-frame CDS sequences only (skip ORF identification)
+my $minorf = 1;    # smallest ORF size to consider
+my $incomplete;    # are incomplete coding sequences expected?  (e.g. draft transcript assembly or something)
+my $all_frames;    # retain results from all frames, instead of just the best frame? (i.e. one with longest ORF)
+my $all_orfs;      # retain all ORFs, not just the longest, per frame?
+my $codontable;    # what codon table to use for somatic genes?  (Default 'Standard'; for others see &load_codon_tables subroutine at EOF);
+my $Mcodontable;   # what codon table to use for mitochondrial genes?  (Default 'Mitochondrial'; for others see &load_codon_tables subroutine at EOF);
+my $mitolist;      # single-column headerless file with list of gene IDs that should be translated with $Mcodontable
+my $relaxM;        # relax requirement that ORFs begin with Ms
+my $report;        # write report with translation and ORF stats
+my $all_sequences; # write everything (sequencewise) -- all sequences, all frames, all orfs, all gaps
+my $print_tables;  # ONLY print codon table matrix (then exit)
+
+
+GetOptions("f=s"=>\$fasta, "t=i"=>\$tmode, "p=s"=>\$prefix, "ct=s"=>\$codontable, "ctm=s"=>\$Mcodontable, "mito=s"=>\$mitolist, "m=i"=>\$minorf, "stop-names"=>\$stopnames, "all-frames"=>\$all_frames, "all-orfs"=>\$all_orfs, "relax-M"=>\$relaxM, "incomplete"=>\$incomplete, "report"=>\$report, "all-sequences"=>\$all_sequences, "print-tables"=>\$print_tables);
+
+## setup
+my %codon_tables = %{ &load_codon_tables };  # populate %codon_tables; stored at end of script for cleanliness of code
+&print_codon_tables if $print_tables;   # SCRIPT WILL EXIT HERE
+
+die "Fasta file '$fasta' not found!" unless -e $fasta;
+my ($fname) = ($fasta =~ /([^\/]+)\.f\w{1,4}$/);
+($fname) = ($fasta =~ /([^\/]+)$/) unless $fname;   # unusual extension?
+$prefix = $fname unless $prefix;
+my $bin = '/home/apa/local/bin';         # script locations
+$all_orfs = 1 if $all_sequences;
+unless ($codontable) {
+    $codontable = $stopnames ? 'Standard_StopNames' : 'Standard';
+}
+
+my @framelist;
+if ($tmode == 1 || $tmode == 0) {
+    @framelist = ('+0');
+} elsif ($tmode == 3) {
+    @framelist = ('+0','+1','+2');
+} elsif ($tmode == 6) {
+    @framelist = ('+0','+1','+2','-0','-1','-2');
+} else {
+    die "$0: Translation mode '$tmode' not one of 1,3,6 (or 0)!\n";
+}
+
+my %stopcodons;
+my %knownstops = map {($_=>1)} qw/ * c a p /;  # normal or named
+my %knownstarts = map {($_=>1)} qw/ M /;       # in the future, others will be specifiable
+foreach my $table (keys %codon_tables) {
+    foreach my $codon (keys %{ $codon_tables{$table} }) {
+	$stopcodons{$table}{$codon} = 1 if $knownstops{ $codon_tables{$table}{$codon} };
+    }
+}
+my (%data, $header, @headers, %which_table, %ctable_out);
+
+
+## read fasta
+chomp(my $now = `date`);
+print "Reading fasta: $now\n";
+my $FA = &open2('R', $fasta, 'Input fasta');
+my $h = 0;
+while (<$FA>) {
+    s/[\n\r]+$//g;
+    if (/^>(.*)/) {
+	$header = $1;
+	$h++;
+#	last if $h > 100;   # TRAINING WHEELS
+	push @headers, $header;		# keep things in input order
+	$data{$header}{NAME} = $header;
+    } else {
+	$data{$header}{RAWSEQ} .= $_ if $_;
+    }
+}
+close $FA;
+
+
+## read handling table, if exists
+my $HT = &open2('R', $handlefile, 'Handling table');
+my @htypes;
+while (<$HT>) {
+    s/[\n\r]+$//g;
+    my ($header, @data) = split /\t/, $_;
+    if ($. == 1) {
+	@htypes = @data;
+    } else {
+	$handling{$header}{ $htypes[$_] } = $data[$_] foreach (0..$#htypes);
+    }
+}
+close $HT;
+
+my %alltables = map {($_=>1)} values %which_table;
+my @unk_tables;
+foreach my $table (keys %alltables) { 
+    push @unk_tables, $table if $table && ! exists $codon_tables{$table};
+}
+if (@unk_tables) {
+    my $unk = join(', ', sort @unk_tables);
+    my $kno = join(', ', sort keys %codon_tables);
+    die "$0: The following requested codon tables do not exist:\n$unk\nThese are the existing (snpEff) codon tables:\n$kno\n";
+}
+
+foreach my $header (@headers) {
+    $which_table{$header} = $codontable unless $which_table{$header};
+    ## SET ALL THE OTHER DEFAULTS HERE
+}
+
+
+## translate
+chomp(my $now = `date`);
+print "Translating: $now\n";
+my ($tcount, $hcount) = (0, scalar keys %data);
+my %results;
+&local_translate($_) foreach @headers;
+#die Dumper(\%data);
+
+## prepare standard fasta output(s)
+chomp(my $now = `date`);
+print "Writing: $now\n";
+
+open FA, "> $prefix.ORFs.aa.fa";
+if ($all_sequences) {
+    open FA2, "> $prefix.gaps.aa.fa";
+    open FAF, "> $prefix.full-frame.aa.fa";
+}
+if ($report) {
+    open CUTG, "> $prefix.global_codon_usage_table.txt";
+    open CUT, "> $prefix.transcript_codon_usage_table.txt";
+    open REP, "> $prefix.translation_report.txt";
+}
+
+foreach my $header (@headers) {
+    
+    my (%maxdata, %stopdata, @maxframes, $stopnames, $cnc);
+    my $table = $which_table{$header};
+    
+#    foreach my $frame (@framelist) {
+#	print "$header FRAME $frame\n",Dumper(\%{ $data{$header}{FRAME}{$frame} }),"\n";
+#    }
+#    die;
+    
+    ## NEW FRAME SELECTION APPROACH
+    
+    my %framesByMaxOrf;
+    $framesByMaxOrf{ $data{$header}{FRAME}{$_}{MAXORFAA} }{$_} = 1 foreach @framelist;
+    my $maxOrf = (sort {$b<=>$a} keys %framesByMaxOrf)[0];
+    my @maxFrames = keys %{ $framesByMaxOrf{$maxOrf} };  # frame(s) with longest ORF length
+    
+    my @useframes = $all_frames ? @framelist : @maxFrames;
+    foreach my $frame (@useframes) {
+	my %f = %{ $data{$header}{FRAME}{$frame} };
+	
+	foreach my $orfnum (sort {$a <=> $b} keys %{ $f{ORF} }) {
+	    my %x = %{ $f{ORF}{$orfnum} };
+	    my $orfseq = $x{AASEQ};
+	    $orfseq .= '*' if $x{STOPS};  # if ORF terminated with a stop (and not just end of sequence), then be formal and indicate the stop
+	    $orfseq = ${ &blockify($orfseq) };
+	    print FA ">$header|Frame:$frame|ORF:$orfnum|Len:$x{AALEN}\n$orfseq\n";
+	    
+	    if ($report) {
+		## Now, codon usage table ONLY reflects selected ORFs
+		$ctable_out{$table}{C}{$_}++ foreach @{ $x{CODON} };
+		$ctable_out{$table}{R}{$_}++ foreach @{ $x{RESID} };
+		$ctable_out{$table}{X} += $x{AMBIG};
+	    }
+	}
+	
+	if ($all_sequences) {
+	    my $frameseq = ${ &blockify($f{AASEQ}) };
+	    print FAF ">$header|Frame:$frame|MaxORFLen:$f{MAXAALEN}\n$frameseq\n";
+	    
+	    #foreach my $gapnum (sort {$a <=> $b} keys %{ $f{GAP} }) {
+	    #}
+	}
+    }
+}
+
+close FA;
+if ($all_sequences) {
+    close FA2;
+    close FAF;
+}
+if ($report) {
+    
+		$ctable_out{$table}{C}{$_}++ foreach @{ $x{CODON} };
+		$ctable_out{$table}{R}{$_}++ foreach @{ $x{RESID} };
+		$ctable_out{$table}{X} += $x{AMBIG};
+    
+    
+    
+    close CUTG;
+    close CUT;
+    close REP;
+}
+
+chomp(my $now = `date`);
+print "$0 complete! $now\n";
+exit;
+
+
+
+
+
+
+
+#########################################################  SUBROUTINES  #########################################################
+#########################################################  SUBROUTINES  #########################################################
+#########################################################  SUBROUTINES  #########################################################
+#########################################################  SUBROUTINES  #########################################################
+#########################################################  SUBROUTINES  #########################################################
+
+
+
+
+
+
+
+### translation, ORF detection
+sub local_translate {
+
+    my $HEADER = shift;
+    $tcount++;
+    print " $tcount/$hcount\n" if $tcount % 1000 == 0;
+
+    my %frameseq;
+    my $mrna = $data{$HEADER}{RAWSEQ};
+    my $table = $which_table{$HEADER};
+    
+    # preprocess sequence
+    $mrna =~ s/^\s+//;	    # clip leading whitespace
+    $mrna =~ s/\s+$//;      # clip trailing whitespace
+    $mrna =~ s/(.*)/\U$1/;  # all caps
+    $mrna =~ s/U/T/g;	    # RNA->DNA
+    
+    # create separate sequence per frame
+    $frameseq{'+0'} = $mrna;
+    my @jsplit = split //, $mrna;
+    if ($tmode > 1) {
+	$frameseq{'+1'} = join '', @jsplit[1..$#jsplit];
+	$frameseq{'+2'} = join '', @jsplit[2..$#jsplit];
+    }
+    
+    # original-sequence statistics
+    if ($report) {
+	$data{$HEADER}{NTSEQ} = $mrna;
+	$data{$HEADER}{NTLEN} = length($mrna);
+	$data{$HEADER}{AALEN} = int(length($mrna)/3);
+    }
+    
+    # prep for translation mode
+    if ($tmode == 6) {
+	$frameseq{'-0'} = ${ &revcomp($mrna) };
+	my $temp1 = join '', @jsplit[0..$#jsplit-1];
+	my $temp2 = join '', @jsplit[0..$#jsplit-2];
+	$frameseq{'-1'} = ${ &revcomp($temp1) };
+	$frameseq{'-2'} = ${ &revcomp($temp2) };
+    }
+    
+    # translate each specified frame
+    foreach my $frame (@framelist) {
+	
+	## setup
+	my $seqlen = length($frameseq{$frame});
+	my $startmax = int($seqlen/3);  # will never exceed $seqlen
+	my ($stopped, $orfnum, $gapnum, $resnum, $in_orf, $in_gap, $crop);
+	
+	if ($report) {
+	    $data{$HEADER}{FRAME}{$frame}{NTSEQ} = $frameseq{$frame};
+	    $data{$HEADER}{FRAME}{$frame}{NTLEN} = $seqlen;
+	    $data{$HEADER}{FRAME}{$frame}{AALEN} = int($seqlen/3);  # may be revised below
+ 	}
+	
+	## convert codons
+	foreach my $C (0..$startmax) {   # one start per codon
+	    
+	    my $start = $C * 3;
+	    
+	    if ($start == $seqlen) {
+		
+		## the end of the sequence -- bye
+		
+	    } else {
+		
+		## not yet reached the end of the sequence
+		
+		my $codon = substr($frameseq{$frame}, $start, 3);
+		my $residue;
+		my $fake;
+		
+		if (abs($seqlen-$start) <= 2) {
+		    ## end of _translatable_ sequence...
+		    ## now, are we considering ORF as 3'-incomplete or not?
+		    my $crop = $seqlen - $start;
+		    $data{$HEADER}{FRAME}{$frame}{CROP} = $crop;  # by design, cropping ONLY happens to 3'-most ORF, if it happens at all
+		    if ($in_orf) {
+			$data{$HEADER}{FRAME}{$frame}{ORF}{$orfnum}{CROP} = $crop;
+			if ($incomplete && !$stopped) {
+			    ## ran to end with no stop; assume partial ORF, may have continued if sequence was longer
+			    ## one fake AA will be added to sequence, since we don't know the identity of the next codon
+			    $data{$HEADER}{FRAME}{$frame}{ORF}{$orfnum}{INCO3} = $fake = 1;
+			    $codon .= 'N' x $crop;  # pad missing NTs with Ns
+			} else {
+			    ## not allowing partial ORFs, or, the ORF stopped already -- bye
+			    last;
+			}
+		    }
+		}
+		
+		## get codon and translation
+		if (exists $codon_tables{$table}{$codon}) {
+		    $residue = $codon_tables{$table}{$codon};
+		} else {
+		    ## codon failed to translate: has Ns or IUPAC degenerate bases
+#		    push @errors, "header $HEADER | residue $residue | codon $codon | start $start | frame $frame | len $seqlen | seq $frameseq{$i}\n" unless $fake;
+		    $data{$HEADER}{FRAME}{$frame}{AMBIG}++;
+		    $residue = 'X';
+		}
+		if ($all_sequences) {
+		    $data{$HEADER}{FRAME}{$frame}{AASEQ} .= $residue;
+		    $data{$HEADER}{FRAME}{$frame}{ALNSEQ} .= "  $residue";
+		}
+		
+		## determine where we are, with respect to an ORF
+		my $is_stop = exists $stopcodons{$table}{$codon} ? 1 : 0;
+		my $is_start = exists $knownstarts{$residue} || $relaxM ? 1 : 0;  # call start if M, or if it doesn't matter
+		my $partial_start = 0;  # initially
+		my $stmsg = $is_start ? '(start)' : '';
+		if ($is_stop) {
+		    ## this residue is a stop codon (end of ORF, or inter-ORF gap)
+		    if ($in_orf) {
+			$data{$HEADER}{FRAME}{$frame}{ORF}{$orfnum}{STOP} = $residue;   # record ONLY the first stop codon after an ORF (useful only if $stopnames...)
+			$data{$HEADER}{FRAME}{$frame}{ORF}{$orfnum}{STOPS}++;
+		    }
+		    $data{$HEADER}{FRAME}{$frame}{ORF}{$orfnum}{STOPS}++ if $orfnum & $stopped;  # recording additional consecutive stops at end of ORF
+		    $stopped = 1;
+		    $in_orf = 0;
+		    $in_gap = 0;
+		    $data{$HEADER}{FRAME}{$frame}{STOPS}++;
+#		    print "$HEADER $frame $orfnum | $start $C . | STOP $residue = $codon  $stmsg\n" if $HEADER eq $FLAG[0] && $frame eq $FLAG[1];
+		} else {
+		    ## this residue is not a stop codon
+		    ## determine if we are continuing an ORF or gap, or starting a new one
+		    $stopped = 0;
+		    if ($incomplete && $C==0 && !$is_start) {
+			## special case: if $incomplete, and first residue of frame is not a start or stop, assume ORF is incomplete and extends 5' (so, start the ORF now...)
+			$is_start = 1;
+			$partial_start = 1;
+		    }
+		    if (!$in_orf) {
+			## not yet in ORF (just left stop, or currently in gap)
+			if ($is_start) {
+			    ## found a start codon; start new ORF (if $relaxM, this will be ANY non-stop codon)
+			    $orfnum++;  # ORF number
+			    $in_orf = 1;
+			    $in_gap = 0;
+			    $resnum = 0;
+			    $data{$HEADER}{FRAME}{$frame}{STARTS}++;
+			} else {
+			    ## not a start codon, continue in gap
+			    $gapnum++ unless $in_gap;  # 'inter-ORF-gap' number, not yet in use // only increment when entering gap
+			    $in_orf = 0;
+			    $in_gap = 1;
+			    $resnum = 0;
+			}
+		    }
+		    $resnum++;
+		    my $whereami = $in_orf ? 'ORF' : 'GAP';
+#		    print "$HEADER $frame $orfnum | $start $C $resnum | $whereami $residue = $codon  $stmsg\n" if $HEADER eq $FLAG[0] && $frame eq $FLAG[1];
+		    if ($in_orf) {
+			## currently inside an ORF
+			push @{ $data{$HEADER}{FRAME}{$frame}{ORF}{$orfnum}{CODON} }, $codon if $report;
+			push @{ $data{$HEADER}{FRAME}{$frame}{ORF}{$orfnum}{RESID} }, $residue;
+			$data{$HEADER}{FRAME}{$frame}{ORF}{$orfnum}{AMBIG}++ if $residue eq 'X';
+			if ($partial_start) {
+			    ## note if ORF was considered 5'-incomplete; do not record "start" codon in this case
+			    $data{$HEADER}{FRAME}{$frame}{ORF}{$orfnum}{INCO5} = 1;
+			} elsif ($resnum == 1) {
+			    ## if not incomplete, then record start codon
+			    $data{$HEADER}{FRAME}{$frame}{ORF}{$orfnum}{START} = $residue;
+			    $data{$HEADER}{FRAME}{$frame}{ORF}{$orfnum}{KSTART} = exists $knownstarts{$residue} ? 1 : 0;   # ORF starts with a known start?
+			}
+		    } else {
+			## could track non-ORF stuff here, but not currently
+		    }
+		}
+	    }
+	}
+	
+	my $ORFNUM = $orfnum;  # last number
+	my $GAPNUM = $gapnum;  # last number
+	
+	## finalize ORF stats
+	foreach my $orfnum (1..$ORFNUM) {
+	    ## final ORF stats 
+	    my $orfseq = join '', @{ $data{$HEADER}{FRAME}{$frame}{ORF}{$orfnum}{RESID} };
+	    my $orflen = length($orfseq);
+	    $data{$HEADER}{FRAME}{$frame}{ORF}{$orfnum}{AASEQ} = $orfseq;
+	    $data{$HEADER}{FRAME}{$frame}{ORF}{$orfnum}{AALEN} = $orflen;
+	    $data{$HEADER}{FRAME}{$frame}{ORF}{$orfnum}{NTLEN} = $orflen*3;
+      	}
+	
+	## Max-ORF stats for frame
+	my @orflens = map { $data{$HEADER}{FRAME}{$frame}{ORF}{$_}{AALEN} } (1..$ORFNUM);
+	my $orfmax = (sort {$b <=> $a} @orflens)[0];   # length of longest ORF
+	$data{$HEADER}{FRAME}{$frame}{MAXORFAA} = $orfmax;
+	$data{$HEADER}{FRAME}{$frame}{MAXORFNT} = $orfmax*3;
+	foreach my $i (0..$#orflens) {
+	    $data{$HEADER}{FRAME}{$frame}{NMAXORF}++ if $orflens[$i] == $orfmax;
+	}
+	
+	## AFTER enumeration, apply ORF selection filters, if any
+	## This way, ORF numbers are the same no matter what filters are applied
+	if (!$all_orfs || $minorf>0) {  # filters exist
+	    foreach my $orfnum (1..$ORFNUM) {
+		my %x = %{ $data{$HEADER}{FRAME}{$frame}{ORF}{$orfnum} };
+		if (!$all_orfs) {
+		    ## only keep if largest
+		    delete $data{$HEADER}{FRAME}{$frame}{ORF}{$orfnum} unless $x{AALEN} == $orfmax && $x{AALEN} >= $minorf;
+		} elsif ($minorf) {
+		    ## only keep if >= $minorf
+		    delete $data{$HEADER}{FRAME}{$frame}{ORF}{$orfnum} if $x{AALEN} < $minorf;
+		}
+	    }
+	}
+    }
+}
+
+
+### print matrix of codon tables, then exit
+sub print_codon_tables {
+    
+    my @tablenames = sort keys %codon_tables;
+    my @codons = sort keys %{ $codon_tables{Standard} };
+    open OUT, "> fastaTranslate.all_codon_tables.txt";
+    print OUT join("\t", 'snpEff_Table', @codons), "\n";
+    foreach my $table (@tablenames) {
+	print OUT join("\t", $table, map { $codon_tables{$table}{$_} } @codons), "\n";
+    }
+    close OUT;
+    exit;
+    
+}
+
+
+### codon -> AA, in all different ways
+sub load_codon_tables {
+    
+    ## All tables taken from snpEff v4_3
+    ## Code used to create hashes below:
+    ## grep "^codon" /n/data1/genomes/bowtie-index/snpEff/current/snpEff.config | sed 's/^codon.//' > x
+    ## perl -i -pe 's/^(\S+)\s+: /},\n\t"$1" => {\n/' x
+    ## perl -i -pe 's/([ACGT]{3})\/([^,]+),/\t\t"$1" => "$2",\n/g' x
+    ## perl -i -pe 's/([ACGT]{3})\/([^,]+)[\n\r]+$/\t\t"$1" => "$2"\n/' x
+    ## 'x' now contains the lines between '%codon_tables = (' and ');'
+    ## lines below have been shortened by putting 4 codon defs per line
+    ## 'Standard_StopNames' table is 'Standard' modified by replacing the three stop '*' with {c,a,p} indicating {ochre,amber,opal}.
+    ## '+' symbols have been retained for reference, and are removed before exporting the table/
+    
+    my %CTEMP = (
+	
+	'Standard' => {
+	    'TTT' => 'F', 'TTC' => 'F', 'TTA' => 'L', 'TTG' => 'L+',
+	    'TCT' => 'S', 'TCC' => 'S', 'TCA' => 'S', 'TCG' => 'S',
+	    'TAT' => 'Y', 'TAC' => 'Y', 'TAA' => '*', 'TAG' => '*',
+	    'TGT' => 'C', 'TGC' => 'C', 'TGA' => '*', 'TGG' => 'W',
+	    'CTT' => 'L', 'CTC' => 'L', 'CTA' => 'L', 'CTG' => 'L+',
+	    'CCT' => 'P', 'CCC' => 'P', 'CCA' => 'P', 'CCG' => 'P',
+	    'CAT' => 'H', 'CAC' => 'H', 'CAA' => 'Q', 'CAG' => 'Q',
+	    'CGT' => 'R', 'CGC' => 'R', 'CGA' => 'R', 'CGG' => 'R',
+	    'ATT' => 'I', 'ATC' => 'I', 'ATA' => 'I', 'ATG' => 'M+',
+	    'ACT' => 'T', 'ACC' => 'T', 'ACA' => 'T', 'ACG' => 'T',
+	    'AAT' => 'N', 'AAC' => 'N', 'AAA' => 'K', 'AAG' => 'K',
+	    'AGT' => 'S', 'AGC' => 'S', 'AGA' => 'R', 'AGG' => 'R',
+	    'GTT' => 'V', 'GTC' => 'V', 'GTA' => 'V', 'GTG' => 'V',
+	    'GCT' => 'A', 'GCC' => 'A', 'GCA' => 'A', 'GCG' => 'A',
+	    'GAT' => 'D', 'GAC' => 'D', 'GAA' => 'E', 'GAG' => 'E',
+	    'GGT' => 'G', 'GGC' => 'G', 'GGA' => 'G', 'GGG' => 'G'
+	},
+	'Standard_StopNames' => {
+	    'TTT' => 'F', 'TTC' => 'F', 'TTA' => 'L', 'TTG' => 'L+',
+	    'TCT' => 'S', 'TCC' => 'S', 'TCA' => 'S', 'TCG' => 'S',
+	    'TAT' => 'Y', 'TAC' => 'Y', 'TAA' => 'c', 'TAG' => 'a',  # c=ochre, a=amber
+	    'TGT' => 'C', 'TGC' => 'C', 'TGA' => 'p', 'TGG' => 'W',  # p=opal
+	    'CTT' => 'L', 'CTC' => 'L', 'CTA' => 'L', 'CTG' => 'L+',
+	    'CCT' => 'P', 'CCC' => 'P', 'CCA' => 'P', 'CCG' => 'P',
+	    'CAT' => 'H', 'CAC' => 'H', 'CAA' => 'Q', 'CAG' => 'Q',
+	    'CGT' => 'R', 'CGC' => 'R', 'CGA' => 'R', 'CGG' => 'R',
+	    'ATT' => 'I', 'ATC' => 'I', 'ATA' => 'I', 'ATG' => 'M+',
+	    'ACT' => 'T', 'ACC' => 'T', 'ACA' => 'T', 'ACG' => 'T',
+	    'AAT' => 'N', 'AAC' => 'N', 'AAA' => 'K', 'AAG' => 'K',
+	    'AGT' => 'S', 'AGC' => 'S', 'AGA' => 'R', 'AGG' => 'R',
+	    'GTT' => 'V', 'GTC' => 'V', 'GTA' => 'V', 'GTG' => 'V',
+	    'GCT' => 'A', 'GCC' => 'A', 'GCA' => 'A', 'GCG' => 'A',
+	    'GAT' => 'D', 'GAC' => 'D', 'GAA' => 'E', 'GAG' => 'E',
+	    'GGT' => 'G', 'GGC' => 'G', 'GGA' => 'G', 'GGG' => 'G'
+	},
+	'Vertebrate_Mitochondrial' => {
+	    'TTT' => 'F', 'TTC' => 'F', 'TTA' => 'L', 'TTG' => 'L',
+	    'TCT' => 'S', 'TCC' => 'S', 'TCA' => 'S', 'TCG' => 'S',
+	    'TAT' => 'Y', 'TAC' => 'Y', 'TAA' => '*', 'TAG' => '*',
+	    'TGT' => 'C', 'TGC' => 'C', 'TGA' => 'W', 'TGG' => 'W',
+	    'CTT' => 'L', 'CTC' => 'L', 'CTA' => 'L', 'CTG' => 'L',
+	    'CCT' => 'P', 'CCC' => 'P', 'CCA' => 'P', 'CCG' => 'P',
+	    'CAT' => 'H', 'CAC' => 'H', 'CAA' => 'Q', 'CAG' => 'Q',
+	    'CGT' => 'R', 'CGC' => 'R', 'CGA' => 'R', 'CGG' => 'R',
+	    'ATT' => 'I+', 'ATC' => 'I+', 'ATA' => 'M+', 'ATG' => 'M+',
+	    'ACT' => 'T', 'ACC' => 'T', 'ACA' => 'T', 'ACG' => 'T',
+	    'AAT' => 'N', 'AAC' => 'N', 'AAA' => 'K', 'AAG' => 'K',
+	    'AGT' => 'S', 'AGC' => 'S', 'AGA' => '*', 'AGG' => '*',
+	    'GTT' => 'V', 'GTC' => 'V', 'GTA' => 'V', 'GTG' => 'V+',
+	    'GCT' => 'A', 'GCC' => 'A', 'GCA' => 'A', 'GCG' => 'A',
+	    'GAT' => 'D', 'GAC' => 'D', 'GAA' => 'E', 'GAG' => 'E',
+	    'GGT' => 'G', 'GGC' => 'G', 'GGA' => 'G', 'GGG' => 'G'
+	},
+	'Yeast_Mitochondrial' => {
+	    'TTT' => 'F', 'TTC' => 'F', 'TTA' => 'L', 'TTG' => 'L',
+	    'TCT' => 'S', 'TCC' => 'S', 'TCA' => 'S', 'TCG' => 'S',
+	    'TAT' => 'Y', 'TAC' => 'Y', 'TAA' => '*', 'TAG' => '*',
+	    'TGT' => 'C', 'TGC' => 'C', 'TGA' => 'W', 'TGG' => 'W',
+	    'CTT' => 'T', 'CTC' => 'T', 'CTA' => 'T', 'CTG' => 'T',
+	    'CCT' => 'P', 'CCC' => 'P', 'CCA' => 'P', 'CCG' => 'P',
+	    'CAT' => 'H', 'CAC' => 'H', 'CAA' => 'Q', 'CAG' => 'Q',
+	    'CGT' => 'R', 'CGC' => 'R', 'CGA' => 'R', 'CGG' => 'R',
+	    'ATT' => 'I', 'ATC' => 'I', 'ATA' => 'M+', 'ATG' => 'M+',
+	    'ACT' => 'T', 'ACC' => 'T', 'ACA' => 'T', 'ACG' => 'T',
+	    'AAT' => 'N', 'AAC' => 'N', 'AAA' => 'K', 'AAG' => 'K',
+	    'AGT' => 'S', 'AGC' => 'S', 'AGA' => 'R', 'AGG' => 'R',
+	    'GTT' => 'V', 'GTC' => 'V', 'GTA' => 'V', 'GTG' => 'V',
+	    'GCT' => 'A', 'GCC' => 'A', 'GCA' => 'A', 'GCG' => 'A',
+	    'GAT' => 'D', 'GAC' => 'D', 'GAA' => 'E', 'GAG' => 'E',
+	    'GGT' => 'G', 'GGC' => 'G', 'GGA' => 'G', 'GGG' => 'G'
+	},
+	'Mold_Mitochondrial' => {
+	    'TTT' => 'F', 'TTC' => 'F', 'TTA' => 'L+', 'TTG' => 'L+',
+	    'TCT' => 'S', 'TCC' => 'S', 'TCA' => 'S', 'TCG' => 'S',
+	    'TAT' => 'Y', 'TAC' => 'Y', 'TAA' => '*', 'TAG' => '*',
+	    'TGT' => 'C', 'TGC' => 'C', 'TGA' => 'W', 'TGG' => 'W',
+	    'CTT' => 'L', 'CTC' => 'L', 'CTA' => 'L', 'CTG' => 'L+',
+	    'CCT' => 'P', 'CCC' => 'P', 'CCA' => 'P', 'CCG' => 'P',
+	    'CAT' => 'H', 'CAC' => 'H', 'CAA' => 'Q', 'CAG' => 'Q',
+	    'CGT' => 'R', 'CGC' => 'R', 'CGA' => 'R', 'CGG' => 'R',
+	    'ATT' => 'I+', 'ATC' => 'I+', 'ATA' => 'I+', 'ATG' => 'M+',
+	    'ACT' => 'T', 'ACC' => 'T', 'ACA' => 'T', 'ACG' => 'T',
+	    'AAT' => 'N', 'AAC' => 'N', 'AAA' => 'K', 'AAG' => 'K',
+	    'AGT' => 'S', 'AGC' => 'S', 'AGA' => 'R', 'AGG' => 'R',
+	    'GTT' => 'V', 'GTC' => 'V', 'GTA' => 'V', 'GTG' => 'V+',
+	    'GCT' => 'A', 'GCC' => 'A', 'GCA' => 'A', 'GCG' => 'A',
+	    'GAT' => 'D', 'GAC' => 'D', 'GAA' => 'E', 'GAG' => 'E',
+	    'GGT' => 'G', 'GGC' => 'G', 'GGA' => 'G', 'GGG' => 'G'
+	},
+	'Protozoan_Mitochondrial' => {
+	    'TTT' => 'F', 'TTC' => 'F', 'TTA' => 'L+', 'TTG' => 'L+',
+	    'TCT' => 'S', 'TCC' => 'S', 'TCA' => 'S', 'TCG' => 'S',
+	    'TAT' => 'Y', 'TAC' => 'Y', 'TAA' => '*', 'TAG' => '*',
+	    'TGT' => 'C', 'TGC' => 'C', 'TGA' => 'W', 'TGG' => 'W',
+	    'CTT' => 'L', 'CTC' => 'L', 'CTA' => 'L', 'CTG' => 'L+',
+	    'CCT' => 'P', 'CCC' => 'P', 'CCA' => 'P', 'CCG' => 'P',
+	    'CAT' => 'H', 'CAC' => 'H', 'CAA' => 'Q', 'CAG' => 'Q',
+	    'CGT' => 'R', 'CGC' => 'R', 'CGA' => 'R', 'CGG' => 'R',
+	    'ATT' => 'I+', 'ATC' => 'I+', 'ATA' => 'I+', 'ATG' => 'M+',
+	    'ACT' => 'T', 'ACC' => 'T', 'ACA' => 'T', 'ACG' => 'T',
+	    'AAT' => 'N', 'AAC' => 'N', 'AAA' => 'K', 'AAG' => 'K',
+	    'AGT' => 'S', 'AGC' => 'S', 'AGA' => 'R', 'AGG' => 'R',
+	    'GTT' => 'V', 'GTC' => 'V', 'GTA' => 'V', 'GTG' => 'V+',
+	    'GCT' => 'A', 'GCC' => 'A', 'GCA' => 'A', 'GCG' => 'A',
+	    'GAT' => 'D', 'GAC' => 'D', 'GAA' => 'E', 'GAG' => 'E',
+	    'GGT' => 'G', 'GGC' => 'G', 'GGA' => 'G', 'GGG' => 'G'
+	},
+	'Coelenterate' => {
+	    'TTT' => 'F', 'TTC' => 'F', 'TTA' => 'L+', 'TTG' => 'L+',
+	    'TCT' => 'S', 'TCC' => 'S', 'TCA' => 'S', 'TCG' => 'S',
+	    'TAT' => 'Y', 'TAC' => 'Y', 'TAA' => '*', 'TAG' => '*',
+	    'TGT' => 'C', 'TGC' => 'C', 'TGA' => 'W', 'TGG' => 'W',
+	    'CTT' => 'L', 'CTC' => 'L', 'CTA' => 'L', 'CTG' => 'L+',
+	    'CCT' => 'P', 'CCC' => 'P', 'CCA' => 'P', 'CCG' => 'P',
+	    'CAT' => 'H', 'CAC' => 'H', 'CAA' => 'Q', 'CAG' => 'Q',
+	    'CGT' => 'R', 'CGC' => 'R', 'CGA' => 'R', 'CGG' => 'R',
+	    'ATT' => 'I+', 'ATC' => 'I+', 'ATA' => 'I+', 'ATG' => 'M+',
+	    'ACT' => 'T', 'ACC' => 'T', 'ACA' => 'T', 'ACG' => 'T',
+	    'AAT' => 'N', 'AAC' => 'N', 'AAA' => 'K', 'AAG' => 'K',
+	    'AGT' => 'S', 'AGC' => 'S', 'AGA' => 'R', 'AGG' => 'R',
+	    'GTT' => 'V', 'GTC' => 'V', 'GTA' => 'V', 'GTG' => 'V+',
+	    'GCT' => 'A', 'GCC' => 'A', 'GCA' => 'A', 'GCG' => 'A',
+	    'GAT' => 'D', 'GAC' => 'D', 'GAA' => 'E', 'GAG' => 'E',
+	    'GGT' => 'G', 'GGC' => 'G', 'GGA' => 'G', 'GGG' => 'G'
+	},
+	'Mitochondrial' => {
+	    'TTT' => 'F', 'TTC' => 'F', 'TTA' => 'L+', 'TTG' => 'L+',
+	    'TCT' => 'S', 'TCC' => 'S', 'TCA' => 'S', 'TCG' => 'S',
+	    'TAT' => 'Y', 'TAC' => 'Y', 'TAA' => '*', 'TAG' => '*',
+	    'TGT' => 'C', 'TGC' => 'C', 'TGA' => 'W', 'TGG' => 'W',
+	    'CTT' => 'L', 'CTC' => 'L', 'CTA' => 'L', 'CTG' => 'L+',
+	    'CCT' => 'P', 'CCC' => 'P', 'CCA' => 'P', 'CCG' => 'P',
+	    'CAT' => 'H', 'CAC' => 'H', 'CAA' => 'Q', 'CAG' => 'Q',
+	    'CGT' => 'R', 'CGC' => 'R', 'CGA' => 'R', 'CGG' => 'R',
+	    'ATT' => 'I+', 'ATC' => 'I+', 'ATA' => 'I+', 'ATG' => 'M+',
+	    'ACT' => 'T', 'ACC' => 'T', 'ACA' => 'T', 'ACG' => 'T',
+	    'AAT' => 'N', 'AAC' => 'N', 'AAA' => 'K', 'AAG' => 'K',
+	    'AGT' => 'S', 'AGC' => 'S', 'AGA' => 'R', 'AGG' => 'R',
+	    'GTT' => 'V', 'GTC' => 'V', 'GTA' => 'V', 'GTG' => 'V+',
+	    'GCT' => 'A', 'GCC' => 'A', 'GCA' => 'A', 'GCG' => 'A',
+	    'GAT' => 'D', 'GAC' => 'D', 'GAA' => 'E', 'GAG' => 'E',
+	    'GGT' => 'G', 'GGC' => 'G', 'GGA' => 'G', 'GGG' => 'G'
+	},
+	'Mycoplasma' => {
+	    'TTT' => 'F', 'TTC' => 'F', 'TTA' => 'L+', 'TTG' => 'L+',
+	    'TCT' => 'S', 'TCC' => 'S', 'TCA' => 'S', 'TCG' => 'S',
+	    'TAT' => 'Y', 'TAC' => 'Y', 'TAA' => '*', 'TAG' => '*',
+	    'TGT' => 'C', 'TGC' => 'C', 'TGA' => 'W', 'TGG' => 'W',
+	    'CTT' => 'L', 'CTC' => 'L', 'CTA' => 'L', 'CTG' => 'L+',
+	    'CCT' => 'P', 'CCC' => 'P', 'CCA' => 'P', 'CCG' => 'P',
+	    'CAT' => 'H', 'CAC' => 'H', 'CAA' => 'Q', 'CAG' => 'Q',
+	    'CGT' => 'R', 'CGC' => 'R', 'CGA' => 'R', 'CGG' => 'R',
+	    'ATT' => 'I+', 'ATC' => 'I+', 'ATA' => 'I+', 'ATG' => 'M+',
+	    'ACT' => 'T', 'ACC' => 'T', 'ACA' => 'T', 'ACG' => 'T',
+	    'AAT' => 'N', 'AAC' => 'N', 'AAA' => 'K', 'AAG' => 'K',
+	    'AGT' => 'S', 'AGC' => 'S', 'AGA' => 'R', 'AGG' => 'R',
+	    'GTT' => 'V', 'GTC' => 'V', 'GTA' => 'V', 'GTG' => 'V+',
+	    'GCT' => 'A', 'GCC' => 'A', 'GCA' => 'A', 'GCG' => 'A',
+	    'GAT' => 'D', 'GAC' => 'D', 'GAA' => 'E', 'GAG' => 'E',
+	    'GGT' => 'G', 'GGC' => 'G', 'GGA' => 'G', 'GGG' => 'G'
+	},
+	'Spiroplasma' => {
+	    'TTT' => 'F', 'TTC' => 'F', 'TTA' => 'L+', 'TTG' => 'L+',
+	    'TCT' => 'S', 'TCC' => 'S', 'TCA' => 'S', 'TCG' => 'S',
+	    'TAT' => 'Y', 'TAC' => 'Y', 'TAA' => '*', 'TAG' => '*',
+	    'TGT' => 'C', 'TGC' => 'C', 'TGA' => 'W', 'TGG' => 'W',
+	    'CTT' => 'L', 'CTC' => 'L', 'CTA' => 'L', 'CTG' => 'L+',
+	    'CCT' => 'P', 'CCC' => 'P', 'CCA' => 'P', 'CCG' => 'P',
+	    'CAT' => 'H', 'CAC' => 'H', 'CAA' => 'Q', 'CAG' => 'Q',
+	    'CGT' => 'R', 'CGC' => 'R', 'CGA' => 'R', 'CGG' => 'R',
+	    'ATT' => 'I+', 'ATC' => 'I+', 'ATA' => 'I+', 'ATG' => 'M+',
+	    'ACT' => 'T', 'ACC' => 'T', 'ACA' => 'T', 'ACG' => 'T',
+	    'AAT' => 'N', 'AAC' => 'N', 'AAA' => 'K', 'AAG' => 'K',
+	    'AGT' => 'S', 'AGC' => 'S', 'AGA' => 'R', 'AGG' => 'R',
+	    'GTT' => 'V', 'GTC' => 'V', 'GTA' => 'V', 'GTG' => 'V+',
+	    'GCT' => 'A', 'GCC' => 'A', 'GCA' => 'A', 'GCG' => 'A',
+	    'GAT' => 'D', 'GAC' => 'D', 'GAA' => 'E', 'GAG' => 'E',
+	    'GGT' => 'G', 'GGC' => 'G', 'GGA' => 'G', 'GGG' => 'G'
+	},
+	'Invertebrate_Mitochondrial' => {
+	    'TTT' => 'F', 'TTC' => 'F', 'TTA' => 'L', 'TTG' => 'L+',
+	    'TCT' => 'S', 'TCC' => 'S', 'TCA' => 'S', 'TCG' => 'S',
+	    'TAT' => 'Y', 'TAC' => 'Y', 'TAA' => '*', 'TAG' => '*',
+	    'TGT' => 'C', 'TGC' => 'C', 'TGA' => 'W', 'TGG' => 'W',
+	    'CTT' => 'L', 'CTC' => 'L', 'CTA' => 'L', 'CTG' => 'L',
+	    'CCT' => 'P', 'CCC' => 'P', 'CCA' => 'P', 'CCG' => 'P',
+	    'CAT' => 'H', 'CAC' => 'H', 'CAA' => 'Q', 'CAG' => 'Q',
+	    'CGT' => 'R', 'CGC' => 'R', 'CGA' => 'R', 'CGG' => 'R',
+	    'ATT' => 'I+', 'ATC' => 'I+', 'ATA' => 'M+', 'ATG' => 'M+',
+	    'ACT' => 'T', 'ACC' => 'T', 'ACA' => 'T', 'ACG' => 'T',
+	    'AAT' => 'N', 'AAC' => 'N', 'AAA' => 'K', 'AAG' => 'K',
+	    'AGT' => 'S', 'AGC' => 'S', 'AGA' => 'S', 'AGG' => 'S',
+	    'GTT' => 'V', 'GTC' => 'V', 'GTA' => 'V', 'GTG' => 'V+',
+	    'GCT' => 'A', 'GCC' => 'A', 'GCA' => 'A', 'GCG' => 'A',
+	    'GAT' => 'D', 'GAC' => 'D', 'GAA' => 'E', 'GAG' => 'E',
+	    'GGT' => 'G', 'GGC' => 'G', 'GGA' => 'G', 'GGG' => 'G'
+	},
+	'Ciliate_Nuclear' => {
+	    'TTT' => 'F', 'TTC' => 'F', 'TTA' => 'L', 'TTG' => 'L',
+	    'TCT' => 'S', 'TCC' => 'S', 'TCA' => 'S', 'TCG' => 'S',
+	    'TAT' => 'Y', 'TAC' => 'Y', 'TAA' => 'Q', 'TAG' => 'Q',
+	    'TGT' => 'C', 'TGC' => 'C', 'TGA' => '*', 'TGG' => 'W',
+	    'CTT' => 'L', 'CTC' => 'L', 'CTA' => 'L', 'CTG' => 'L',
+	    'CCT' => 'P', 'CCC' => 'P', 'CCA' => 'P', 'CCG' => 'P',
+	    'CAT' => 'H', 'CAC' => 'H', 'CAA' => 'Q', 'CAG' => 'Q',
+	    'CGT' => 'R', 'CGC' => 'R', 'CGA' => 'R', 'CGG' => 'R',
+	    'ATT' => 'I', 'ATC' => 'I', 'ATA' => 'I', 'ATG' => 'M+',
+	    'ACT' => 'T', 'ACC' => 'T', 'ACA' => 'T', 'ACG' => 'T',
+	    'AAT' => 'N', 'AAC' => 'N', 'AAA' => 'K', 'AAG' => 'K',
+	    'AGT' => 'S', 'AGC' => 'S', 'AGA' => 'R', 'AGG' => 'R',
+	    'GTT' => 'V', 'GTC' => 'V', 'GTA' => 'V', 'GTG' => 'V',
+	    'GCT' => 'A', 'GCC' => 'A', 'GCA' => 'A', 'GCG' => 'A',
+	    'GAT' => 'D', 'GAC' => 'D', 'GAA' => 'E', 'GAG' => 'E',
+	    'GGT' => 'G', 'GGC' => 'G', 'GGA' => 'G', 'GGG' => 'G'
+	},
+	'Dasycladacean_Nuclear' => {
+	    'TTT' => 'F', 'TTC' => 'F', 'TTA' => 'L', 'TTG' => 'L',
+	    'TCT' => 'S', 'TCC' => 'S', 'TCA' => 'S', 'TCG' => 'S',
+	    'TAT' => 'Y', 'TAC' => 'Y', 'TAA' => 'Q', 'TAG' => 'Q',
+	    'TGT' => 'C', 'TGC' => 'C', 'TGA' => '*', 'TGG' => 'W',
+	    'CTT' => 'L', 'CTC' => 'L', 'CTA' => 'L', 'CTG' => 'L',
+	    'CCT' => 'P', 'CCC' => 'P', 'CCA' => 'P', 'CCG' => 'P',
+	    'CAT' => 'H', 'CAC' => 'H', 'CAA' => 'Q', 'CAG' => 'Q',
+	    'CGT' => 'R', 'CGC' => 'R', 'CGA' => 'R', 'CGG' => 'R',
+	    'ATT' => 'I', 'ATC' => 'I', 'ATA' => 'I', 'ATG' => 'M+',
+	    'ACT' => 'T', 'ACC' => 'T', 'ACA' => 'T', 'ACG' => 'T',
+	    'AAT' => 'N', 'AAC' => 'N', 'AAA' => 'K', 'AAG' => 'K',
+	    'AGT' => 'S', 'AGC' => 'S', 'AGA' => 'R', 'AGG' => 'R',
+	    'GTT' => 'V', 'GTC' => 'V', 'GTA' => 'V', 'GTG' => 'V',
+	    'GCT' => 'A', 'GCC' => 'A', 'GCA' => 'A', 'GCG' => 'A',
+	    'GAT' => 'D', 'GAC' => 'D', 'GAA' => 'E', 'GAG' => 'E',
+	    'GGT' => 'G', 'GGC' => 'G', 'GGA' => 'G', 'GGG' => 'G'
+	},
+	'Hexamita_Nuclear' => {
+	    'TTT' => 'F', 'TTC' => 'F', 'TTA' => 'L', 'TTG' => 'L',
+	    'TCT' => 'S', 'TCC' => 'S', 'TCA' => 'S', 'TCG' => 'S',
+	    'TAT' => 'Y', 'TAC' => 'Y', 'TAA' => 'Q', 'TAG' => 'Q',
+	    'TGT' => 'C', 'TGC' => 'C', 'TGA' => '*', 'TGG' => 'W',
+	    'CTT' => 'L', 'CTC' => 'L', 'CTA' => 'L', 'CTG' => 'L',
+	    'CCT' => 'P', 'CCC' => 'P', 'CCA' => 'P', 'CCG' => 'P',
+	    'CAT' => 'H', 'CAC' => 'H', 'CAA' => 'Q', 'CAG' => 'Q',
+	    'CGT' => 'R', 'CGC' => 'R', 'CGA' => 'R', 'CGG' => 'R',
+	    'ATT' => 'I', 'ATC' => 'I', 'ATA' => 'I', 'ATG' => 'M+',
+	    'ACT' => 'T', 'ACC' => 'T', 'ACA' => 'T', 'ACG' => 'T',
+	    'AAT' => 'N', 'AAC' => 'N', 'AAA' => 'K', 'AAG' => 'K',
+	    'AGT' => 'S', 'AGC' => 'S', 'AGA' => 'R', 'AGG' => 'R',
+	    'GTT' => 'V', 'GTC' => 'V', 'GTA' => 'V', 'GTG' => 'V',
+	    'GCT' => 'A', 'GCC' => 'A', 'GCA' => 'A', 'GCG' => 'A',
+	    'GAT' => 'D', 'GAC' => 'D', 'GAA' => 'E', 'GAG' => 'E',
+	    'GGT' => 'G', 'GGC' => 'G', 'GGA' => 'G', 'GGG' => 'G'
+	},
+	'Echinoderm_Mitochondrial' => {
+	    'TTT' => 'F', 'TTC' => 'F', 'TTA' => 'L', 'TTG' => 'L',
+	    'TCT' => 'S', 'TCC' => 'S', 'TCA' => 'S', 'TCG' => 'S',
+	    'TAT' => 'Y', 'TAC' => 'Y', 'TAA' => '*', 'TAG' => '*',
+	    'TGT' => 'C', 'TGC' => 'C', 'TGA' => 'W', 'TGG' => 'W',
+	    'CTT' => 'L', 'CTC' => 'L', 'CTA' => 'L', 'CTG' => 'L',
+	    'CCT' => 'P', 'CCC' => 'P', 'CCA' => 'P', 'CCG' => 'P',
+	    'CAT' => 'H', 'CAC' => 'H', 'CAA' => 'Q', 'CAG' => 'Q',
+	    'CGT' => 'R', 'CGC' => 'R', 'CGA' => 'R', 'CGG' => 'R',
+	    'ATT' => 'I', 'ATC' => 'I', 'ATA' => 'I', 'ATG' => 'M+',
+	    'ACT' => 'T', 'ACC' => 'T', 'ACA' => 'T', 'ACG' => 'T',
+	    'AAT' => 'N', 'AAC' => 'N', 'AAA' => 'N', 'AAG' => 'K',
+	    'AGT' => 'S', 'AGC' => 'S', 'AGA' => 'S', 'AGG' => 'S',
+	    'GTT' => 'V', 'GTC' => 'V', 'GTA' => 'V', 'GTG' => 'V+',
+	    'GCT' => 'A', 'GCC' => 'A', 'GCA' => 'A', 'GCG' => 'A',
+	    'GAT' => 'D', 'GAC' => 'D', 'GAA' => 'E', 'GAG' => 'E',
+	    'GGT' => 'G', 'GGC' => 'G', 'GGA' => 'G', 'GGG' => 'G'
+	},
+	'Flatworm_Mitochondrial' => {
+	    'TTT' => 'F', 'TTC' => 'F', 'TTA' => 'L', 'TTG' => 'L',
+	    'TCT' => 'S', 'TCC' => 'S', 'TCA' => 'S', 'TCG' => 'S',
+	    'TAT' => 'Y', 'TAC' => 'Y', 'TAA' => '*', 'TAG' => '*',
+	    'TGT' => 'C', 'TGC' => 'C', 'TGA' => 'W', 'TGG' => 'W',
+	    'CTT' => 'L', 'CTC' => 'L', 'CTA' => 'L', 'CTG' => 'L',
+	    'CCT' => 'P', 'CCC' => 'P', 'CCA' => 'P', 'CCG' => 'P',
+	    'CAT' => 'H', 'CAC' => 'H', 'CAA' => 'Q', 'CAG' => 'Q',
+	    'CGT' => 'R', 'CGC' => 'R', 'CGA' => 'R', 'CGG' => 'R',
+	    'ATT' => 'I', 'ATC' => 'I', 'ATA' => 'I', 'ATG' => 'M+',
+	    'ACT' => 'T', 'ACC' => 'T', 'ACA' => 'T', 'ACG' => 'T',
+	    'AAT' => 'N', 'AAC' => 'N', 'AAA' => 'N', 'AAG' => 'K',
+	    'AGT' => 'S', 'AGC' => 'S', 'AGA' => 'S', 'AGG' => 'S',
+	    'GTT' => 'V', 'GTC' => 'V', 'GTA' => 'V', 'GTG' => 'V+',
+	    'GCT' => 'A', 'GCC' => 'A', 'GCA' => 'A', 'GCG' => 'A',
+	    'GAT' => 'D', 'GAC' => 'D', 'GAA' => 'E', 'GAG' => 'E',
+	    'GGT' => 'G', 'GGC' => 'G', 'GGA' => 'G', 'GGG' => 'G'
+	},
+	'Euplotid_Nuclear' => {
+	    'TTT' => 'F', 'TTC' => 'F', 'TTA' => 'L', 'TTG' => 'L',
+	    'TCT' => 'S', 'TCC' => 'S', 'TCA' => 'S', 'TCG' => 'S',
+	    'TAT' => 'Y', 'TAC' => 'Y', 'TAA' => '*', 'TAG' => '*',
+	    'TGT' => 'C', 'TGC' => 'C', 'TGA' => 'C', 'TGG' => 'W',
+	    'CTT' => 'L', 'CTC' => 'L', 'CTA' => 'L', 'CTG' => 'L',
+	    'CCT' => 'P', 'CCC' => 'P', 'CCA' => 'P', 'CCG' => 'P',
+	    'CAT' => 'H', 'CAC' => 'H', 'CAA' => 'Q', 'CAG' => 'Q',
+	    'CGT' => 'R', 'CGC' => 'R', 'CGA' => 'R', 'CGG' => 'R',
+	    'ATT' => 'I', 'ATC' => 'I', 'ATA' => 'I', 'ATG' => 'M+',
+	    'ACT' => 'T', 'ACC' => 'T', 'ACA' => 'T', 'ACG' => 'T',
+	    'AAT' => 'N', 'AAC' => 'N', 'AAA' => 'K', 'AAG' => 'K',
+	    'AGT' => 'S', 'AGC' => 'S', 'AGA' => 'R', 'AGG' => 'R',
+	    'GTT' => 'V', 'GTC' => 'V', 'GTA' => 'V', 'GTG' => 'V',
+	    'GCT' => 'A', 'GCC' => 'A', 'GCA' => 'A', 'GCG' => 'A',
+	    'GAT' => 'D', 'GAC' => 'D', 'GAA' => 'E', 'GAG' => 'E',
+	    'GGT' => 'G', 'GGC' => 'G', 'GGA' => 'G', 'GGG' => 'G'
+	},
+	'Bacterial_and_Plant_Plastid' => {
+	    'TTT' => 'F', 'TTC' => 'F', 'TTA' => 'L', 'TTG' => 'L+',
+	    'TCT' => 'S', 'TCC' => 'S', 'TCA' => 'S', 'TCG' => 'S',
+	    'TAT' => 'Y', 'TAC' => 'Y', 'TAA' => '*', 'TAG' => '*',
+	    'TGT' => 'C', 'TGC' => 'C', 'TGA' => '*', 'TGG' => 'W',
+	    'CTT' => 'L', 'CTC' => 'L', 'CTA' => 'L', 'CTG' => 'L+',
+	    'CCT' => 'P', 'CCC' => 'P', 'CCA' => 'P', 'CCG' => 'P',
+	    'CAT' => 'H', 'CAC' => 'H', 'CAA' => 'Q', 'CAG' => 'Q',
+	    'CGT' => 'R', 'CGC' => 'R', 'CGA' => 'R', 'CGG' => 'R',
+	    'ATT' => 'I+', 'ATC' => 'I+', 'ATA' => 'I+', 'ATG' => 'M+',
+	    'ACT' => 'T', 'ACC' => 'T', 'ACA' => 'T', 'ACG' => 'T',
+	    'AAT' => 'N', 'AAC' => 'N', 'AAA' => 'K', 'AAG' => 'K',
+	    'AGT' => 'S', 'AGC' => 'S', 'AGA' => 'R', 'AGG' => 'R',
+	    'GTT' => 'V', 'GTC' => 'V', 'GTA' => 'V', 'GTG' => 'V+',
+	    'GCT' => 'A', 'GCC' => 'A', 'GCA' => 'A', 'GCG' => 'A',
+	    'GAT' => 'D', 'GAC' => 'D', 'GAA' => 'E', 'GAG' => 'E',
+	    'GGT' => 'G', 'GGC' => 'G', 'GGA' => 'G', 'GGG' => 'G'
+	},
+	'Alternative_Yeast_Nuclear' => {
+	    'TTT' => 'F', 'TTC' => 'F', 'TTA' => 'L', 'TTG' => 'L',
+	    'TCT' => 'S', 'TCC' => 'S', 'TCA' => 'S', 'TCG' => 'S',
+	    'TAT' => 'Y', 'TAC' => 'Y', 'TAA' => '*', 'TAG' => '*',
+	    'TGT' => 'C', 'TGC' => 'C', 'TGA' => '*', 'TGG' => 'W',
+	    'CTT' => 'L', 'CTC' => 'L', 'CTA' => 'L', 'CTG' => 'S+',
+	    'CCT' => 'P', 'CCC' => 'P', 'CCA' => 'P', 'CCG' => 'P',
+	    'CAT' => 'H', 'CAC' => 'H', 'CAA' => 'Q', 'CAG' => 'Q',
+	    'CGT' => 'R', 'CGC' => 'R', 'CGA' => 'R', 'CGG' => 'R',
+	    'ATT' => 'I', 'ATC' => 'I', 'ATA' => 'I', 'ATG' => 'M+',
+	    'ACT' => 'T', 'ACC' => 'T', 'ACA' => 'T', 'ACG' => 'T',
+	    'AAT' => 'N', 'AAC' => 'N', 'AAA' => 'K', 'AAG' => 'K',
+	    'AGT' => 'S', 'AGC' => 'S', 'AGA' => 'R', 'AGG' => 'R',
+	    'GTT' => 'V', 'GTC' => 'V', 'GTA' => 'V', 'GTG' => 'V',
+	    'GCT' => 'A', 'GCC' => 'A', 'GCA' => 'A', 'GCG' => 'A',
+	    'GAT' => 'D', 'GAC' => 'D', 'GAA' => 'E', 'GAG' => 'E',
+	    'GGT' => 'G', 'GGC' => 'G', 'GGA' => 'G', 'GGG' => 'G'
+	},
+	'Ascidian_Mitochondrial' => {
+	    'TTT' => 'F', 'TTC' => 'F', 'TTA' => 'L', 'TTG' => 'L+',
+	    'TCT' => 'S', 'TCC' => 'S', 'TCA' => 'S', 'TCG' => 'S',
+	    'TAT' => 'Y', 'TAC' => 'Y', 'TAA' => '*', 'TAG' => '*',
+	    'TGT' => 'C', 'TGC' => 'C', 'TGA' => 'W', 'TGG' => 'W',
+	    'CTT' => 'L', 'CTC' => 'L', 'CTA' => 'L', 'CTG' => 'L',
+	    'CCT' => 'P', 'CCC' => 'P', 'CCA' => 'P', 'CCG' => 'P',
+	    'CAT' => 'H', 'CAC' => 'H', 'CAA' => 'Q', 'CAG' => 'Q',
+	    'CGT' => 'R', 'CGC' => 'R', 'CGA' => 'R', 'CGG' => 'R',
+	    'ATT' => 'I', 'ATC' => 'I', 'ATA' => 'M+', 'ATG' => 'M+',
+	    'ACT' => 'T', 'ACC' => 'T', 'ACA' => 'T', 'ACG' => 'T',
+	    'AAT' => 'N', 'AAC' => 'N', 'AAA' => 'K', 'AAG' => 'K',
+	    'AGT' => 'S', 'AGC' => 'S', 'AGA' => 'G', 'AGG' => 'G',
+	    'GTT' => 'V', 'GTC' => 'V', 'GTA' => 'V', 'GTG' => 'V+',
+	    'GCT' => 'A', 'GCC' => 'A', 'GCA' => 'A', 'GCG' => 'A',
+	    'GAT' => 'D', 'GAC' => 'D', 'GAA' => 'E', 'GAG' => 'E',
+	    'GGT' => 'G', 'GGC' => 'G', 'GGA' => 'G', 'GGG' => 'G'
+	},
+	'Alternative_Flatworm_Mitochondrial' => {
+	    'TTT' => 'F', 'TTC' => 'F', 'TTA' => 'L', 'TTG' => 'L',
+	    'TCT' => 'S', 'TCC' => 'S', 'TCA' => 'S', 'TCG' => 'S',
+	    'TAT' => 'Y', 'TAC' => 'Y', 'TAA' => 'Y', 'TAG' => '*',
+	    'TGT' => 'C', 'TGC' => 'C', 'TGA' => 'W', 'TGG' => 'W',
+	    'CTT' => 'L', 'CTC' => 'L', 'CTA' => 'L', 'CTG' => 'L',
+	    'CCT' => 'P', 'CCC' => 'P', 'CCA' => 'P', 'CCG' => 'P',
+	    'CAT' => 'H', 'CAC' => 'H', 'CAA' => 'Q', 'CAG' => 'Q',
+	    'CGT' => 'R', 'CGC' => 'R', 'CGA' => 'R', 'CGG' => 'R',
+	    'ATT' => 'I', 'ATC' => 'I', 'ATA' => 'I', 'ATG' => 'M+',
+	    'ACT' => 'T', 'ACC' => 'T', 'ACA' => 'T', 'ACG' => 'T',
+	    'AAT' => 'N', 'AAC' => 'N', 'AAA' => 'N', 'AAG' => 'K',
+	    'AGT' => 'S', 'AGC' => 'S', 'AGA' => 'S', 'AGG' => 'S',
+	    'GTT' => 'V', 'GTC' => 'V', 'GTA' => 'V', 'GTG' => 'V',
+	    'GCT' => 'A', 'GCC' => 'A', 'GCA' => 'A', 'GCG' => 'A',
+	    'GAT' => 'D', 'GAC' => 'D', 'GAA' => 'E', 'GAG' => 'E',
+	    'GGT' => 'G', 'GGC' => 'G', 'GGA' => 'G', 'GGG' => 'G'
+	},
+	'Blepharisma_Macronuclear' => {
+	    'TTT' => 'F', 'TTC' => 'F', 'TTA' => 'L', 'TTG' => 'L',
+	    'TCT' => 'S', 'TCC' => 'S', 'TCA' => 'S', 'TCG' => 'S',
+	    'TAT' => 'Y', 'TAC' => 'Y', 'TAA' => '*', 'TAG' => 'Q',
+	    'TGT' => 'C', 'TGC' => 'C', 'TGA' => '*', 'TGG' => 'W',
+	    'CTT' => 'L', 'CTC' => 'L', 'CTA' => 'L', 'CTG' => 'L',
+	    'CCT' => 'P', 'CCC' => 'P', 'CCA' => 'P', 'CCG' => 'P',
+	    'CAT' => 'H', 'CAC' => 'H', 'CAA' => 'Q', 'CAG' => 'Q',
+	    'CGT' => 'R', 'CGC' => 'R', 'CGA' => 'R', 'CGG' => 'R',
+	    'ATT' => 'I', 'ATC' => 'I', 'ATA' => 'I', 'ATG' => 'M+',
+	    'ACT' => 'T', 'ACC' => 'T', 'ACA' => 'T', 'ACG' => 'T',
+	    'AAT' => 'N', 'AAC' => 'N', 'AAA' => 'K', 'AAG' => 'K',
+	    'AGT' => 'S', 'AGC' => 'S', 'AGA' => 'R', 'AGG' => 'R',
+	    'GTT' => 'V', 'GTC' => 'V', 'GTA' => 'V', 'GTG' => 'V',
+	    'GCT' => 'A', 'GCC' => 'A', 'GCA' => 'A', 'GCG' => 'A',
+	    'GAT' => 'D', 'GAC' => 'D', 'GAA' => 'E', 'GAG' => 'E',
+	    'GGT' => 'G', 'GGC' => 'G', 'GGA' => 'G', 'GGG' => 'G'
+	},
+	'Chlorophycean_Mitochondrial' => {
+	    'TTT' => 'F', 'TTC' => 'F', 'TTA' => 'L', 'TTG' => 'L',
+	    'TCT' => 'S', 'TCC' => 'S', 'TCA' => 'S', 'TCG' => 'S',
+	    'TAT' => 'Y', 'TAC' => 'Y', 'TAA' => '*', 'TAG' => 'L',
+	    'TGT' => 'C', 'TGC' => 'C', 'TGA' => '*', 'TGG' => 'W',
+	    'CTT' => 'L', 'CTC' => 'L', 'CTA' => 'L', 'CTG' => 'L',
+	    'CCT' => 'P', 'CCC' => 'P', 'CCA' => 'P', 'CCG' => 'P',
+	    'CAT' => 'H', 'CAC' => 'H', 'CAA' => 'Q', 'CAG' => 'Q',
+	    'CGT' => 'R', 'CGC' => 'R', 'CGA' => 'R', 'CGG' => 'R',
+	    'ATT' => 'I', 'ATC' => 'I', 'ATA' => 'I', 'ATG' => 'M+',
+	    'ACT' => 'T', 'ACC' => 'T', 'ACA' => 'T', 'ACG' => 'T',
+	    'AAT' => 'N', 'AAC' => 'N', 'AAA' => 'K', 'AAG' => 'K',
+	    'AGT' => 'S', 'AGC' => 'S', 'AGA' => 'R', 'AGG' => 'R',
+	    'GTT' => 'V', 'GTC' => 'V', 'GTA' => 'V', 'GTG' => 'V',
+	    'GCT' => 'A', 'GCC' => 'A', 'GCA' => 'A', 'GCG' => 'A',
+	    'GAT' => 'D', 'GAC' => 'D', 'GAA' => 'E', 'GAG' => 'E',
+	    'GGT' => 'G', 'GGC' => 'G', 'GGA' => 'G', 'GGG' => 'G'
+	},
+	'Trematode_Mitochondrial' => {
+	    'TTT' => 'F', 'TTC' => 'F', 'TTA' => 'L', 'TTG' => 'L',
+	    'TCT' => 'S', 'TCC' => 'S', 'TCA' => 'S', 'TCG' => 'S',
+	    'TAT' => 'Y', 'TAC' => 'Y', 'TAA' => '*', 'TAG' => '*',
+	    'TGT' => 'C', 'TGC' => 'C', 'TGA' => 'W', 'TGG' => 'W',
+	    'CTT' => 'L', 'CTC' => 'L', 'CTA' => 'L', 'CTG' => 'L',
+	    'CCT' => 'P', 'CCC' => 'P', 'CCA' => 'P', 'CCG' => 'P',
+	    'CAT' => 'H', 'CAC' => 'H', 'CAA' => 'Q', 'CAG' => 'Q',
+	    'CGT' => 'R', 'CGC' => 'R', 'CGA' => 'R', 'CGG' => 'R',
+	    'ATT' => 'I', 'ATC' => 'I', 'ATA' => 'M', 'ATG' => 'M+',
+	    'ACT' => 'T', 'ACC' => 'T', 'ACA' => 'T', 'ACG' => 'T',
+	    'AAT' => 'N', 'AAC' => 'N', 'AAA' => 'N', 'AAG' => 'K',
+	    'AGT' => 'S', 'AGC' => 'S', 'AGA' => 'S', 'AGG' => 'S',
+	    'GTT' => 'V', 'GTC' => 'V', 'GTA' => 'V', 'GTG' => 'V+',
+	    'GCT' => 'A', 'GCC' => 'A', 'GCA' => 'A', 'GCG' => 'A',
+	    'GAT' => 'D', 'GAC' => 'D', 'GAA' => 'E', 'GAG' => 'E',
+	    'GGT' => 'G', 'GGC' => 'G', 'GGA' => 'G', 'GGG' => 'G'
+	},
+	'Scenedesmus_obliquus_Mitochondrial' => {
+	    'TTT' => 'F', 'TTC' => 'F', 'TTA' => 'L', 'TTG' => 'L',
+	    'TCT' => 'S', 'TCC' => 'S', 'TCA' => '*', 'TCG' => 'S',
+	    'TAT' => 'Y', 'TAC' => 'Y', 'TAA' => '*', 'TAG' => 'L',
+	    'TGT' => 'C', 'TGC' => 'C', 'TGA' => '*', 'TGG' => 'W',
+	    'CTT' => 'L', 'CTC' => 'L', 'CTA' => 'L', 'CTG' => 'L',
+	    'CCT' => 'P', 'CCC' => 'P', 'CCA' => 'P', 'CCG' => 'P',
+	    'CAT' => 'H', 'CAC' => 'H', 'CAA' => 'Q', 'CAG' => 'Q',
+	    'CGT' => 'R', 'CGC' => 'R', 'CGA' => 'R', 'CGG' => 'R',
+	    'ATT' => 'I', 'ATC' => 'I', 'ATA' => 'I', 'ATG' => 'M+',
+	    'ACT' => 'T', 'ACC' => 'T', 'ACA' => 'T', 'ACG' => 'T',
+	    'AAT' => 'N', 'AAC' => 'N', 'AAA' => 'K', 'AAG' => 'K',
+	    'AGT' => 'S', 'AGC' => 'S', 'AGA' => 'R', 'AGG' => 'R',
+	    'GTT' => 'V', 'GTC' => 'V', 'GTA' => 'V', 'GTG' => 'V',
+	    'GCT' => 'A', 'GCC' => 'A', 'GCA' => 'A', 'GCG' => 'A',
+	    'GAT' => 'D', 'GAC' => 'D', 'GAA' => 'E', 'GAG' => 'E',
+	    'GGT' => 'G', 'GGC' => 'G', 'GGA' => 'G', 'GGG' => 'G'
+	},
+	'Thraustochytrium_Mitochondrial' => {
+	    'TTT' => 'F', 'TTC' => 'F', 'TTA' => '*', 'TTG' => 'L',
+	    'TCT' => 'S', 'TCC' => 'S', 'TCA' => 'S', 'TCG' => 'S',
+	    'TAT' => 'Y', 'TAC' => 'Y', 'TAA' => '*', 'TAG' => '*',
+	    'TGT' => 'C', 'TGC' => 'C', 'TGA' => '*', 'TGG' => 'W',
+	    'CTT' => 'L', 'CTC' => 'L', 'CTA' => 'L', 'CTG' => 'L',
+	    'CCT' => 'P', 'CCC' => 'P', 'CCA' => 'P', 'CCG' => 'P',
+	    'CAT' => 'H', 'CAC' => 'H', 'CAA' => 'Q', 'CAG' => 'Q',
+	    'CGT' => 'R', 'CGC' => 'R', 'CGA' => 'R', 'CGG' => 'R',
+	    'ATT' => 'I+', 'ATC' => 'I', 'ATA' => 'I', 'ATG' => 'M+',
+	    'ACT' => 'T', 'ACC' => 'T', 'ACA' => 'T', 'ACG' => 'T',
+	    'AAT' => 'N', 'AAC' => 'N', 'AAA' => 'K', 'AAG' => 'K',
+	    'AGT' => 'S', 'AGC' => 'S', 'AGA' => 'R', 'AGG' => 'R',
+	    'GTT' => 'V', 'GTC' => 'V', 'GTA' => 'V', 'GTG' => 'V+',
+	    'GCT' => 'A', 'GCC' => 'A', 'GCA' => 'A', 'GCG' => 'A',
+	    'GAT' => 'D', 'GAC' => 'D', 'GAA' => 'E', 'GAG' => 'E',
+	    'GGT' => 'G', 'GGC' => 'G', 'GGA' => 'G', 'GGG' => 'G'
+	}
+    );
+    
+    ## remove '+' symbols
+    foreach my $table (keys %CTEMP) {
+	foreach my $codon (keys %{ $CTEMP{$table} }) {
+	    $CTEMP{$table}{$codon} =~ s/\+$//;
+	}
+    }
+    
+    return \%CTEMP;
+}
+
+
+
+## Description of $handlefile:
+## 1. Optional file, enables sequence-specific translation behaviors.  If missing, all sequences get the default treatment, given the command line params.
+## 2. 2+ columns, 1 row per sequence, tab delimited; column 1 must be the sequence ID (and must match fasta header).
+## 3. Not all sequences in input fasta need to be present; if any are absent, they will be assigned default values for each column.
+## 4. HEADER IS REQUIRED; only certain column names are recognized (case sensitive; others are ignored), which are:
+##    A. "CodonTable": column contains names of snpEff codon tables to use per sequence, values may be:  
+##       i.  "Standard", usually (this is default, if missing).
+##       ii. Other values are keys of %codon_tables; see &load_codon_tables subroutine above.
+##       This column is chiefly used to toggle between Standard and mitochondrial tables.
+##    B. "Frames": column with 1, 3, or 6.  If present, overrides value of -t for that sequence only.
+##    C. "Strategy": column of translation strategies to use per sequence.  Values may be:
+##       i.   "MaxOrf": default strategy; returns the longest ORF(s) across all indicated frames.
+##       ii.  "FrameMaxOrf": returns the longest ORF(s) for each indicated frame.
+##       iii. "FullFrame": returns the entire AA translation for each indicated frame, stops and all.
+##       iv.  "StartFrame": same as "FullFrame" but sequence begins with the first start codon. 
+##       v.   "MaxFrame": returns the entire AA translation for the frame(s) with the longest ORF(s).
+##    D. "AltStart": column with comma-separated list of alternate start codons to allow, e.g. "ATC,TTG".  If "*", all non-stop codons are allowed.
+##    E. "Incomplete": column wth 5/3/53/0 indicating if the *CODING SEQUENCE* is 5'-incomplete, 3'-incomplete, both, or neither (informs ORF detection).
+##    F. "MicroORF": column with 1/0 indicating if min-ORF-length restrictions should be ignored.
+
+## future: force ORF starts/stops, ignore stop codon at position X, allow leaky stops -> multiple outcome sequences, ...?
+
+

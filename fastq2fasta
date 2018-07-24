@@ -1,0 +1,50 @@
+#!/usr/bin/env perl
+require '/home/apa/local/bin/apa_routines.pm';
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my ($fastq, $fasta, $qual, $nobreak, $noheader, $gzip);
+
+GetOptions("i=s"=>\$fastq, "o=s"=>\$fasta, "qual"=>\$qual, "no-break"=>\$nobreak, "no-header"=>\$noheader, "gzip"=>\$gzip);
+
+($fasta = $fastq) =~ s/\.(fastq|fq)(.gz)?/.fa/ unless $fasta;
+my $qualfa = "$fasta.qual";
+
+my ($QU, $i, $header);
+my $IN = &open2('R', $fastq, 'Input fastq');
+my $FA = &open2('W', $fasta, 'Output fasta');
+$QU = &open2('W', $qualfa, 'Output quality fasta') if $qual;
+
+while (<$IN>) {
+    $i++;
+    if ($i == 1) {
+	($header) = ($_ =~ /^@(\S+)/);
+    } elsif ($i == 2) {
+	print $FA ">$header\n" unless $noheader;
+	if ($nobreak) {
+	    print $FA $_;
+	} else {
+	    print $FA ${ &blockify(\$_) };
+	}
+    } elsif ($i == 4) {
+	if ($qual) {
+	    print $QU ">$header\n" unless $noheader;
+	    if ($nobreak) {
+		print $QU $_;
+	    } else {
+		print $QU ${ &blockify(\$_) };
+	    }
+	}
+	$i = 0;
+    }
+}
+close $IN;
+close $FA;
+close $QU if $qual;
+
+if ($gzip) {
+    system "gzip $fasta";
+    system "gzip $qualfa" if $qual;
+}
+exit;

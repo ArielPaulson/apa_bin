@@ -1,0 +1,61 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use strict;
+
+# takes sam/bam input, extracts unaligned reads, and returns sam/bam output.
+# input format does not have to be the same as output format
+# requires one of '--one', '--any', or '--all':
+#  --one: extract PE reads where only one read is unaligned (but not both).
+#  --any: extract PE reads where any reads are unaligned (one or both).  [Default]
+#  --all: extract PE reads where both reads are unaligned.
+
+my %formats = map {($_=>1)} qw/ sam bam /;
+
+my ($in, $out, $one, $any, $all);
+GetOptions("i=s" => \$in, "o=s" => \$out, "one" => \$one, "any" => \$any, "all" => \$all);
+
+my ($informat, $outformat, $mode);
+
+($informat) = ($in =~ /\.([sb]am)$/i);
+$informat = "\L$informat";
+die "Input file '$in' must have sam|bam extension!\n" unless $formats{$informat};
+
+die "Cannot specify more than one of '--one', '--any' or '--all'!\n" if $one+$any+$all > 1;
+$any = 1 if $one+$any+$all == 0;  # default
+$mode = $any ? 'any' : $all ? 'all' : 'one';
+
+if ($out) {
+    ($outformat) = ($out =~ /\.([sb]am)$/i);
+    $outformat = "\L$outformat";
+    die "Output file '$out' must have sam|bam extension!\n" unless $formats{$outformat};
+} else {
+    ($out = $in) =~ s/\.[sb]am//i unless $out;
+    $out .= ".$mode.unaligned.bam";  # default bam output
+    $outformat = 'bam';
+}
+
+my $tmp = "$out.tmp";  # intermediate sam file
+my $cmd = 'samtools view';
+$cmd .= ' -S' if $informat eq 'sam';
+
+# begin with header
+system "$cmd -H $in > $tmp";
+
+# add reads
+if ($one) {
+    system "$cmd -X $in | grep -P '\tpu[12]' >> $tmp";
+} elsif ($any) {
+    system "$cmd -F 2 $in >> $tmp";
+} elsif ($all) {
+    system "$cmd -X $in | grep -P '\tpuU' >> $tmp";
+}
+
+# finalize
+if ($outformat eq 'bam') {
+    system "samtools view -bS $tmp > $out";
+    system "rm -f $tmp";
+} else {
+    system "mv $tmp $out";
+}
+exit;
+

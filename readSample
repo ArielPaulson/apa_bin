@@ -1,0 +1,183 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my ($file, $type, $N, $K, $R, $A, $outfile, $reduce, $help);
+GetOptions(
+    "f=s" => \$file,
+    "t=s" => \$type,
+    "n=i" => \$N,
+    "k=i" => \$K,
+    "r=i" => \$R,  # NOT READY
+    "a" => \$A,
+    "o=s" => \$outfile,
+    "reduce" => \$reduce,  # ONLY IF -n USED // DNA ONLY
+    "help" => \$help
+    );
+
+my $NKA = ($N>0) + ($K>0) + ($A>0);
+die "$0: Can only use one of -a (All), -n (top-N), or -k (every-Kth)!\n" if $NKA > 1;
+die "$0: Must specify one of -a (All), -n (top-N), or -k (every-Kth)!\n" if $NKA == 0;
+
+my %types = map {($_=>1)} qw/ fasta fastq bam /;
+my $typestr = join ', ', map { "'$_'" } sort keys %types;
+
+unless ($type) {
+    $type = 'fasta' if $file =~ /(fa|fsta|fasta)(\.gz)?$/i;
+    $type = 'fastq' if $file =~ /(fq|fastq)(\.gz)?$/i;
+    $type = 'bam' if $file =~ /bam$/i;
+}
+die "$0: Unknown file type '$type': must be one of: $typestr\n" unless $types{$type};
+
+my ($i, $j, $tmpseq, $header, @headers, %seq);
+
+my $IN;
+if ($type eq 'bam') {
+    open $IN, '-|', "samtools view $file" or die "$0: Cannot read from input '$file': $!\n";
+} elsif ($file =~ /\.gz$/) {
+    open $IN, '-|', "gunzip -c $file" or die "$0: Cannot read from input '$file': $!\n";
+} else {
+    open $IN, '<', $file or die "$0: Cannot read from input '$file': $!\n";
+}
+
+my $OUT;
+$outfile = "$file.sample" unless $outfile;
+if ($outfile =~ /\.gz$/) {
+    open $OUT, '|-', "gzip > $outfile" or die "$0: Cannot write to output '$outfile': $!\n";
+} else {
+    open $OUT, '>', $outfile or die "$0: Cannot write to output '$outfile': $!\n";
+}
+
+if ($N || $A) {
+    
+    if ($type eq 'fasta') {
+	while (<$IN>) {
+	    $_ =~ s/[\n\r]+$//;
+	    if ($_ =~ /^>/) {
+		if ($tmpseq) {
+		    $seq{$tmpseq}->[0]++;
+		    $tmpseq = '';
+		}
+	    } else {
+		$tmpseq .= $_;
+	    }
+	}
+    } elsif ($type eq 'fastq') {
+	while (<$IN>) {
+	    $_ =~ s/[\n\r]+$//;
+	    $i++;
+	    if ($i == 2) {
+		$seq{$_}->[0]++;
+	    } elsif ($i == 4) {
+		$i = 0;
+	    }
+	}
+    } elsif ($type eq 'bam') {
+	while (<$IN>) {
+	    my @data = split /\t/, $_, 11;
+	    $seq{$data[9]}->[0]++;
+	}
+    }
+    
+    my %seqhash;
+    if ($reduce) {
+	print STDERR "Reducing sequences...\n";
+	my %reduced;
+	my @bylen = sort { length($b) <=> length($a) } keys %seq;  # longest first
+	foreach my $i (0..$#bylen-1) {
+	    next unless exists $seq{$bylen[$i]};  # may have been absorbed in a previous iteration
+	    print " $i/$N: ".`date` if $i % 1000 == 0;
+	    last if $i == $N;  # by this point, we have reduced at least $N longest sequences we can write out
+	    $reduced{$bylen[$i]} = [$seq{$bylen[$i]}->[0], 1];
+	    foreach my $j ($i+1..$#bylen) {
+		if ($bylen[$i] =~ /$bylen[$j]/) {
+		    $reduced{$bylen[$i]}->[0] += $seq{$bylen[$j]}->[0];
+		    $reduced{$bylen[$i]}->[1]++;
+		    delete $seq{$bylen[$j]};      # absorbed by $bylen[$i];
+#		} else {  # test $bylen[$j] revcomp
+#		    (my $rc = reverse $bylen[$j]) =~ tr/ACGTacgt/TGCAtgca/;
+#		    if ($bylen[$i] =~ /$rc/) {
+#			$reduced{$bylen[$i]}->[0] += $seq{$bylen[$j]}->[0];
+#			$reduced{$bylen[$i]}->[1]++;
+#			delete $seq{$bylen[$j]};  # absorbed by $bylen[$i];
+#		    }
+		}
+	    }
+	}
+	%seqhash = %reduced;
+    } else {
+	%seqhash = %seq;
+    }
+    
+    my ($single, $total);
+    foreach my $s (sort { $seqhash{$b}->[0] <=> $seqhash{$a}->[0] } keys %seqhash) {
+	$j++;
+	my $tag = join('_', @{ $seqhash{$s} });  # may be "count_subseqs" if --reduce, or "count" otherwise
+	$single++ if $tag == 1;
+	$total += $tag;
+	print $OUT ">${j}_$tag\n$s\n";
+	last if $j == $N;  # will never be true if $A
+    }
+    
+    print STDERR "$j/$total sequences were unique | $single singletons\n" if $A;
+    
+} elsif ($K) {
+    
+    if ($type eq 'fasta') {
+	while (<$IN>) {
+	    if ($_ =~ /^>/) {
+		$j++;
+		if ($j == $K) {
+		    print $OUT $_;
+		} elsif ($j == $K+1) {  # header after a Kth
+		    $j = 1;		
+		}
+	    } elsif ($j == $K) {  # line(s) after a Kth header
+		print $OUT $_;
+	    } else {
+		$j++;
+	    }
+	}
+    } elsif ($type eq 'fastq') {
+	while (<$IN>) {
+	    $_ =~ s/[\n\r]+$//;
+	    $i++;
+	    if ($i == 1) {
+		$header = $_;
+	    } elsif ($i == 2) {
+		$j++;
+		if ($j == $K) {
+		    print $OUT ">$header\n$_\n";
+		    $j = 0;
+		}
+	    } elsif ($i == 4) {
+		$i = 0;
+	    }
+	}
+    } elsif ($type eq 'bam') {
+	while (<$IN>) {
+	    $j++;
+	    if ($j == $K) {
+		my @data = split /\t/, $_, 11;
+		print $OUT ">$data[0]\t$data[9]\n";
+		$j = 0;
+	    }
+	}
+    }
+    
+} elsif ($R) {
+
+    die;   # NOT READY YET
+    print "Counting records...\n";
+    chomp(my $recno = ``);
+    
+}
+close $IN;
+close $OUT;
+
+print "$0 Complete!\n";
+system "kill $$ 2>/dev/null";
+
+

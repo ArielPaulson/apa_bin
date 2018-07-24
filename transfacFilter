@@ -1,0 +1,26 @@
+#!/usr/bin/env perl
+use strict;
+
+my ($infile, $outfile) = @ARGV;
+my $qrycount = my $alncount = my $usecount = 0;
+
+open IN, $infile or die "Can't read from '$infile': $!\n";
+open OUT, "> $outfile" or die "Can't write to '$outfile': $!\n";  # do NOT want to hold a whole TF run in memory!
+while (<IN>) {
+    if ($_ =~ /^Inspect/) {
+	print OUT $_;
+	$qrycount++;
+    } else {
+	$alncount++;
+	my ($coreSim, $matSim) = (split /[\s\|]+/, $_)[4,5];
+	next if ($coreSim > 1 || $matSim > 1);   # junk hits have scores > 1  |  and blank lines will definitely not, so this allows spacer lines through
+	print OUT $_;
+	$usecount++;
+    }
+}
+close IN;
+close OUT;
+
+my $usepct = $alncount ? sprintf("%0.0f", $usecount/$alncount) : 0;
+print "$qrycount sequences | $alncount total alignments | $usecount good alignments ($usepct%)\n";
+exit;

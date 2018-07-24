@@ -1,0 +1,38 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use strict;
+
+## A wrapper for the Perl subroutine &vcf_orderheader.
+## Orders the header of a VCF file.
+## Can take a genome argument $geno, in which case:
+##  Adds/replaces contig lines in the header; also adds reference line if it doesn't already exist.
+##  The file /n/data1/genomes/indexes/$geno/$geno.chrom.sizes must exist.
+
+my ($invcf, $outvcf, $geno) = @ARGV;
+
+die "$0: input VCF '$invcf' does not exist!\n" unless -e $invcf;
+die "$0: output VCF '$outvcf' not specified!\n" unless $outvcf;
+my $chrsz = "/n/data1/genomes/indexes/$geno/$geno.chrom.sizes";
+die "$0: Required chrom.sizes file '$chrsz' does not exist!\n" if $geno && !-e $chrsz;
+
+my $IN = &open2('R', $invcf, 'input VCF');
+my (@header, @data);
+while (<$IN>) {
+    if (/^#/) {
+        push @header, $_;
+    } else {
+        push @data, $_;
+    }
+}
+close $IN;
+@header = @{ &vcf_orderheader(\@header, $geno) };
+my $OUT = &open2('W', $outvcf, 'output VCF', 1);  # if $outvcf is .gz, then extra '1' indicates to use bgzip
+print $OUT @header;
+print $OUT @data;
+close $OUT;
+
+my ($iscomp, $err, $rcmd, $wcmd) = @{ &is_compressed($outvcf, 1) };
+system "tabix -p vcf -f $outvcf" if $iscomp && -e "$invcf.tbi";  # tabix output if input was tabixed
+print "$0 $invcf complete!\n";
+exit;
+

@@ -1,0 +1,155 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+# The unix 'split' utility made fasta-friendly, basically.
+# Splits 1 or more fasta files by sequences, not simply by lines.
+# Also splits fastq files, with '--fastq' flag.  Do not mix fastas with fastqs.
+# All output files are named "<fasta>.###", where "###" is a zero-padded integer, beginning with 1.
+#
+# Usages:
+# fastaSplit -s <max_sequences_per_output_file> <fasta_files>
+# fastaSplit -o <N_output_files> <fasta_files>
+# fastaSplit -b <max_bytes_per_output_file> <fasta_files>
+#
+
+my ($bytesPerFile, $seqsPerFile, $nOutFiles, $numJust, $fastq, $gzip);
+GetOptions("b=s" => \$bytesPerFile, "s=i" => \$seqsPerFile, "o=i" => \$nOutFiles, "num-just" => \$numJust, "fastq" => \$fastq, "gzip" => \$gzip);
+my @fastas = @ARGV;  # post-GetOptions args
+
+my $specified;
+$specified++ if $bytesPerFile;
+$specified++ if $seqsPerFile;
+$specified++ if $nOutFiles;
+die "Can only specify one of -b, -s, or -o!\n" if $specified > 1;
+die "Must specify one of -b, -s, or -o!\n" unless $specified;
+
+foreach my $fasta (@fastas) { 
+    
+    my (@headers, $header, %records, $i, $IN, $OUT, $Nrecs, $outfile);
+    
+    if ($fasta =~ /\.gz$/) {
+	open $IN, '-|', "gunzip -c $fasta" or die "$0: Cannot open '$fasta' for reading: $!\n";
+    } else {
+	open $IN, '<', $fasta or die "$0: Cannot open '$fasta' for reading: $!\n";
+    }
+    
+    print "Splitting $fasta...\n";
+    
+    if ($fastq) {
+	while (<$IN>) {
+	    $i++;
+	    if ($i == 1 && /^\@(.*)/) {
+		$header = $1;
+		push @headers, $header;
+	    } elsif ($i == 4) {
+		$i = 0;
+	    }
+	    $records{$header} .= $_;
+	}
+    } else {
+	while (<$IN>) {
+	    if (/^>(.*)/) {
+		$header = $1;
+		push @headers, $header;
+	    }
+	    $records{$header} .= $_;  # retain newlines
+	}
+    }
+    close $IN;
+    
+    $Nrecs = scalar @headers;
+    
+    if ($seqsPerFile) {
+	
+	my $N = int($Nrecs/$seqsPerFile);
+	$N++ if $Nrecs % $seqsPerFile;
+	my $ndig = length($N);
+	my @filenames = $numJust ? ( map { sprintf("$fasta.%0${ndig}i",$_) } (1..$N) ) : ( map { "$fasta.$_" } (1..$N) );
+	
+	my ($nfile, $i) = (-1, $seqsPerFile);
+	foreach my $header (@headers) {
+	    $i++;
+	    if ($i > $seqsPerFile) {
+		$nfile++;
+		$i = 1;
+		system "gzip -f $outfile" if $gzip && $outfile;
+		$outfile = $filenames[$nfile];
+		open $OUT, '>', $outfile or die "$0: Cannot write to '$outfile' for writing: $!\n";
+	    }
+	    print $OUT $records{$header};  # newlines included
+	}
+	close $OUT;  # only closes final file
+	system "gzip -f $outfile" if $gzip;
+    }
+    
+    if ($nOutFiles) {
+	
+	my $N = int($Nrecs/$nOutFiles);
+	my @PerFile = map {$N} (1..$nOutFiles);
+	my $extra = $Nrecs % $nOutFiles;
+	my $i = -1;
+	while ($extra) {
+	    $i++;
+	    $PerFile[$i]++;
+	    $extra--;
+	}
+	push @PerFile, 0;  # dummy entry in last position
+	my $ndig = length($nOutFiles);
+	my @filenames = map { sprintf("$fasta.%0${ndig}i",$_) } (1..$nOutFiles);
+	
+	my ($nfile, $i) = (-1, $PerFile[-1]);
+	foreach my $header (@headers) {
+	    $i++;
+	    if ($i > $PerFile[$nfile]) {
+		$nfile++;
+		$i = 1;
+		system "gzip -f $outfile" if $gzip && $outfile;
+		$outfile = $filenames[$nfile];
+		open $OUT, '>', $outfile or die "$0: Cannot write to '$outfile' for writing: $!\n";
+	    }
+	    print $OUT ">$header\n$records{$header}";  # newline included
+	}
+	close $OUT;
+	system "gzip -f $outfile" if $gzip;
+    }
+    
+    if ($bytesPerFile) {
+	
+	my (@SeqBytes, %FileHeaders, $maxBytes);
+	foreach my $i (0..$#headers) {
+	    my $bytes = length($records{$headers[$i]});
+	    push @SeqBytes, $bytes;
+	    $maxBytes = $bytes if $bytes > $maxBytes;
+	}
+	die "$0: Max bytes for any header+sequence ($maxBytes) exceeds -b ($bytesPerFile)!  Cannot split fasta.\n" if $maxBytes > $bytesPerFile;
+	
+	my ($nfile, $fileBytes) = (1, 0);
+	foreach my $i (0..$#headers) {
+	    if ($fileBytes+$SeqBytes[$i] > $bytesPerFile) {
+		$nfile++;
+		$fileBytes = 0;
+	    }
+	    push @{ $FileHeaders{$nfile} }, $headers[$i];
+	    $fileBytes += $SeqBytes[$i];
+	}
+	
+	my $N = $nfile;
+	my $ndig = length($N);
+	my @filenames = map { sprintf("$fasta.%0${ndig}i",$_) } (1..$N);
+	
+	foreach my $nfile (1..$N) {
+	    $outfile = $filenames[$nfile-1];
+	    open $OUT, '>', $outfile or die "$0: Cannot write to '$outfile' for writing: $!\n";
+	    print $OUT $records{$_} foreach @{ $FileHeaders{$nfile} };
+	    close $OUT;
+	    system "gzip -f $outfile" if $gzip;
+	}
+    }
+    
+}
+
+print "fastaSplit complete!\n";
+system "kill $$";
+

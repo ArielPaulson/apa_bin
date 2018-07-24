@@ -1,0 +1,110 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use strict;
+
+
+## Show NCBI taxon IDs for various Stowers model orgs
+
+
+my $NO_sprintf = $ARGV[0] eq '--no-sprintf';
+
+my $build_dir = '/n/data1/genomes/bowtie-index';
+my (%gtypes, %gtypes2, %ttypes, %ttypes2, %latest, @output);
+
+
+## these exist for legacy purposes only
+my %geno_ignore = ('Pombe'=>1);  # have since adopted a capitalized-Genus, lowercased-species standard (so now 'pombe_ASM294').
+my %trans_ignore = ('nemVec1'=>{'Ens_71'=>1});  # was properly, EnsGen_18; must ignore since version succession is based on 'EnsGen' prefix, not 'Ens'
+my $null = '-';  # '';
+my $tnull = '-';  # for transcriptome column only
+
+my @header = qw/ GENOME TRANSCRIPTOME STAR-INDEX IGV LATEST /;
+
+## Find genome/transcriptome pairs
+foreach my $gdir (glob "$build_dir/*") {       # should mostly be genome build dirs
+    (my $gpref = $gdir) =~ s/$build_dir\///;
+    if (-e "$gdir/$gpref.README.txt") {        # is actual genome build dir
+        my ($gtype, $gver);
+        if ($gpref =~ /^([A-Za-z]+)(\d+)$/) {  # appears to be typical UCSC genome label convention, e.g. 'hg38', 'astMex1'
+            ($gtype, $gver) = ($1, $2);
+        } elsif ($gpref =~ /^([A-Za-z]+)_\w+v(\d+)/) {  # EnsemblGenomes-style naming convention, e.g. 'pombe_ASM294v2', 'Trichoplax_ASM15027v1'
+            ($gtype, $gver) = ($1, $2);
+        } else {
+            ($gtype, $gver) = ($gpref =~ /^(\D+?)_?(\d+)$/);
+        }
+        next if $geno_ignore{$gtype};
+        $gtypes{$gpref} = $gtype;              # just type of genome, not version number, e.g. 'mm' or 'Pombe'
+        $gtypes2{$gtype}{$gver} = [$gpref, -l $gdir];
+        my $has_transcriptome = 0;
+        if ($gpref =~ /^ERCC/) {
+            my @STARs;
+            foreach my $star (glob "$gdir/STAR_*") {
+                my ($readlen) = ($star =~ /STAR_(\d+)bp/);
+                push @STARs, $readlen;
+            }
+            my $STARs = @STARs ? join(',',sort {$a <=> $b} @STARs) : $null;
+            push @output, [$gpref,$tnull,$STARs,$null];
+            $has_transcriptome = 1;  # just to deactivate 'push @output' line below
+        } else {
+            foreach my $tdir (glob "$gdir/*") {    # will mostly be files, not transcriptome dirs
+                next if $tdir =~ /^$gpref/;        # genome file, not transcriptome dir
+                (my $tpref = $tdir) =~ s/.*annotation\///;
+                next if $trans_ignore{$gpref}{$tpref};
+                if (-e "$tdir/$gpref.$tpref.README.txt") {  # transcriptome build dir
+                    my $ttype = (split /_/, $tpref)[0];
+                    $ttype =~ s/\d+$//;
+                    $ttypes{$gpref}{$tpref} = $ttype;  # just type of transcriptome, not version number, e.g. 'Ens' or 'EnsGen'
+                    (my $tver = $tpref) =~ s/${ttype}_?//;  # version, e.g. Ens_80 -> 80
+                    $ttypes2{$gpref}{$ttype}{$tver} = [$tpref, -l $tdir];
+                    $has_transcriptome = 1;
+                    my @STARs;
+                    foreach my $star (glob "$tdir/STAR_*") {
+                        my ($readlen) = ($star =~ /STAR_(\d+)bp/);
+                        push @STARs, $readlen;
+                    }
+                    my $STARs = @STARs ? join(',',sort {$a <=> $b} @STARs) : $null;
+                    my $igv = -e "$tdir/$gpref.$tpref.igv.genome" ? 'Y' : $null;
+                    push @output, [$gpref,$tpref,$STARs,$igv];
+                }
+            }
+        }
+        push @output, [$gpref,$tnull,$null,$null] unless $has_transcriptome;
+    }
+}
+
+## Figure out which is the latest g/t combo
+foreach my $gtype (keys %gtypes2) {
+    my $gmaxver;
+    foreach my $ver (sort {$b <=> $a} keys %{ $gtypes2{$gtype} }) {
+        my ($prefix, $is_symlink) = @{ $gtypes2{$gtype}{$ver} };
+        next if $is_symlink;
+        $gmaxver = $ver if $ver > $gmaxver;  # numerically greatest version
+    }
+    $latest{G}{$gtype} = $gtypes2{$gtype}{$gmaxver}->[0];
+}
+foreach my $gtype (keys %{ $latest{G} }) {
+    my $gpref = $latest{G}{$gtype};
+    if (exists $ttypes2{$gpref}) {  # has transcriptome
+        foreach my $ttype (keys %{ $ttypes2{$gpref} }) {
+            my $tmaxver;
+            foreach my $ver (sort {$b <=> $a} keys %{ $ttypes2{$gpref}{$ttype} }) {
+                my ($prefix, $is_symlink) = @{ $ttypes2{$gpref}{$ttype}{$ver} };
+                next if $is_symlink;
+                $tmaxver = $ver if $ver > $tmaxver;  # numerically greatest version
+            }
+            $latest{T}{$gpref}{ $ttypes2{$gpref}{$ttype}{$tmaxver}->[0] } = $gtype;
+        }
+    } else {  # no associated transcriptomes
+        $latest{T}{$gpref}{$tnull} = $gtype;   # $tnull is the 'no-transcriptome' mark
+    }
+}
+
+## Print and exit
+my @OUT = (\@header);
+foreach my $pair (@output) {
+    my $is_latest = exists $latest{T}{$$pair[0]}{$$pair[1]} ? 'LATEST '.$latest{T}{$$pair[0]}{$$pair[1]} : '';
+    push @OUT, [@$pair, $is_latest];
+}
+&print_table(\@OUT, !$NO_sprintf);
+exit;
+

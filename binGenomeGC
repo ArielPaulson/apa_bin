@@ -1,0 +1,101 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## Inputs
+my $fasta;   # genome toplevel fasta to bin GC content in
+my $faidx;   # if using $usechr, can specify an index for $fasta ($fasta.fai, made by "samtools faidx $fasta") -- HUGE REDUCTION IN RUNTIME
+my $usechr;  # bin only this chromosome
+my $window;  # binning window, in bp
+my $outfile; # output file
+my ($help, $man, $version);
+
+GetOptions(
+    "f=s" => \$fasta,
+    "i=s" => \$faidx,
+    "c=s" => \$usechr,
+    "w=s" => \$window,
+    "o=s" => \$outfile,
+    "help" => \$help,
+    "man" => \$man,
+    "version" => \$version
+    );
+
+die "Window size must be >= 1!\n" unless $window >= 1;
+
+unless ($outfile) {
+    $outfile = $usechr ? "$fasta.$usechr.$window.frequencies.txt" : "$fasta.$window.frequencies.txt";
+}
+
+## Globals
+my $offset; # fasta index offset for $usechr
+my %seq;    # fasta sequence
+my %freq;   # base frequencies per bin
+my @chrs;   # ordered chromosomes
+my %clens;  # chromosome lengths
+my %bases;  # observed letters
+
+
+## Main
+
+
+if ($usechr && $faidx) {
+    open my $FAI, '<', $faidx or die "$0: Cannot read fasta index '$faidx': $!\n";
+    while (<$FAI>) {
+	$_ =~ s/[\n\r]+$//;
+	my @data = split /\t/, $_;
+	$offset = $data[2]-length($usechr)-2 if $data[0] eq $usechr;
+    }
+    close $FAI;
+}
+
+open my $IN, '<', $fasta or die "$0: Cannot read input fasta '$fasta': $!\n";
+my $chr;
+my ($i, $bin) = (0, 1);
+seek($IN, $offset, 0) if $offset && $faidx;
+while (<$IN>) {
+    $_ =~ s/[\n\r]+$//;
+    if ($_ =~ /^>(.*)/) {
+	$clens{$chr} = $i if $chr;  # after first
+	$chr = $1;
+	last if $usechr && $chr ne $usechr && %freq;
+	next if $usechr && $chr ne $usechr;
+	push @chrs, $chr;
+	print " $chr\n";
+	($i, $bin) = (0, 1);
+    } else {
+	next if $usechr && $chr ne $usechr;
+	foreach my $base (split //, $_) {
+	    $freq{$chr}{$bin}{$base}++;
+	    $bases{$base}++;
+	    $i++;
+	    $bin++ if $i % $window == 0;
+	}
+    }
+}
+$clens{$chr} = $i;
+close $IN;
+
+my @bases = qw/ A C G T N /;
+my %normal = map {($_=>1)} @bases;
+foreach my $base (sort keys %bases) {
+    $base = "\U$base";
+    push @bases, $base unless $normal{$base};
+}
+
+open my $OUT, '>', $outfile or die "$0: Cannot write output file '$outfile': $!\n";
+print $OUT join("\t", 'Chr', 'Start', 'End', @bases), "\n";
+foreach my $chr (@chrs) {
+    foreach my $bin (sort {$a <=> $b} keys %{ $freq{$chr} }) {
+	my $start = $window*($bin-1);
+	my $end = $start+$window;
+	$end = $clens{$chr} if $end > $clens{$chr};
+	print $OUT join("\t", $chr, $start, $end, map { ($freq{$chr}{$bin}{"\U$_"}+$freq{$chr}{$bin}{"\L$_"})||0 } @bases), "\n";
+    }
+}
+print $OUT join("\t", "TOTAL\t\t", map { ($bases{"\U$_"}+$bases{"\L$_"})||0 } @bases), "\n";
+close $OUT;
+
+print "$0 $fasta $window complete!\n";
+exit;

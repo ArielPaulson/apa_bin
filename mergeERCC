@@ -1,0 +1,43 @@
+#!/usr/bin/env perl
+use Pod::Usage;
+use strict;
+
+## this script identical to mergeIdxstats, except it prepends the reference data for ERCC92 as cols 1-7
+## thus it requires /home/apa/local/bin/datasets/ERCC92_cms_095046.txt
+
+die "$0: No inputs specified!\n" unless @ARGV;
+
+## Inputs
+# @ARGV -- list of "samtools idxstats" outputs for ERCC92 bams
+
+## Globals
+my %ref;    # ERCC reference data
+my %reads;  # reads per ERCC
+my %lens;   # ERCC length
+
+## Main
+open my $REF, '<', '/home/apa/local/bin/datasets/ERCC92_cms_095046.txt';
+while (<$REF>) {
+    chomp;
+    my @data = split /\t/, $_;
+    $ref{$data[1]} = $_;
+}
+close $REF;
+
+foreach my $file (@ARGV) {
+    open my $IN, '<', $file;
+     while (<$IN>) {
+	my ($ERCC, $length, $mapped, $unmapped) = split /\t/, $_;
+	next if $ERCC eq '*';
+	$reads{$ERCC}{$file} = $mapped;
+	$lens{$ERCC} = $length;
+    }
+    close $IN;
+}
+
+print join ("\t", $ref{'ERCC ID'}, 'Length', @ARGV), "\n";
+foreach my $ERCC (sort keys %reads) {
+    print join ("\t", $ref{$ERCC}, $lens{$ERCC}, map { $reads{$ERCC}{$_} } @ARGV), "\n";
+}
+exit;
+

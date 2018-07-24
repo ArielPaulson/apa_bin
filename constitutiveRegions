@@ -1,0 +1,234 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use strict;
+
+my ($gtf, $genefilter, $sequence, $bed, $maxonly, $minlen, $noPCNC, $noANYNC, $nextbest);
+GetOptions("g=s" => \$gtf, "f=s" => \$genefilter, "s=s" => \$sequence, "bed" => \$bed, "max" => \$maxonly, "minlen" => \$minlen, "no-pc-nc" => \$noPCNC, "no-any-nc" => \$noANYNC, "nextbest" => \$nextbest);
+
+$noPCNC = 1 if $noANYNC;  # automatic
+
+my (%filter, %gte, %gbio, %gdat, %tdat, %seq, @output);
+
+print "Reading data...\n";
+open IN, $genefilter or die "Cannot open filter file '$genefilter': $!\n";
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    $filter{$_} = 1;
+}
+close IN;
+
+if ($sequence) {
+    my $trans;
+    open IN, $sequence or die "Cannot read sequence file '$sequence': $!\n";
+    while (<IN>) {
+	$_ =~ s/[\n\r]+$//;
+	if ($_ =~ /^>(.*)/) {
+	    $trans = $1;
+	} else {
+	    $seq{$trans} .= $_;
+	}
+    }
+    close IN;
+}
+
+my %tlens = map {($_=>length($seq{$_}))} %seq;
+my $ok;
+open IN, $gtf;
+while (<IN>) {
+    next if $_ =~ /^#/;
+    $_ =~ s/[\n\r]+$//;
+    my ($chr, $biotype, $feature, $start, $end, $score, $strand, $phase, $annot) = split /\t/, $_;
+    next unless $feature eq 'exon';
+    my $exon = "$start\t$end";
+    my ($gene) = ($annot =~ /gene_id "([^"]+)"/);
+    my ($trans) = ($annot =~ /transcript_id "([^"]+)"/);
+    next if $genefilter && !$filter{$gene};
+    push @{ $gte{$gene}{$trans} }, $exon;
+    
+    if (%gdat) {
+	$gdat{$gene}->[1] += $start if $start < $gdat{$gene}->[0];
+    } else {
+	$gdat{$gene}->[1] = $start;  # initial value
+    }
+    $gdat{$gene}->[2] += $end if $end > $gdat{$gene}->[2];
+    @{ $gdat{$gene} }[0,3] = ($chr, $strand);   # gdat = (chr, start, end, strand, uxonlen)
+    $gbio{$gene}{$biotype} = 1;
+    
+    if (%tdat) {
+	$tdat{$trans}->[0] += $start if $start < $tdat{$trans}->[0];
+    } else {
+	$tdat{$trans}->[0] = $start;  # initial value
+    }
+    $tdat{$trans}->[1] += $end if $end > $tdat{$trans}->[1];
+    $tdat{$trans}->[2] += $end-$start+1;
+    $tdat{$trans}->[3] = $biotype;     		# tdat = (start, end, mrnalen, biotype)
+}
+close IN;
+
+if ($noANYNC) {
+    foreach my $gene (sort keys %gte) {
+	## strip NC genes, if specified
+	delete $gte{$gene} unless $gbio{$gene}{'protein_coding'};  # filter
+    }
+}
+if ($noPCNC) {
+    foreach my $gene (sort keys %gte) {
+	## strip NC transcripts, if specified
+	if ($gbio{$gene}{'protein_coding'}) {
+	    foreach my $trans (sort keys %{ $gte{$gene} }) {
+		delete $gte{$gene}{$trans} unless $tdat{$trans}->[3] eq 'protein_coding';  # filter
+	    }
+	}
+    }
+}
+
+print "Processing genes...\n";
+foreach my $gene (sort keys %gte) {
+    $ok++;
+    my ($chr, $strand) = @{ $gdat{$gene} }[0,3];
+    my $ntrans = scalar keys %{ $gte{$gene} };
+    my (%maps, %splices);
+    
+    ## assess constitutive regions, if any
+    if ($ntrans == 1) {
+	foreach my $trans (sort keys %{ $gte{$gene} }) {  # only one
+	    my $xseq = $seq{$trans} ? $seq{$trans} : 'Missing Sequence!';
+	    my $tail = $sequence ? "\t$xseq\n" : "\n";
+	    if ($bed) {
+		push @output, "$trans\t1\t".$tdat{$trans}->[2]."\t$gene\t".$tdat{$trans}->[2]."\t$strand$tail";
+	    } else {
+		push @output, "$gene\t1\t1\t1\t".$tdat{$trans}->[2]."\t$trans\t$tlens{$trans}\t1\t".$tdat{$trans}->[2]."\t$strand$tail";
+	    }
+	}
+    } else {
+	foreach my $trans (sort keys %{ $gte{$gene} }) {
+	    @{ $gte{$gene}{$trans} } = sort {$a <=> $b} @{ $gte{$gene}{$trans} };     # sort exons by start
+	    my $tbp;
+	    foreach my $exon (@{ $gte{$gene}{$trans} }) {
+		my ($start, $end) = split /\t/, $exon;
+		$maps{$_}{$trans} = ++$tbp foreach ($start..$end);	# scalar keys %{$maps{$_}} = # transcripts reporting at genomic pos $_ // $tbp = transcript mrna position of this genomic bp
+		warn "$trans: $tbp exceeds $tlens{$trans}!\n" if $tbp > $tlens{$trans};
+	    }
+	    foreach my $i (0..$#{ $gte{$gene}{$trans} }-1) {
+		my $this_end = (split /\t/, $gte{$gene}{$trans}->[$i])[1];
+		my $next_start = (split /\t/, $gte{$gene}{$trans}->[$i+1])[0];
+		push @{ $splices{$this_end}{$next_start} }, $trans;
+	    }
+	}
+	
+	my @temp = @{ &find_regions($gene, $ntrans, \%maps, \%splices) };
+	if (@temp) {
+	    push @output, @temp;
+	} else {  # no constitutive bp -- disjoint transcripts exist
+	    if ($nextbest) {
+		my $depth = $ntrans;
+		{
+		    $depth--;  # drop transcript coverage depth by 1 and see what "constitutive" regions we can find
+		    last unless $depth;
+		    print "$gene $depth\n";
+		    my @temp =  @{ &find_regions($gene, $depth, \%maps, \%splices) };
+		    if (@temp) {
+			push @output, @temp;
+		    } else {
+			redo;
+		    }
+		}
+	    } else {
+		my $tail = $sequence ? "\t\n" : "\n";
+		push @output, "$gene\t$ntrans\t0\t0\t\t\t\t\t\t$strand$tail";
+	    }
+	}
+    }
+}
+
+if ($bed) {
+    open OUT, "> constitutiveRegions_$gtf.bed";
+} else {
+    open OUT, "> constitutiveRegions_$gtf.txt";
+    my $tail = $sequence ? "\tSequence\n" : "Strand\n";
+    print OUT "Gene\tNTrans\tRegion\tCovg\tRegionLen\tTrans\tTransLen\tStart\tEnd\tStrand$tail";
+}
+print OUT @output;
+close OUT;
+print $ok, "/", scalar(keys %filter), " filter sequences analyzed\n";
+exit;
+
+
+sub find_regions {
+    
+    my ($gene, $depth, $MAPS, $SPLICES) = @_;
+    
+    my (%runs, %runtrans, %regtrans, %const, %temp, $pending, @reportable, @returns);
+    my ($chr, $strand) = @{ $gdat{$gene} }[0,3];
+    my $ntrans = scalar keys %{ $gte{$gene} };
+    my $n = my $r = 1;
+    my $xtrans = (keys %{ $gte{$gene} })[0];   # 'exemplar transcript' - a reference for extracting constitutive sequence
+    my $constit = $depth == $ntrans ? 1 : 0;
+    
+    foreach my $bp (sort {$a <=> $b} keys %$MAPS) {   # genomic bp
+	if (scalar (keys %{ $$MAPS{$bp} }) == $depth) {
+	    push @{ $runs{$n} }, $bp;
+	    $runtrans{$n}{$_} = 1 foreach keys %{ $$MAPS{$bp} };   # store transcripts contributing to each run
+	    $pending = 1;
+	} else {
+	    $n++ if $pending;  # increment only if we just ended a run
+	    $pending = 0;
+	}
+    }
+    $n--;  # always increments 1 too many
+    if (%runs) {  # constitutive bp exist
+	my $run_start = (sort {$a <=> $b} @{ $runs{1} })[0];
+	foreach my $run (1..$n-1) {
+	    my ($this_start, $this_end) = (sort {$a <=> $b} @{ $runs{$run} })[0,-1];
+	    my $next_start = (sort {$a <=> $b} @{ $runs{$run+1} })[0];
+	    $regtrans{$r}{$_} = 1 foreach keys %{ $runtrans{$run} };   # store transcripts contributing to each region
+	    if (exists $$SPLICES{$this_end}{$next_start}) {
+		if (scalar (@{ $$SPLICES{$this_end}{$next_start} }) == $depth) {  # constitutive splice -- ok
+		    # continue through to next exon
+		} else {  # these regions spliced, but not constitutively
+		    push @{ $const{$r} }, ($run_start, $this_end);
+		    $run_start = $next_start;
+		    $r++;
+		}
+	    } else {  # these regions not spliced at all
+		push @{ $const{$r} }, ($run_start, $this_end);
+		$run_start = $next_start;
+		$r++;
+	    }
+	}
+	$r--;  # always increments 1 too many
+	foreach my $region (1..$r) {
+	    my $rtrans = $depth == $ntrans ? $xtrans : (sort { $tlens{$b} <=> $tlens{$a} } keys %{ $regtrans{$region} })[0];
+	    my ($tstart, $tend) = map { $$MAPS{$_}{$rtrans} } (sort {$a <=> $b} @{ $const{$region} })[0,-1];   #  *****  CONVERT TO EXEMPLAR-MRNA COORDS  *****
+	    my $len = $tend - $tstart + 1;
+	    if ($strand eq '-') {
+		my ($t1, $t2) = ($tstart, $tend);
+		($tstart, $tend) = ($tdat{$rtrans}->[2]-$tend+1, $tdat{$rtrans}->[2]-$tstart+1);  # flip coords around on the transcript
+	    }
+	    my $xseq = $seq{$rtrans} ? substr($seq{$rtrans}, $tstart-1, $len) : 'Missing Sequence!';
+	    my $tail = $sequence ? "\t$xseq\n" : "\n";
+	    if ($bed) {
+		$temp{$len}{"$rtrans\t$tstart\t$tend\t%ID%\t$len\t$strand$tail"} = 1;
+	    } else {
+		$temp{$len}{"$gene\t$ntrans\t%ID%\t$depth\t$len\t$rtrans\t$tlens{$rtrans}\t$tstart\t$tend\t$strand$tail"} = 1;
+	    }
+	}
+	if ($maxonly) {
+	    my $maxlen = (sort {$b <=> $a} keys %temp)[0];
+	    @reportable = keys %{ $temp{$maxlen} };
+	} else {
+	    foreach my $len (sort {$b <=> $a} keys %temp) {
+		push @reportable, $_ foreach keys %{ $temp{$len} };
+	    }
+	}
+	my $rank;
+	foreach my $region (@reportable) {
+	    $rank++;
+	    $bed ? ($region =~ s/%ID%/$gene:$rank/) : ($region =~ s/%ID%/$rank/);
+	    push @returns, $region;
+	}
+    } else {
+	@returns = ();
+    }
+    return \@returns;
+}

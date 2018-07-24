@@ -1,0 +1,288 @@
+#!/usr/bin/env Rscript
+
+# A function for imagizing multiple sets of per-residue protein annotations.
+# Given a specially formatted file, convert to matrix, one row per annotation set, one column per residue.
+# Each type of annotations is translate into a predefined color scheme, and the matrix is imaged like a heatmap.
+# Written by Ariel Paulson apa@stowers.org way back when R was 3.0.1.
+
+
+# Requires 6-7 command-line arguments, no switches:
+# 1 = dat: input file 
+# 2 = title: 'main' for image
+# 3 = save: an RData file to save session to, or FALSE to prevent.
+# 4 = imgname: output PNG name
+# 5 = imgwd: PNG width
+# 6 = imght: PNG height
+# 7 = cex: OPTIONAL; default=1.2
+
+
+## NOTES: 
+## 'dat' matrix is 4 columns: 1=Label, 2=Datatype, 3=Format, 4=Values
+## 'Label' is used-defined, but at least one particular label must be present: 'SEQUENCE', for the protein sequence line
+## 'Datatype' is one of the following: CHARGE, STRUCTURE, TOPOLOGY, SOLVENT, STATE, NUMERIC
+## 'Format' is either MAP, RANGES, or FLOAT
+## 'Values' is an arrangement of residue annotations in the format specified by 'Format'
+##
+## 'Datatype' descriptions:
+## CHARGE   : Residue charge state: INPUT ACTUAL AA SEQUENCE.  Gets translated into N,U,B,A for Nonpolar, Polar-Uncharged, Basic, Acidic.
+## STRUCTURE: DSSP structure code: C=Disordered, S=Non-Beta Bend, H=Alpha Helix, I=Pi Helix, G=310 Helix, E=Beta Strand, B=Beta Bridge, T=Beta Turn.
+##            For this script, I have extended the DSSP by one more letter: O=Coiled-coil .
+## TOPOLOGY : Transmembrane topology.  Can be C,L,M for Cytosolic, Luminal/external, and Membrane-embedded.
+## SOLVENT  : Solvent accessibility.  Can be E,B,I,A for Exposed, Buried, Interfacial, Active-site.  "Interfacial" i.e. protein-protein interface; conditional accessibility.
+## STATE    : Generic region of interest, as defined by user; a letter from 1-26. NO DELIMITER. 
+##            Examples of use: binary state (conserved regions, single-feature predictions); exon identity; generic regions of interest; etc.
+## NUMERIC  : Generic numeric value per residue, as defined by user; COMMA-SEPARATED string of numbers.
+##            Examples of use: per-residue likelihood for structural contributions, e.g. helical propensity; geometric or thermodynamic values; etc.
+## 
+## 'Format' descriptions:
+## MAP    : A solid string of values, no delimiters; must have N characters = N residues.  Non-valued positions must be "-".
+## RANGES : A semicolon-delimited string of range blocks; each has the format "Code=Start1-End1,Start2-End2,...,StartN-EndN".
+## NUMERIC: To go with NUMERIC datatype.  A COMMA-SEPARATED string of numbers, one per residue.  Missing numbers can be "-" or NA.
+## 
+## Example of a topology map specified with two different formats:
+## MAP    : CCCCCCCCCCCCMMMMMMMMMMMMMMMMMLLLLLLLLLMMMMMMMMMMMMMMMMMMMMMCCCCCCCC
+## RANGES : C=1-12,60-67;L=30-38;M=13-29,39-59
+## 
+
+
+    
+## Command-Line Arguments
+source("/n/projects/apa/R/apa_tools.R")
+options(stringsAsFactors=FALSE)
+args <- commandArgs(trailing=TRUE)
+dat <- read.delim(args[1], sep="\t", header=FALSE, as.is=TRUE)
+title <- args[2]
+do.save <- args[3]
+imgname <- args[4]
+imgwd <- as.numeric(args[5])
+imght <- as.numeric(args[6])
+cex <- ifelse(length(args)>6, as.numeric(args[6]), 1.2)
+#for (i in 1:length(args)) IM(i, args[i])  # screen reporter for argument parsing
+
+
+
+## Amino-Acid Property Data -- add other per-residue property columns to plot, as desired
+aa <- data.frame(
+    LETTER=qw(A,C,D,E,F,G,H,I,K,L,M,N,P,Q,R,S,T,V,W,Y),
+    CHARGE=qw(N,U,A,A,N,N,B,N,B,N,N,U,N,U,B,U,U,N,N,N),
+    `HELICAL PROPENSITY`=c(0.00,0.68,0.69,0.40,0.54,1.00,0.61,0.41,0.26,0.21,0.24,0.65,3.16,0.39,0.21,0.50,0.66,0.61,0.49,0.53),
+    check.names=FALSE
+    )
+aa$`HELICAL PROPENSITY`[aa$LETTER=="P"] <- 1.5  # outlier reduction of 3.16 -> 1.5 makes the color scale less dramatic (if Proline exists)
+
+
+
+## Master Property List
+bc=c(4:2,7,5:6)  # base cols for STATE
+blocks <- list(
+    MISC=data.frame(
+        Code=c("-","."),
+        Color=qw(white,8),
+        Name=c("No Annotation","Unknown/Conflicting Annot")
+	),
+    CHARGE=data.frame(
+        Code=qw(N,U,B,A),
+        Color=c(7,3,4,2),
+        Name=c("Nonpolar","Polar, Uncharged","Polar, Basic","Polar, Acidic")
+	),
+    `HELICAL PROPENSITY`=data.frame(
+        Code=round(seq(0,max(aa[,3]),length=10),2),
+        Color=rev(palettizer("Reds",10)),
+        Name=c("Highest (0.0)","","","Median  (0.5)",rep("",5),"Lowest  (3.2)")
+	),
+    STRUCTURE=data.frame(
+        Code=qw(O,C,S,H,I,G,E,B,T),
+        Color=qw(forestgreen,khaki3,darkorange,6,rosybrown1,purple3,royalblue,skyblue,aquamarine2),
+        Name=c("Coiled Coil","Disordered  (C)","Bend        (S)","Alpha Helix (H)","Pi Helix    (I)","310 Helix   (G)","Beta Strand (E)","Beta Bridge (B)","Beta Turn   (T)")
+	),
+    TOPOLOGY=data.frame(
+        Code=qw(C,M,L),
+        Color=qw(5,red4,gold2),
+        Name=qw(Cytosolic,Membrane,Luminal)
+	),
+    SOLVENT=data.frame(
+        Code=qw(E,B,I),
+        Color=qw(greenyellow,darkslateblue,pink1),
+        Name=qw(Exposed,Buried,Interfacial)
+	),
+    STATE=data.frame(
+        Code=LETTERS,
+        Color=c( 1, "purple3", bc, hsv.tweak(bc,v=-0.45), hsv.tweak(bc,s=-0.6), hsv.tweak(bc,s=-0.7,v=-0.4) ),
+        Name=paste0("State",LETTERS)
+	)
+    )
+## Set up some 'block'-related variables
+B <- length(blocks)
+which.misc <- which(names(blocks)=="MISC")
+used.blocks <- rep(FALSE, B)
+hp <- "HELICAL PROPENSITY"
+## Add 1 more column to blocks: the heatmap integer value for each property-color
+## This is dynamic because the heatmap palette order is dynamic; thus 'blocks' can be edited without disrupting value->color mappings
+j=0
+for (i in 1:B) {
+    nrb <- nrow(blocks[[i]])
+    blocks[[i]] <- cbind(blocks[[i]], Value=j:(j+nrb-1))
+    j <- blocks[[i]]$Value[nrb]+1
+}
+
+
+
+## Master Format-Handling Function
+parse.format <- function(x, fmt) {  ## OK = MAP, RANGES, NUMERIC; also CHARGE and HELICAL PROPENSITY
+    switch(fmt,
+           "MAP"=toupper(unlist(strsplit(x,""))),
+           "NUMERIC"=as.numeric(unlist(strsplit(x,","))),
+           "RANGES"={
+               all.pos <- c()					   # all-positions tracking
+               m <- rep("",L)					   # blank map
+               w <- unlist(strsplit(x,";"))			   # ranges per code
+               for (i in 1:length(w)) {			   # for each code,
+                   y <- unlist(strsplit(w[i],"="))	   # separate code ([1]) from ranges ([2])
+                   z <- unlist(lapply(unlist(strsplit(y[2],",")), function(w){ n=as.numeric(unlist(strsplit(w,"-"))); n[1]:n[2] }))  # convert string "a-b" to vector a:b
+                   m[unique(z)] <- y[1]			   # assign code to regions
+                   all.pos <- c(all.pos, z)		   # add all positions to all.pos
+               }
+               pos.tab <- table(all.pos)
+               overlaps <- as.numeric(names(pos.tab))[pos.tab>1]  # positions annotated 2+ times
+               m[overlaps] <- "."				   # flag overannotated positions
+               toupper(m)
+           },
+           "CHARGE"={
+               aa2 <- rbind2(aa[,1:2],list("-","-"),list(".","."))
+               aa2$CHARGE[match(toupper(unlist(strsplit(x,""))),aa2$LETTER)]
+           },
+           "HELICAL PROPENSITY"=quantize(aa[match(x,aa$LETTER),hp],blocks[[hp]]$Code)  # quantize per-residue HP values into predefined bins from blocks$`HELICAL PROPENSITY`
+           )
+}
+
+
+
+## Remove blank rows; name columns
+valued <- dat[,1]!=""
+valued[is.na(valued)] <- FALSE
+dat <- dat[valued,]
+colnames(dat) <- qw(Label,Format,Type,Value)
+
+
+
+## Find sequence; create parsed-data matrix and some objects used for matrix-loading and palette-making
+s <- match("SEQUENCE",dat[,1])
+if (is.na(s)) stop("No SEQUENCE record found!\n")
+seq <- unlist(strsplit(dat$Value[1],''))
+L <- length(seq)
+N <- nrow(dat)
+row.blocks <- rep("", N)
+res <- matrix("", N, length(seq), F, list(dat$Labels, 1:L)) 
+
+
+
+## Fill matrix
+for (i in 1:N) {
+    if (dat$Label[i] == hp) {
+        x <- parse.format(seq, hp)
+        b <- which(names(blocks)==hp)
+        dat$Type[i] <- "NUMERIC"   # used for matrix right-axis
+    } else if (dat$Type[i] == "CHARGE") {
+        x <- parse.format(dat$Value[i], "CHARGE")
+        b <- which(names(blocks)=="CHARGE")
+    } else if (dat$Format[i] %in% qw(MAP,RANGES,NUMERIC)) {
+        x <- parse.format(dat$Value[i], dat$Format[i])
+        b <- match(dat$Type[i],names(blocks))
+    } else {
+        stop(paste0("Unknown format '",dat$Format[i],"'\n"))
+    }
+    if (is.na(b)) stop(paste0("Unknown datatype '",dat$Type[i],"'\n"))
+    x[is.na(x)|x==""] <- "."
+    block2 <- rbind(blocks[[b]], blocks[["MISC"]])  # latter for missing-value control
+    res[i,] <- block2$Value[match(x,block2$Code)]
+    used.blocks[b] <- TRUE
+    row.blocks[i] <- names(blocks)[b]
+    lost <- which(x %in% c("-","."))
+    if (length(lost)>0) {
+        res[i,lost] <- blocks[[which.misc]]$Value[match(x[lost],blocks[[which.misc]]$Code)]
+        used.blocks[which.misc] <- TRUE
+    }
+}
+mode(res) <- "numeric"
+
+
+
+## Create palette -- show only used datatypes
+pal.blocks <- blocks[used.blocks]
+pal.blocks <- pal.blocks[order(names(pal.blocks))]
+if ("STATE" %in% names(pal.blocks)) {   # sort STATE last
+    state <- which(names(pal.blocks)=="STATE")
+    others <- which(names(pal.blocks)!="STATE")
+    pal.blocks <- pal.blocks[c(others,state)]
+}
+if ("MISC" %in% names(pal.blocks)) {    # sort MISC last / STATE second-to-last
+    misc <- which(names(pal.blocks)=="MISC")
+    others <- which(names(pal.blocks)!="MISC")
+    pal.blocks <- pal.blocks[c(others,misc)]
+}
+palette <- data.frame(Color=unlist(slice.list(pal.blocks, "Color")), Initial=unlist(slice.list(pal.blocks, "Value")), Final=unlist(slice.list(pal.blocks, "Value")))
+used.values <- palette$Initial %in% c(res) # from all datatypes -- which values are present in matrix?
+palette <- palette[used.values,]           # restrict palette to only used values
+palette$Final <- 1:nrow(palette)           # re-rank palette values to get rid of gaps, which would distort color mapping
+for (i in 1:nrow(res)) res[i,] <- palette$Final[match(res[i,], palette$Initial)]  # replace matrix initial values with final values
+
+
+
+## autodetect pixel width of ROW labels (works for most PNG plots, anyway)
+#ppc <- 5.4 + round((cex-1)/0.2,0)	# empirically determined mean pixels per char when family="mono"; holds for cex = { 0.8 1.0 1.2 1.4 1.6 } using png(), Windows 7, R 2.14.1
+#lab.pix <- 10 + ppc * max(nchar(dat$Label))  # 10 pixels given for the distance between the labels and the axis
+
+
+
+## PLOT MAP
+png(imgname, imgwd, imght)
+par(mar=c(4,10,6,0), las=1, cex=cex, family="mono")
+null.plot(xlim=c(0.01,2), main=title)
+image(t(res[N:1,]), col=palette$Color, xaxt="n", yaxt="n", add=TRUE)
+axis(2, percentify(1:N,range=TRUE), rev(dat$Label), pos=0-0.5/L)
+axis(4, percentify(1:N,range=TRUE), rev(dat$Type), pos=1+0.5/L)
+axseq <- seq(0,L,10); axseq[1] <- 1
+axis(1, percentify(axseq,range=c(1,L)), axseq, padj=-0.8)
+axis(3, percentify(axseq,range=c(1,L)), axseq, padj=0.8)
+
+
+
+## Trim some unused colors from palette before converting palette to key
+key.blocks <- pal.blocks
+if (hp %in% names(pal.blocks)) key.blocks[[hp]] <- pal.blocks[[hp]][c(1,4,10),]
+#if ("STATE" %in% names(pal.blocks)) key.blocks[["STATE"]] <- pal.blocks[["STATE"]][pal.blocks[["STATE"]][,2] %in% palette[,1],]
+key.blocks <- key.blocks[which(names(key.blocks)!="STATE")]
+
+
+
+## PLOT LEGEND
+yseq <- seq(0, 1, length=sum(sapply(key.blocks,nrow))+length(key.blocks)*2)
+gap <- diff(yseq)[1]
+y <- 1
+xoff <- 1.3
+for (i in length(key.blocks):1) {
+    for (j in nrow(key.blocks[[i]]):1) {
+        col <- key.blocks[[i]]$Color[j]
+        rect(0.05+xoff,yseq[y], 0.2+xoff,yseq[y]+0.8*gap, col=col, border=ifelse(col=="white",1,col))
+        text(0.25+xoff, yseq[y]+0.4*gap, key.blocks[[i]]$Name[j], pos=4)
+        y <- y+1
+    }
+    text(0.05+xoff, yseq[y]+0.4*gap, names(key.blocks)[i], pos=4, offset=0, cex=1.2)
+    y <- y+2  # with spacer
+}
+dev.off()
+
+
+
+## SAVE
+if (is.na(as.logical(do.save))) {  # was not logical
+    objname <- do.save
+    do.save <- TRUE
+} else {
+    do.save <- as.logical(do.save)
+    objname <- paste0(args[1],".proteinMap.RData")
+}
+if (do.save) save.image(objname)
+quit()
+
+

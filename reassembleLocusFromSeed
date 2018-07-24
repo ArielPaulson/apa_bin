@@ -1,0 +1,170 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## Takes seed sequence(s), extracts reads aligning to seed(s), assembles them with Trinity to form new seed(s), and repeats until convergence.
+## Returns the final contig fasta.
+
+
+## TO DO MAYBE: Exhaustive Trinity mode, which will run Trinity N times and return only the longest transcript per homologous set.  See reassembleLocusFromBam issue.
+
+
+my $seedfa;        # Fasta with seed sequence(s)
+my $outdir;        # Output dir
+my $clobber;       # Output dir, if overwriting
+my @inputs;        # list of input (fasta|fastq) to pull reads from; must all be same format. Also, must all be gzipped or all not.
+my $keep;          # keep intermediate datasets?
+my $cores = 1;     # cores for Trinity
+my $mem = '1G';    # RAM for Trinity
+my $minlen = 100;  # smallest Trinity contig to retain
+my $maxlen;        # maximum length of any single contig declare assembly "good enough", if it hasn't already converged.
+my $maxiter = 100; # maximum iteration to allow
+my $PE;            # inputs are paired-end (will separate based on "_1.f", "_2.f" strings in filenames)
+
+## Should there be a switch-ends arg if TruSeq stranded PE?  Does it affect Trinity?
+
+GetOptions("f=s"=>\$seedfa, "o=s"=>\$outdir, "oc=s"=>\$clobber, "c=i"=>\$cores, "m=s"=>\$mem, "l=i"=>\$minlen, "x=i"=>\$maxlen, "i=i"=>\$maxiter, "keep"=>\$keep, "PE"=>\$PE);
+@inputs = @ARGV;
+die "$0: no input sequences specified!\n" unless @inputs;
+die "$0: no seed fasta given, or fasta is empty!\n" unless -s $seedfa;
+die "$0: maximum contig length (stopping point) must be specified!\n" unless $maxlen;
+die "$0: maximum contig length (stopping point) must be a positive integer!\n" if $maxlen < 1 || $maxlen =~ /\D/;
+
+my $bowtie2 = 'bowtie2';
+my $Trinity = 'Trinity';
+my $bin = '/home/apa/local/bin';
+my %dirs;
+
+if ($clobber) {
+    system "rm -rf $clobber" if -d $clobber;
+    $outdir = $clobber;
+} elsif ($outdir) {
+    ## do nothing
+} else {
+    $outdir = "reassembleLocusFromSeed.$$";
+}
+die "$0: output dir '$outdir' already exists!  Use -oc to overwrite.\n" if -d $outdir;
+system "mkdir -p $outdir";
+die "$0: failed to create output dir '$outdir'!\n" unless -d $outdir;
+
+my $log = "$outdir/log.txt";
+my $iterdir = "$outdir/iterations";
+my $LOG = &open2('W', $log, 'log file');
+&execute("mkdir $iterdir", 1, $LOG);
+
+my $opencmd = $inputs[0] =~ /\.gz$/ ? 'zcat' : 'cat';
+my $line1 = `$opencmd $inputs[0] | head -1`;
+my ($is_fa, $is_fq, $suffix);
+if ($line1 =~ /^\@/) {
+    $is_fq = 1;
+    $suffix = 'fq';
+    $fsuffix = 'fastq';
+} elsif ($line1 =~ /^>/) {
+    $is_fa = 1;
+    $suffix = 'fa';
+    $fsuffix = 'fasta';
+} else {
+    die "$0: Unrecognized file format for input #1 '$inputs[0]': must be fastq or fasta!\n";
+}
+
+my $allinput = "$outdir/initial_input.$suffix.gz";    # single-end
+my $allinput1 = "$outdir/initial_input_1.$suffix.gz"; # PE
+my $allinput2 = "$outdir/initial_input_2.$suffix.gz"; # "
+my $trinput = "$outdir/assembly_input.$suffix";       # single-end
+my $trinput1 = "$outdir/assembly_input_1.$suffix";    # PE
+my $trinput2 = "$outdir/assembly_input_2.$suffix";    # "
+if ($PE) {
+    my (@inputs1, @inputs2);
+    foreach (@inputs) {
+        if (/_1\.f/) {
+            push @inputs1, $_;
+        } elsif (/_2\.f/) {
+            push @inputs2, $_;
+        } else {
+            die "$0: cannot determine if input '$_' is end 1 or 2!\n";
+        }
+    }
+    &execute("$opencmd @inputs1 | gzip > $allinput1", 1, $LOG);
+    &execute("$opencmd @inputs2 | gzip > $allinput2", 1, $LOG);
+} else {
+    &execute("$opencmd @inputs | gzip > $allinput", 1, $LOG);
+}
+
+my ($isum, $imax, $psum, $pmax, $aln, $iter);
+($isum, $imax) = &initialize_iteration(++$iter);
+if ($imax < $maxlen) {
+    {
+        $psum = $isum;
+        ($aln, $isum, $imax) = &initialize_iteration(++$iter);
+        ## Stopping conditions: no aligned reads OR assembly length unchanged OR max contig length passes threshold OR too many iterations
+        redo unless $aln == 0 || $isum == $psum || $imax >= $maxlen || $iter > $maxiter;
+    }
+}
+
+system "gzip $trinput";
+system "ln -sf $dirs{$iter}{trinity}/trinity.fa $outdir/final.fa";
+print "$0 $seedfa complete!\n";
+exit;
+
+
+
+
+
+sub iterate {
+    my $I = shift;
+    &logreport("\n\n************\nITERATION $I\n************\n\n", 1, $LOG);
+    ## Location prep
+    my $Idir = "$iterdir/$I";
+    $dirs{$I}{$_} = "$Idir/$_" foreach qw/ samples aligns index trinity /;
+    system "mkdir $_" foreach values %{ $dirs{$I} };
+    ## Alignment reference
+    my $Iseed = "$dirs{$I}{index}/seed";
+    my $I0 = $I-1;
+    my $I0fasta = $I==1 ? $seedfa : "$dirs{$I0}{trinity}/trinity.fa";
+    &logreport("ln -sf $I0fasta $Iseed.fa", 1, $LOG);
+    &logreport("samtools faidx $Iseed.fa", 1, $LOG);
+    &logreport("$bowtie2-build $Iseed.fa $Iseed > $Iseed.log", 1, $LOG);
+    my ($any_aln, $sumcontig, $maxcontig);
+    ## Align
+    my $Ibt2 = "$dirs{$I}{aligns}/bowtie2";
+    my $Ialign = "$Ibt2.aligned";
+    my $Iunaln = "$Ibt2.unaligned";
+    my $I0unaln = $I==1 ? $allinput : "$dirs{$I0}{aligns}/bowtie2.unaligned";
+    if ($PE) {
+        my $I0unaln_fq1 = "${I0unaln}_1.$suffix.gz";
+        my $I0unaln_fq2 = "${I0unaln}_2.$suffix.gz";
+        &execute("$bowtie2 --local -p $cores -x $Iseed -1 $I0unaln_fq1 -2 $I0unaln_fq2 -S $Ialign.sam 2> $Ibt2.align_summary.txt", 1, $LOG);
+        my $fqu_cmd = "$bin/fastqUnaligned -fq1 $I0unaln_fq1 -fq2 $I0unaln_fq -p $Ibt2.unaligned --no-gzip --aligned";
+        $fqu_cmd .= ' --fasta' if $is_fa;
+        &execute("$fqu_cmd $Ialign.sam", 1, $LOG);
+        &execute("cat ${Iunaln}_aligned_${_}.$fsuffix ${Iunaln}_orphans_${_}.$fsuffix | gzip > ${Ialign}_${_}.$suffix.gz", 1, $LOG) foreach (1,2);
+        &execute("rm -f $Ialign.sam ${Iunaln}_aligned_* ${Iunaln}_orphans_*", 1, $LOG);
+        chomp($any_aln = `zcat ${Ialign}_1.$suffix.gz | head | wc -l`);
+        if ($any_aln) {
+            &execute("zcat ${Ialign}_1.$suffix.gz >> $trinput1", 1, $LOG);
+            &execute("zcat ${Ialign}_2.$suffix.gz >> $trinput2", 1, $LOG);
+            my $Itrinfa = "$dirs{$I0}{trinity}/trinity.fa";
+            &execute("$Trinity --seqType $suffix --max_memory $mem --left $trinput1 --right $trinput2 --CPU $cores --min_contig_length $minlen --output $dirs{$I0}{trinity}", 1, $LOG);
+            &execute("cat $dirs{$I0}{trinity}/Trinity.fasta | $bin/fasta2tab | perl -pe 's/ [^\t]+//' | awk '{ print \$0\"\\t\"length(\$2) }' | sort -k3,3nr | cut -f1-2 | $bin/tab2fasta > $Itrinfa", 1, $LOG);
+            &execute("$bin/fastaLengths -f $Itrinfa > $Itrinfa.lengths", 1, $LOG);
+            chomp($sumcontig = `bash -c 'paste -s -d+ <(cut -f2 $Itrinfa.lengths) | bc'`);
+            chomp($maxcontig = `cut -f2 $Itrinfa.lengths | sort -nr | head -1`);
+        }
+    } else {
+        &execute("$bowtie2 --local -p $cores --al-gz $Ialign.$suffix.gz --un-gz $Iunaln.$suffix.gz -x $Iseed -U $I0unaln -S /dev/null 2> $Ibt2.align_summary.txt", 1, $LOG);
+        chomp($any_aln = `zcat $Ialign.$suffix.gz | head | wc -l`);
+        if ($any_aln) {
+            &execute("zcat $Ialign.$suffix.gz >> $trinput", 1, $LOG);
+            my $Itrinfa = "$dirs{$I0}{trinity}/trinity.fa";
+            &execute("$Trinity --seqType $suffix --max_memory $mem --single $trinput --CPU $cores --min_contig_length $minlen --output $dirs{$I0}{trinity}", 1, $LOG);
+            &execute("cat $dirs{$I0}{trinity}/Trinity.fasta | $bin/fasta2tab | perl -pe 's/ [^\t]+//' | awk '{ print \$0\"\\t\"length(\$2) }' | sort -k3,3nr | cut -f1-2 | $bin/tab2fasta > $Itrinfa", 1, $LOG);
+            &execute("$bin/fastaLengths -f $Itrinfa > $Itrinfa.lengths", 1, $LOG);
+            chomp($sumcontig = `bash -c 'paste -s -d+ <(cut -f2 $Itrinfa.lengths) | bc'`);
+            chomp($maxcontig = `cut -f2 $Itrinfa.lengths | sort -nr | head -1`);
+        }
+    }
+    return ($any_aln, $sumcontig, $maxcontig);
+}
+    

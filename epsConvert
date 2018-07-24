@@ -1,0 +1,14 @@
+#!/usr/bin/env perl
+
+## written by apa from a one-liner by asg
+
+my @eps = glob "$ARGV[0]/*.eps";
+my @png = glob "$ARGV[0]/*.png";
+if (scalar @png != scalar @eps) {	# either no .png, or some .eps unconverted
+    foreach my $epsname (@eps) {
+	(my $pngname = $epsname) =~ s/\.eps$//;
+	system "python /home/apa/local/bin/epsconvert.py $epsname $pngname" unless -e $pngname;	# convert eps unless png exists
+    }
+}
+
+

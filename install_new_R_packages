@@ -1,0 +1,445 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use IO::CaptureOutput qw / capture_exec /;
+use Getopt::Long;
+
+## written by apa 2011/04/19
+## fixed by apa 2011/12/14
+
+chomp(my $I = `whoami`);
+die "Must be logged on as 'bioinfo'!\n" unless $I eq 'bioinfo';
+
+my %repoURLs = (  # entire string inside 'available.packages()' call
+    'cran' => 'http://cran.r-project.org/src/contrib/',
+    'omegahat' => 'contrib.url("http://www.omegahat.org/R/", type="source")',
+    'rforge' => 'contrib.url("http://R-Forge.R-project.org/", type="source")',
+    'bioc_core' => 'paste("http://www.bioconductor.org/packages",bioc_ver,"bioc/src/contrib/",sep="/")',
+    'bioc_exp' => 'paste("http://www.bioconductor.org/packages",bioc_ver,"data/experiment/src/contrib/",sep="/")',
+    'bioc_annot' => 'paste("http://www.bioconductor.org/packages",bioc_ver,"data/annotation/src/contrib/",sep="/")'
+    );
+
+my %blacklists = (  # packages known to break or hang biocLite() or otherwise stall the install process
+    'cran' => [qw/ BMA BMN BMS ConvergenceConcepts HumMeth27QCReport ImageMetrics IsoGeneGUI MLPAstats Metabonomics mlogitBMA onemap /],
+    'omegahat' => [qw/  /],
+    'rforge' => [qw/  /],
+    'bioc_core' => [qw/ MBCB genArise iterativeBMA iterativeBMAsurv /],
+    'bioc_exp' => [qw/  /],
+    'bioc_annot' => [qw/  /]
+    );
+
+my $cranrepo = join "\n", ('repos <- getOption("repos")','repos["CRAN"] <- "http://cran.wustl.edu"','options(repos=repos)');
+
+my ($version, $continue);
+GetOptions("v=s" => \$version, "continue" => \$continue);
+die "Invalid R version format: must be \"\d+.\d+.[01]\"\n" unless $version =~ /^\d+\.\d+\.[01]$/;
+my $Rdir = "/n/site/inst/Linux-x86_64/bioinfo/R/$version/bin";
+my $logdir = "/n/site/inst/Linux-x86_64/bioinfo/R/$version/logs";
+die "'$logdir' does not exist: new R version not installed!  Stopping.\n" unless -d $logdir;
+chdir $logdir;
+
+$mode = $continue ? '>>' : '>';  # appends if $continue; else overwrites
+system "rm -f *.log" unless $continue;
+my $globallog = "install_new_packages.log";
+open LOG, "$mode $globallog";
+close LOG;
+
+chomp(my $start = `date`);
+&logreport("****************************************\nRESTARTED\n****************************************\n", 0, $globallog) if $continue;
+&logreport("VERSION\t$version\nSTART\t$start\n", 0, $globallog);
+
+unless ($continue) {
+    print "Checking previous packages: $start\n";
+    my $script = &Rcheck;
+    open RS, "> check_prev.R";
+    print RS $script;
+    close RS;
+    system "nohup $Rdir/R --vanilla < check_prev.R > check_prev.Rout";  # always checks current sitewide
+}
+
+my $logfile;
+foreach my $repo (qw/ cran omegahat rforge bioc_exp bioc_core bioc_annot /) {
+    sleep 1;   # for CTRL-Cing
+    if ($continue && -e "install_$repo.times.log") {
+        chomp(my $check = `tail -1 install_$repo.times.log`);
+        if ($check eq 'Complete!') {  # repository install already complete
+			print "$repo already complete: skipping\n";
+			next;
+		}
+    }
+    $logfile = "install_$repo.log";
+    open LOG, "$mode $logfile";
+    close LOG;
+
+    my $script = Rscript($repo);
+    $script = &bioc_annot_greps . "\n$script" if $repo eq 'bioc_annot';
+##    $script = "x <- grep(\"BIOC_VERSION\",body(biocinstall))\ny <- unlist(strsplit(as.character(body(biocinstall)[x[1]]), split='\"', fixed=T))\nthis_bioc_ver <- as.numeric(y[2])\n$script" if $repo =~ /^bioc/;
+    $script = "this_bioc_ver <- tools:::.BioC_version_associated_with_R_version\n$script" if $repo =~ /^bioc/;
+    $script = "source(\"http://bioconductor.org/biocLite.R\")\n$script";
+    open RS, "> install_$repo.R";
+    print RS $script;
+    close RS;
+
+    chomp(my $now = `date`);
+    &logreport("Installing $repo packages: $now\n", 1, $globallog);
+    execute("nohup $Rdir/R --vanilla < install_$repo.R $mode install_$repo.Rout");
+    chomp(my $now = `date`);
+    &logreport("$repo complete: $now\n", 1, $globallog);
+}
+
+my @libs = `du -ch /n/site/inst/Linux-x86_64/bioinfo/R/$version/lib64/R/library/`;
+my $libsize = (split /\s+/, $libs[-1])[0];
+pop @libs foreach (1..2);
+my %libnames;
+foreach (@libs) {
+    $libnames{$1} = 1 if $_ =~ /$version\/lib64\/R\/library\/([^\/]+)$/;
+}
+my $libnum = scalar keys %libnames;
+
+chomp(my $now = `date`);
+print "Finalizing package installation: $now\n";
+my $script = &Rfinal;
+open RS, "> finalize_packages.R";
+print RS $script;
+close RS;
+system "nohup $Rdir/R --vanilla < finalize_packages.R > finalize_packages.Rout";  # checks installs, generates final package reports
+system "tar -cf package_report.tar final_*.txt";       # tar the final package reports generated above
+system "cp package_report.tar /n/projects/apa/drop/package_report_$version.tar";  # send to windows-accessible location
+chomp(my $end = `date`);
+&logreport("END\t$end\nPACKAGES\t$libnum\nSPACE\t$libsize\n\n", 0, $globallog);
+exit;
+
+
+sub execute {
+    my $COM = shift;
+    $! = undef;
+    my ($success, $messages) = capture_exec($COM);	# capture any STDOUT/STDERR from command and report this also
+    if ($messages) {
+	&logreport($messages, 0, $logfile);  # all &execute writes go to $logfile
+    } elsif (!$success) {
+	&logreport("\nPERL WARNING: command '$COM' failed: $!\n\n", 0, $logfile);
+    }
+}
+
+
+
+
+
+
+sub Rcheck {
+    my $doc = <<'EOF';
+source("http://bioconductor.org/biocLite.R")
+bioc_ver <- tools:::.BioC_version_associated_with_R_version
+
+base.names <- sapply(searchpaths()[grep("^/n/",searchpaths())], FUN=function(x){strsplit(x,"/")[[1]][12]})  # names of the base packages
+
+cran.pkg <- available.packages("http://cran.r-project.org/src/contrib/")
+write.table(cran.pkg, "cran_packages.txt", sep="\t", quote=F)
+bioc.core.pkg <- available.packages(paste("http://www.bioconductor.org/packages",bioc_ver,"bioc/src/contrib/",sep="/"))
+write.table(.pkg, "bioc.core_packages.txt", sep="\t", quote=F)
+bioc.annot.pkg <- available.packages(paste("http://www.bioconductor.org/packages",bioc_ver,"data/annotation/src/contrib/",sep="/"))
+write.table(.pkg, "bioc.annot_packages.txt", sep="\t", quote=F)
+bioc.exp.pkg <- available.packages(paste("http://www.bioconductor.org/packages",bioc_ver,"data/experiment/src/contrib/",sep="/"))
+write.table(.pkg, "bioc.exp_packages.txt", sep="\t", quote=F)
+omega.pkg <- available.packages(contrib.url("http://www.omegahat.org/R", type="source"))
+write.table(.pkg, "omega_packages.txt", sep="\t", quote=F)
+forge.pkg <- available.packages(contrib.url("http://R-Forge.R-project.org/", type="source"))
+write.table(.pkg, "forge_packages.txt", sep="\t", quote=F)
+
+i.old <- installed.packages()
+
+old.cran <- rownames(cran.pkg)[rownames(cran.pkg) %in% rownames(i.old)]
+old.bioc.core <- rownames(bioc.core.pkg)[rownames(bioc.core.pkg) %in% rownames(i.old)]
+old.bioc.annot <- rownames(bioc.annot.pkg)[rownames(bioc.annot.pkg) %in% rownames(i.old)]
+old.bioc.exp <- rownames(bioc.exp.pkg)[rownames(bioc.exp.pkg) %in% rownames(i.old)]
+old.omega <- rownames(omega.pkg)[rownames(omega.pkg) %in% rownames(i.old)]
+old.forge <- rownames(forge.pkg)[rownames(forge.pkg) %in% rownames(i.old)]
+
+old.other <- i.old[-match(c(base.names,old.cran,old.bioc.core,old.bioc.annot,old.bioc.exp,old.omega,old.forge),rownames(i.old)),]
+
+write.table(c(paste("Lost packages from",version[13][[1]]), rownames(old.other)), "packages_no_longer_available.txt", row.names=F, col.names=F, quote=F)
+save.image("check_prev.RData")
+
+version[13][[1]]
+bioc_ver
+nrow(old.other)
+rownames(old.other)
+EOF
+    return $doc;
+}
+
+
+
+
+
+
+sub Rscript {
+    my $REPO = shift;
+    my $blackstring = join ',', map { "\"$_\"" } @{ $blacklist{$REPO} };
+	my $reposcall = $REPO eq 'cran' ? "$cranrepo\n" : "\n";
+    my $doc = <<EOF;
+$reposcall
+repo.pkg <- available.packages($repoURL{$REPO})
+pkgs <- rownames(repo.pkg)
+N <- length(pkgs)
+skip <- c($blackstring)
+
+if (file.exists("install_$REPO.times.log")) {
+    already <- as.matrix(read.delim("install_$REPO.times.log", sep="\\t", header=T))
+    fh <- file("install_$REPO.times.log", open="at")
+} else {
+    fh <- file("install_$REPO.times.log", open="wt")
+    writeLines("Num\\tPackage\\tElapsed", fh)
+    already <- c()  # dummy object
+}
+for (i in 1:N) {
+    if (pkgs[i] %in% already[,2]) { next }
+    if (pkgs[i] %in% skip) {
+        writeLines(paste(i,pkgs[i],"Skipped",sep="\\t"), fh)
+    } else {
+        cat("Package:",i,"/",N,"\\n"); flush.console()
+	now <- Sys.time()
+	writeLines(paste(i,pkgs[i],"Installing:",now,sep="\\t"), fh)
+	flush(fh)
+	time <- NA
+        tryCatch(time <- system.time( biocLite(pkgs[i]) ))
+	if (!is.na(time)) {
+	    writeLines(paste(i,pkgs[i],round(time[[3]],2),sep="\\t"), fh)
+        } else {
+	    writeLines(paste(i,pkgs[i],"FAILED",sep="\\t"), fh)
+        }
+    }
+    flush.connection(fh)
+}
+writeLines("Complete!", fh)
+EOF
+    return $doc;
+}
+
+
+
+
+
+
+sub bioc_annot_greps {
+    my $doc = <<'EOF';
+strings1 <- c("Hs","Mm","Rn","Dm","Ce","Sc","Ec","Dr","Gg","At")  # genus/species strings for org.*.db, BSgenome.*, SNPlocs.*, hom.*
+strings2 <- c("hgu","hthgu","gahgu","hu","Hu","hg","Hs","u133","illuminaHu","lumiH","mgu","htmg","mo","mu","illuminaMo","lumiMo","ye","yg","human","mouse","celegans","chicken","ecoli","dros","fly","worm","zebrafish","ath","ag","arabidopsis","OperonHuman")  # Sstrings beginning cdf, .db, other array packages
+strings3 <- c("celegans","chicken","cyto","eco","e.co","hg","mg","ht.hg","ht.mg","hu","mu","mo","mirna","u133","yeast","yg","zebrafish")  # strings for pd.*.db array platform design packages
+strings4 <- c("RmiR","mir","targetscan","HsAgilent","MmAgilent")  # prefixes for other desired annot package sets
+strings5 <- c("GO.db","KEGG.db","PFAM.db","indac.db","oligoData")  # manually specify any additional annot packages
+
+##### strings1 greps
+
+greps1 <- nogreps1 <- c()
+for (i in c("org","BSgenome","SNPlocs","hom")) {
+    for (j in strings1) {
+    	query <- paste("^",i,"\\.",j,sep="")
+    	x <- grep(query,bioc.annot,T)
+	if (length(x) > 0) {
+	    greps1 <- c(greps1, x) 
+	} else {
+	    nogreps1 <- c(nogreps1, query) 
+	}
+    }
+}
+greps1 <- sort(unique(greps1))
+set1 <- bioc.annot[greps1]
+set1
+
+if (length(nogreps1) > 0) { cat("Nothing matching greps:\n"); nogreps1 }
+
+##### strings2 greps
+
+greps2 <- nogreps2 <- c()
+for (i in strings2) { 
+    query <- paste("^",i,sep="")
+    x <- grep(query,bioc.annot,T)
+    if (length(x) > 0) {
+        greps2 <- c(greps2, x) 
+    } else {
+        nogreps2 <- c(nogreps2, query) 
+    }
+}
+greps2 <- sort(unique(greps2))
+set2 <- bioc.annot[greps2]
+set2
+
+if (length(nogreps2) > 0) { cat("Nothing matching greps:\n"); nogreps2 }
+
+##### strings3 greps
+
+greps3 <- nogreps3 <- c()
+for (i in strings3) { 
+    query <- paste("^pd\\.",i,sep="")
+    x <- grep(query,bioc.annot,T)
+    if (length(x) > 0) {
+        greps3 <- c(greps3, x) 
+    } else {
+        nogreps3 <- c(nogreps3, query) 
+    }
+}
+greps3 <- sort(unique(greps3))
+set3 <- bioc.annot[greps3]
+
+if (length(nogreps3) > 0) { cat("Nothing matching greps:\n"); nogreps3 }
+
+## auxiliary pd.*.(hg|mm) greps
+all.pd <- grep("^pd\\.",bioc.annot,T)
+hgmm.pd.hg.grep <- grep("hg",bioc.annot[all.pd],T)
+hgmm.pd.mm.grep <- grep("mm",bioc.annot[all.pd],T)
+hgmm.pd.hg <- bioc.annot[all.pd[hgmm.pd.hg.grep]]
+hgmm.pd.mm <- bioc.annot[all.pd[hgmm.pd.mm.grep]]
+hgmm.pd.hg.new <- hgmm.pd.hg[!(hgmm.pd.hg %in% set3)]
+hgmm.pd.mm.new <- hgmm.pd.mm[!(hgmm.pd.mm %in% set3)]
+if (length(hgmm.pd.hg.new) > 0) {
+    set3 <- c(set3, hgmm.pd.hg.new)
+} else {
+    cat("Nothing matching '^pd.*.hg' greps\n")
+}
+if (length(hgmm.pd.mm.new) > 0) {
+    set3 <- c(set3, hgmm.pd.mm.new)
+} else {
+    cat("Nothing matching '^pd.*.mm' greps\n")
+}
+greps3 <- sort(unique(c(greps3, all.pd[hgmm.pd.hg.grep], all.pd[hgmm.pd.mm.grep]))) 
+set3 <- unique(set3)  # might any aux greps be in hg and mm?
+set3
+
+##### strings4 greps
+
+greps4 <- nogreps4 <- c()
+for (i in strings4) { 
+    query <- paste("^",i,sep="")
+    x <- grep(query,bioc.annot,T)
+    if (length(x) > 0) {
+        greps4 <- c(greps4, x) 
+    } else {
+        nogreps4 <- c(nogreps4, query) 
+    }
+}
+greps4 <- sort(unique(greps4))
+set4 <- bioc.annot[greps4]
+set4
+
+if (length(nogreps4) > 0) { cat("Nothing matching greps:\n"); nogreps4 }
+
+## Identify any standalone .db files, like GO.db or PFAM.db -- want these, and not the .db files with associated cdfs, like hgu133a.db.
+##  The latter types which we will download are to be explicitly identified with string matching; we don't want ALL the Affy arrays...
+if (FALSE) {  # it was a nice idea, but there are too many unnecessary singleton .db packages: replaced by 'strings5' set
+    all.db <- grep("\\.db$", bioc.annot)
+    all.db <- setdiff(all.db, c(greps1, greps2, greps3, greps4))	# remove anything already filtered for
+    dbnames <- sub(".db","",bioc.annot[all.db])
+    dbsingle <- rep(TRUE, length(dbnames))
+    for (i in 1:length(dbnames)) { 
+        if (length(grep(paste("^",dbnames[i],sep=""),bioc.annot,T)) > 1) {	# not a solo .db package; part of a set
+            dbsingle[i] <- FALSE
+        }
+    }
+    dbs <- all.db[dbsingle]
+}
+
+##### strings5 greps
+
+greps5 <- nogreps5 <- c()
+for (i in strings5) { 
+    x <- grep(i,bioc.annot,T)
+    if (length(x) > 0) {
+        greps5 <- c(greps5, x) 
+    } else {
+        nogreps5 <- c(nogreps5, i) 
+    }
+}
+greps5 <- sort(unique(greps5))
+set5 <- bioc.annot[greps5]
+set5
+
+if (length(nogreps5) > 0) { cat("Nothing matching greps:\n"); nogreps5 }
+
+## Final set of annot packages to install / report all BioC annot packages that will not be installed
+
+allgreps <- unique(c(greps1, greps2, greps3, greps4, greps5))
+allgreps25 <- unique(c(greps2, greps3, greps4, greps5))
+pkgs <- bioc.annot[allgreps]
+bioc.annot.noinstall <- setdiff(bioc.annot, pkgs)
+write.table(c(paste(version[13][[1]],"BioC version",this_bioc_ver,"annotation packages not installed:"), bioc.annot.noinstall), "bioc_annot_packages_not_installed.txt", row.names=F, col.names=F, quote=F)
+
+bioc.annot.noinstall
+
+EOF
+return $doc;
+}
+
+
+
+
+
+
+
+sub Rfinal {
+    my $doc = <<'EOF';
+source("http://bioconductor.org/biocLite.R")
+bioc_ver <- tools:::.BioC_version_associated_with_R_version
+
+cran.pkg <- available.packages("http://cran.r-project.org/src/contrib/")
+bioc.core.pkg <- available.packages(paste("http://www.bioconductor.org/packages",bioc_ver,"bioc/src/contrib/",sep="/"))
+bioc.annot.pkg <- available.packages(paste("http://www.bioconductor.org/packages",bioc_ver,"data/annotation/src/contrib/",sep="/"))
+bioc.exp.pkg <- available.packages(paste("http://www.bioconductor.org/packages",bioc_ver,"data/experiment/src/contrib/",sep="/"))
+omega.pkg <- available.packages(contrib.url("http://www.omegahat.org/R", type="source"))
+#forge.pkg <- available.packages(contrib.url("http://R-Forge.R-project.org"), type="source"))
+forge.pkg <- c()
+
+inst <- installed.packages()
+write.table(rownames(inst), "final_packages_installed.txt", row.names=F, col.names=F, quote=F)
+
+nla <- scan("packages_no_longer_available.txt", what="", skip=1)
+ok <- nla %in% rownames(inst)
+nla[ok]
+nla[!ok]
+write.table(nla[!ok], "final_prev_packages_lost.txt", row.names=F, col.names=F, quote=F)
+
+cran.ok <- rownames(cran.pkg) %in% rownames(inst) 
+omega.ok <- rownames(omega.pkg) %in% rownames(inst) 
+forge.ok <- rownames(forge.pkg) %in% rownames(inst) 
+bioc.core.ok <- rownames(bioc.core.pkg) %in% rownames(inst) 
+bioc.exp.ok <- rownames(bioc.exp.pkg) %in% rownames(inst) 
+
+rownames(cran.pkg)[!cran.ok]
+rownames(omega.pkg)[!omega.ok]
+rownames(forge.pkg)[!forge.ok]
+rownames(bioc.core.pkg)[!bioc.core.ok]
+rownames(bioc.exp.pkg)[!bioc.exp.ok]
+
+write.table(rownames(cran.pkg)[!cran.ok], "final_cran_not_installed.txt", row.names=F, col.names=F, quote=F)
+write.table(rownames(omega.pkg)[!omega.ok], "final_omegahat_not_installed.txt", row.names=F, col.names=F, quote=F)
+#write.table(rownames(forge.pkg)[!forge.ok], "final_rforge_not_installed.txt", row.names=F, col.names=F, quote=F)
+write.table(rownames(bioc.core.pkg)[!bioc.core.ok], "final_bioc_core_not_installed.txt", row.names=F, col.names=F, quote=F)
+write.table(rownames(bioc.exp.pkg)[!bioc.exp.ok], "final_bioc_exp_not_installed.txt", row.names=F, col.names=F, quote=F)
+
+bioca <- rownames(bioc.annot.pkg)
+bioc.annot.ok <- bioca %in% rownames(inst) 
+bioca.nok <- bioca[!bioc.annot.ok]
+
+bioca.no <- scan("bioc_annot_not_installed.txt", what="", skip=1)
+dni <- setdiff(bioca.nok, bioca.no)  # bioc.annot packages desired but not installed
+dni
+ind <- setdiff(bioca.no, bioca.nok)  # bioc.annot packages installed but not desired
+ind
+
+write.table(bioca.nok, "final_bioc_annot_not_installed.txt", row.names=F, col.names=F, quote=F)
+
+readme <- c(
+       "File contents:",
+       "final_packages_installed.txt: all packages currently installed",
+       "final_prev_packages_lost.txt: packages from the previous sitewide that could not be found in the current repositories",
+       "final_cran_not_installed.txt: CRAN packages that were not installed",
+       "final_omegahat_not_installed.txt: Omegahat packages that were not installed",
+       "final_rforge_not_installed.txt: R-Forge packages that were not installed",
+       "final_bioc_core_not_installed.txt: Bioconductor core packages that were not installed",
+       "final_bioc_exp_not_installed.txt: Bioconductor experiment data packages that were not installed",
+       "final_bioc_annot_not_installed.txt: Bioconductor annotation packages that were not installed",
+       "final_README.txt: this file" )
+write.table(readme, "final_README.txt", row.names=F, col.names=F, quote=F)
+EOF
+    return ($doc);
+}
+

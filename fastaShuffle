@@ -1,0 +1,25 @@
+#!/usr/bin/env perl
+require '/home/apa/local/bin/apa_routines.pm';  # &blockify
+use strict;
+
+my ($header, @headers, %seq);
+
+open my $IN, $ARGV[0] or die "$0: Cannot open fasta file '$ARGV[0]': $!\n";
+while (<$IN>) {
+    s/[\n\r]+$//;
+    if (/^>(.*)/) {
+	$header = $1;
+	push @headers, $header;
+    } else {
+	$seq{$header} .= $_;
+    }
+}
+close $IN;
+
+foreach my $header (@headers) {
+    my $cmd = 'paste -s -d+ <(echo "'.$seq{$header}.'" | sed \'s/\(.\)/\1\n/g\' | shuf) | sed \'s/+//g\'';
+#    print STDERR "$cmd\n";
+    chomp(my $shuf = `bash -c "$cmd"`);
+    print ">$header\n".${ &blockify($shuf) }."\n";
+}
+

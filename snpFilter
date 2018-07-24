@@ -1,0 +1,130 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+# Deps:
+
+## Inputs
+my $invcf;
+my $outvcf;
+my $prefix;
+my $depth;
+my $quality;
+my $keep_effects;
+my $drop_effects;
+my $keep_hethom;
+my ($help, $man, $version);
+
+GetOptions(
+    "v=s" => \$invcf,
+    "o=s" => \$outvcf,
+    "d=i" => \$depth,
+    "q=f" => \$quality,
+    "ke=s" => \$keep_effects,
+    "de=s" => \$drop_effects,
+    "hh=s" => \$keep_hethom,
+    "help" => \$help,
+    "man" => \$man,
+    "version" => \$version
+    );
+
+## Globals
+my $header;   # VCF header
+my @output;   # VCF output
+my $efilter;  # snpEff effect-type filter; keep|drop
+my %filtEff;  # snpEff effects to filter on
+my %lost;     # tally for losses due to filters
+my %keepHH = map {("\U$_"=>1)} split /,/, $keep_hethom;  # zygosity filter; HET|HOM
+
+($outvcf = $invcf) =~ s/\.vcf$/.filtered.vcf/ unless $outvcf;
+
+if ($keep_effects && $drop_effects) {
+    die "$0: Can specify either '-ke' or '-de' but not both!\n";
+} elsif ($keep_effects) {
+    $efilter = 'keep';
+    %filtEff = map {("\U$_"=>1)} split /,/, $keep_effects;
+} elsif ($drop_effects) {
+    $efilter = 'drop';
+    %filtEff = map {("\U$_"=>1)} split /,/, $drop_effects;
+}
+
+
+## Main
+
+open my $IN, '<', $invcf or die "$0: Cannot read VCF file '$invcf': $!\n";
+while (my $line = <$IN>) {
+    $line =~ s/[\n\r]+$//;
+    if ($line =~ /^#/) {
+	$header .= "$line\n";
+	next;
+    }
+    my @data = split /\t/, $line;
+    my ($chr, $pos, $id, $ref, $alt, $qual, $filter, $info, $genoF, $genoV) = @data;
+    if ($quality && $qual < $quality) {
+	$lost{Q}++;
+	next;
+    }
+    my (%INFO, $type, $hh, $whichEff, @selectEffs, @noneffect);
+    my @ifields = split /;/, $info;
+    foreach my $i (0..$#ifields) {
+	if ($ifields[$i] =~ /EFF=/) {
+	    if ($efilter) {  # filtering on effects
+		$whichEff = $i;
+		my ($key, $val) = split /=/, $ifields[$i];
+		my @effTypes = split /,/, $val;
+		foreach my $impact (@effTypes) { 
+		    my $effect = (split /\(/, $impact)[0];
+		    if ($efilter eq 'keep' && $filtEff{$effect}) {
+			push @selectEffs, $impact;  # keep if kept
+		    } elsif ($efilter eq 'drop' && !$filtEff{$effect}) {
+			push @selectEffs, $impact;  # keep if not dropped
+		    }
+		}
+	    } else {  # not filtering on effects
+		$ifields[$i] =~ s/^EFF=//;
+		@selectEffs = ($ifields[$i]);
+	    }
+	} else {
+	    push @noneffect, $ifields[$i];
+	    if ($ifields[$i] =~ /=/) {
+		my ($key, $val) = split /=/, $ifields[$i];
+		$INFO{$key} = $val;
+	    } elsif ($ifields[$i] =~ /^(HET|HOM)$/) {
+		$hh = $ifields[$i];
+	    } elsif ($ifields[$i] =~ /^(SNP|MNP|INS|DEL)$/) {
+		$type = $ifields[$i];
+	    } elsif ($ifields[$i] eq 'STR') {  # what the hell is STR??
+		# ignore
+	    } else {
+		print "Unknown field type '$ifields[$i]'!\n";
+	    }
+	}
+    }
+    if ($depth && $INFO{DP} < $depth) {
+	$lost{D}++;
+	next;
+    }
+    if ($hh && !$keepHH{$hh}) {
+	$lost{HH}++;
+	next;
+    }
+    if ($efilter && !@selectEffs) {
+	$lost{EF}++;
+	next;
+    }
+    my $eff2 = join ',', @selectEffs;
+    my $info2 = join ';', (@noneffect, "EFF=$eff2");
+    my $line2 = join "\t", (@data[0..6], $info2, $genoF, $genoV);
+    push @output, "$line2\n";
+}
+close $IN;
+
+open my $OUT, '>', $outvcf or die "$0: Cannot write to VCF file '$outvcf': $!\n";
+print $OUT $header, @output if @output;  # actual filtered results exist -- otherwise leave as size-0 VCF
+close $OUT;
+
+print "LOST: ", join(" | ", map { "$_: $lost{$_}" } sort keys %lost), "\n";
+print "$0 Complete!\n";
+exit;
+

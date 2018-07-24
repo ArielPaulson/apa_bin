@@ -1,0 +1,37 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use strict;
+
+## Converts the header in one VCF file to the header from another.
+
+my ($invcf, $headvcf, $outvcf) = @ARGV;
+
+die "$0: input VCF '$invcf' does not exist!\n" unless -e $invcf;
+die "$0: header VCF '$invcf' does not exist!\n" unless -e $headvcf;
+die "$0: output VCF '$outvcf' not specified!\n" unless $outvcf;
+
+my $OUT = &open2('W', $outvcf, 'output VCF', 1);  # if $outvcf is .gz, then extra '1' indicates to use bgzip
+my $HEAD = &open2('R', $headvcf, 'header VCF');
+while (<$HEAD>) {
+    if (/^#/) {
+        print $OUT $_;
+    } else {
+        last;
+    }
+}
+close $HEAD;
+my $IN = &open2('R', $invcf, 'input VCF');
+while (<$IN>) {
+    if (/^#/) {
+        next;
+    } else {
+        print $OUT $_;
+    }
+}
+close $IN;
+close $OUT;
+
+system "tabix -p vcf -f $outvcf" if $outvcf =~ /\.gz/ && -e "$invcf.tbi";
+print "$0 $invcf complete!\n";
+exit;
+

@@ -1,0 +1,18 @@
+#!/usr/bin/perl
+
+my $verbose = $ARGV[1] eq '--verbose' ? 1 : 0;
+die "Not a directory!\n" unless -d $ARGV[0];
+&recurse($ARGV[0]);
+exit;
+
+
+sub recurse {
+    my $dir = shift;
+    (my $dir2 = $dir) =~ s/ /\\ /g;
+    print "Compressing: $dir\n" if $verbose;
+    system "gzip $dir2/*";
+    foreach my $subdir (glob "$dir2/*") {
+	next unless -d $subdir;
+	&recurse($subdir);
+    }
+}

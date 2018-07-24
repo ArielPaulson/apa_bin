@@ -1,0 +1,60 @@
+#!/usr/bin/env perl
+
+my (@files, $lines);
+my %modes = map {($_=>$_)} qw/ blast blat exonerate transfac sam bam /;
+$modes{psl} = 'blat';
+$modes{match} = 'transfac';
+$modes{est2genome} = 'exonerate';
+$modes{$_} = 'blast' foreach qw/ blastn blastp blastx tblastx megablast /;
+my $mnames = join ', ', sort keys %modes;
+
+foreach (@ARGV) {
+    if ($_ eq '-l' || $_ eq '--lines') {
+	$lines = 1;
+    } elsif ($_ =~ /^--(.*)$/) {
+	$mode = $1;
+	die "Unsupported format '$mode': must be one of '$mnames'\n" unless $modes{$mode};
+    } else {
+	push @files, $_;
+    }
+}
+
+unless ($mode) {
+    my ($ext) = ($files[0] =~ /\.([^.]+)$/);
+    $modes{$ext} ? ($mode = $modes{$ext}) : (die "'--mode' not specified, and file extension is not recognized!\n");
+}
+
+print "LINES\t" if $lines;
+print "QUERIES\tFILE\n";
+my ($Ntotal, $Ltotal);
+foreach my $file (@files) {
+    my $N;
+    if ($mode eq 'blast') {
+	chomp($N = `cut -f1 $file | sort -u | wc -l`);
+    } elsif ($mode eq 'blat') {
+	chomp($N = `cut -f10 $file | sort -u | wc -l`);
+	$N -= 5;  # remove header contribution
+    } elsif ($mode eq 'transfac') {
+	chomp($N = `grep "^Inspecting sequence ID" $file | wc -l`);
+    } elsif ($mode eq 'exonerate') {
+	chomp($N = `grep "^\s+Query:" | sort -u | wc -l`);
+    } elsif ($mode eq 'bam') {
+	chomp($N = `samtools view $file | cut -f1 | sort -u | wc -l`);
+    } elsif ($mode eq 'sam') {
+	chomp($N = `cut -f1 $file | grep -v -P "^@" | sort -u | wc -l`);
+    }
+    $Ntotal += $N;
+    if ($lines) {
+	my $L = (split /\s+/, `wc -l $file`)[0];
+	print "$L\t$N\t$file\n";
+	$Ltotal += $_;
+    } else {
+	print "$N\t$file\n";
+    }
+}
+if ($lines) {
+    print "$Ltotal\t$Ntotal\tTOTAL\n";
+} else {
+    print "$Ntotal\tTOTAL\n";
+}
+exit;

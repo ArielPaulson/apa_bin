@@ -1,0 +1,113 @@
+#!/usr/bin/env Rscript
+
+#library(methods)
+
+ca <- commandArgs(trailing=TRUE)
+aln.file <- ca[1]
+ref.file <- ca[2]
+aln.type <- ca[3]
+strand.use <- ca[4]
+strand.show <- ca[5]  # none|same|opp
+min.len <- as.numeric(ca[5])
+AIO <- as.logical(ca[6])
+
+aln.bed <- paste0(aln.file,".bed")
+ref.bed <- paste0(ref.file,".bed")
+covg.file <- paste0(aln.file,".covg")
+covg.pdf <- paste0(covg.file,".pdf")
+covg.RData <- paste0(covg.file,".RData")
+
+ref.len <- read.fasta(ref.file)
+ref.len <- data.frame(REF=names(ref.len),START=1,END=nchar(ref.len))
+
+if (aln.type == "blast") {
+    
+    header.test <- suppressWarnings(as.numeric(unlist(strsplit(system(paste("head -n 1",aln.file),intern=TRUE),"\t"))))
+    has.header <- ifelse(is.na(header.test[3]), TRUE, FALSE)  # if "identity" column of first row is non-numeric, then header exists
+    aln <- read.delim(aln.file, as.is=TRUE, header=has.header)
+    if (nrow(aln)>12) {
+        if (colnames(aln)[13]=="Qlen") qlen <- aln[,13]
+    }
+    aln <- aln[,1:12]
+    colnames(aln) <- c("Query","Subj","Ident","Mlen","Mism","Ngaps","Qpos1","Qpos2","Spos1","Spos2","Eval","Score")
+    bed <- cbind(aln[,c(2,9,10,1,12)],Strand="+")
+    w.rev <- which(bed[,3]<bed[,2])
+    if (length(w.rev)>0) {
+        bed[w.rev,2:3] <- bed[w.rev,3:2]
+        bed[w.rev,6] <- "-"
+    }
+    bed[,2] <- bed[,2]-1
+    
+    stats <- list()
+    
+} else if (aln.type == "blat") {
+    
+    fullheader.test <- system(paste("head -n 5",aln.file,"| tail -n 1"),intern=TRUE)
+    has.fullheader <- ifelse(grepl("^-",fullheader.test), TRUE, FALSE)  # if first character of fifth row is "-", then standard psl header exists
+    if (has.fullheader) {
+        aln <- read.delim(aln.file, as.is=TRUE, skip=5)[,1:21]
+    } else {
+        header.test <- suppressWarnings(as.numeric(unlist(strsplit(system(paste("head -n 1",aln.file),intern=TRUE),"\t"))))
+        has.header <- ifelse(is.na(header.test[1]), TRUE, FALSE)  # if "identity" column of first row is non-numeric, then header exists
+        aln <- read.delim(aln.file, as.is=TRUE, header=has.header)[,1:21]
+    }
+    colnames(aln) <- c("Ident","Mism","Repm","Ns","Qgaps","Qgapbp","Sgaps","Sgapbp","Strand","Query","Qlen","Qpos1","Qpos2","Subj","Slen","Spos1","Spos2","Nblocks","Blocksizes","Qstarts","Sstarts")
+    multi <- aln$Nblocks>1
+    multi.Nb <- sum(aln$Nblocks[multi])
+    multi.blank <- aln[1,c(14,16,17,10,1,9)]
+    for (i in 1:6) multi.blank[[i]] <- NA
+    bed <- aln[!multi,c(14,16,17,10,1,9)]
+    if (multi.Nb>0) {
+        w.multi <- which(multi)
+        row <- nrow(bed)
+        bed <- do.call(rbind, c(list(bed), lapply(1:multi.Nb, function(i) multi.blank)))
+        for (i in 1:length(w.multi)) {
+            sz <- as.numeric(unlist(strsplit(aln$Blocksizes[w.multi[i]],",")))
+            st <- as.numeric(unlist(strsplit(aln$Sstarts[w.multi[i]],",")))
+            for (j in 1:length(sz)) {
+                row <- row + 1
+                fields <- aln[w.multi[i],c(14,16,17,10,1,9)]
+                fields[2] <- st[j]
+                fields[3] <- st[j]+sz[j]
+                bed[row,] <- fields
+            }
+        }
+    }
+    stats <- list(
+        blocks=aln$Nblocks,
+        match.pct=(aln$Ident + aln$Repm + aln$Ns) / aln$Qlen,
+        mism.pct=aln$Mism / aln$Qlen,
+        gap.pct=(aln$Qgapbp + aln$Sgapbp) / aln$Qlen
+    )
+}
+
+write.table(bed, aln.bed, sep="\t", quote=FALSE, row.names=FALSE, col.names=FALSE)
+write.table(ref.len, ref.bed, sep="\t", quote=FALSE, row.names=FALSE, col.names=FALSE)
+system(paste("coverageBed -d -a",ref.bed,"-b",aln.bed,">",covg.file))  # later: support for -s or -S
+
+covg <- read.delim(covg.file, as.is=TRUE, header=FALSE)
+covg <- split(covg[,5], covg[,1])
+
+AIO <- TRUE   # for now
+nrrl <- nrow(ref.len)
+
+if (nrrl==1) {
+    pdf(covg.pdf)
+    par(las=1, xaxs="i")
+    for (i in 1:nrrl) {
+        lineplot(covg[[ which(names(covg)==ref.len[i,1]) ]], xlab="Position", ylab="Coverage", main=ref.len[i,1])
+    }
+    dev.off()
+} else if (AIO) {
+    pdf(covg.pdf)
+    par(mfrow=c(3,1), las=1, xaxs="i")
+    for (i in 1:nrrl) {
+        lineplot(covg[[ which(names(covg)==ref.len[i,1]) ]], xlab="Position", ylab="Coverage", main=ref.len[i,1])
+    }
+    dev.off()
+} else {
+    
+}
+
+save(aln, stats, ref.len, covg, file=covg.RData)
+

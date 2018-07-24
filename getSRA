@@ -1,0 +1,310 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use LWP::Simple;
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+## Automatically downloads and fastq-dumps SRA data
+
+
+## Help below not in POD; much simpler.
+my $helpdoc = <<EOF;
+
+### Takes a file of SRA summary records for a BioProject, OR an equivalent ENA summary file (see below).
+### Converts the input file to a targets.txt file, which contains download links.
+### If specified, it can also download files and convert SRA->FASTQ.
+
+
+### Arguments:
+   
+   -i         : Input file (see below for instuctions on making this file)
+   -o         : Output directory (only if --download)
+   --download : Downloads all .sra files.
+   --convert  : Converts .sra to .fastq.gz.
+   --clobber  : Overwrites already-downloaded files, instead of skipping them.
+   --no-gzip  : Do not compress dumped SRA fastq files (by default, will compress).
+   --aspera   : SRA only: uses Aspera with 100Mb/s rate cap (instead of FTP).
+   --ENA      : Download from ENA (input file differs; --aspera not available; --convert not necessary)
+   --verbose  : Verbose reporting
+
+
+### Making an SRA input file:
+   
+   1. Visit SRA BioProject page for project.
+      (e.g. http://www.ncbi.nlm.nih.gov/bioproject/PRJNA122153)
+   
+   2. In the "Project Data" table, click on "SRA Experiments" link.
+      (here, the link with number "45", upper right corner of table)
+   
+   3. Save the records to file, using "Summary" format.
+      (use "Send to" links at top or bottom of page)
+   
+   4. Save as CSV (default).  Then convert to TSV (convert commas to tabs), strip any unwanted records, and KEEP HEADER.
+      (cat sra_result.csv | sed 's/","/\\t/g' | sed 's/"//g' > PRJNA122153.txt)
+   
+   5. Typically, column 9 ("Sample Title") is blank; fill this column with some sample alias if you want a good targets.txt file.
+      (here, can convert strings from column 2 like:  "GSM1131179: Pol2_planula; Nematostella vectensis; ChIP-Seq"  to column 11 value:  "Pol2_planula")
+      On Linux with X (not via remote terminal!!), "libreoffice --calc PRJNA122153.txt" should give you an Excel-like interface.
+   
+
+### Starting ENA with an input file:
+   
+   0. Normally, there is no input file.  Simply specify -i <ENA_sample_accession>.  Accessions start with "ERS", then 6 or more digits.
+   
+   If something goes wrong, OR, you only want certain files under that accession (not all), you can make a targets.txt file manually:
+   
+   1. Visit ENA page for accession.
+      (e.g. http://www.ebi.ac.uk/ena/data/view/ERS076384)
+   
+   2. Above the results table, there will be an option to download the results as TEXT
+      (the line says "Download: [1] - [N] of N results in TEXT", click the "TEXT")
+   
+   3. The file <accession.txt> will download.
+      (here, it downloads "ERS076384.txt")
+   
+   4. Rename this file with ".targets.txt" extension.
+      (e.g. "mv ERS076384.txt ERS076384.targets.txt")
+   
+   5. Remove any unwanted rows, KEEP HEADER.
+   
+   6. Just for reference, the column order you will get is (as of this writing, 20160923):
+      1:study_accession, 2:sample_accession, 3:secondary_sample_accession, 4:experiment_accession, 5:run_accession, 6:tax_id, 7:scientific_name, 
+      8:instrument_model, 9:library_layout, 10:fastq_ftp, 11:fastq_galaxy, 12:submitted_ftp, 13:submitted_galaxy, 14:cram_index_ftp, 15:cram_index_galaxy
+      
+      *** Only column 10, "fastq_ftp", is actually used by this script.  It is identified by column name, so it doesn\'t matter what column number it is. ***
+   
+   7. Run the getSRA script normally (as though the targets file did not exist); it will detect the targets file and continue.
+   
+EOF
+
+
+my ($input, $outdir, $download, $convert, $nogzip, $aspera, $clobber, $ENA, $verbose, $help);
+GetOptions("i=s"=>\$input, "o=s"=>\$outdir, "download"=>\$download, "convert"=>\$convert, "no-gzip"=>\$nogzip, "aspera"=>\$aspera, "clobber"=>\$clobber, "ENA"=>\$ENA, "verbose"=>\$verbose, "help"=>\$help);
+
+if ($help) {
+    print $helpdoc;
+    exit;
+}
+
+print "\n";  # push off prompt, in case in background;
+my $targets;
+if ($ENA) {
+    die "$0: ENA-mode input is not a file, nor an ERS-type accession!\n" unless -e $input || $input =~ /^ERS\d+/;
+    $targets = "$input.targets.txt";
+    $aspera = undef;   # not possible
+    $convert = undef;  # not required
+} else {
+    die "$0: No input specified or file not found!\n" unless -e $input;
+    ($targets = $input) =~ s/\.txt$/.targets.txt/;
+}
+
+($outdir = $input) =~ s/\.txt$// unless $outdir;
+$outdir .= '.1' if -e $outdir && !-d $outdir;  # unwisely-named ENA file?
+system "mkdir -p $outdir" unless -d $outdir;
+chomp($outdir = `readlink -f $outdir`);
+
+my $aspera_path = '/n/local/stage/aspera-connect/current';
+my $aspera_call = "$aspera_path/bin/ascp -i $aspera_path/etc/asperaweb_id_dsa.openssh -k 1 -T -l 100M";
+
+my $sra_ftp_root = 'sra/sra-instant/reads/ByStudy/sra/SRP';
+my $sra_ftp_url = "ftp://ftp-trace.ncbi.nlm.nih.gov/$sra_ftp_root";
+my $aspera_url = "anonftp\@ftp.ncbi.nlm.nih.gov:/$sra_ftp_root";
+
+my (%reps, @DL);
+
+
+## Create targets file
+
+if (! -e $targets || $clobber) {
+    
+    print STDERR "\n";  # push off prompt; probably running in background
+    chomp(my $lines = `tail -n +2 $input | wc -l`);
+    my $lw = length($lines);
+    
+    if ($ENA) {
+        
+        &execute("wget -O $targets \"http://www.ebi.ac.uk/ena/data/warehouse/filereport?accession=$input&result=read_run&fields=study_accession,secondary_study_accession,sample_accession,secondary_sample_accession,experiment_accession,run_accession,tax_id,scientific_name,instrument_model,library_layout,fastq_ftp,fastq_galaxy,submitted_ftp,submitted_galaxy,cram_index_ftp,cram_index_galaxy\"");  # download targets.txt
+        
+    } else {
+        
+        my @output;
+        open my $IN, '<', $input or die "$0: Cannot read '$input': $!\n";
+        while (<$IN>) {
+            next if $. == 1;  # expects header
+            my ($SRX, $title) = (split /\t/, $_)[0,8];
+            my $url = 'http://www.ncbi.nlm.nih.gov/sra/'.$SRX.'[accn]';
+            printf STDERR "Scanning %${lw}i/$lines: $url\n", $.-1;
+            my $page = get($url);
+            print " Get failed!\n" unless $page;
+            $page =~ s/\n//g;
+            my ($SRP) = ($page =~ /study=(\w{3}\d+)/);
+            my ($SRP3) = ($SRP =~ /^(\D+\d{3})/);
+            my ($sample) = ($page =~ /\"\/biosample\/(SAMN\d+)\"/);
+            print "$SRP ($SRP3) $sample\n" if $verbose;
+            while ($page =~ /run=(\w{3}\d+)/g) {
+                my $run = $1;
+                $reps{$SRX}++;
+                my $path = "$SRP3/$SRP/$run/$run.sra";
+                my $ftp_path = "$sra_ftp_url/$path";
+                my $aspera_path = "$aspera_url/$path";
+                my $line = "$title\t$reps{$SRX}\t$sample\t$run\t$SRX\t$SRP\t$ftp_path\t$aspera_path\n";
+                push @output, $line;
+                print " Run $run:\n $line" if $verbose;
+                my $name = $title ? "$title.$run" : $run;  # auto-prepend title where available
+                my $dl_path = $aspera ? $aspera_path : $ftp_path;
+                push @DL, [$name, $dl_path];
+            }
+        }
+        close $IN;
+
+        if (@output) {
+            open my $OUT, '>', $targets or die "$0: Cannot write '$targets': $!\n";
+            print $OUT "Alias\tRep\tSample\tSRR\tSRX\tSRP\tFTP_Path\tAspera_Path\n";
+            print $OUT @output;
+            close $OUT;
+        } else {
+            print "Failed to identify any downloadable data!\n";
+        }
+        
+    }
+    
+}
+
+
+## Read targets and prepare list of downloads
+
+if (-e $targets) {
+    
+    my $fq_col;
+    open my $IN, '<', $targets or die "$0: Cannot read '$targets': $!\n";
+    while (<$IN>) {
+        s/[\n\r]+$//;
+        my @data = split /\t/, $_;
+        
+        if ($ENA) {
+            if ($. == 1) {  # requires header
+                foreach my $i (0..$#data) {
+                    $fq_col = $i if $data[$i] eq 'fastq_ftp';
+                }
+                die "$0: Failed to identify 'fastq_ftp' column in targets file!\n" unless defined $fq_col;
+            } else {
+                foreach my $fq (split /;/, $data[$fq_col]) {
+                    (my $name = $fq) =~ s/.*\///;
+                    push @DL, [$name, "ftp://$fq"];
+                }
+            }
+        } else {
+            next if $. == 1;  # expects header
+            my ($title, $rep, $sample, $run, $SRX, $SRP, $ftp_path, $aspera_path) = @data;
+            my $name = $title ? "$title.$run" : $run;   # auto-prepend title where available
+            my $dl_path = $aspera ? $aspera_path : $ftp_path;
+            push @DL, [$name, $dl_path];
+        }
+        
+    }
+    close $IN;
+    
+} else {
+    
+    die "$0: Failed to create targets.txt file!\n";
+    
+}
+
+
+## Download files
+
+if ($download) {
+    
+    my $N = scalar @DL;
+    my $Nw = length($N);
+    die "$0: No files in download list; exiting.\n" unless $N;
+    
+    foreach my $i (0..$#DL) {
+        
+        my $label = sprintf("%${Nw}i/$N", $i+1);
+        my ($name, $path) = @{$DL[$i]};
+        
+        if ($ENA) {
+            
+            my $cmd1 = "wget -O $outdir/$name $path";
+            print STDERR "Downloading $label:\n $cmd1\n";
+            system $cmd1;
+            
+        } else {
+            
+            my $prefix = "$outdir/$name";
+            my $sra = "$prefix.sra";
+            my $fq0 = "$prefix.fastq";
+            my $fq1 = "${prefix}_1.fastq";
+            my $fq0z = "$fq0.gz";
+            my $fq1z = "$fq1.gz";
+            my $already = (-e $sra || -e $fq0 || -e $fq1 || -e $fq0z || -e $fq1z) ? 1 : 0;
+            
+            my $cmd1 = $aspera ? "$aspera_call $path $sra" : "wget -O $sra $path";
+            my $continue;
+            
+            if ($already) {
+                if ($aspera && -e "$sra.aspx") {
+                    print STDERR "Resuming $label:\n $cmd1\n";
+                    $continue = 1;
+                } elsif ($clobber) {
+                    print STDERR "Clobbering $label:\n $cmd1\n";
+                    $continue = 1;
+                } else {
+                    print STDERR "Skipping $label: Already downloaded.  ($sra)\n";
+                }
+            } else {
+                print STDERR "Downloading $label:\n $cmd1\n";
+                $continue = 1;
+            }
+            
+            if ($continue) {
+                
+                system $cmd1;
+                
+                if ($convert) {
+                    my $cmd2 = "fastq-dump --split-spot --split-files --outdir $outdir $sra";
+                    if (-e $sra) {
+                        printf STDERR "Converting $label:\n $cmd2\n";
+                        system $cmd2;
+                    } else {
+                        print "Expected SRA file '$sra' does not exist!  Cannot process.\n";
+                    }
+                    
+                    my $usefq = (-e $fq0 || -e $fq0z) ? "$prefix.fastq" : "${prefix}_[12].fastq";
+                    chomp(my $Nfq = `ls $usefq 2>/dev/null | wc -l`);
+                    if ($Nfq>0) {
+                        unless ($nogzip) {
+                            my $cmd3 = "gzip -f $usefq";
+                            print STDERR "Compressing $label:\n $cmd3\n";
+                            system $cmd3;
+                        }
+                    } else {
+                        print "Expected FASTQ file(s) '$usefq' do not exist!  Cannot process.\n";
+                    }
+                }
+            }
+            
+        }
+    }
+}
+
+
+
+
+## 
+## ASPERA REFERENCE STUFF: 
+## http://www.ncbi.nlm.nih.gov/books/NBK242625/
+## http://www.ncbi.nlm.nih.gov/books/NBK158899/#SRA_download.determining_the_location_of
+## 
+## ASP=/n/local/stage/aspera-connect/current
+## $ASP/bin/ascp -i $ASP/etc/asperaweb_id_dsa.openssh -k 1 -T -l 100M anonftp@ftp.ncbi.nlm.nih.gov:/sra/sra-instant/reads/ByRun/sra/SRR/SRR304/SRR304976/SRR304976.sra [local_target_directory]
+## 
+##  
+## And, from http://bioinfo/n/core/Bioinformatics/analysis/Gerton/bax/cbio.bax.102/data/dbGaP/ :
+## assumes the following is in your environment:
+## export ASPERA_CONNECT_DIR=/n/local/stage/aspera-connect/current
+## prefetch -X 100G -t ascp -a "${ASPERA_CONNECT_DIR}/bin/ascp|${ASPERA_CONNECT_DIR}/etc/asperaweb_id_dsa.openssh"   cart_prj8303_201505211330.krt
+## 

@@ -1,0 +1,30 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+foreach my $bam (@ARGV) {
+    print "$bam: ",`date`;
+    my ($ta, $IN);
+    if ($bam =~ /.bam$/) {
+	($ta = $bam) =~ s/.bam$/.tagAlign/;
+	open $IN, '-|', "samtools view $bam" or print STDERR "$0: Error reading bam file '$bam': no data or file does not exist.\n";
+    } elsif ($bam =~ /.sam$/) {
+	open $IN, '-|', "grep -v \"^@\" $bam" or print STDERR "$0: Error reading sam file '$bam': no data or file does not exist.\n";
+    } else {
+	print STDERR "$0: Input file '$bam' does not appear to be BAM/SAM format!  Skipping.\n";
+    }
+    open my $OUT, '>', $ta or print STDERR "$0: Cannot write output '$ta': $!\n";
+    while (<$IN>) {
+	s/[\n\r]+$//;
+	my ($flags, $chr, $start, $mapq, $seq) = (split /\t/, $_)[1..4,9];
+	my $end = $start+length($seq)-1;
+	my $strand = $flags & 16 ? '-' : '+';
+	print $OUT join("\t", $chr, $start, $end, $seq, $mapq, "$strand\n");
+    }
+    close $IN;
+    close $OUT;
+}
+print "$0: Complete! ",`date`;
+exit;
+

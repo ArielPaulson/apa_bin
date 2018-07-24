@@ -1,0 +1,912 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+
+## Workflow:
+## 1. trim input fastq
+## 2. remove too-short fragments
+## 3. fractionate by size range and piRNA signature (miRNA, piRNA {A,U,X}, too large).  By default, there is no fraction between too-short the miRNA, but that can be changed.
+## 4. align fractions to TE set, if provided
+## 5. align fractions to known sRNA set
+## 6. align fractions to genome
+## 7. make tracks, hub files
+## 8. quantitate genes/TEs
+
+
+
+## FIXME: I don't think this pipeline will work without the TE-alignment step, even though it is supposed to...
+
+
+
+### Dependencies
+my $bin = '/home/apa/local/bin';
+my $indexes = '/n/data1/genomes/indexes';
+my $SmallRnaQuantitate2 = "$bin/smallRNA-quantitate2";
+my $readCount = "$bin/readCount";
+my $bam2track = "$bin/bam2track";
+my $sortBedCoord = "$bin/sortBedCoord";
+my $stripMultireads = "$bin/stripMultireads";
+my $mergeIdxStats = "$bin/mergeIdxStats";
+my $mergeMatrix = "$bin/mergeMatrix";
+my $bed2BigBed = "$bin/scriptutils/bedToBigBed";
+my $splitBam = "$bin/splitBam";
+my $tracks2hub = "$bin/tracks2hub";
+my $trimadap = "$bin/scriptutils/adapter_collection.fa";   # adapter fasta for trimming; may specify non-default with '-t'
+my $trimmomatic = '/n/local/stage/trimmomatic/Trimmomatic-0.30/trimmomatic-0.30.jar';
+my $ShortStack = "$bin/scriptutils/ShortStack/ShortStack-smallRNApipeline";
+my $java = 'java';
+my $tophat2 = 'tophat';
+my $bowtie1 = 'bowtie';
+my $bowtie2 = 'bowtie2';
+my $bowtie1_build = 'bowtie-build';
+my $bowtie2_build = 'bowtie2-build';
+my $samtools = 'samtools';
+
+
+
+### Inputs
+
+## Mandatory
+my $inputfq;   # input fastq
+my $outdir;    # output location, if not clobbering
+
+## Optional, for Fastq Handling
+my $lenmin;    # smallest post-trimming fragment length to analyze, default 16
+my $lenmax;    # largest post-trimming fragment length to analyze, default 41
+my $alnmax;    # maximum allowed alignments before a read is ignored; default 100
+my $ranmax;    # ShortStack --ranmax argument; default int($alnmax/10)
+my $mirange;   # miRNA size range in bp, as "lower-upper"; default "16-22"
+my $pirange;   # piRNA size range in bp, as "lower-upper"; default "23-31"
+my $notrim;    # indicate that input fastq is ALREADY TRIMMED.
+my $no_pi_split;  # do not fractionate piRNAs by signature?
+
+## Optional, for Analysis 
+## Every argument triggers its own layer of analysis
+my $TEpref;    # optional: prefix for transposon bowtie[12]-index and fasta files (i.e. files $TEpref.fa $TEpref.1.ebwt, $TEpref.1.bt2, etc. exist -- if no indexes, at least fasta; indexes will be created)
+my $geno;      # genome index label, e.g. 'dm6', 'mm10'  ### REQUIRES $anno
+my $anno;      # genome-annotation label, e.g. 'Ens_80'  ### REQUIRES $geno
+my $cores;     # N cores for bowtie2 alignment, default 1 (if running alignments)
+my $mem;       # mem arg for 'samtools sort', default '5G' (if running alignments)
+my $hubname;   # track name for hub files
+
+
+
+### Get arguments
+GetOptions("i=s"=>\$inputfq, "o=s"=>\$outdir, "TE=s"=>\$TEpref, "ln=i"=>\$lenmin, "lx=i"=>\$lenmax, "ax=i"=>\$alnmax, "rx=i"=>\$ranmax, "rp=s"=>\$pirange, "rm=s"=>\$mirange, "g=s"=>\$geno, "a=s"=>\$anno, "c=i"=>\$cores, "m=s"=>\$mem, "h=s"=>\$hubname, "t=s"=>\$trimadap, "no-trim"=>\$notrim, "no-pi-split"=>\$no_pi_split);
+
+
+
+### Globals
+my @infracs   = qw/ input trimmed /;  # input fraction names
+my @allfracs  = qw/ too-short sub-miRNA miRNA intermediate piRNA piRNA-A piRNA-U piRNA-X over-piRNA too-long /;  # all possible fraction names
+my @unafracs  = @allfracs[0,-1];  # terminal fracs are not aligned or analyzed
+my @outfracs; # all output fraction names; gets populated below
+my @alnfracs; # all alignable fraction names; gets populated below
+my @reforder; # abbreviations for alignment references, in order of processing
+my %refdata;  # reference-specific data
+my %CALLS;    # hash with final alignment command lines per fraction (automatically populated, but arguments can be customized below)
+my $genodir   = "$indexes/$geno";   # may not be specified
+my $annodir   = "$genodir/$anno";   # may not be specified
+my $genoidx   = "$genodir/$geno";   # prefix only
+my $srnadir   = "$annodir/smallRNA";
+my $srnaidx   = "$srnadir/$geno.$anno.smallRNA";  # prefix only
+my $gtf       = "$annodir/$geno.$anno.cuff.gtf";
+my $gtfidx    = "$annodir/$geno.$anno.cuff.gtf.index/$geno.$anno.cuff";  # prefix only
+my $cmdline   = (split /\n/, qx/ps -o args $$/)[1];  # just for reporting
+my $restart;  # flag if pipeline is restarting or not
+my $submi;    # will smaller-than-miRNA fraction exist?
+my $intermed; # will intermediate fraction exist?
+my $overpi;   # will larger-than-piRNA fraction exist?
+my %stats;    # counts for various read fractions
+my %pstats;   # counts, as % total
+my %pstats2;  # counts, as % reads in size range
+my %F;        # filename and filehandle storage
+my %stage;    # stage completion tracking
+my %maxstage; # highest consecutive stage completed (restart after here)
+
+
+### Test arguments; initialize workspace and some globals
+die "$0: No input specified!\n" unless $inputfq;
+chomp($inputfq = `readlink -f $inputfq`);
+die "$0: Cannot find input fastq '$inputfq'!\n" unless -e $inputfq;
+if ($anno || $geno) {
+    die "$0: Must specify -g along with -a!\n" if $anno && !$geno;
+    die "$0: Must specify -a along with -g!\n" if $geno && !$anno;
+    die "$0: Geno/anno combination '$annodir' not found!\n" unless -d $annodir;
+    die "$0: Geno/anno combination has no smallRNA build!\n" unless -d $srnadir;
+    die "$0: Cannot resolve genome/annotation GTF file '$gtf'!\n" unless -e $gtf;
+}
+die "$0: Cannot find indicated adapter fasta '$trimadap'!\n" if $trimadap && ! -e $trimadap;
+die "$0: -ln must be a positive integer!\n" if $lenmin =~ /\D/;
+die "$0: -lx must be a positive integer!\n" if $lenmax =~ /\D/;
+die "$0: -ax must be a positive integer!\n" if $alnmax =~ /\D/;
+$lenmin = 16 unless $lenmin;    # default minimum post-trim fragment length (smallest miRNA length, basically)
+$lenmax = 41 unless $lenmax;    # default maximum post-trim fragment length (smallest trimmed fragment size, given Trimmomatic settings below, basically -- larger = untrimmable)
+$alnmax = 100 unless $alnmax;   # default maximum alignments per read (before read is ignored)
+$ranmax = int($alnmax/10) unless $ranmax;  # ShortStack --ranmax param
+
+my $TEfasta;
+if ($TEpref) {
+	$TEfasta = -e "$TEpref.fa" ? "$TEpref.fa" : -e "$TEpref.fasta" ? "$TEpref.fasta" : undef;
+	die "$0: Cannot detect TE fasta!\n" unless $TEfasta;
+	system "samtools faidx $TEfasta" unless -e "$TEfasta.fai";
+	system "bowtie-build $TEfasta $TEpref" unless -e "$TEpref.1.ebwt";
+}
+
+@reforder = qw/ S T G J M /;  # sRNA first (for speed), TE second (for succinctness), genome third (for everything else), junctions fourth (genome cleanup)
+%refdata = (
+	'S'  => { 'NAME'=>'sRNA', 'IDX'=>$srnaidx }, 
+	'T'  => { 'NAME'=>'TE', 'IDX'=>$TEpref },
+	'pG' => { 'NAME'=>'pre_genome', 'IDX'=>$genoidx },
+	'pJ' => { 'NAME'=>'pre_junction', 'IDX'=>$genoidx }   # not really a separate reference, but it is efficient to handle junction alignments this way
+	'G'  => { 'NAME'=>'genome', 'IDX'=>$genoidx }   # not really a separate reference, but it is efficient to handle junction alignments this way
+);
+foreach my $ref (@reforder) {
+	my $fa = "$refdata{$ref}{IDX}.fa";
+	$refdata{$ref}{FA} = -e $fa ? $fa : -e "${fa}sta" ? "${fa}sta" : undef;
+	die "$0: Failed to identify fasta file associated with $refdata{$ref}{NAME} index set '$refdata{$ref}{IDX}'!\n" unless $refdata{$ref}{FA};
+}
+
+$cores = 1 unless $cores;
+die "$0: Invalid number of cores '$cores'!\n" if $cores <=0 || $cores =~ /\D/;
+$mem = '5G' unless $mem;
+die "$0: Invalid memory string '$mem'!  Try something like '5G'.\n" if $mem !~ /^\d+[KMG]$/;
+
+$mirange = "16-22" unless $mirange;
+my @mirange = split /-/, $mirange;
+die "$0: miRNA size range not specified correctly.  Give two positive integers like \"16-22\", which is the default.\n" if $#mirange != 1 || $mirange[0] =~ /\D/ || $mirange[1] =~ /\D/;
+
+$pirange = "23-31" unless $pirange;
+my @pirange = split /-/, $pirange;
+die "$0: piRNA size range not specified correctly.  Give two positive integers like \"23-31\", which is the default.\n" if $#pirange != 1 || $pirange[0] =~ /\D/ || $pirange[1] =~ /\D/;
+
+## Now can finalize @alnfracs!
+## Decide on final fractions list
+## qw/ too-short sub-miRNA miRNA intermediate piRNA piRNA-A piRNA-U piRNA-X over-piRNA too-long /;
+$submi = $lenmin < $mirange[0] ? 1 : 0;           # will 'sub-miRNA' fraction exist?
+$overpi = $lenmax > $pirange[1] ? 1 : 0;          # will 'over-piRNA' fraction exist?
+if ($mirange[1] > $pirange[0]) {
+	## Ranges overlap; de-overlap, and former overlap range will become 'intermediate'
+	print STDERR "WARNING: miRNA and piRNA size ranges overlap!  Assigning overlap to 'intermediate' fraction...\n";
+	$mirange[1] = $pirange[0] - 1;
+	$pirange[0] = $mirange[1] + 1;
+}
+die "$0: miRNA size range has length 0!\n" if $mirange[0] == $mirange[1];
+die "$0: piRNA size range has length 0!\n" if $pirange[0] == $pirange[1];
+$intermed = $pirange[0]-$mirange[1]==1 ? 0 : 1;   # will 'intermediate' fraction exist?
+@alnfracs = @allfracs;
+pop @alnfracs;                            # ignore 'too-long' (not aligned)
+splice(@alnfracs,8,1) unless $overpi;     # remove 'over-piRNA'
+splice(@alnfracs,5,3) if $no_pi_split;    # remove 'piRNA-{A,U,X}'
+splice(@alnfracs,3,1) unless $intermed;   # remove 'intermediate'
+splice(@alnfracs,1,1) unless $submi;      # remove 'sub-miRNA'
+shift @alnfracs;                          # ignore 'too-short' (not aligned)
+@outfracs = (@unafracs, @alnfracs);
+
+#print STDERR "SUBMI: $submi\nOVERPI: $overpi\nINTERMED: $intermed\nNOPISPLIT: $no_pi_split\n";
+#print STDERR "ALLFRACS: @allfracs\n";
+#print STDERR "UNAFRACS: @unafracs\n";
+#print STDERR "ALNFRACS: @alnfracs\n";
+
+if ($hubname) {
+    $hubname =~ s/ /_/g;
+    $hubname .= "_sRNA" unless $hubname =~ /srna/i;
+}
+
+
+### Output directory stuff
+chomp($outdir = `readlink -f $outdir`);
+my $trackdir = "$outdir/tracks";
+my $fastqdir = "$outdir/fastq";
+die "$0: Output location '$outdir' already exists!\n" if -d $outdir;   ##### FIXME: PIPELINE-RESTARTING MECHANISM NOT WORKING YET *****
+system "mkdir $outdir";
+foreach my $subdir ($trackdir, $fastqdir) {
+    system "mkdir $subdir";
+    die "$0: Failed to create subdirectory '$subdir'!\n" unless -d $subdir;
+}
+
+
+### Logfile stuff
+my $log = "$outdir/smallRNA-pipeline2.log";
+my $LOG;  # $log filehandle
+if (-e $log) {
+    $restart = 1;
+    open $LOG, '>>', $log or die "$0: Failed to reopen log file '$log': $!\n";
+} else {
+    open $LOG, '>', $log or die "$0: Failed to open log file '$log': $!\n";
+}
+
+
+
+
+### Filename control
+### Also build ShortStack options, once filenames are settled
+
+## input fractions
+$F{input}{FQ} = $inputfq =~ /\.gz$/ ? "$fastqdir/input.fastq.gz" : "$fastqdir/input.fastq";  # input may not have been gzipped?
+system "ln -sf $inputfq $F{input}{FQ}";  # Always keep the input as a symlink in the output directory
+$F{input}{UFQ} = "$fastqdir/unaligned.fastq.gz";  # single master unaligned fastq (subset $frac/$aln UFQs will still exist)
+$F{trimmed}{FQ} = "$fastqdir/trimmed.fastq.gz";
+$F{trimmed}{ERR} = "$outdir/trimmed.stderr.txt";
+$F{trimmed}{LOG} = "$outdir/trimmed.trimlog.txt";
+$F{trimmed}{HISTO} = "$outdir/trimmed.histogram.txt";
+$F{trimmed}{FQR} = "$outdir/trimmed.fqReads.txt";
+
+## unaligned output fractions
+$F{$_}{FQ} = "$fastqdir/$_.fastq.gz" foreach @unafracs;  # this is the only file that will exist for this fraction
+
+## aligned output fractions
+foreach my $frac (@alnfracs) {
+    
+    $F{$frac}{FQ} = "$fastqdir/$frac.fastq.gz";  # keep all fraction fastqs in fastq dir
+    $F{$frac}{DIR} = "$outdir/analysis_$frac";   # all analysis on fastqs goes into separate fraction directories
+    $F{$frac}{PREFIX} = "$F{$frac}{DIR}/$frac";
+    $F{$frac}{UFQ} = "$F{$frac}{PREFIX}.unaligned.fastq.gz";  # final TE/genome-unaligned fraction only
+    
+    ## outputs for all aligned fractions
+    foreach my $ref (@reforder) {
+		my $refname = $refdata{$ref}{NAME};
+		
+		## outputs from ShortStack and subsequent processes
+		$F{$frac}{$ref}{DIR}     = "$F{$frac}{DIR}/${refname}_alignment";
+		$F{$frac}{$ref}{PREFIX}  = "$F{$frac}{$ref}{DIR}/$frac.$ref";	
+		$F{$frac}{$ref}{UFQ}     = "$F{$frac}{$ref}{PREFIX}.unaligned.fastq.gz";
+		$F{$frac}{$ref}{ALN_SUM} = "$F{$frac}{$ref}{PREFIX}.align_summary.txt";
+		$F{$frac}{$ref}{BAM_ALL} = "$F{$frac}{$ref}{PREFIX}.bam";
+		$F{$frac}{$ref}{BAM_SMR} = "$F{$frac}{$ref}{PREFIX}.stripMultireads.bam";
+		$F{$frac}{$ref}{BAM_UNQ} = "$F{$frac}{$ref}{PREFIX}.unique.bam";
+		$F{$frac}{$ref}{IDX_ALL} = "$F{$frac}{$ref}{PREFIX}.idxstats.txt";
+		$F{$frac}{$ref}{IDX_UNQ} = "$F{$frac}{$ref}{PREFIX}.unique.idxstats.txt";
+		
+		next unless $ref eq 'G';  # below, genome-aligned fractions only
+		
+		## output for temp genome alignment
+		$F{$frac}{$ref}{G_DIR}     = "$F{$frac}{$ref}{DIR}/temp_genome";
+		$F{$frac}{$ref}{G_PREFIX}  = "$F{$frac}{$ref}{G_DIR}/$frac";
+		$F{$frac}{$ref}{G_BAM_ALL} = "$F{$frac}{$ref}{G_PREFIX}.bam";
+		$F{$frac}{$ref}{G_BAM_SMR} = "$F{$frac}{$ref}{G_PREFIX}.stripMultireads.bam";
+		$F{$frac}{$ref}{G_BAM_UNQ} = "$F{$frac}{$ref}{G_PREFIX}.unique.bam";
+		
+		## Currently, we use ShortStack for non-junction genome alignment; these lines are for ShortStack-specific outputs
+		## Currently, ShortStack logs get symlinked to parent dir as the "final" logs for whole genome
+		## This means that alignment totals will ignore contribution of splice junction reads, but these are usually < 1% of genomic alignments anyway...
+		@{ $F{$frac}{$ref}{J_LOGS} } = qw/ Log.txt ErrorLogs.txt /;
+		
+		## output for temp junction-read alignment
+		$F{$frac}{$ref}{J_DIR}     = "$F{$frac}{$ref}{DIR}/temp_junctions";
+		$F{$frac}{$ref}{J_PREFIX}  = "$F{$frac}{$ref}{J_DIR}/$frac";
+		$F{$frac}{$ref}{J_BAM_ALL} = "$F{$frac}{$ref}{J_PREFIX}.bam";
+		$F{$frac}{$ref}{J_BAM_SMR} = "$F{$frac}{$ref}{J_PREFIX}.stripMultireads.bam";
+		$F{$frac}{$ref}{J_BAM_UNQ} = "$F{$frac}{$ref}{J_PREFIX}.unique.bam";
+		
+		## Currently, we use Tophat2 for junction alignment; these lines are for Tophat-specific outputs
+		## Tophat alignments get rolled into the final genomic bam, but the alignment stats -- a tiny % of total -- are not currently added up.  Could fix this in future.
+		$F{$frac}{$ref}{J_BAM_UNM} = "$F{$frac}{$ref}{J_DIR}/unmapped.bam";       # gets converted to fastq & deleted
+		$F{$frac}{$ref}{J_BAM_RAW} = "$F{$frac}{$ref}{J_DIR}/accepted_hits.bam";  # gets renamed
+		@{ $F{$frac}{$ref}{J_MISC_KEEP} } = qw/ align_summary.txt junctions.bed logs /;  # files to keep; will get SJ file prefix
+		@{ $F{$frac}{$ref}{J_MISC_DROP} } = qw/ unmapped.bam insertions.bed deletions.bed prep_reads.info /;  # files to delete
+		
+		## bigWigs
+		$F{$frac}{$ref}{BW_W_ALL}     = "$F{$frac}{$ref}{PREFIX}.plus.APM.bw";
+		$F{$frac}{$ref}{BW_C_ALL}     = "$F{$frac}{$ref}{PREFIX}.minus.APM.bw";
+		$F{$frac}{$ref}{BW_W_UNQ}     = "$F{$frac}{$ref}{PREFIX}.unique.plus.APM.bw";
+		$F{$frac}{$ref}{BW_C_UNQ}     = "$F{$frac}{$ref}{PREFIX}.unique.minus.APM.bw";
+		$F{$frac}{$ref}{BW_W_ALL_SYM} = "$trackdir/$frac.$ref.plus.APM.bw";
+		$F{$frac}{$ref}{BW_C_ALL_SYM} = "$trackdir/$frac.$ref.minus.APM.bw";
+		$F{$frac}{$ref}{BW_W_UNQ_SYM} = "$trackdir/$frac.$ref.unique.plus.APM.bw";
+		$F{$frac}{$ref}{BW_C_UNQ_SYM} = "$trackdir/$frac.$ref.unique.minus.APM.bw";
+    }
+    
+}
+
+
+## ShortStack, Tuxedo call construction
+
+my %frac_ss_opts = (    ## fraction-specific ShortStack options -- POTENTIAL FOR FUTURE USE -- doing nothing right now
+       'sub-miRNA' => "",
+           'miRNA' => "",
+    'intermediate' => "",
+           'piRNA' => "",
+         'piRNA-A' => "",
+         'piRNA-U' => "",
+         'piRNA-X' => "",
+      'over-piRNA' => ""
+    );
+
+my %frac_tux_opts = (   ## fraction-specific Tuxedo-Suite options -- POTENTIAL FOR FUTURE USE -- doing nothing right now
+       'sub-miRNA' => { 'bowtie'=>"" },
+           'miRNA' => { 'bowtie'=>"" },
+    'intermediate' => { 'bowtie'=>"" },
+           'piRNA' => { 'bowtie'=>"", 'tophat2'=>"" },
+         'piRNA-A' => { 'bowtie'=>"", 'tophat2'=>"" },
+         'piRNA-U' => { 'bowtie'=>"", 'tophat2'=>"" },
+         'piRNA-X' => { 'bowtie'=>"", 'tophat2'=>"" },
+      'over-piRNA' => { 'bowtie'=>"", 'tophat2'=>"" }
+    );
+
+## Lists of un-prefixed files generated by certain aligners (i.e. $F{$frac}{$ref}{PREFIX} must be prepended manually)
+my @ShortStack_otherfiles = qw/ ErrorLogs.txt Log.txt /;
+my @Tophat_otherfiles = qw/ accepted_hits.bam unmapped.bam deletions.bed insertions.bed junctions.bed prep_reads.info align_summary.txt /;
+
+foreach my $frac (@alnfracs) {
+    foreach my $r (0..$#reforder) {
+		my $ref = $reforder[$r];
+		
+		## All workflows: 
+		## 1. Align input to sRNA set with ShortStack.
+		## 2. Align sRNA-unmapped to TE set with ShortStack.
+		## 3. Align TE-unmapped to genome with ShortStack.
+		## 4. Align genome-unmapped to genome with Tophat2, just to get splice junction reads.
+		## 5. Final unaligned fraction really is unalignable.
+		
+		my $fqin = $r == 0 ? $F{$frac}{FQ} : $F{$frac}{ $reforder[$r-1] }{UFQ};   # first align gets input fastq; subsequent aligns get N-1 unmapped fastqs
+		(my $fqout = $F{$frac}{$ref}{UFQ}) =~ s/\.gz//;  # output unaligned fastq (not gzipped when written)
+		(my $bamprefix = $F{$frac}{$ref}{BAM_ALL}) =~ s/.bam$//;
+		
+		## https://github.com/MikeAxtell/ShortStack
+		## ShortStack core params -- NOT involving fraction/reference
+		my $ShortStackCall = "$ShortStack --align_only --nostitch --bowtie_cores $cores --sort_mem $mem --mismatches 2 --mmap u --bowtie_m $alnmax --ranmax $ranmax ";
+		## Shortstack extra params -- involving fraction/reference
+		$ShortStackCall .= "--readfile $fqin --bowtie_un $fqout --outprefix $frac.$ref --outdir $F{$frac}{$ref}{DIR} --genomefile $refdata{$ref}{FA}";
+		push @{ $CALLS{STAGE3}{ShortStack}{$frac}{$ref} }, ["rm -rf $F{$frac}{$ref}{DIR}", 1, $LOG, 3];
+		push @{ $CALLS{STAGE3}{ShortStack}{$frac}{$ref} }, [$ShortStackCall, 1, $LOG, 3];
+		push @{ $CALLS{STAGE3}{ShortStack}{$frac}{$ref} }, ["samtools index $F{$frac}{$ref}{BAM_ALL}", 1, $LOG, 3];
+		push @{ $CALLS{STAGE3}{ShortStack}{$frac}{$ref} }, ["gzip -f $fqout", 1, $LOG, 2];
+		push @{ $CALLS{STAGE3}{ShortStack}{$frac}{$ref} }, ["samtools idxstats $F{$frac}{$ref}{BAM_ALL} > $F{$frac}{$ref}{IDX_ALL}", 1, $LOG, 2];
+		push @{ $CALLS{STAGE3}{ShortStack}{$frac}{$ref} }, ["$stripMultireads --mode2 --shortstack --index $F{$frac}{$ref}{BAM_ALL}", 1, $LOG, 3];
+		push @{ $CALLS{STAGE3}{ShortStack}{$frac}{$ref} }, ["mv -f $F{$frac}{$ref}{BAM_SMR} $F{$frac}{$ref}{BAM_UNQ}", 1, $LOG, 3];
+		push @{ $CALLS{STAGE3}{ShortStack}{$frac}{$ref} }, ["mv -f $F{$frac}{$ref}{BAM_SMR}.bai $F{$frac}{$ref}{BAM_UNQ}.bai", 1, $LOG, 3];
+		push @{ $CALLS{STAGE3}{ShortStack}{$frac}{$ref} }, ["samtools idxstats $F{$frac}{$ref}{BAM_UNQ} > $F{$frac}{$ref}{IDX_UNQ}", 1, $LOG, 3];
+		
+		if ($ref eq 'G') {
+			
+			## Tophat runs mop up the splice junctions, ensuring that the unaligned fastqs really are unalignable.
+			## Splice junction aligns will also be added back to the genomic bams
+			## Total and unique fractions must be extracted from genomic and junction bams separately, then merged separately, since Tophat multiread filters differ from ShortStack
+			## https://ccb.jhu.edu/software/tophat/manual.shtml
+			## Tophat2 core params -- NOT involving fraction/reference
+			my $Tophat2Call = "$tophat2 -p $cores -g 1 -x 1 -N 2 --bowtie1 --segment-length 10 --no-novel-juncs --no-coverage-search ";
+			## Tophat2 extra params -- involving fraction/reference
+			$Tophat2Call .= "--transcriptome-index $gtfidx -o $F{$frac}{$ref}{J_DIR} $genoidx $fqout.gz";
+			
+			## Initial Tophat2 workflow
+			push @{ $CALLS{STAGE3}{Tophat2}{$frac}{$ref} }, [$Tophat2Call, 1, $LOG, 3];
+			push @{ $CALLS{STAGE3}{Tophat2}{$frac}{$ref} }, ["mv -f $F{$frac}{$ref}{J_BAM_RAW} $F{$frac}{$ref}{J_BAM_ALL}", 1, $LOG, 3];
+			push @{ $CALLS{STAGE3}{Tophat2}{$frac}{$ref} }, ["samtools index $F{$frac}{$ref}{J_BAM_ALL}", 1, $LOG, 3];
+			push @{ $CALLS{STAGE3}{Tophat2}{$frac}{$ref} }, ["samtools idxstats $F{$frac}{$ref}{J_BAM_ALL} > $F{$frac}{$ref}{J_IDX_ALL}", 1, $LOG, 2];
+			push @{ $CALLS{STAGE3}{Tophat2}{$frac}{$ref} }, ["$stripMultireads --mode2 --tophat --index $F{$frac}{$ref}{J_BAM_ALL}", 1, $LOG, 3];
+			push @{ $CALLS{STAGE3}{Tophat2}{$frac}{$ref} }, ["mv -f $F{$frac}{$ref}{J_BAM_SMR} $F{$frac}{$ref}{J_BAM_UNQ}", 1, $LOG, 3];
+			push @{ $CALLS{STAGE3}{Tophat2}{$frac}{$ref} }, ["mv -f $F{$frac}{$ref}{J_BAM_SMR}.bai $F{$frac}{$ref}{J_BAM_UNQ}.bai", 1, $LOG, 3];
+			push @{ $CALLS{STAGE3}{Tophat2}{$frac}{$ref} }, ["samtools idxstats $F{$frac}{$ref}{J_BAM_UNQ} > $F{$frac}{$ref}{J_IDX_UNQ}", 1, $LOG, 3];
+			push @{ $CALLS{STAGE3}{Tophat2}{$frac}{$ref} }, ["samtools bam2fq -n -s >(gzip -f > $F{$frac}{UFQ}) $F{$frac}{$ref}{J_BAM_UNM}", 1, $LOG, 3, 1];  # REQUIRES BASH
+			push @{ $CALLS{STAGE3}{Tophat2}{$frac}{$ref} }, ["mv -f $F{$frac}{$ref}{J_DIR}/$_ $F{$frac}{$ref}{J_PREFIX}.$_", 1, $LOG, 3] foreach @{ $F{$frac}{$ref}{J_MISC_KEEP} };
+			push @{ $CALLS{STAGE3}{Tophat2}{$frac}{$ref} }, [join(' ', "rm -f", map {"$F{$frac}{$ref}{J_DIR}/$_"} @{ $F{$frac}{$ref}{J_MISC_DROP} }), 1, $LOG, 3];
+			
+			## After Tophat2 completes, merge earlier ShortStack genome results with Tophat2's junction results
+			push @{ $CALLS{STAGE3}{Tophat2}{$frac}{$ref} }, ["samtools merge $F{$frac}{$ref}{MR_BAM_ALL} $F{$frac}{$ref}{BAM_ALL} $F{$frac}{$ref}{J_BAM_ALL}", 1, $LOG, 3];
+
+			
+		## outputs from ShortStack and subsequent processes
+		$F{$frac}{$ref}{DIR}     = "$F{$frac}{DIR}/${refname}_alignment";
+		$F{$frac}{$ref}{PREFIX}  = "$F{$frac}{$ref}{DIR}/$frac.$ref";	
+		$F{$frac}{$ref}{UFQ}     = "$F{$frac}{$ref}{PREFIX}.unaligned.fastq.gz";
+		$F{$frac}{$ref}{ALN_SUM} = "$F{$frac}{$ref}{PREFIX}.align_summary.txt";
+		$F{$frac}{$ref}{BAM_ALL} = "$F{$frac}{$ref}{PREFIX}.bam";
+		$F{$frac}{$ref}{BAM_SMR} = "$F{$frac}{$ref}{PREFIX}.stripMultireads.bam";
+		$F{$frac}{$ref}{BAM_UNQ} = "$F{$frac}{$ref}{PREFIX}.unique.bam";
+		$F{$frac}{$ref}{IDX_ALL} = "$F{$frac}{$ref}{PREFIX}.idxstats.txt";
+		$F{$frac}{$ref}{IDX_UNQ} = "$F{$frac}{$ref}{PREFIX}.unique.idxstats.txt";
+		
+		## output for temp genome alignment
+		$F{$frac}{$ref}{G_DIR}     = "$F{$frac}{$ref}{DIR}/temp_genome";
+		$F{$frac}{$ref}{G_PREFIX}  = "$F{$frac}{$ref}{G_DIR}/$frac";
+		$F{$frac}{$ref}{G_BAM_ALL} = "$F{$frac}{$ref}{G_PREFIX}.bam";
+		$F{$frac}{$ref}{G_BAM_SMR} = "$F{$frac}{$ref}{G_PREFIX}.stripMultireads.bam";
+		$F{$frac}{$ref}{G_BAM_UNQ} = "$F{$frac}{$ref}{G_PREFIX}.unique.bam";
+		
+		## Currently, we use ShortStack for non-junction genome alignment; these lines are for ShortStack-specific outputs
+		## Currently, ShortStack logs get symlinked to parent dir as the "final" logs for whole genome
+		## This means that alignment totals will ignore contribution of splice junction reads, but these are usually < 1% of genomic alignments anyway...
+		@{ $F{$frac}{$ref}{J_LOGS} } = qw/ Log.txt ErrorLogs.txt /;
+		
+		## output for temp junction-read alignment
+		$F{$frac}{$ref}{J_DIR}     = "$F{$frac}{$ref}{DIR}/temp_junctions";
+		$F{$frac}{$ref}{J_PREFIX}  = "$F{$frac}{$ref}{J_DIR}/$frac";
+		$F{$frac}{$ref}{J_BAM_ALL} = "$F{$frac}{$ref}{J_PREFIX}.bam";
+		$F{$frac}{$ref}{J_BAM_SMR} = "$F{$frac}{$ref}{J_PREFIX}.stripMultireads.bam";
+		$F{$frac}{$ref}{J_BAM_UNQ} = "$F{$frac}{$ref}{J_PREFIX}.unique.bam";
+		
+		## Currently, we use Tophat2 for junction alignment; these lines are for Tophat-specific outputs
+		## Tophat alignments get rolled into the final genomic bam, but the alignment stats -- a tiny % of total -- are not currently added up.  Could fix this in future.
+		$F{$frac}{$ref}{J_BAM_UNM} = "$F{$frac}{$ref}{J_DIR}/unmapped.bam";       # gets converted to fastq & deleted
+		$F{$frac}{$ref}{J_BAM_RAW} = "$F{$frac}{$ref}{J_DIR}/accepted_hits.bam";  # gets renamed
+		@{ $F{$frac}{$ref}{J_MISC_KEEP} } = qw/ align_summary.txt junctions.bed logs /;  # files to keep; will get SJ file prefix
+		@{ $F{$frac}{$ref}{J_MISC_DROP} } = qw/ unmapped.bam insertions.bed deletions.bed prep_reads.info /;  # files to delete
+			
+
+
+
+
+			## After genome+junctions merge completes, generate track files
+			push @{ $CALLS{STAGE4}{$frac} }, ["$bam2track -b $F{$frac}{$ref}{BAM_ALL} -g $geno -n APM --BW --stranded", 1, $LOG, 3];
+			push @{ $CALLS{STAGE4}{$frac} }, ["ln -sf $F{$frac}{$ref}{BW_W_ALL} $F{$frac}{$ref}{BW_W_ALL_SYM}", 1, $LOG, 3];
+			push @{ $CALLS{STAGE4}{$frac} }, ["ln -sf $F{$frac}{$ref}{BW_C_ALL} $F{$frac}{$ref}{BW_C_ALL_SYM}", 1, $LOG, 3];
+			push @{ $CALLS{STAGE4}{$frac} }, ["$bam2track -b $F{$frac}{$ref}{BAM_UNQ} -g $geno -n APM --BW --stranded", 1, $LOG, 3];
+			push @{ $CALLS{STAGE4}{$frac} }, ["ln -sf $F{$frac}{$ref}{BW_W_UNQ} $F{$frac}{$ref}{BW_W_UNQ_SYM}", 1, $LOG, 3];
+			push @{ $CALLS{STAGE4}{$frac} }, ["ln -sf $F{$frac}{$ref}{BW_C_UNQ} $F{$frac}{$ref}{BW_C_UNQ_SYM}", 1, $LOG, 3];
+		}
+		
+    }
+	
+	## Run Quantitator
+    ## This occurs after $ref-specific operations (and incorporates results from both)
+    push @{ $CALLS{STAGE5}{$frac} }, ["$SmallRnaQuantitate2 -gb $F{$frac}{G}{BAM_ALL} -tb $F{$frac}{T}{BAM_ALL} -sb $F{$frac}{S}{BAM_ALL} -o $F{$frac}{PREFIX}.Total -g $geno -a $anno", 1, $LOG];
+    push @{ $CALLS{STAGE5}{$frac} }, ["$SmallRnaQuantitate2 -gb $F{$frac}{G}{BAM_UNQ} -tb $F{$frac}{T}{BAM_UNQ} -sb $F{$frac}{S}{BAM_UNQ} -o $F{$frac}{PREFIX}.Unique -g $geno -a $anno", 1, $LOG];
+    
+}
+
+
+
+
+
+#####  LOG FILE ANALYSIS  #####
+
+## EARLY GLOBAL STAGES (run sequentially once; not per fraction)
+## STAGE 1: trim / remove too-short
+## STAGE 2: fractionate trimmed reads by size
+##   FRACTION STAGES (run sequentially for each fraction)
+##   STAGE 3: align fractions to genome / TE set
+##   STAGE 4: make bigWigs & hub files
+##   STAGE 5: run SmallRnaQuantitate
+## LATE GLOBAL STAGES (run sequentially once; not per fraction)
+## STAGE 6: aggregate unaligned reads
+## STAGE 7: build hub files *** IN DEVELOPMENT ***
+
+if (-e $log) {
+    ## Find highest consecutive completed stage.
+    my $IN = &open2('R', $log, 'Stage log');
+    my ($frac_complete, @latest);
+    while (<$IN>) {
+		if (/^STAGE (\w+) (SKIPPED|COMPLETE)/) {
+			if ($1 <= 2) {
+				## early global stages
+				if ($1 == 1 || $stage{G}{EARLY}{$1-1}) {
+					## consider complete ONLY if N-1 stage is also complete (exempting the first stage)
+					$stage{G}{EARLY}{$1} = 1;
+					@latest = ('G', 'EARLY', $1);
+				}
+			} elsif ($1 >= 6) {  
+				## late global stages
+				next unless $frac_complete == scalar @alnfracs;
+				## if any fraction is incomplete, ignore late global stages.
+				if ($1 == 6 || $stage{G}{LATE}{$1-1}) {
+					## consider complete ONLY if N-1 stage is also complete (exempting the first stage)
+					$stage{G}{LATE}{$1} = 1;
+					@latest = ('G', 'LATE', $1);
+				}
+			}
+		} elsif (/^FRACTION (\S+) STAGE (\w+) (SKIPPED|COMPLETE)/) {
+			## fraction stages
+			next unless $stage{2};	
+			## if early stages not complete, ignore everything else.
+			if ($2 == 3 || $stage{F}{$1}{$2-1}) {
+				## consider complete ONLY if fraction N-1 stage is also complete (exempting the first fraction stage)
+				$stage{F}{$1}{$2} = 1;
+				$frac_complete++ if $2 == 5;  # final fraction stage
+				@latest = ('F', $1, $2);
+			}
+		}
+    }
+    close $IN;
+    $maxstage{ $latest[0] }{ $latest[1] }{ $latest[2] } = 1;
+}
+
+
+
+
+
+#####  STAGE 1 OPERATIONS  #####
+
+if ($notrim) {
+    
+    ## fill some slots and continue
+    $F{trimmed}{FQ} = $F{input}{FQ};
+    &evaluate_trimming;    
+    &logreport("\n\nSTAGE 1 SKIPPED\n\n", 1, $LOG);
+    
+} elsif (! exists $stage{1}) {
+    
+    ## STAGE 1: TRIMMING
+    
+    &logreport("Trimming input fastq: ".`date`, 1, $LOG);
+    
+    ## Trimmomatic manual: http://www.usadellab.org/cms/uploads/supplementary/Trimmomatic/TrimmomaticManual_V0.32.pdf
+    ## See also: http://seqanswers.com/forums/showthread.php?t=11186 for discussion on simpleClip value -- '6' will require something like 10 high-quality base matches
+    my $trimcmd = "$java -Xmx$mem -jar $trimmomatic SE -threads $cores -trimlog $F{trimmed}{LOG} $F{input}{FQ} $F{trimmed}{FQ} ILLUMINACLIP:$trimadap:2:12:6 MINLEN:1 2> $F{trimmed}{ERR}";
+    &logreport("Trimmomatic Line: \"$trimcmd\"\n\n", 1, $LOG);
+    system('bash','-c',$trimcmd);
+    &execute("cat $F{trimmed}{LOG} | rev | cut -f4 -d' ' | rev | sort -n | uniq -c | awk '{ print \$2\"\\t\"\$1 }' > $F{trimmed}{HISTO}", 1, $LOG, 2);
+    &execute("rm -f $F{trimmed}{LOG}", 1, $LOG, 3);
+    
+    &evaluate_trimming;
+    chomp(my $now = `date`);
+    &logreport("$stats{TOTAL} reads | $stats{TRIMLOST} lost to trimming ($pstats{TRIMLOST}%)\n\nSTAGE 1 COMPLETE: $now\n\n", 1, $LOG);
+
+} else {
+
+    ## Stage already run, but we need some numbers
+    &evaluate_trimming;
+
+}
+$stage{1} = 1;  # "complete"
+sleep 1;   # killability
+
+
+
+
+
+#####  STAGE 2 OPERATIONS  #####
+
+if (! exists $stage{2}) {
+    
+    ## STAGE 2: Size Fractionation
+    
+    ## Output filehandles
+    my %H;
+    foreach my $frac (@outfracs) {  # alignable + too-small, too-large
+		(my $rawfq = $F{$frac}{FQ}) =~ s/\.gz$//;
+		my $FH = &open2('W', $rawfq, "$frac fastq");
+		$H{$frac} = $FH;
+    }
+    
+    my ($i, $type, @rec, $frac);
+    &logreport("Fractionating reads by size: ".`date`, 1, $LOG);
+    
+    my $TRIM = &open2('R', $F{trimmed}{FQ}, 'Trimmed fastq');
+    while (<$TRIM>) {
+		push @rec, $_;
+		$i++;
+		if ($i == 4) {
+			my $readlen = length($rec[1]) - 1;  # subtract 1 for newline
+			if ($readlen < $lenmin) {
+				$frac = 'too-short';
+			} elsif ($readlen >= $lenmin && $readlen < $mirange[0]) {
+				$frac = 'sub-miRNA';
+			} elsif ($readlen >= $mirange[0] && $readlen <= $mirange[1]) {
+				$frac = 'miRNA';
+			} elsif ($readlen > $mirange[1] && $readlen < $pirange[0]) {
+				$frac = 'intermediate';
+			} elsif ($readlen >= $pirange[0] && $readlen <= $pirange[1]) {
+				if ($no_pi_split) {
+					$frac = 'piRNA';
+				} else {
+					my @chars = split //, $rec[1];
+					if ($chars[0] eq 'T') {
+						$frac = 'piRNA-U';   # U-type signature
+					} elsif ($chars[9] eq 'A') {
+						$frac = 'piRNA-A';   # A-type signature
+					} else {
+						$frac = 'piRNA-X';
+					}
+				}
+			} elsif ($readlen <= $lenmax && $readlen > $pirange[1]) {
+				$frac = 'over-piRNA';
+			} elsif ($readlen > $lenmax) {
+				$frac = 'too-long';
+			} else {
+				&logreport("$0: Size detection failed on fastq '$F{trimmed}{FQ}' record $i line $.!\n", 1, $LOG);
+				die;
+			}
+			
+			$stats{$frac}++;
+			$stats{ALLFRAC}++;
+			my $fh = $H{$frac};
+			print $fh @rec;
+			if ($frac =~ /^piRNA-[AUX]$/) {
+				## also print reads to total-piRNA fraction
+				$stats{piRNA}++;
+				my $fh = $H{piRNA};
+				print $fh @rec;
+			}
+			$i = 0;
+			$frac = undef;
+			@rec = ();
+			
+		}
+    }
+    close $TRIM;
+    &execute("gzip $fastqdir/*.fastq", 1, $LOG, 3);
+    &execute("rm -f $F{trimmed}{FQ}", 1, $LOG, 3);  # no longer needed -- all records have been assigned to fraction fastqs
+    
+    my $fqlist;
+    $fqlist .= "$F{$_}{FQ} " foreach @outfracs;
+    &execute("$readCount --uhisto $fqlist | perl -pe 's!^$fastqdir/!!' > $F{trimmed}{FQR}", 1, $LOG, 2);
+    
+    chomp(my $now = `date`);
+    &logreport("\nSTAGE 2 COMPLETE: $now\n\n", 1, $LOG);
+    
+} else {
+    
+    ## restarting; recover some numbers
+    my $IN = &open2('R', $F{trimmed}{FQR}, 'Trimmed fqReads file'); 
+    while (<$IN>) {
+		next if $. == 1;
+		my ($frac, $N) = (split /\t/, $_)[0,1];
+		$frac =~ s/.fastq.gz$//;
+		$stats{$frac} = $N;
+		$stats{ALLFRAC} += $N;
+    }
+    close $IN;
+    if ($notrim) {
+		$stats{TOTAL} = $stats{ALLFRAC};  # If trimming, we already have TOTAL.  Otherwise, ALLFRAC will be the first total we see.
+		&logreport("$stats{TOTAL} reads; no trimming took place\n", 1, $LOG);
+    }
+    my $msgblock = "\nFraction\tReads\tPctTotal\n";
+    foreach my $frac (@alnfracs) {
+		$pstats{$frac} = sprintf("%0.2f", 100*$stats{$frac}/$stats{TOTAL});
+		$msgblock .= "$frac\t$stats{$frac}\t$pstats{$frac}\n";
+    }
+    &logreport("$msgblock\n", 1, $LOG);
+    
+}
+$stage{2} = 1;
+sleep 1;   # killability
+
+
+
+
+
+#####  FRACTION-WISE STAGES  #####
+
+foreach my $frac (@alnfracs) {
+    
+    ## Each fraction proceeds through stages 3-5 before moving on to the next fraction.
+    
+	## All fractions workflows: 
+    ## STAGE 3A: Align input to TE
+    ## STAGE 3B: Align TE-unmapped to genome
+    ## STAGE 3C: Align genome-unmapped with Tophat2 to pick up junction reads, so that the final unaligned fraction really is unalignable
+    ## STAGE 4: Track files
+    ## STAGE 5: Quantitation
+    
+    unless ($stage{$frac}{3}) {
+		
+		system "rm -rf $F{$frac}{DIR}";   # clean slate before proceeding
+		system "mkdir $F{$frac}{DIR}";
+		
+		## STAGE 3: ALIGNMENTS
+		
+		foreach my $ref (@reforder) {
+			
+			chomp(my $now = `date`);
+			&logreport("\nAligning $frac, $refnames{$ref}: $now\n", 1, $LOG);
+			&execute(@{$_}) foreach @{ $CALLS{STAGE3}{ShortStack}{$frac}{$ref} };
+			sleep 1;   # killability
+			
+			if ($ref eq 'G') {
+				&execute(@{$_}) foreach @{ $CALLS{STAGE3}{Tophat2}{$frac}{$ref} };
+				sleep 1;   # killability
+			}
+		}
+		chomp(my $now = `date`);
+		&logreport("\n\nFRACTION $frac STAGE 3 COMPLETE: $now\n\n", 1, $LOG);
+		$stage{$frac}{3} = 1;
+		
+    }
+    
+    unless ($stage{$frac}{4}) {
+		
+		## STAGE 4: VISUALIZATION
+		
+		&execute(@{$_}) foreach @{ $CALLS{STAGE4}{$frac} };
+		sleep 1;   # killability
+		chomp(my $now = `date`);
+		&logreport("\n\nFRACTION $frac STAGE 4 COMPLETE: $now\n\n", 1, $LOG);
+		$stage{$frac}{4} = 1;
+		
+    }
+    
+    unless ($stage{$frac}{5}) {
+		
+		## STAGE 5: QUANTITATION
+		
+		&execute(@{$_}) foreach @{ $CALLS{STAGE5}{$frac} };
+		sleep 1;   # killability
+		chomp(my $now = `date`);
+		&logreport("\n\nFRACTION $frac STAGE 5 COMPLETE: $now\n\n", 1, $LOG);
+		$stage{$frac}{5} = 1;
+		
+    }
+    
+}
+
+
+
+
+
+#####  STAGE 6 OPERATIONS  #####
+
+## merge all unaligned fastqs into final version
+my $mergecmd = "zcat";
+foreach my $frac (@alnfracs) {
+    $mergecmd .= " $F{$frac}{UFQ}" if -s $F{$frac}{UFQ};
+}
+$mergecmd .= " | gzip > $F{input}{UFQ}";
+&execute($mergecmd, 1, $LOG, 2);
+$stage{6} = 1;
+
+
+
+
+
+#### STUFF BELOW IS REFERENCE FOR HUB-FILE MAKING -- FUTURE WORK
+#
+#
+#    my $hubgrp = "$anadir/groups.txt";
+#    my $hubdb = "$anadir/trackDb.txt";
+#    my $TE_cts = "$anadir/counts.TE.txt";
+#    my $gene_cts = "$anadir/counts.gene.txt";
+#   
+#    ## Analysis Globals
+#    my %AUXdat = (
+#	'A'=>{'FQ'=>$piA, 'UFQ'=>$piA_NT, 'TRK'=>"$hubname.A", 'BCOL'=>'255,0,0', 'HCOL'=>'255,150,150'}, 
+#	'U'=>{'FQ'=>$piU, 'UFQ'=>$piU_NT, 'TRK'=>"$hubname.U", 'BCOL'=>'0,0,255', 'HCOL'=>'150,150,255'}, 
+#	'X'=>{'FQ'=>$piX, 'UFQ'=>$piX_NT, 'TRK'=>"$hubname.X", 'BCOL'=>'0,0,0', 'HCOL'=>'100,100,100'}
+#	);  # data per piRNA signature type: Fastq file, Track file prefix, BED color, Hub color
+#    
+#    
+#    ## Hub File Init
+#    my $DBW;  # + strand block
+#    my $DBC;  # - strand block
+#    $DBW = "track ${hubname}_W\ncontainer multiWig\nshortLabel ${hubname}_W\nlongLabel $hubname, (+) Strand piRNA Alignments, 1 Align per Read, RPM, Colored by Signature (Red=A, Blue=U, Gray=None)\ngroup piRNA\n";
+#    $DBW .= "aggregate transparentOverlay\nshowSubtrackColorOnUi on\ntype bigWig 0 100\nviewLimits 0:15\nmaxHeightPixels 200:100:0\nalwaysZero on\nautoScale on\nvisibility full\npriority 99\n";
+#    $DBC = "track ${hubname}_C\ncontainer multiWig\nshortLabel ${hubname}_C\nlongLabel $hubname, (-) Strand piRNA Alignments, 1 Align per Read, RPM, Colored by Signature (Red=A, Blue=U, Gray=None)\ngroup piRNA\n";
+#    $DBC .= "aggregate transparentOverlay\nshowSubtrackColorOnUi on\ntype bigWig 0 100\nviewLimits 0:15\nmaxHeightPixels 200:100:0\nalwaysZero on\nautoScale on\nvisibility full\npriority 99\n";
+#    
+#    
+#   ## Process piRNAs per signature 
+#    foreach my $sig (qw/ A U X /) {
+#	
+#	&logreport("\npiExtract analyzing $outdir : $sig-type : ".`date`, 1, $LOG);
+#	
+#	## Directories and file-set prefixes
+#	my $bt2out = "$anadir/TE_$sig";
+#	my $TE = "$bt2out/TE_hits";
+#	my $TEU = "$bt2out/TE_hits.unq";
+#	my $topout = "$anadir/genome_$sig";
+#	my $all = "$topout/accepted_hits";
+#	my $allU = "$topout/accepted_hits.unq";
+#	my $unq = "$topout/accepted_hits_unqmary";
+#	
+#	
+#	## TE alignment & quantitation, if indicated
+#	if ($TEidx) {
+#	    
+#	    ## Bowtie2 TE alignment
+#	    system "mkdir $bt2out";
+#	    die "$0: Failed to create TE-bowtie2 output dir '$bt2out'!\n" unless -d $bt2out;
+#	    system "$bowtie2 --un-gz $AUXdat{$sig}{UFQ} -p $cores -x $TEidx -U $AUXdat{$sig}{FQ} -S $TE.sam 2> $TE.align_stats.txt";
+#	    system "$samtools view -F 4 -bS $TE.sam | $samtools sort -@ $cores -m $mem - $TE.sorted";
+#	    system "mv -f $TE.sorted.bam $TE.bam";
+#	    system "rm -f $TE.sam";
+#	    
+#	    ## Unique-reads and Stranded Bams
+#	    system "$stripMultireads --mode2 --bowtie $TE.bam";
+#	    system "rename stripMultireads unq $TE.*";  ############# MUST MATCH $TEU
+#	    system "$samtools view -h -f 16 $TE.bam | $samtools view -Sb - > $TE.W.bam";
+#	    system "$samtools view -h -F 16 $TE.bam | $samtools view -Sb - > $TE.C.bam";
+#	    system "$samtools view -h -f 16 $TEU.bam | $samtools view -Sb - > $TEU.W.bam";
+#	    system "$samtools view -h -F 16 $TEU.bam | $samtools view -Sb - > $TEU.C.bam";
+#	    
+#	    ## Counting hits
+#	    system "for bam in $TE.*.bam; do samtools index \$bam; done";
+#	    system "$samtools idxstats $TE.W.bam > $TE.W.idxstats.txt";
+#	    system "$samtools idxstats $TE.C.bam > $TE.C.idxstats.txt";
+#	    system "$samtools idxstats $TEU.W.bam > $TEU.W.idxstats.txt";
+#	    system "$samtools idxstats $TEU.C.bam > $TEU.C.idxstats.txt";
+#	    
+#	}
+#	
+#	
+#	## Tophat transcriptome/genome alignment (for 2 reasons: transcriptome prealignment, and also splice alignments)
+#	system "$tophat -p $cores -o $topout --transcriptome-index=$gtfi --segment-length=10 --no-coverage-search --no-novel-juncs $bti $AUXdat{$sig}{FQ}";
+#	system "$samtools index $all.bam";
+#	
+#
+#	## Primary Alignments, Unique-read BAMs
+#	system "$stripMultireads --mode1 --tophat --index $all.bam";
+##	system "rename stripMultireads unq $all.*";  ############# MUST MATCH $ALLU
+#	system "$samtools view -h -F 256 $all.bam | $samtools view -Sb - > $unq.bam";
+#	system "$samtools index $unq.bam";
+#	
+#	
+#	## Counts
+#	system "$samtools view $unq.bam | $htseq_count -s yes -a 0 -m intersection-nonempty - $gtf > $unq.htseq_counts_sense.txt";
+#	system "$samtools view $unq.bam | $htseq_count -s reverse -a 0 -m intersection-nonempty - $gtf > $unq.htseq_counts_anti.txt";
+##	system "$samtools view $allU.bam | $htseq_count -s yes -a 0 -m intersection-nonempty - $gtf > $allU.htseq_counts_sense.txt";
+##	system "$samtools view $allU.bam | $htseq_count -s reverse -a 0 -m intersection-nonempty - $gtf > $allU.htseq_counts_anti.txt";
+#	
+#	
+#	## Stranded BAMs & bigWigs
+#	system "$samtools view -h -f 16 $unq.bam | $samtools view -Sb - > $unq.W.bam";
+#	system "$samtools view -h -F 16 $unq.bam | $samtools view -Sb - > $unq.C.bam";
+#	system "$bam2track -b $unq.W.bam -g $geno -p $trackdir/$AUXdat{$sig}{TRK}.W --color=$AUXdat{$sig}{BCOL} -n APM --BB --BW";
+#	system "$bam2track -b $unq.C.bam -g $geno -p $trackdir/$AUXdat{$sig}{TRK}.C --color=$AUXdat{$sig}{BCOL} -n APM --BB --BW --neg";
+#	
+#	
+#	## extend trackDb files for A, U, X tracks
+#	my $labelW = "${hubname}_${sig}type_W";
+#	my $labelC = "${hubname}_${sig}type_C";
+#	$DBW .= "\n\ttrack $labelW\n\tparent ${hubname}_W\n\tbigDataUrl $AUXdat{$sig}{TRK}.W.bw\n\ttype bigWig 0 100\n\tcolor $AUXdat{$sig}{HCOL}\n";
+#	$DBC .= "\n\ttrack $labelC\n\tparent ${hubname}_C\n\tbigDataUrl $AUXdat{$sig}{TRK}.C.bw\n\ttype bigWig 0 100\n\tcolor $AUXdat{$sig}{HCOL}\n";
+#    }
+#    
+#    
+#    ## Create Counts Matrices
+#    system "$mergeIdxStats -o $TE_cts $anadir/*/*.idxstats.txt";
+#    system "$mergeMatrix -k 1 -v 2 -h 0 -o $gene_cts $anadir/*/*.htseq_counts_*.txt";
+#    
+#    ## Write Hub Files
+#    open my $GRP, '>', $hubgrp or die "$0: Failed to write to hub group file '$hubgrp': $!\n";
+#    print $GRP "\nname piRNA\nlabel piRNA Coverage by Signature\npriority 99\ndefaultIsClosed 0\n";
+#    close $GRP;
+#    open my $TDB, '>', $hubdb or die "$0: Failed to write to hub trackDb file '$hubdb': $!\n";
+#    print $TDB "\n$DBW\n$DBC\n";
+#    close $TDB;
+#    
+#    &logreport("\npiExtract analysis complete: ".`date`, 1, $LOG);
+#}
+
+$stage{7} = 1;   # POST-HUB STAGE MARKER // ADD THIS JUST FOR COMPLETENESS
+
+&logreport("\nsmallRNA-pipeline2 complete: ".`date`, 1, $LOG);
+close $LOG;
+exit;
+
+
+
+
+
+sub evaluate_trimming {
+    
+    if ($notrim) {
+		$stats{TOTAL} = $pstats{TOTAL} = undef;  # get these later
+		$stats{TRIMMED} = $stats{TRIMLOST} = 'NA';
+		$pstats{TRIMMED} = $pstats{TRIMLOST} = 'NA';
+    } else {
+		chomp(my $trimstats = `grep "^Input" $F{trimmed}{ERR}`);
+		($stats{TOTAL}, $stats{TRIMMED}, $stats{TRIMLOST}) = ($trimstats =~ /Input Reads: (\d+) Surviving: (\d+) .* Dropped: (\d+)/);
+		if (!$stats{TOTAL}) {
+			## No read totals??
+			if (defined $stats{TOTAL}) {
+				## 0 reads in input??
+				&logreport("$0: Trimmomatic reports that the input fastq was empty!\n", 1, $LOG);
+			} else {
+				&logreport("$0: Failed to interpret Trimmomatic output: cannot find read statistics!\n", 1, $LOG);
+			}
+			die;
+		}
+		$pstats{$_} = sprintf("%0.2f", 100*$stats{$_}/$stats{TOTAL}) foreach qw/ TOTAL TRIMMED TRIMLOST /;
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

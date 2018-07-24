@@ -1,0 +1,501 @@
+#!/usr/bin/env perl
+use Data::Dumper;
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+use Cwd;
+require '/home/apa/local/bin/apa_routines.pm';  # 
+
+## Inputs
+my @memes;             # input meme run directories
+my $minConn = 2;       # minimum network connectivity (node degree) per motif to include in a metamotif
+my $minMotifs = 2;     # minimum number of component motifs to call a metamotif
+my $minOverlap = 4;    # min overlap for a motif match
+my $tomQmax = 0.1;     # tomtom q-value threshold
+my $tomPmax = 1e-4;    # tomtom p-value threshold (post-scaling)
+my $clobber;           # output dir name, which overwrites any existing output dir
+my $outdir = 'findMetamotifs';  # output dir name (default) which will not overwrite existing
+my $rm_prefix;         # any systematic prefix from entries in @memes to ignore, when parsing out the meme run "name"
+my $rm_suffix;         # any systematic suffix from entries in @memes to ignore, when parsing out the meme run "name"
+my $motifdb = '/n/data1/biobase/transfac/current/meme/transfac.meme';           # a database of known motifs (e.g. transfac.meme) to characterize metamotifs with
+
+GetOptions("o=s" => \$outdir, "oc=s" => \$clobber, "mo=i" => \$minOverlap, "tq=s" => \$tomQmax, "tp=s" => \$tomPmax, "md=s" => \$motifdb, "rp=s" => \$rm_prefix, "rs=s" => \$rm_suffix, "mm=i" => \$minMotifs, "mc=i" => \$minConn);
+@memes = @ARGV;
+die "$0: No MEME runs specified!\n" unless @memes;
+
+## Globals
+my %master;             # master data hash
+my $tomtom = 'tomtom';  # tomtom executable
+my $wdir = cwd();       # base dir
+$outdir = "$wdir/$outdir" unless $outdir =~ /^\//;  # root $outdir, unless already
+my $tomdir = "$outdir/tomtom_out";                  # tomtom output dir
+my $tomdir_resc = "$outdir/tomtom_rescaled";        # tomtom p-value rescaling dir
+my $metadir_raw = "$outdir/metamotifs_raw";         # raw metamotif data dir
+my $metadir_ann = "$outdir/metamotifs_annot";       # tomtom-annotated metamotif data dir
+my $metadir_tom = "$outdir/meta_tomtom_out";        # metamotif-tomtom output dir
+my $metadir_resc = "$outdir/meta_tomtom_rescaled";  # metamotif-tomtom p-value rescaling dir
+my $mastermeme = "$outdir/master.meme";             # single MEME defs file for all motifs
+my $metameme = "$outdir/metamotif.meme";            # single MEME defs file for all metamotif members
+
+if ($clobber) {
+    $outdir = $clobber;
+    system "rm -Rf $outdir";
+}
+#die "Directory '$outdir' already exists!\n" if -d $outdir;
+system "mkdir -p $outdir";
+die "$0: Unable to create output directory '$outdir'!\n" unless -d $outdir;
+system "mkdir -p $tomdir";
+system "mkdir -p $tomdir_resc";
+system "mkdir -p $metadir_resc";
+system "mkdir -p $metadir_raw";
+system "mkdir -p $metadir_ann" if $motifdb;
+system "mkdir -p $metadir_tom" if $motifdb;
+
+print "Getting MEME data...\n";
+my (%runNames, @minMemeHeader, @minMemeData, %motifData, %motifsByRun, @allWidths);
+
+foreach my $m (0..$#memes) {
+    my $runPath = $memes[$m];
+    my ($runName) = ($runPath =~ /([^\/]+)$/);
+    $runName =~ s/^$rm_prefix//;
+    $runName =~ s/$rm_suffix$//;
+    $runNames{$runPath} = $runName;
+    print "$runPath => $runName\n";
+    my %memeRunData = %{ get_memedata($runPath) };
+#   $memeRunData{$motif}{NSITES} >= $minSites;
+    push @allWidths, $memeRunData{$_}{WIDTH} foreach keys %memeRunData;
+    my (@temp, $maxmot);
+    my @memefmt = (split /\n/, `meme2meme $runPath/meme.html`);
+    foreach my $i (0..$#memefmt) {
+	my $line = $memefmt[$i];
+	if ($i < 7) {
+	    push @minMemeHeader, "$line\n" if $m == 0;   # print on first meme run only
+	    next;
+	} elsif ($i == 7) {
+	    push @minMemeHeader, "A 0.25000 C 0.25000 G 0.25000 T 0.25000\n" if $m == 0;
+	    next;
+	} elsif ($i == 8) {
+	    push @minMemeHeader, "\n" if $m == 0;
+	    next;
+	}
+	if ($_ =~ /^MOTIF (\d+)/) {
+	    $maxmot = $1 if $1 > $maxmot;
+	}
+	push @temp, $line if $line;  # only non-blank post-header lines
+    }
+    my ($n, $newMotifID, %minMemeTemp);
+    foreach my $line (@temp) {
+	if ($line =~ /^MOTIF (\d+)/) {
+	    $n = $1;
+	    my $zeroes = '0' x (length($maxmot)-length($n));
+	    $newMotifID = "${runName}_$zeroes$n";
+	    $motifsByRun{$runName}{$n} = $newMotifID;
+	    $motifData{$newMotifID} = $memeRunData{$n};  # copy over temp MEME data
+	    $motifData{$newMotifID}{MEMERUN} = $runName;
+	    push @{ $motifData{$newMotifID}{MINIMAL} }, "\nMOTIF $newMotifID\n\n";  # for metamotif-only .meme file
+	    push @{ $minMemeTemp{$n} }, "\nMOTIF $newMotifID\n\n";  # for master.meme, which will get sorted by motif number
+	} else {
+	    push @{ $motifData{$newMotifID}{MINIMAL} }, "$line\n";
+	    push @{ $minMemeTemp{$n} }, "$line\n";
+	}
+    }
+    push @minMemeData, @{ $minMemeTemp{$_} } foreach sort {$a <=> $b} keys %minMemeTemp;
+}
+
+my ($shortest, $longest) = (sort {$a <=> $b} @allWidths)[0,-1];
+
+open my $OUT1, '>', $mastermeme;
+print $OUT1 (@minMemeHeader,@minMemeData);
+close $OUT1;
+
+## TOMTOM
+print "Running motif pairwise alignments...\n";
+chomp(my $now = `date`);
+print "Running tomtom: $now\n";
+system "$tomtom -min-overlap $minOverlap -oc $tomdir -thresh $tomQmax $mastermeme $mastermeme";
+
+chomp(my $now = `date`);
+my $rescaled_tom = "$tomdir_resc/tomtom.rescaled.txt";
+&rescale_tomtom("$tomdir/tomtom.txt", $tomdir_resc);
+
+my (%tomtoms, %premeta, %postmeta, %finalmeta, %metamotifs, %annMotifs, %motifseq, %offstr, %connectivity, $m1, $m2, $style, %rank, @log);
+
+print "Postprocessing tomtom: $now\n";
+open my $TOM1, '<', $rescaled_tom or die "$0: Cannot open scaled Tomtom output '$rescaled_tom' for reading: $!\n";
+while (<$TOM1>) {
+    next if $. == 1;
+    $_ =~ s/[\n\r]+$//;
+    my ($motifA, $motifB, $offset, $p, $e, $q, $overlap, $seqA, $seqB, $strand, $scaledp) = split /\t/, $_;
+    next unless $scaledp <= $tomPmax;
+    my ($memeA) = ($motifA =~ /(.*)_\d+$/);
+    my ($memeB) = ($motifB =~ /(.*)_\d+$/); 
+    $tomtoms{$motifA}{$memeB} = "$motifA\t$motifB\t$offset\t$scaledp\t$q\t$overlap\t$seqA\t$seqB\t$strand\n";
+    $tomtoms{$motifB}{$memeA} = "$motifB\t$motifA\t$offset\t$scaledp\t$q\t$overlap\t$seqA\t$seqB\t$strand\n";
+    push @{ $premeta{$motifA}{$memeB}{$scaledp} }, $motifB;
+    push @{ $premeta{$motifB}{$memeA}{$scaledp} }, $motifA;
+    $motifseq{$motifA} = $seqA;
+    $motifseq{$motifB} = $seqB;
+    $offstr{$motifA}{$motifB}{$scaledp} = [$offset, $overlap, $strand];	# input data
+    $offstr{$motifB}{$motifA}{$scaledp} = [-1*$offset, $overlap, $strand];
+    $connectivity{$motifA}{1}++;
+    $connectivity{$motifB}{1}++;
+}
+close $TOM1;
+
+foreach my $motifA (keys %offstr) {
+#    $connectivity{$motifA}{2}++ ## add self;
+    foreach my $motifB (keys %{ $offstr{$motifA} }) {
+	next if $motifA eq $motifB;
+	$connectivity{$motifA}{2} += $connectivity{$motifB}{1};
+    }
+}
+
+my (%metamotifs, %postmeta, %minmeta, %finalmeta, %degree, %already, %already2, %alreadyX, %thislevel, %nextlevel, %symbetcheck, %temp, $blocked, $depth);
+foreach my $initial_motif (keys %premeta) {
+    my %temp;
+    foreach my $meme (keys %{ $premeta{$initial_motif} }) {
+	my $bestp = (sort {$a <=> $b} keys %{ $premeta{$initial_motif}{$meme} })[0];
+	foreach my $pval (keys %{ $premeta{$initial_motif}{$meme} }) {
+	    $temp{$_} = $pval foreach @{ $premeta{$initial_motif}{$meme}{$pval} };
+	    delete $premeta{$initial_motif}{$meme}{$pval};
+	}
+    }
+    %{ $premeta{$initial_motif} } = %temp;	# replace with denoised data
+}
+foreach my $initial_motif (keys %premeta) {	# remap
+    $postmeta{$initial_motif}{$initial_motif} = 1;
+    foreach my $other_motif (keys %{ $premeta{$initial_motif} }) {
+	$postmeta{$initial_motif}{$other_motif} = 1;
+	$postmeta{$other_motif}{$initial_motif} = 1;
+    }
+}
+foreach my $i (1..10) {		# assuming 10 iterations will be more than sufficient to traverse alignment network
+    foreach my $motif (keys %postmeta) {	# crossmap + uniqueing
+	foreach my $motif1 (keys %{ $postmeta{$motif} }) {
+	    $postmeta{$motif}{$motif1} = 1;
+	    $postmeta{$motif1}{$motif} = 1;
+	    foreach my $motif2 (keys %{ $postmeta{$motif} }) {
+		$postmeta{$motif}{$motif2} = 1;
+		$postmeta{$motif2}{$motif} = 1;
+		$postmeta{$motif1}{$motif2} = 1;
+		$postmeta{$motif2}{$motif1} = 1;
+	    }
+	}
+    }
+}
+my (%prenet, %networks, $netN);
+foreach my $motif (keys %postmeta) {	# merge sets into strings; count members
+    my $set = join "\t", sort keys %{ $postmeta{$motif} };
+    $prenet{$set} = scalar keys %{ $postmeta{$motif} };
+}
+foreach my $set (sort { $prenet{$b} <=> $prenet{$a} } keys %prenet) {
+    $netN++;
+    my @motifs = split "\t", $set;
+    $networks{INIT}{$netN} = \@motifs;
+}
+foreach my $initial (keys %premeta) {
+    $degree{$initial} = scalar keys %{ $offstr{$initial} };
+}
+print "Finding Metamotifs...\n";
+my $Nmeta;
+foreach my $initial (sort { $degree{$b} <=> $degree{$a} } keys %postmeta) {	# seed final pools starting with highest connectivity first
+    next if $already2{$initial};	# already accounted for elsewhere
+    my @pool;
+    foreach my $motif (sort { $degree{$b} <=> $degree{$a} } keys %{ $postmeta{$initial} }) {
+	push @pool, $motif unless $already2{$motif};
+    }
+#    if (scalar @pool < 2) {
+    if (scalar @pool < $minMotifs) {
+	$alreadyX{$_} = 1 foreach @pool;
+	next;
+    }
+    {
+	my ($i, $accountedfor, %members);
+	{
+	    $i++;
+	    %members = ();  # initialized with 2 highest-connectivity members
+	    $members{$pool[0]} = 1;	# always contains highest member in pool
+	    $members{$pool[$i]} = 1;	# then get next-highest directly-connected member
+	    if ($postmeta{$pool[0]}{$pool[$i]}) {	# 2 highest conn MUST be connected to each other to begin seeding!
+#		print "Initialized on $initial: $pool[0] $pool[$i]\n";
+	    } else {
+#		print "Re-initialize on $initial: $i ", scalar @pool, "\n";
+		if ($i <= 10) {
+		    redo;
+		} else {
+		    die "Too many restarts!!\n";
+		}
+	    }
+	}
+	$Nmeta++;
+	foreach (1..10) {	# assuming <= 10 degrees of separation across entire network
+	    foreach my $motif (@pool) {
+		my ($conn, @whichconn);
+		foreach my $motif2 (keys %members) {
+		    $conn++ if $offstr{$motif}{$motif2};	# $motif is directly connected to a known member of this pool
+		    push @whichconn, $motif2 if $offstr{$motif}{$motif2};	# $motif is directly connected to a known member of this pool
+		}
+		$members{$motif} = 1 if $conn >= $minConn;	# $motif is connected to 2 or more members; earns membership itself
+#		print "$Nmeta add: $motif | @whichconn\n";
+	    }
+	}
+	my $Nmemb = scalar keys %members;
+#	print "$Nmeta FINAL: $Nmemb\n";
+	$accountedfor += $Nmemb;
+	$already2{$_} = 1 foreach keys %members;
+	$finalmeta{$Nmeta} = \%members;		# store network compartment as separate metamotif
+	my @newpool;
+	foreach my $motif (@pool) {
+	    push @newpool, $motif unless $members{$motif};
+	}
+	@pool = @newpool;	# replace old pool with remainder pool
+	if (@pool) {		# another network compartment remains; process it
+#	    print "More components remain: restarting\n";
+#	    redo;	# don't restart; allow another motif to initialize the remainder
+	}
+    }
+}
+
+print scalar(keys %postmeta), " motifs to account for -> ",( scalar(keys %already2) + scalar(keys %alreadyX) ), " motifs accounted for\n";
+
+
+## Metamotif numbers should be sorted decreasing by N members.  Sort raw metamotifs and re-number.
+print "Meta\tN\tMotifs\n";
+my $M;
+foreach my $i (sort { scalar (keys %{$finalmeta{$b}}) <=> scalar (keys %{$finalmeta{$a}}) } keys %finalmeta) {	# merge sets into strings; count members
+    $M++;  # final metamotif number
+    @{ $networks{FINAL}{$M} } = sort keys %{ $finalmeta{$i} };
+    my $set = join "\t", sort @{ $networks{FINAL}{$M} };  # concatenated motif ID string
+    $minmeta{$set} = scalar keys %{ $finalmeta{$i} };
+    
+    $metamotifs{$M}{N} = $minmeta{$set};
+    $metamotifs{$M}{MOTIFS}{$_} = 1 foreach @{ $networks{FINAL}{$M} };
+    $motifData{$_}{META} = $M foreach @{ $networks{FINAL}{$M} };
+    $metamotifs{$M}{MOTIFSTR} = $set;
+    print "$M\t$minmeta{$set}\t$set\n";
+    
+    foreach my $motif (keys %{ $finalmeta{$i} }) {
+	my ($meme) = ($motif =~ /(.*)_\d+$/);
+	$metamotifs{$M}{MEMERUNS}{$meme} = 1;
+	$metamotifs{$M}{SEQUENCES}{$_} = 1 foreach keys %{ $motifData{$motif}{POS} };
+	$metamotifs{$M}{NSITES} += $motifData{$motif}{NSITES};
+    }
+}
+#print Dumper(\%premeta), "\n";
+
+
+open my $OUT2, '>', $metameme;
+print $OUT2 @minMemeHeader;
+foreach my $M (sort {$a <=> $b} keys %metamotifs) {
+    print $OUT2 @{ $motifData{$_}{MINIMAL} } foreach sort keys %{ $metamotifs{$M}{MOTIFS} };
+}
+close $OUT2;
+
+if ($motifdb) {
+    print "Characterizing metamotifs...\n";
+    my $meta_rescaled_tom = "$metadir_resc/tomtom.rescaled.txt";
+    chomp(my $now = `date`);
+    print "Running tomtom: $now\n";
+    system "$tomtom -min-overlap $minOverlap -oc $metadir_tom -thresh $tomQmax $metameme $motifdb";
+    &rescale_tomtom("$metadir_tom/tomtom.txt", $metadir_resc);
+    
+    my (%accNames, $acc, $name);
+    open my $DB, '<', $motifdb;
+    while (<$DB>) {
+	$_ =~ s/[\n\r]+$//;
+	if ($_ =~ /^MOTIF (\S+) (\S+)/) {
+	    ($acc, $name) = ($1, $2);
+	    $accNames{$acc} = $name;
+	} elsif ($_ =~ /letter-probability matrix: alength= 4 w= (\d+) nsites= 5 E= 0/) {
+	    $annMotifs{$name}{WIDTH} = $1;
+	}
+    }
+    close $DB;
+    
+    open my $TOM2, '<', $meta_rescaled_tom or die "$0: Cannot open scaled Tomtom output '$meta_rescaled_tom' for reading: $!\n";
+    while (<$TOM2>) {
+	next if $. == 1;
+	$_ =~ s/[\n\r]+$//;
+	my ($motif, $annotAcc, $offset, $p, $e, $q, $overlap, $seqA, $seqB, $strand, $scaledp) = split /\t/, $_;
+	next unless $scaledp <= $tomPmax;
+	my $M = $motifData{$motif}{META};
+	my $annot = $accNames{$annotAcc};
+	
+	$annMotifs{$annot}{HITS}++;
+	$annMotifs{$annot}{WIDTH} = length($seqB);
+	$annMotifs{$annot}{MOTIFS}{$motif} = $scaledp;
+	$annMotifs{$annot}{MEMERUNS}{ $motifData{$motif}{MEMERUN} }++;
+	
+	$motifData{$motif}{ANNOTS}{$annot} = $scaledp;
+	$metamotifs{$M}{ANNOTS}{$annot}->[0]++;
+	$metamotifs{$M}{ANNOTS}{$annot}->[1] = $scaledp if $scaledp < $metamotifs{$M}{ANNOTS}{$annot}->[1];
+    }
+    close $TOM2;
+}
+
+print "Writing graphs...\n";
+my $styles = "node [shape=box,style=\"\",color=black,fontcolor=black]\;\nedge [arrowhead=none];\n";
+my %stagenames = ('I','Initial', 'F','Final');
+my $netdir = "$outdir/net_temp";
+#system "rm -Rf $netdir";
+system "mkdir $netdir" unless -d $netdir;
+foreach my $stage (qw/ I F /) {
+    foreach my $i (keys %{ $networks{$stage} }) {
+	my %knownedge;
+	my $label = "$stagenames{$stage}_$i";
+	open my $OUT3, '>', "$netdir/$label.dot" or die "$0: Cannot open scaled path '$netdir/$label.dot' for writing: $!\n";
+	print $OUT3 "digraph $label {\n$styles";
+	foreach my $motif1 (@{ $networks{$stage}{$i} }) {
+	    foreach my $motif2 (@{ $networks{$stage}{$i} }) {
+		next if $motif1 eq $motif2;
+		next unless $offstr{$motif1}{$motif2};	# must have direct connection
+		my $edge = $style."\"".$motif1."\" -> \"".$motif2."\"\;\n";
+		print OUT $edge unless $knownedge{$motif1}{$motif2} || $knownedge{$motif2}{$motif1};	# no redundant edges
+		$knownedge{$motif1}{$motif2} = $knownedge{$motif2}{$motif1} = 1;
+	    }
+	}
+	print $OUT3 "}\n";
+	close $OUT3;
+	system "dot -Tpng -o $netdir/$label.png $netdir/$label.dot";
+    }
+}
+
+my $sumfile = "$outdir/metamotif_summary.txt";
+open my $SUM, '>', $sumfile or die "$0: Cannot open metamotif summary file '$sumfile' for writing: $!\n";
+print $SUM "Metamotif\tMotifs\tMemeRuns\tSequences\tInstances\tAnnotations\n";
+
+my $detfile = "$outdir/metamotif_detail.txt";
+open my $DET, '>', $detfile or die "$0: Cannot open metamotif detail file '$detfile' for writing: $!\n";
+print $DET "Metamotif\tMotif\tType\tWidth\tConn1\tConn2\tMemeRun\tNSeqs\tNSites\tLogLR\tEval\tEntro\tInfo\tBpInfo\tMinPval\tAnnotations\n";  
+
+foreach my $M (sort {$a <=> $b} keys %metamotifs) {
+    my ($motifs, $runs, $seqs, $annots) = map { scalar(keys %{ $metamotifs{$M}{$_} }) } qw/ MOTIFS MEMERUNS SEQUENCES ANNOTS /;
+    print $SUM join("\t", ($M, $motifs, $runs, $seqs, $metamotifs{$M}{NSITES}, $annots)),"\n";
+    foreach my $motif (sort keys %{ $metamotifs{$M}{MOTIFS} }) {
+	my ($width, $runs, $nsites, $llr, $eval, $info, $entro) = map { $motifData{$motif}{$_} } qw/ WIDTH MEMERUN NSITES LOGLR EVAL INFO ENTRO /; 
+	my ($nseqs, $bpinfo, $conn1, $conn2) = (scalar(keys %{ $metamotifs{$M}{SEQUENCES} }), $info/$width, $connectivity{$motif}{1}, $connectivity{$motif}{2});
+	my $pval = (sort {$a <=> $b} keys %{ $motifData{$motif}{PVAL} })[0];
+	my @annots;
+	foreach my $annot (keys %{ $motifData{$motif}{ANNOTS} }) {
+	    my $annPval = $motifData{$motif}{ANNOTS}{$annot};
+	    push @annots, [$annPval, "$annot ($annPval)"];
+	}
+	my $annotstr = join '; ', map { $$_[1] } sort { $$a[0] <=> $$b[0] } @annots;
+	print $DET "$M\t$motif\tMEMBER\t$width\t$conn1\t$conn2\t$runs\t$nseqs\t$nsites\t$llr\t$eval\t$entro\t$info\t$bpinfo\t$pval\t$annotstr\n";
+    }
+    foreach my $annot (keys %{ $metamotifs{$M}{ANNOTS} }) {   # motifs from $motifdb\
+	my $runs = scalar keys %{ $annMotifs{$annot}{MEMERUNS} };
+	my $minPval = (sort {$a <=> $b} values %{ $annMotifs{$annot}{MOTIFS} })[0];
+	print $DET "$M\t$annot\tANNOT\t$annMotifs{$annot}{WIDTH}\t$annMotifs{$annot}{HITS}\t\t$runs\t\t\t\t\t\t\t\t$minPval\t\n";
+    }
+}
+close $SUM;
+close $DET;
+
+&align_motifs($metadir_raw);
+&align_motifs($metadir_ann, $motifdb) if $motifdb;
+
+print "Done!\n";
+exit;
+
+
+
+sub global_tophits {
+    my $PEND = shift;
+    my %tophits;
+    foreach my $M (keys %{ $premeta{$PEND} }) {
+	my $bestp = (sort {$a <=> $b} keys %{ $premeta{$PEND}{$M} })[0];
+	$tophits{$bestp}{$M}{$_} = 1 foreach (keys %{ $premeta{$PEND}{$M}{$bestp} });
+    }
+    my $allbestp = (sort {$a <=> $b} keys %tophits)[0];
+    my %results = %{ $tophits{$allbestp} };
+    print "$PEND | $allbestp | ", (scalar keys %results), "\n", Dumper(\%results), "\n";
+    $symbetcheck{$PEND} = \%results;
+}
+
+sub local_tophits {
+    my ($PEND, $n) = @_;
+    my %results;
+    my $bestp = (sort {$a <=> $b} keys %{ $premeta{$PEND}{$n} })[0];
+    $results{$_} = 1 foreach (keys %{ $premeta{$PEND}{$n}{$bestp} });
+    print "$PEND | $n | $bestp | ", (scalar keys %results), "\n", Dumper(\%results), "\n";
+    $symbetcheck{$PEND}{$n} = \%results;
+}
+
+sub rescale_tomtom {
+    
+    print "Regressing and rescaling Tomtom p-values...\n";
+    my ($input, $write_dir) = @_;
+    my $Rscript = "$write_dir/pval_regression.R";
+    
+    open my $ROUT1, '>', $Rscript or die "$0: Cannot open path '$Rscript' for writing: $!\n";;
+    print $ROUT1 "tom <- read.delim('$input', as.is=T)\n";
+    print $ROUT1 "rownames(tom) <- NULL\n";
+    print $ROUT1 "u7 <- sort(unique(tom[,7]))\n";
+    print $ROUT1 "reg <- lm(tom[,4] ~ tom[,7])\n";
+    print $ROUT1 "reg.ymin <- reg[[1]][[1]] + reg[[1]][[2]] * max(u7)\n";
+    print $ROUT1 "p.scaled <- tom[,4] * reg.ymin / ( reg[[1]][[1]] + reg[[1]][[2]] * tom[,7] )\n";
+    print $ROUT1 "reg.scaled <- lm(p.scaled ~ tom[,7])\n\n";
+    print $ROUT1 "tom <- cbind(tom, p.scaled=p.scaled)\n";
+    print $ROUT1 "write.table(tom, '$write_dir/tomtom.rescaled.txt', sep='\t', row.names=F, quote=F)\n\n";
+    print $ROUT1 "get.pct <- function(p,v){ sapply(u7, function(i){ sprintf('%0.1f', 100*sum(v[tom[,7]==i]<=p)/sum(tom[,7]==i) ) }) }\n";
+    print $ROUT1 "png('$write_dir/pvalue_regression_scaling.png', 1000, 500)\n";
+    print $ROUT1 "par(mfrow=c(1,2), cex=1.2, las=1)\n";
+    print $ROUT1 "plot(tom[,7], tom[,4], main='Before P-Value Scaling', xlab='Motif Overlap Bp', ylab='Motif Overlap P-Value')\n";
+    print $ROUT1 "abline(reg, col=2)\n";
+    print $ROUT1 "abline(h=reg.ymin, col=4)\n";
+    print $ROUT1 "mtext(get.pct(reg.ymin,tom[,4]), 3, 0, F, u7, col=4)\n";
+    print $ROUT1 "plot(tom[,7], p.scaled, main='After P-Value Scaling', xlab='Motif Overlap Bp', ylab='Motif Overlap P-Value')\n";
+    print $ROUT1 "abline(reg.scaled, col=2)\n";
+    print $ROUT1 "abline(h=reg.ymin, col=4)\n";
+    print $ROUT1 "mtext(get.pct(reg.ymin,p.scaled), 3, 0, F, u7, col=4)\n";
+    print $ROUT1 "dev.off()\n";
+    close $ROUT1;
+    system "R --vanilla < $Rscript > ${Rscript}out";
+}
+
+sub align_motifs {
+    
+    print "Multiple-aligning motif sets...\n";
+    my ($write_dir, $annots) = @_;
+    my $Rscript = "$write_dir/motif_multialign.R";
+    my $suffix = $annots ? 'annotated.' : '';
+    
+    print "Calling alignment printer in R...\n";
+    my $Rscript = "$write_dir/motif_multialign.R";
+    open my $ROUT2, '>', $Rscript or die "$0: Cannot open path '$Rscript' for writing: $!\n";
+    print $ROUT2 "\nsource('/n/projects/apa/R/apa_tools.R')\n";
+    print $ROUT2 "dat <- read.delim('$detfile', as.is=T)[,c(1,2,3,5,6)]\n";
+    print $ROUT2 "mot <- read.minimal.meme('$metameme', title.fmt='name')\$MOTIFS\n";
+    if ($annots) {
+	print $ROUT2 "ann <- read.minimal.meme('$annots')\$MOTIFS\n";
+	print $ROUT2 "names(ann) <- slice.list(ann,'name')\n";
+	print $ROUT2 "mot <- c(mot,ann)\n";
+    }
+    print $ROUT2 "pwm <- slice.list(mot, 'pwm')\n";
+    print $ROUT2 "mm <- mat.split(dat, dat[,1])\n";
+    print $ROUT2 "mm <- mm[order(as.numeric(names(mm)))]\n";
+    print $ROUT2 "meta.pwm <- nsites <- mm\n" unless $annots;
+    print $ROUT2 "\nfor (i in 1:length(mm)) {\n";
+    print $ROUT2 "  u <- unique(mm[[i]])\n";
+    print $ROUT2 "  mem <- which(u[,3]=='MEMBER')\n";
+    print $ROUT2 "  hubs <- mem[which(u[mem,4]==max(u[mem,4]))]\n";
+    print $ROUT2 "  max.hub <- hubs[which.max(u[hubs,5])]\n";
+    print $ROUT2 "  aln <- PSSM.align(pwm[names(pwm) %in% u[,2]], max.hub)\n";
+    print $ROUT2 "  logo.batchpdf(aln\$aligned, paste('$write_dir/metamotif',i,'members.${suffix}pdf',sep='.'))\n";
+#    print $ROUT2 "  logo.batchpdf(aln\$aligned, 'x.pdf')\n";
+#    print $ROUT2 "  pdfname <- paste('$write_dir/metamotif',i,'${suffix}pdf',sep='.')\n";
+#    print $ROUT2 "  system(paste('pdfjam --nup 1x',length(aln),' x.pdf --outfile ',pdfname,sep=''))\n";   ## NEED PDFJAM SITEWIDE FIRST
+    unless ($annots) {
+	print $ROUT2 "  imots <- which(names(mot) %in% u[mem,2])\n";
+	print $ROUT2 "  nsites[[i]] <- unlist(slice.list(mot[imots],'nsites'))\n";
+	print $ROUT2 "  aln2 <- lapply(1:length(mem), function(j){ round(aln\$aligned[[j]]*nsites[[i]][j],0) })\n";
+	print $ROUT2 "  meta.pwm[[i]] <- Reduce('+', aln2)\n";
+	print $ROUT2 "  meta.pwm[[i]] <- t( t(meta.pwm[[i]]) / colSums(meta.pwm[[i]]) )\n";
+	print $ROUT2 "  plotLogo(meta.pwm[[i]], paste('$write_dir/metamotif',i,'pwm.png',sep='.'), paste('Metamotif',i))\n";
+    }
+    print $ROUT2 "}\n";
+    print $ROUT2 "write.minimal.meme(meta.pwm, paste('$write_dir/final_metamotifs.meme',sep='.'), mnames=paste('Metamotif',1:length(mm),sep='_'), nsites=sapply(nsites,sum))\n" unless $annots;
+    close $ROUT2;
+    system "R --vanilla < $Rscript > ${Rscript}out";
+}

@@ -1,0 +1,23 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my ($inpng, $outpng, $tagged, $oneline);
+
+GetOptions("i=s"=>\$inpng, "o=s"=>\$outpng, "tagged"=>\$tagged, "1"=>\$oneline, "oneline"=>\$oneline);
+
+chomp(my $png64 = `openssl enc -base64 -in $inpng`);
+$png64 =~ s/\s//g if $oneline;  # strips newlines
+$png64 = "<IMG src=\"data:image/png;base64,$png64\">" if $tagged;
+$png64 .= "\n";
+
+if ($outpng) {
+    open OUT, "> $outpng" or die "$0: failed to write file '$outpng': $!\n";
+    print OUT $png64;
+    close OUT;
+} else {
+    print $png64;
+}
+exit;
+

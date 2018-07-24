@@ -1,0 +1,27 @@
+#!/bin/bash
+
+if [ -z $1 ]; then no_qsub=0; else no_qsub=1; fi
+
+#ls -la results/tmp/*/tmp.dead
+N=$(ls results/tmp/*/tmp.dead 2>/dev/null | wc -l)
+
+if [ $N -eq 0 ]; then
+    echo "No dead runs!"
+else
+    echo "$N jobs remaining"
+    rm -f rerun_dead.e rerun_dead.o rerun_dead.array
+    #greps=$(paste -s -d'|' <(ls results/tmp/*/tmp.dead | sed 's/\/tmp.dead//' | sed 's/.*\///'))
+    #grep -P "($greps)" *.array > rerun_dead.array
+    for ens in $(ls results/tmp/*/tmp.dead | sed 's/\/tmp.dead//' | sed 's/.*\///'); do grep $ens *.array; done > rerun_dead.x
+    if [ $no_qsub -eq 1 ]; then
+        cat rerun_dead.x | awk '{ print $0" &" }' > rerun_dead.array
+        echo "./rerun_dead.array"
+    else
+        mv rerun_dead.x rerun_dead.array
+        qsub -t 1-$N:1 -tc 32 -q all.q -b y -cwd -o rerun_dead.o -e rerun_dead.e '$(sed -n ${SGE_TASK_ID}p rerun_dead.array)'
+        sleep 1
+        qstat -u "*"
+        echo "qstat -u \"*\""
+    fi
+fi
+

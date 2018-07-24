@@ -1,0 +1,242 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use strict;
+
+
+##### MODIFIED FROM /n/local/stage/samtools/current/misc/psl2sam.pl
+##### 5 Mods: 
+##### 1. Include read sequence, quality in SAM (not just position/cigar)
+##### 2. Include header in SAM (otherwise, not true SAM format)
+##### 3. Option to record clipping as soft or hard, instead of only hard
+##### 4. Option to read from file instead of STDIN
+##### 5. Option to write to file instead of STDOUT
+
+### FIXME (or addme): add records for unaligned sequences; add cigar N type if possible
+
+
+
+# Author: lh3
+# This script calculates a score using the BLAST scoring
+# system. However, I am not sure how to count gap opens and gap
+# extensions. It seems to me that column 5-8 are not what I am
+# after. This script counts gaps from the last three columns. It does
+# not generate reference skip (N) in the CIGAR as it is not easy to
+# directly tell which gaps correspond to introns.
+
+
+## NEW
+my ($psl, $fa, $fq, $out, $sep);
+my $scoring = 1;  # 1 = original mode; 2 = end-to-end ident%; 3 = length%
+my ($a, $b, $q, $r) = (1, 3, 5, 2);  # from original script
+my $clip = 'S';  # = [ISHM]  # how you want clipping to be recorded in the CIGAR string: Soft or Hard (or Insert, or as Mapped) ## OR: '1I' for 1-ins-per-clip-bp
+
+GetOptions("p=s"=>\$psl, "fa=s"=>\$fa, "fq=s"=>\$fq, "o=s"=>\$out, "a=i"=>\$a, "b=i"=>\$b, "q=i"=>\$q, "r=i"=>\$r, "c=s"=>\$clip, "s=i"=>\$scoring, "separate"=>\$sep);
+die("Usage: psl2sam.pl [-p psl] [-fa fasta | -fq fastq] [-o output] [-a $a] [-b $b] [-q $q] [-r $r] [-c $clip] <in.psl>\n") unless ($psl || -t STDIN);
+
+print "CLIPPING: $clip\n";
+
+my (%references, %sequence, %querydat);
+
+if ($fa) {
+    open my $FA, '<', $fa or die "$0: Cannot read fasta file '$fa': $!\n";
+    my $header;
+    while (<$FA>) {
+	s/[\n\r]+$//;
+	if (/^>(\S+)/) {
+	    $header = $1;
+	} else {
+	    $sequence{$header}{S} .= $_;
+	}
+    }
+    close $FA;
+} elsif ($fq) {
+    open my $FQ, '<', $fq or die "$0: Cannot read fastq file '$fq': $!\n";
+    my ($i, $header);
+    while (<$FQ>) {
+	s/[\n\r]+$//;
+	$i++;
+	if ($i == 1) {
+	    ($header) = ($_ =~ /^\@(\S+)/);
+	} elsif ($i == 2) {
+	    $sequence{$header}{S} = $_;
+	} elsif ($i == 4) {
+	    $i = 0;
+	    $sequence{$header}{Q} = $_;
+	}
+    }
+    close $FQ;
+}
+
+my $IN;
+if ($psl) {
+    open $IN, '<', $psl or die "$0: Cannot read psl file '$psl': $!\n";
+} else {
+    open $IN, '<', *STDIN;
+}
+## END NEW
+
+
+my @headers;
+my @stack;
+my $last = '';
+
+while (<$IN>) {
+    next unless (/^\d/);
+    my @fields = split;
+    push @headers, $fields[0] unless exists $querydat{$fields[0]};
+    my @out;
+    my $cigar = '';
+    if ($fields[8] eq '-') {
+	my $tmp = $fields[11];
+	$fields[11] = $fields[10] - $fields[12];
+	$fields[12] = $fields[10] - $tmp;
+    }
+    $references{$fields[13]} = $fields[14];
+    my ($seq, $qual);
+    if ($sequence{$fields[9]}{S}) {
+	$fields[8] eq '+' ? $seq = $sequence{$fields[9]}{S} : ($seq = reverse $sequence{$fields[9]}{S}) =~ tr/ACGTacgt/TGCAtgca/;
+    } else {
+	$seq = '*';
+    }      
+    if ($sequence{$fields[9]}{Q}) {
+	$qual = $fields[8] eq '+' ? $sequence{$fields[9]}{Q} : reverse($sequence{$fields[9]}{Q});
+    } else {
+	$qual = '*';
+    }      
+    @out[0..4] = ($fields[9], (($fields[8] eq '+')? 0 : 16), $fields[13], $fields[15]+1, 0);
+    @out[6..10] = ('*', 0, 0, $seq, $qual);  ## MODIFIED TO INCLUDE SEQ/QUAL IF ANY
+    $fields[$_] =~ s/,$// foreach (18..20);
+    my @sizes = split(',', $fields[18]);
+    my @qstarts = split(',', $fields[19]);
+    my @tstarts = split(',', $fields[20]);
+    if ($fields[11]) {  # 5'-end clipping
+	if ($clip eq '1I') { # one insert per clipped bp
+	    $cigar .= '1I' x $fields[11];
+	} elsif ($clip eq 'M') {
+	    if ($fields[11] <= $fields[15]) {   # target can accommodate entire clip; pretend no clipping occurred.
+		$sizes[0] += $fields[11];
+		$qstarts[0] = 0;
+		$fields[11] = 0;
+		$tstarts[0] -= $fields[11];
+		$fields[15] -= $fields[11];
+	    } else {   # clip exceeds reference start; set clip end where reference would start.
+		$sizes[0] += $fields[15];
+		$qstarts[0] -= $fields[15];
+		$fields[11] -= $fields[15];
+		$tstarts[0] = 0;
+		$fields[15] = 0;
+		$cigar .= $fields[11] . 'S';
+	    }
+	} else {
+	    $cigar .= $fields[11] . $clip;
+	}
+    }
+    my ($gap_open, $gap_ext) = (0, 0, 0);
+    for my $i (1 .. $fields[17]-1) {
+	my $qlen = $qstarts[$i] - $qstarts[$i-1] - $sizes[$i-1];
+	my $tlen = $tstarts[$i] - $tstarts[$i-1] - $sizes[$i-1];
+	if ($qlen < $tlen) {  # del: the reference gap is longer
+	    ++$gap_open;
+	    $gap_ext += $tlen - $qlen;
+	    $cigar .= ($qstarts[$i] - $fields[11]) . 'M';
+	    $cigar .= ($tlen - $qlen) . 'D';
+	    ($fields[11], $fields[15]) = ($qstarts[$i], $tstarts[$i]);
+	} elsif ($tlen < $qlen) {  # ins: the query gap is longer
+	    ++$gap_open;
+	    $gap_ext += $qlen - $tlen;
+	    $cigar .= ($tstarts[$i] - $fields[15]) . 'M';
+	    $cigar .= ($qlen - $tlen) . 'I';
+	    ($fields[11], $fields[15]) = ($qstarts[$i], $tstarts[$i]);
+	}
+    }
+    if ($fields[10] != $fields[12]) {  # 3'-end clipping
+	if ($clip eq '1I') {
+	    $cigar .= ($fields[12] - $fields[11]) . 'M';
+	    $cigar .= '1I' x ($fields[10] - $fields[12]);
+	} elsif ($clip eq 'M') {
+	    my $qextra = $fields[10] - $fields[12];  # length of clipped seq
+	    my $textra = $fields[14] - $fields[16];  # max room available on subject to accommodate clipped seq
+	    if ($qextra <= $textra) {  # target can accommodate entire clip
+		$sizes[-1] += $qextra;
+#		$qstarts[-1] = $fields[10];
+		$fields[12] = $fields[10];
+#		$tstarts[-1] += $qextra;
+		$fields[16] += $qextra;
+		$cigar .= ($fields[12] - $fields[11]) . 'M';
+	    } else {   # clip exceeds reference end; set clip start where reference ends
+		$sizes[-1] += ($qextra - $textra);
+#		$qstarts[-1] += ($qextra - $textra);
+		$fields[12] += ($qextra - $textra);
+#		$tstarts[-1] = $fields[14];
+		$fields[16] = $fields[14];
+		$cigar .= ($fields[12] - $fields[11]) . 'M';
+		$cigar .= ($fields[10] - $fields[12]) . 'S';
+	    }
+	} else {
+	    $cigar .= ($fields[12] - $fields[11]) . 'M';
+	    $cigar .= ($fields[10] - $fields[12]) . $clip;
+	}
+    } else {
+	$cigar .= ($fields[12] - $fields[11]) . 'M';
+    }
+#    $cigar =~ s/(\d+)M(\d+)M/($1+$2).'M'/eg if $clip eq 'M';
+    $out[5] = $cigar;
+    my $score;
+    if ($scoring == 1) {
+	$score = $a * $fields[0] - $b * $fields[1] - $q * $gap_open - $r * $gap_ext;
+	$score = 0 if ($score < 0);
+    } elsif ($scoring == 2) {
+	$score = sprintf("%0.0f", 100*$fields[0]/$fields[10]);
+    } elsif ($scoring == 3) {
+	$score = sprintf("%0.0f", 100*($fields[12]-$fields[11])/$fields[10]);
+    }
+    $out[11] = "AS:i:$score";
+    $querydat{$fields[0]}{ALN}++;
+    push @{ $querydat{$fields[0]}{LINE} }, join("\t", @out)."\n";
+}
+
+## NEW: ADD SAM LINES FOR UNALIGNED READS
+foreach my $query (sort keys %sequence) {
+    next if exists $querydat{$query};  # aligned read
+    push @headers, $query;
+    my $line = join("\t", $query, "4\t*\t0\t0\t*\t*\t0\t0", $sequence{$query}{S}, $sequence{$query}{Q}||'*')."\n";
+    push @{ $querydat{$query}{LINE} }, $line;
+}
+
+## NEW: ADD SAM HEADER TO OUTPUT, OPTIONAL FILE OUTPUT
+
+my $samheader = "\@HD\tVN:1.4\tGO:none\tSO:coordinate\n";
+$samheader .= "\@SQ\tSN:$_\tLN:$references{$_}\n" foreach sort keys %references;
+
+my $OUT;
+if ($out && $sep) {  # $sep only if $out
+    (my $outu = $out) =~ s/.sam$/.unique.sam/;
+    (my $outm = $out) =~ s/.sam$/.multi.sam/;
+    (my $outn = $out) =~ s/.sam$/.unaligned.sam/;
+    open my $OUTU, '>', $outu or die "$0: Cannot write output '$outu': $!\n";
+    open my $OUTM, '>', $outm or die "$0: Cannot write output '$outm': $!\n";
+    open my $OUTN, '>', $outn or die "$0: Cannot write output '$outn': $!\n";
+    print $OUTU $samheader;
+    print $OUTM $samheader;
+    print $OUTN $samheader;
+    foreach my $query (@headers) {
+	if ($querydat{$query}{ALN}==1) {
+	    print $OUTU @{ $querydat{$query}{LINE} };
+	} elsif ($querydat{$query}{ALN}>1) {
+	    print $OUTM @{ $querydat{$query}{LINE} };
+	} else {
+	    print $OUTN @{ $querydat{$query}{LINE} };
+	}
+    }
+    close $_ foreach ($OUTU, $OUTM, $OUTN);
+} else {
+    if ($out) {
+	open $OUT, '>', $out or die "$0: Cannot write output '$out': $!\n";
+    } else {
+	open $OUT, '>', *STDOUT;
+    }
+    print $OUT $samheader;
+    print $OUT @{ $querydat{$_}{LINE} } foreach @headers;
+    close $OUT;
+}
+exit;

@@ -1,0 +1,60 @@
+#!/bin/bash
+
+geno=$1
+anno=$2
+outfile=$3
+
+mergeBed=mergeBed
+subtractBed=subtractBed
+
+prefix=/n/data1/genomes/bowtie-index/$geno/$anno/$geno.$anno
+tmp=/tmp/GenomeBpTypes.$$
+mkdir $tmp
+
+fai=/n/data1/genomes/bowtie-index/$geno/$geno.fa.fai
+GS=$(paste -s -d+ <(cut -f2 $fai) | bc)  # genome size
+
+echo "Preparing BED files..."
+grep -P "\t(Mt_)?rRNA\t" $prefix.genedata.txt | cut -f3-5 > $tmp/ribo.bed
+cat $prefix.CDSs.bed | awk '{ if ($3 > $2) print $0 }' > $tmp/cds1
+$mergeBed -i $tmp/cds1 > $tmp/cds
+$mergeBed -i $prefix.UTRs.bed > $tmp/utr
+#$mergeBed -i $prefix.introns.bed > $tmp/int
+$mergeBed -i $prefix.iintrons.bed > $tmp/iint
+$mergeBed -i $prefix.intergenes.bed > $tmp/itgc
+$mergeBed -i $prefix.uxons.bed > $tmp/exo
+$mergeBed -i $tmp/ribo.bed > $tmp/ribo
+cat $tmp/cds $tmp/utr | /home/apa/local/bin/sortBedCoord - > $tmp/exo2
+
+echo "Removing overlaps..."
+$subtractBed -a $tmp/utr -b $tmp/cds > $tmp/utr-cds
+$subtractBed -a $tmp/exo -b $tmp/exo2 > $tmp/exo-exo2
+$subtractBed -a $tmp/exo -b $tmp/cds > $tmp/exo-cds
+$subtractBed -a $tmp/iint -b $tmp/exo > $tmp/iint-exo
+$subtractBed -a $tmp/utr-cds -b $tmp/ribo > $tmp/utr-cds-ribo
+$subtractBed -a $tmp/exo-exo2 -b $tmp/ribo > $tmp/exo-exo2-ribo
+
+#$subtractBed -a $tmp/int -b $tmp/exo > $tmp/int-exo
+#$subtractBed -a $tmp/int -b $tmp/exo2 > $tmp/int-exo2
+#$subtractBed -a $tmp/iint -b $tmp/exo2 > $tmp/iint-exo2
+
+echo "Calculating compartment sizes..."
+mv $tmp/exo-exo2-ribo $tmp/NC-EXON
+mv $tmp/utr-cds-ribo $tmp/PC-UTR
+mv $tmp/cds $tmp/PC-CDS
+mv $tmp/itgc $tmp/INTERGENE
+mv $tmp/iint-exo $tmp/INTRON
+mv $tmp/ribo $tmp/RIBOSOME
+
+echo -e "GENOME\t$geno" > $outfile
+echo -e "TRANSCRIPTOME\t$anno" >> $outfile
+echo -e "TOTAL_BP\t$GS" >> $outfile
+for bed in INTERGENE INTRON PC-UTR PC-CDS NC-EXON RIBOSOME
+do
+    N=$(paste -s -d+ <(/home/apa/local/bin/bedLengths -b $tmp/$bed | cut -f4) | bc)
+    if [ -z $N ] || [ $N == "" ]; then N=0; fi
+    echo -e "${bed}_BP\t$N" >> $outfile
+done
+rm -rf $tmp
+
+echo "GenomeBpTypes $geno $anno done!"

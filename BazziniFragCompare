@@ -1,0 +1,601 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Data::Dumper;
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+## Do 4 things, mainly:
+## 1. Compare full frag to 101bp-emulated imputed-frag, for sequences with full frag.
+## 2. Compare alignments of 101bp-emulated to full versions (which will be no-overlap OR full-frag).
+## 3. Get (shortest) frag len dist for non-overlapping pairs.
+## 4. See how often the longest transcript was: 1) a passing alignment, 2) an optimal alignment, 3) a novel alignment.
+
+## TO DO: alignment-has-indel/frameshift tracking
+
+my $watch;
+#$watch = "M01285:59:000000000-AV70C:1:2119:15503:14553";   # header to report on   # M01285:59:000000000-AV70C:1:2118:23979:15873  M01285:59:000000000-AV70C:1:1106:28874:14211  M01285:59:000000000-AV70C:1:1101:2364:14384
+
+my ($sample, $org, $aligner) = @ARGV;   # , $cores, $mem
+$aligner = 'bowtie2' unless $aligner;
+my $sampdir = "/n/core/Bioinformatics/analysis/Bazzini/arb/cbio.arb.101/data/output/$sample";
+my $orgdir  = "$sampdir/$org";
+#$cores = 1 unless $cores;
+#$mem = '1G' unless $mem;
+
+my $refdir = '/n/core/Bioinformatics/analysis/Bazzini/arb/cbio.arb.101/code/refs';
+my %orgs = map {($_=>1)} qw/ Drosophila Danio Pombe Schmidtea MiniGene /;
+die "$0: given organism '$org' not one of the 5 valid orgs: Drosophila Danio Pombe Schmidtea MiniGene !\n" unless $orgs{$org};
+my (%data, %refdata, %reflen, %rtype, %astats, %stats, %stats2);
+my $outpref = "$orgdir/$sample.$org.$aligner.FragCompare";
+
+## do not change these values unless you know what you are doing
+my $endcomp = 25;
+my $endcomp1 = $endcomp-1;
+my $min_nsame = 45;
+
+
+## Load reference data
+
+print "Reading reference data: ".`date`;
+print "Full: $refdir/${org}_full/${org}_full.fa\n";
+my $FAF = &open2('R', "$refdir/${org}_full/${org}_full.fa", "$org full-transcripts fasta");
+my @x = &readFasta($FAF,0,1);
+$refdata{FULL} = $x[0];  # header => seq hash
+close $FAF;
+
+unless ($org eq 'MiniGene') {
+    ## longest-only does not exist for minigenes
+    print "Long: $refdir/${org}_longest/${org}_longest.fa\n";
+    my $FAL = &open2('R', "$refdir/${org}_longest/${org}_longest.fa", "$org longest-transcripts fasta");
+    my @y = &readFasta($FAL,0,1);
+    $refdata{LONG}{ (split /\|/, $_)[1] } = $y[0]->{$_} foreach keys %{ $y[0] };  # header => seq hash
+    close $FAL;
+}
+
+foreach my $REF (qw/ FULL LONG /) {
+    $reflen{$REF}{$_} = length($refdata{$REF}{$_}) foreach keys %{ $refdata{$REF} };
+}
+
+
+## Load read data
+
+print "Reading reads: ".`date`;
+my $prefix = "$orgdir/$sample.$org.read_fractions.reconstructed-fragments";
+my $nolfq1 = "$prefix.no-overlap_1.fastq.gz";
+my $nolfq2 = "$prefix.no-overlap_2.fastq.gz";
+my $emufq1 = "$prefix.101bp-emu_1.fastq.gz";
+my $emufq2 = "$prefix.101bp-emu_2.fastq.gz";
+my $fragfa = "$prefix.fa.gz";
+
+print "reading $fragfa\n";
+my $FFA = &open2('R', $fragfa, "$org fragments fasta");
+my @x = &readFasta($FFA);
+my %seq = %{$x[0]};
+foreach my $header (keys %seq) {
+    $data{FRAG}{$header}{LEN}{1} = length($seq{$header});
+    $data{FRAG}{$header}{SEQ}{1} = $seq{$header};
+    $rtype{$header} = 'FRAG';
+    print "$header READ: FRAG $data{FRAG}{$header}{LEN}{1} $seq{$header}\n" if $header eq $watch;
+}
+close $FFA;
+
+print "zcat $nolfq1 | paste - - - - | cut -f1,2\n";
+open NFQ1, '-|', "zcat $nolfq1 | paste - - - - | cut -f1,2";
+while (<NFQ1>) {
+    chomp;
+    my ($header, $read) = split /\t/, $_;
+    $header =~ s/^@//;
+    $data{NOOL}{$header}{LEN}{1} = length($read);
+    $data{NOOL}{$header}{SEQ}{1} = $read;
+    $rtype{$header} = 'NOOL';
+    print "$header READ: NOOL 1 $data{NOOL}{$header}{LEN}{1} $read\n" if $header eq $watch;
+}
+close NFQ1;
+
+print "zcat $nolfq2 | paste - - - - | cut -f1,2\n";
+open NFQ2, '-|', "zcat $nolfq2 | paste - - - - | cut -f1,2";
+while (<NFQ2>) {
+    chomp;
+    my ($header, $read) = split /\t/, $_;
+    $header =~ s/^@//;
+    $data{NOOL}{$header}{LEN}{2} = length($read);
+    $data{NOOL}{$header}{SEQ}{2} = ${ &revcomp(\$read) };
+    print "$header READ: NOOL 2 $data{NOOL}{$header}{LEN}{2} $read\n" if $header eq $watch;
+}
+close NFQ2;
+
+print "zcat $emufq1 | paste - - - - | cut -f1,2\n";
+open NFQ1, '-|', "zcat $emufq1 | paste - - - - | cut -f1,2";
+while (<NFQ1>) {
+    chomp;
+    my ($header, $read) = split /\t/, $_;
+    $header =~ s/^@//;
+    $header =~ s/:data.*//;
+    $data{EMUL}{$header}{LEN}{1} = length($read);
+    $data{EMUL}{$header}{SEQ}{1} = $read;
+    print "$header READ: EMUL 1 $data{EMUL}{$header}{LEN}{1} $read\n" if $header eq $watch;
+}
+close NFQ1;
+
+print "zcat $emufq2 | paste - - - - | cut -f1,2\n";
+open NFQ2, '-|', "zcat $emufq2 | paste - - - - | cut -f1,2";
+while (<NFQ2>) {
+    chomp;
+    my ($header, $read) = split /\t/, $_;
+    $header =~ s/^@//;
+    $header =~ s/:data.*//;
+    $data{EMUL}{$header}{LEN}{2} = length($read);
+    $data{EMUL}{$header}{SEQ}{2} = ${ &revcomp(\$read) };
+    print "$header READ: EMUL 2 $data{EMUL}{$header}{LEN}{2} $read\n" if $header eq $watch;
+}
+close NFQ2;
+
+my $TOTALF = scalar keys %{ $data{FRAG} };
+my $TOTALN = scalar keys %{ $data{NOOL} };
+my $TOTAL = (sort {$b <=> $a} ($TOTALF, $TOTALN))[0];
+my $WIDTH = length($TOTAL);  # for sprintf
+my $PWIDTH = $WIDTH > 6 ? $WIDTH : 6;  # width for percent cols; prefer $WIDTH but must be at least 6
+my $headw = 12;  # max column header width (histogram cols)
+my $WIDTH2 = $WIDTH < $headw ? $headw : $WIDTH;
+
+
+## Parse alignments
+
+my $bampref = $aligner eq 'STAR' ? 'Aligned.out' : 'bowtie2';
+$bampref .= '.name-sorted';
+
+print "Parsing alignments: ".`date`;
+foreach my $refn (qw/ longest full /) {
+    
+    my $full = $refn eq 'full';
+    my $ref = $full ? 'FULL' : 'LONG';
+    next if $ref eq 'LONG' && $org eq 'MiniGene';  # no longest-refs version for MiniGene
+    
+    my $noldir = "$prefix.no-overlap.$refn/$aligner";
+    my $emudir = "$prefix.101bp-emu.$refn/$aligner";
+    my $fradir = "$prefix.full-frag.$refn/$aligner";
+    my $nolbam = "$noldir/$bampref.bam";
+    my $emubam = "$emudir/$bampref.bam";
+    my $frabam = "$fradir/$bampref.bam";
+    
+    if (-e $frabam) {
+        print "samtools view $frabam\n";
+        open IN, '-|', "samtools view $frabam";
+        while (<IN>) {
+            my ($header, $flags, $trans, $start, $cigar) = (split /\t/, $_)[0..3,5];
+            print "FRAG FAIL\n" if $trans eq '*';
+            $trans = (split /\|/, $trans)[1] unless $full;
+            my $readlen = $data{FRAG}{$header}{LEN}{1};
+            my ($mp, $splice) = (1, 0);
+            $splice += $1 while $cigar =~ /(\d+)N/g;
+            my $clip5 = $cigar =~ /^(\d+)S/ ? $1 : 0;
+            my $clip3 = $cigar =~ /(\d+)S$/ ? $1 : 0;
+            my $end = $start + $readlen - 1 - $clip5 - $clip3;
+            $data{FRAG}{$header}{ALNTRUE}{$ref}{$trans}{$mp}{$.} = [$flags, $readlen, $start, $end, $cigar, $clip5, $clip3, $splice];
+            print "$header ALIGN: FRAG ALNTRUE $ref $trans $mp (L$.) = $flags, $readlen, $start, $end, $cigar, $clip5, $clip3, $splice\n" if $header eq $watch;
+        }
+        close IN;
+    } else {
+        print STDERR "WARNING: $sample $org $refn-transcript full-fragment name-sorted bam does not exist!\n";
+    }
+    
+    if (-e $nolbam) {
+        print "samtools view $nolbam\n";
+        open IN, '-|', "samtools view $nolbam";
+        while (<IN>) {
+            my ($header, $flags, $trans, $start, $cigar) = (split /\t/, $_)[0..3,5];
+            print "NOOL FAIL\n" if $trans eq '*';
+            $trans = (split /\|/, $trans)[1] unless $full;
+            my $mp = $flags & 128 ? 2 : 1;
+            my $readlen = $data{NOOL}{$header}{LEN}{$mp};
+            my $splice = 0;
+            $splice += $1 while $cigar =~ /(\d+)N/g;
+            my $clip5 = $cigar =~ /^(\d+)S/ ? $1 : 0;
+            my $clip3 = $cigar =~ /(\d+)S$/ ? $1 : 0;
+            my $end = $start + $readlen - 1 - $clip5 - $clip3;
+            $data{NOOL}{$header}{ALNTRUE}{$ref}{$trans}{$mp}{$.} = [$flags, $readlen, $start, $end, $cigar, $clip5, $clip3, $splice];
+            print "$header ALIGN: NOOL ALNTRUE $ref $trans $mp (L$.) = $flags, $readlen, $start, $end, $cigar, $clip5, $clip3, $splice\n" if $header eq $watch;
+        }
+        close IN;
+    } else {
+        print STDERR "WARNING: $sample $org $refn-transcript no-overlap name-sorted bam does not exist!\n";
+    }
+    
+    if (-e $emubam) {
+        print "samtools view $emubam\n";
+        open IN, '-|', "samtools view $emubam";
+        while (<IN>) {
+            my ($header, $flags, $trans, $start, $cigar) = (split /\t/, $_)[0..3,5];
+            print "EMUL FAIL\n" if $trans eq '*';
+            $header =~ s/:data.*//;
+            $trans = (split /\|/, $trans)[1] unless $full;
+            my $origin = $rtype{$header};
+            my $mp = $flags & 128 ? 2 : 1;
+            my $readlen = $data{EMUL}{$header}{LEN}{$mp};
+            my $splice = 0;
+            $splice += $1 while $cigar =~ /(\d+)N/g;
+            my $clip5 = $cigar =~ /^(\d+)S/ ? $1 : 0;
+            my $clip3 = $cigar =~ /(\d+)S$/ ? $1 : 0;
+            my $end = $start + $readlen - 1 - $clip5 - $clip3;
+            $data{$origin}{$header}{ALNEMUL}{$ref}{$trans}{$mp}{$.} = [$flags, $readlen, $start, $end, $cigar, $clip5, $clip3, $splice];
+            print "$header ALIGN: $origin ALNEMUL $ref $trans $mp (L$.) = $flags, $readlen, $start, $end, $cigar, $clip5, $clip3, $splice\n" if $header eq $watch;
+        }
+        close IN;
+    } else {
+        print STDERR "WARNING: $sample $org $refn-transcript 101bp-emulated name-sorted bam does not exist!\n";
+    }
+    
+}
+
+
+## Condense end-wise alignments into paired alignments
+
+## IN THIS LOOP:
+## Compare alignment positions of emulated to original
+## Collect imputed fragments, labeled with splices/clips/transcript/is-longest/n-possible-frags-per-pair
+my (%truealign, %samepcts, %detail);
+print "Processing alignments: ".`date`;
+foreach my $origin (qw/ FRAG NOOL /) {  # headers will be in one or the other, never in both
+    my $isfrag = $origin eq 'FRAG' ? 1 : 0;
+    my $blurb = $isfrag ? 'Full-fragment' : 'Non-overlapping';
+    print " $blurb alignments...\n";
+    foreach my $header (keys %{ $data{$origin} }) {
+        print "ORIG : $origin $header\n" if $header eq $watch;
+        my $explen = $isfrag ? $data{FRAG}{$header}{LEN}{1} : $data{NOOL}{$header}{LEN}{1}+$data{NOOL}{$header}{LEN}{2};  # exp NOOL len should be longer than this, but this is the forseeable minimum
+        my $expseq = $isfrag ? $data{FRAG}{$header}{SEQ}{1} : $data{NOOL}{$header}{SEQ}{1}.'-'.$data{NOOL}{$header}{SEQ}{2};
+        my $expseqRC = ${ &revcomp($expseq) };
+        my ($TEsame, $FLsame);
+        foreach my $TEaln (qw/ ALNTRUE ALNEMUL /) {
+            print "ALN  : $origin $header $TEaln\n" if $header eq $watch;
+            my $isemul = $TEaln eq 'ALNEMUL' ? 1 : 0;
+            my $TEname = $isemul ? 'EMUL' : 'TRUE';
+            foreach my $ref (qw/ LONG FULL /) {   ## LONGEST FIRST -- want this info loaded by the time we get to 'full'
+                print "REF  : $origin $header $TEaln $ref\n" if $header eq $watch;
+                my $islong = $ref eq 'LONG' ? 1 : 0;
+                my $oref = $islong ? 'FULL' : 'LONG';
+                my %tmp;  # temp stats per $TEaln / $ref
+                foreach my $trans (keys %{ $data{$origin}{$header}{$TEaln}{$ref} }) {
+                    print "TRANS: $origin $header $TEaln $ref $trans\n" if $header eq $watch;
+                    my %hash = %{ $data{$origin}{$header}{$TEaln}{$ref}{$trans} };
+                    my $nh1 = exists $hash{1} ? scalar(keys %{$hash{1}}) : 0;
+                    my $nh2 = exists $hash{2} ? scalar(keys %{$hash{2}}) : 0;
+                    print "TRANS: $origin $header $TEaln $ref $trans ($nh1,$nh2)\n" if $header eq $watch;
+                    if ($nh1 && $nh2) {
+                        #$astats{$origin}{PEALIGN}{$header}{$TEaln}{$ref}{$trans}++;
+                        $astats{$origin}{PEALIGN}{$TEaln}{$ref}{$header}{$trans}++;
+                    } else {
+                        #$astats{$origin}{SEALIGN}{$header}{$TEaln}{$ref}{$trans}++;
+                        $astats{$origin}{SEALIGN}{$TEaln}{$ref}{$header}{$trans}++;
+                    }
+                    foreach my $aln1 (keys %{ $hash{1} }) {
+                        my $strand = $hash{1}{$aln1}->[0] & 16 ? '-' : '+';
+                        
+                        ## 1. Compare full frag to 101bp-emulated imputed-frag, for sequences with full frag.
+                        ## 2. Compare alignments of 101bp-emulated to full versions (which will be no-overlap OR full-frag).
+                        ## 3. Get (shortest) frag len dist for non-overlapping pairs.
+                        ## 4. See how often the longest transcript was: 1) a passing alignment, 2) an optimal alignment, 3) a novel alignment.
+                        ## {$header} => LEN, ALNTRUE, ALNEMUL, IMPSEQ
+                        
+                        if ($isfrag && !$isemul) {
+                            ## Full-frag alignments only
+                            my ($start, $end, $implen, $indels, $extclip, $intclip, $spliced) = @{ &combine_aligns($header, \%hash, $aln1) };  # "combine" only 1 align, because that is all there is
+                            print "$header COMB1: ALN1 $aln1: $start, $end, $strand, $implen, $extclip, $intclip, $spliced\n" if $header eq $watch;
+                            my $key = "$trans:$start-$end";
+                            my $key2 = "$trans:$start-$end:$strand";
+                            $truealign{$origin}{$ref}{$header}{$key} = 1;  # ONLY LOADED HERE
+                            $stats{$origin}{TRUESAME}{$TEaln}{$ref}{$header}++;  # this is the true alignment
+                            $FLsame = 1 if exists $truealign{$origin}{$oref}{$header}{$key};
+                            my $expseq2 = $strand eq '-' ? $expseqRC : $expseq;
+                            my ($impseq, $lensame, $seqsame, $seqnear, $basepct, $codonpct) = @{ &impute_seq([$header, $ref, $trans, $start, $end, $strand, $implen, $explen, $isfrag, $isemul, \$expseq2]) };
+                            $samepcts{B}{$basepct}{$origin}{$TEaln}{$ref}++;
+                            $samepcts{BI}{$basepct}{$origin}{$TEaln}{$ref}++ if $indels;
+                            $samepcts{C}{$codonpct}{$origin}{$TEaln}{$ref}++;
+                            $samepcts{CI}{$codonpct}{$origin}{$TEaln}{$ref}++ if $indels;
+                            push @{ $detail{$TEaln}{$header}{$ref} }, join("\t", $header, $origin, $ref, $TEname, $key2, $aln1, '.', $explen, $implen, $lensame, $seqsame, $basepct, $codonpct, $indels, $extclip, $intclip, $spliced, $impseq, $expseq2), "\n";
+                            &report_aligns([$origin, $isemul, $islong, $TEaln, $ref, $header, $key, $seqsame, $seqnear, $lensame, $extclip, $intclip, $spliced]);
+                            print "$header COMP1: ALN1 $aln1: $origin, $isemul, $islong, $TEaln, $ref, $header, $key | $lensame, $seqnear, $seqsame, $basepct | $extclip, $intclip, $spliced\n" if $header eq $watch;
+                            print STDERR "$origin $header $TEaln $ref: $key ($reflen{$ref}{$trans}), $implen:$explen, $seqsame:$seqnear ($extclip, $intclip, $spliced)\n  $expseq2\n  $impseq\n" if $lensame;
+                        } elsif ($nh2) {
+                            ## If not a full-frag aligment, then reads are be paired-end
+                            ## All emulated alignments are paired-end, and must align that way to be analyzed
+                            ## Likewise, single-end alignments for non-overlapping full reads will also be ignored
+                            foreach my $aln2 (keys %{ $hash{2} }) {
+                                ## evaluate all paired combinations of independent end alignments (all $aln1-$aln2 pairs)
+                                #$astats{$origin}{PEMULTI}{$header}{$TEaln}{$ref}{$trans}++;
+                                $astats{$origin}{PEMULTI}{$TEaln}{$ref}{$header}++;
+                                my ($start, $end, $implen, $indels, $extclip, $intclip, $spliced) = @{ &combine_aligns($header, \%hash, $aln1, $aln2) };  # combine 2 aligns, as intended
+                                print "$header COMB2: ALN2 $aln2: $start, $end, $strand, $implen, $extclip, $intclip, $spliced\n" if $header eq $watch;
+                                my $key = "$trans:$start-$end";
+                                my $key2 = "$trans:$start-$end:$strand";
+                                my ($truesame, $truekeys) = (0, '.');
+                                if (exists $truealign{$origin}{$ref}{$header}{$key}) {
+                                    $truesame = $TEsame = 1;
+                                    $stats{$origin}{TRUESAME}{$TEaln}{$ref}{$header}++;
+                                    $stats{$origin}{TRSMSQNR}{$TEaln}{$ref}{$header}++ if exists $stats{$origin}{SEQNEAR}{ALNTRUE}{$ref}{$header};
+                                } else {
+                                    $truekeys = exists $truealign{$origin}{$ref}{$header} ? join(' ', sort keys %{ $truealign{$origin}{$ref}{$header} }) : 'NA';
+                                    #print "EMUL: $key; TRUE: $truekeys\n" if exists $truealign{$origin}{$ref}{$header};
+                                }
+                                $FLsame = 1 if exists $truealign{$origin}{$oref}{$header}{$key};
+                                my $expseq2 = $strand eq '-' ? $expseqRC : $expseq;
+                                my ($impseq, $lensame, $seqsame, $seqnear, $basepct, $codonpct) = @{ &impute_seq([$header, $ref, $trans, $start, $end, $strand, $implen, $explen, $isfrag, $isemul, \$expseq2]) };
+                                $samepcts{B}{$basepct}{$origin}{$TEaln}{$ref}++;
+                                $samepcts{BI}{$basepct}{$origin}{$TEaln}{$ref}++ if $indels;
+                                $samepcts{C}{$codonpct}{$origin}{$TEaln}{$ref}++;
+                                $samepcts{CI}{$codonpct}{$origin}{$TEaln}{$ref}++ if $indels;
+                                if ($isemul) {
+                                    push @{ $detail{$TEaln}{$header}{$ref} }, join("\t", $header, $origin, $ref, $TEname, $key2, $aln1, $aln2, $truesame, $explen, $implen, $lensame, $extclip, $intclip, $spliced, $truekeys), "\n";
+                                } else {
+                                    push @{ $detail{$TEaln}{$header}{$ref} }, join("\t", $header, $origin, $ref, $TEname, $key2, $aln1, $aln2, $explen, $implen, $lensame, $seqsame, $basepct, $codonpct, $indels, $extclip, $intclip, $spliced, $impseq, $expseq2), "\n";
+                                }
+                                &report_aligns([$origin, $isemul, $islong, $TEaln, $ref, $header, $key, $seqsame, $seqnear, $lensame, $extclip, $intclip, $spliced]);
+                                print "$header COMP2: ALN2 $aln2: $origin, $isemul, $islong, $TEaln, $ref, $header, $key | $lensame, $seqnear, $seqsame, $basepct | $extclip, $intclip, $spliced\n" if $header eq $watch;
+                                #print STDERR "$origin $header $TEaln $ref $trans ($nh1,$nh2) ALN ($aln1,$aln2): $key ($reflen{$ref}{$trans}), $implen:$explen, $seqsame:$seqnear ($extclip, $intclip, $spliced)\n  $expseq2\n  $impseq\n" if $lensame;
+                            }
+                        }
+                        
+                    }
+                }
+            }
+        }
+        ## Check how many EMUL == TRUE
+        if (exists $stats2{$origin}{HASEMUL}{$header} && exists $stats2{$origin}{HASTRUE}{$header}) {
+            $stats2{$origin}{EMULTRUE}{$header} = 1;
+            $TEsame ? ($stats2{$origin}{EMTRSAME}{$header} = 1) : ($stats2{$origin}{EMTRNON}{$header} = 1);
+        } elsif (exists $stats2{$origin}{HASEMUL}{$header}) {
+            $stats2{$origin}{ONLYEMUL}{$header} = 1;
+        } elsif (exists $stats2{$origin}{HASTRUE}{$header}) {
+            $stats2{$origin}{ONLYTRUE}{$header} = 1;
+        } else {
+            $stats2{$origin}{EMULTRUE0}{$header} = 1;
+        }
+        ## Check how many LONG in FULL
+        if (exists $stats2{$origin}{HASLONG}{$header} && exists $stats2{$origin}{HASFULL}{$header}) {
+            $stats2{$origin}{LONGFULL}{$header} = 1;
+            $FLsame ? ($stats2{$origin}{LOFUSAME}{$header} = 1) : ($stats2{$origin}{LOFUNON}{$header} = 1);
+        } elsif (exists $stats2{$origin}{HASLONG}{$header}) {
+            $stats2{$origin}{ONLYLONG}{$header} = 1;
+        } elsif (exists $stats2{$origin}{HASFULL}{$header}) {
+            $stats2{$origin}{ONLYFULL}{$header} = 1;
+        } else {
+            $stats2{$origin}{LONGFULL0}{$header} = 1;
+        }
+        ## Check how many have PE aligns, or SE only
+        
+    }
+}
+
+
+my $TEaln = 'ALNTRUE';
+my $TDET = &open2('W', "$outpref.detail-true.txt", 'detail report');
+print $TDET join("\t", qw/ Header Origin Ref Reads Coords E1Aln# E2Aln# ExpLen ImpLen LenSame SeqSame SeqIdt CodonIdt Indels ExtClip IntClip Spliced ImputedSequence FragmentSequence /), "\n";
+foreach my $header (keys %{ $detail{$TEaln} }) {
+    foreach my $ref (qw/ LONG FULL /) {
+        if (exists $detail{$TEaln}{$header}{$ref}) {
+            if (exists $detail{$TEaln}{$header}{$ref}) {
+                print $TDET @{ $detail{$TEaln}{$header}{$ref} };
+            }
+        }
+    }
+}
+close $TDET;
+
+my $TEaln = 'ALNEMUL';
+my $EDET = &open2('W', "$outpref.detail-emul.txt", 'detail report');
+print $EDET join("\t", qw/ Header Origin Ref Reads Coords E1Aln# E2Aln# SameTrue ExpLen ImpLen LenSame ExtClip IntClip Spliced TrueCoords /), "\n";
+foreach my $header (keys %{ $detail{$TEaln} }) {
+    foreach my $ref (qw/ LONG FULL /) {
+        if (exists $detail{$TEaln}{$header}{$ref}) {
+            if (exists $detail{$TEaln}{$header}{$ref}) {
+                print $EDET @{ $detail{$TEaln}{$header}{$ref} };
+            }
+        }
+    }
+}
+close $EDET;
+
+
+## Summary: important counts: n unaligned, n any aligned, n longest-only / full-only / both aligned, times longest was OK, times longest was best, times longest was correct, times longest was / was not in full, 
+print "Writing summary report: ".`date`;
+my %summary;
+foreach my $origin (qw/ FRAG NOOL /) {
+    my $TOT = $origin eq 'FRAG' ? $TOTALF : $TOTALN;
+    foreach my $TEaln (qw/ ALNTRUE ALNEMUL /) {
+        foreach my $ref (qw/ LONG FULL /) {
+            $summary{$origin}{INPUTS}{$TEaln}{$ref}{N} = $TOT;
+            $summary{$origin}{INPUTS}{$TEaln}{$ref}{P} = 100;
+            $summary{$origin}{PEALIGN}{$TEaln}{$ref}{N} = scalar(keys %{ $astats{$origin}{PEALIGN}{$TEaln}{$ref} })||0;
+            foreach my $header (keys %{ $astats{$origin}{SEALIGN}{$TEaln}{$ref} }) {
+                $summary{$origin}{SEALIGN}{$TEaln}{$ref}{N}++ unless exists $astats{$origin}{PEALIGN}{$TEaln}{$ref}{$header};
+            }
+            $summary{$origin}{NOALIGN}{$TEaln}{$ref}{N} = $TOT - $summary{$origin}{PEALIGN}{$TEaln}{$ref}{N} - $summary{$origin}{SEALIGN}{$TEaln}{$ref}{N};
+            foreach my $header (keys %{ $astats{$origin}{PEMULTI}{$TEaln}{$ref} }) {
+                $summary{$origin}{PEMULTI}{$TEaln}{$ref}{N}++ if $astats{$origin}{PEMULTI}{$TEaln}{$ref}{$header} > 1;
+            }
+            $summary{$origin}{$_}{$TEaln}{$ref}{P} = 100*$summary{$origin}{$_}{$TEaln}{$ref}{N}/$TOT foreach qw/ NOALIGN SEALIGN PEALIGN /;
+            foreach my $s (qw/ TRUESAME TRSMSQNR ALIGNED LENSAME SEQNEAR SEQSAME EXTCLIP INTCLIP SPLICED/) {
+                $summary{$origin}{$s}{$TEaln}{$ref}{N} = scalar(keys %{ $stats{$origin}{$s}{$TEaln}{$ref} })||0;
+                $summary{$origin}{$s}{$TEaln}{$ref}{P} = 100*$summary{$origin}{$s}{$TEaln}{$ref}{N}/$TOT;
+            }
+        }
+    }
+}
+my $SUM = &open2('W', "$outpref.summary.txt", 'summary report');
+print $SUM join(" ", map { sprintf("%${WIDTH2}s",$_) } qw/ TYPE STAT FRAG.FULL FRAG.LONG NOOL.FULL NOOL.LONG FRAG.FULL% FRAG.LONG% NOOL.FULL% NOOL.LONG% /), "\n";
+foreach my $TEaln (qw/ ALNTRUE ALNEMUL /) {
+    my @TEstats = qw/ INPUTS NOALIGN SEALIGN PEALIGN PEMULTI /;
+    if ($TEaln eq 'ALNTRUE') {
+        @TEstats = (@TEstats, qw/ ALIGNED LENSAME SEQNEAR SEQSAME EXTCLIP INTCLIP SPLICED /);
+    } else {
+        @TEstats = (@TEstats, qw/ TRUESAME TRSMSQNR /);
+    }
+    foreach my $s (@TEstats) {
+        my (@narray, @parray);
+        foreach my $origin (qw/ FRAG NOOL /) {
+            foreach my $ref (qw/ FULL LONG /) {
+                push @narray, sprintf("%${WIDTH2}i",$summary{$origin}{$s}{$TEaln}{$ref}{N});
+                push @parray, sprintf("%$WIDTH2.2f",$summary{$origin}{$s}{$TEaln}{$ref}{P});
+            }
+        }
+        my $tag = sprintf("%-${WIDTH2}s %-${WIDTH2}s",$TEaln, $s);
+        print $SUM join(" ", $tag, @narray, @parray), "\n";
+    }
+}
+
+print $SUM "\nSTAT     ";
+print $SUM join(" ", map { sprintf("%${WIDTH}s",$_) } qw/ FRAG NOOL /);
+print $SUM ' ';
+print $SUM join(" ", map { sprintf("%${PWIDTH}s",$_) } qw/ FRAG NOOL /), "\n";
+my @ntot = map { sprintf("%${WIDTH}i",scalar(keys %{ $data{$_} })) } qw/ FRAG NOOL /;
+my @neo  = map { sprintf("%${WIDTH}i",scalar(keys %{ $stats2{$_}{ONLYEMUL } })) } qw/ FRAG NOOL /;
+my @nto  = map { sprintf("%${WIDTH}i",scalar(keys %{ $stats2{$_}{ONLYTRUE } })) } qw/ FRAG NOOL /;
+my @net  = map { sprintf("%${WIDTH}i",scalar(keys %{ $stats2{$_}{EMULTRUE } })) } qw/ FRAG NOOL /;
+my @net0 = map { sprintf("%${WIDTH}i",scalar(keys %{ $stats2{$_}{EMULTRUE0} })) } qw/ FRAG NOOL /;
+my @nets = map { sprintf("%${WIDTH}i",scalar(keys %{ $stats2{$_}{EMTRSAME } })) } qw/ FRAG NOOL /;
+my @netn = map { sprintf("%${WIDTH}i",scalar(keys %{ $stats2{$_}{EMTRNON  } })) } qw/ FRAG NOOL /;
+my @nlo  = map { sprintf("%${WIDTH}i",scalar(keys %{ $stats2{$_}{ONLYLONG } })) } qw/ FRAG NOOL /;
+my @nfo  = map { sprintf("%${WIDTH}i",scalar(keys %{ $stats2{$_}{ONLYFULL } })) } qw/ FRAG NOOL /;
+my @nlf  = map { sprintf("%${WIDTH}i",scalar(keys %{ $stats2{$_}{LONGFULL } })) } qw/ FRAG NOOL /;
+my @nlf0 = map { sprintf("%${WIDTH}i",scalar(keys %{ $stats2{$_}{LONGFULL0} })) } qw/ FRAG NOOL /;
+my @nlfs = map { sprintf("%${WIDTH}i",scalar(keys %{ $stats2{$_}{LOFUSAME } })) } qw/ FRAG NOOL /;
+my @nlfn = map { sprintf("%${WIDTH}i",scalar(keys %{ $stats2{$_}{LOFUNON  } })) } qw/ FRAG NOOL /;
+print $SUM join(" ", 'TOTAL   ', @ntot, sprintf("%$PWIDTH.2f %$PWIDTH.2f\n", 100*$ntot[0]/$ntot[0], 100*$ntot[1]/$ntot[1] ));
+print $SUM join(" ", 'EMULONLY', @neo , sprintf("%$PWIDTH.2f %$PWIDTH.2f\n", 100* $neo[0]/$ntot[0], 100* $neo[1]/$ntot[1] ));
+print $SUM join(" ", 'TRUEONLY', @nto , sprintf("%$PWIDTH.2f %$PWIDTH.2f\n", 100* $nto[0]/$ntot[0], 100* $nto[1]/$ntot[1] ));
+print $SUM join(" ", 'EMULTRUE', @net , sprintf("%$PWIDTH.2f %$PWIDTH.2f\n", 100* $net[0]/$ntot[0], 100* $net[1]/$ntot[1] ));
+print $SUM join(" ", 'EMTRSAME', @nets, sprintf("%$PWIDTH.2f %$PWIDTH.2f\n", 100*$nets[0]/$ntot[0], 100*$nets[1]/$ntot[1] ));
+print $SUM join(" ", 'LONGONLY', @nlo , sprintf("%$PWIDTH.2f %$PWIDTH.2f\n", 100* $nlo[0]/$ntot[0], 100* $nlo[1]/$ntot[1] ));
+print $SUM join(" ", 'FULLONLY', @nfo , sprintf("%$PWIDTH.2f %$PWIDTH.2f\n", 100* $nfo[0]/$ntot[0], 100* $nfo[1]/$ntot[1] ));
+print $SUM join(" ", 'LONGFULL', @nlf , sprintf("%$PWIDTH.2f %$PWIDTH.2f\n", 100* $nlf[0]/$ntot[0], 100* $nlf[1]/$ntot[1] ));
+print $SUM join(" ", 'LOFUSAME', @nlfs, sprintf("%$PWIDTH.2f %$PWIDTH.2f\n", 100*$nlfs[0]/$ntot[0], 100*$nlfs[1]/$ntot[1] ));
+
+my %hheaders = (
+    'FRAG'=>[qw/ FRAG.FULL.bn FRAG.LONG.bn FRAG.FULL.bi FRAG.LONG.bi FRAG.FULL.cn FRAG.LONG.cn FRAG.FULL.ci FRAG.LONG.ci /],
+    'NOOL'=>[qw/ NOOL.FULL.bn NOOL.LONG.bn NOOL.FULL.bi NOOL.LONG.bi NOOL.FULL.cn NOOL.LONG.cn NOOL.FULL.ci NOOL.LONG.ci /]
+);
+foreach my $TEaln (qw/ ALNTRUE /) {  # ALNEMUL /) {
+    foreach my $origin (qw/ FRAG NOOL /) {
+        print $SUM "\n", sprintf("%-7s %5s ", qw/ TYPE NSAME /);
+        print $SUM join(" ", map { sprintf("%${WIDTH2}s",$_) } @{ $hheaders{$origin} }), "\n";
+        foreach my $i (0..100) {
+            print $SUM sprintf("%-7s %5i", $TEaln, $i);
+            foreach my $ref (qw/ FULL LONG /) {
+                print $SUM sprintf(" %${WIDTH2}i",$samepcts{B}{$i}{$origin}{$TEaln}{$ref});   # N @ base similarity %
+            }
+            foreach my $ref (qw/ FULL LONG /) {
+                print $SUM sprintf(" %${WIDTH2}i",$samepcts{BI}{$i}{$origin}{$TEaln}{$ref});  # N with indels (matching base %)
+            }
+            foreach my $ref (qw/ FULL LONG /) {
+                print $SUM sprintf(" %${WIDTH2}i",$samepcts{C}{$i}{$origin}{$TEaln}{$ref});   # N @ codon similarity %
+            }
+            foreach my $ref (qw/ FULL LONG /) {
+                print $SUM sprintf(" %${WIDTH2}i",$samepcts{CI}{$i}{$origin}{$TEaln}{$ref});  # N with indels (matching codon %)
+            }
+            print $SUM "\n";
+        }
+    }
+}
+print $SUM "\n";
+close $SUM;
+
+print "Generating summary R object...\n";
+system "/n/core/Bioinformatics/analysis/Bazzini/arb/cbio.arb.101/code/summarizer.R $sample $org $aligner";
+
+print "\nPlease review $outpref.*\n";
+print "$0 $sample $org complete: ".`date`;
+#print "\n",Dumper(\%stats),"\n";
+#print STDERR "\n",Dumper(\%astats),"\n";
+##END
+
+
+
+
+sub combine_aligns {
+    
+    my ($HEADER, $HASH, $ALN1, $ALN2) = @_;  # $hash e.g. \%{ $data{$origin}{$header}{ALNEMUL}{$ref}{$trans} }
+    my ($FLAGS1, $READLEN1, $START1, $END1, $CIGAR1, $CLIP51, $CLIP31, $SPLICE1) = @{ $$HASH{1}{$ALN1} };
+    my ($START, $END, $EXTCLIP, $INTCLIP, $SPLICED, $INDEL1, $INDEL2);
+    $INDEL1++ while $CIGAR1 =~ /[ID]/g;
+    
+    if (defined $ALN2) {
+        my ($FLAGS2, $READLEN2, $START2, $END2, $CIGAR2, $CLIP52, $CLIP32, $SPLICE2) = @{ $$HASH{2}{$ALN2} };
+        ($START, $END) = (sort {$a <=> $b} ($START1, $END1, $START2, $END2))[0,-1];
+        $INDEL2++ while $CIGAR2 =~ /[ID]/g;
+        $SPLICED = $SPLICE1 + $SPLICE2;
+        if ($START1 < $START2) {
+            $EXTCLIP = $CLIP51 + $CLIP32;
+            $INTCLIP = $CLIP52 + $CLIP31;
+        } else {
+            $INTCLIP = $CLIP51 + $CLIP32;
+            $EXTCLIP = $CLIP52 + $CLIP31;
+        }
+    } else {
+        ($START, $END) = ($START1, $END1);
+        $SPLICED = $SPLICE1;
+        $EXTCLIP = $CLIP51 + $CLIP31;
+        $INTCLIP = 0;
+    }
+    
+    my $IMPLEN = $END-$START+1;
+    my $INDELS = $INDEL1+$INDEL2;
+    return [$START, $END, $IMPLEN, $INDELS, $EXTCLIP, $INTCLIP, $SPLICED];
+}
+
+
+sub impute_seq {
+    my ($HEADER, $REF, $TRANS, $START, $END, $STRAND, $IMPLEN, $EXPLEN, $ISFRAG, $ISEMUL, $EXPSEQREF) = @{ $_[0] };
+    my $IMPSEQ = substr($refdata{$REF}{$TRANS}, $START-1, $IMPLEN);
+    my $LENSAME = $IMPLEN == $EXPLEN ? 1 : 0;
+    my $SEQSAME = $LENSAME == 1 && $IMPSEQ eq $$EXPSEQREF ? 1 : 0;
+    my $SEQNEAR = $SEQSAME;
+    my ($NSAME, $CSAME, $SAMEPCT, $CODONPCT) = (0, 0, 0, 0);
+    print "$HEADER IMPUTE SEQ: $ISFRAG, $ISEMUL | $IMPLEN, $EXPLEN\n" if $HEADER eq $watch;
+    if ($SEQSAME) {
+        $SAMEPCT = $CODONPCT = 100;
+    } elsif (!$ISEMUL) {  # do not test seq similarity for emulated reads
+        if (!$ISFRAG || ($ISFRAG && $LENSAME)) {  # test similarity for non-overlapping pairs, or, fragments IF align len == frag len
+            my @impsample = (split //, $IMPSEQ);
+            my @expsample = (split //, $$EXPSEQREF);
+            my $bases = scalar @impsample;
+            my $codons = int($bases/3);
+            my $codonbp = $codons*3;
+            for (my $i = 0; $i <= $codonbp-1; $i+=3) {
+                my $tmpsame;
+                for (my $j = $i; $j <= $i+2; $j++) {
+                    $tmpsame++ if $impsample[$j] eq $expsample[$j];
+                    #print "$j $i $impsample[$j] $expsample[$j] ($NSAME, $CSAME)\n" if $HEADER eq $watch;
+                }
+                $NSAME += $tmpsame;
+                $CSAME++ if $tmpsame == 3;
+            }
+            if ($codonbp < $bases) {
+                for (my $j = $codonbp; $j <= $#impsample; $j++) {
+                    $NSAME++ if $impsample[$j] eq $expsample[$j];
+                }
+            }
+            $SAMEPCT  = sprintf("%0.0f", 100*$NSAME/$bases);   # round to nearest integer percent
+            $CODONPCT = sprintf("%0.0f", 100*$CSAME/$codons);  # round to nearest integer percent
+            $SEQNEAR = $SAMEPCT >= 96 ? 1 : 0;  # if 96% the same (empirical threshold), consider the sequences to be "basically the same", i.e. the same but for seq error, SNPs, etc.
+        }
+    }
+    print "$HEADER IMP ($ISFRAG, $ISEMUL): $REF $TRANS $START $END $STRAND | $data{FRAG}{$HEADER}{LEN}{1}, $IMPLEN\n" if $HEADER eq $watch;
+    return [$IMPSEQ, $LENSAME, $SEQSAME, $SEQNEAR, $SAMEPCT, $CODONPCT];
+}
+
+
+sub report_aligns {   
+    
+    my ($ORIGIN, $ISEMUL, $ISLONG, $TEALN, $REF, $HEADER, $KEY, $SEQSAME, $SEQNEAR, $LENSAME, $EXTCLIP, $INTCLIP, $SPLICED) = @{ $_[0] };
+    $stats{$ORIGIN}{ALIGNED}{$TEALN}{$REF}{$HEADER} = 1;
+    $stats{$ORIGIN}{SEQNEAR}{$TEALN}{$REF}{$HEADER} = 1 if $SEQNEAR;
+    $stats{$ORIGIN}{SEQSAME}{$TEALN}{$REF}{$HEADER} = 1 if $SEQSAME;
+    $stats{$ORIGIN}{LENSAME}{$TEALN}{$REF}{$HEADER} = 1 if $LENSAME;
+    $stats{$ORIGIN}{EXTCLIP}{$TEALN}{$REF}{$HEADER} = 1 if $EXTCLIP;
+    $stats{$ORIGIN}{INTCLIP}{$TEALN}{$REF}{$HEADER} = 1 if $INTCLIP;
+    $stats{$ORIGIN}{SPLICED}{$TEALN}{$REF}{$HEADER} = 1 if $SPLICED;
+    $ISEMUL ? ($stats2{$ORIGIN}{HASEMUL}{$HEADER} = 1) : ($stats2{$ORIGIN}{HASTRUE}{$HEADER} = 1);
+    $ISLONG ? ($stats2{$ORIGIN}{HASLONG}{$HEADER} = 1) : ($stats2{$ORIGIN}{HASFULL}{$HEADER} = 1);
+}
+

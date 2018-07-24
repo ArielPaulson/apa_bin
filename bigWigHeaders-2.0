@@ -1,0 +1,241 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+#$Id$
+
+# Copyright © 2009, Stowers Institute for Medical Research.  All rights reserved.
+
+# c.f. attached LICENSE
+
+
+
+
+## TO DO:
+## $stranded NOT ENABLED YET.  When ready, it will make sort order return (W,C) not (C,W) for each pair of stranded bams.
+
+
+
+
+=pod
+
+=head1 SYNOPSIS
+
+bigWigHeaders takes a list of bigWig, bigBed, or BAM files and returns a table of UCSC track headers.
+
+Files must be uploaded to tracks.stowers.org, under the repository path /r/.
+
+bigWigHeaders -d repo_dir files 
+
+GetOptions("d=s" => \$tracksdir, "p=s" => \$prefix, "copy" => \$copy, "stranded" => \$stranded, "color=s" => \$color);
+
+=head1 REQUIRED
+
+=over
+
+=item B<-d repo_dir>
+
+The subdirectory(s) of /r/ where the files are located on tracks.stowers.org.  If tracks are in /r/my_tracks/project_1/, then give "-d my_tracks/project_1".
+
+=back
+
+=head1 OPTIONAL
+
+=over
+
+=item B<--copy>
+
+Will also copy given files to that directory on tracks, if they weren't there already.
+
+=item B<-p file_prefix>
+
+Only meaningful if using --copy.  Prepends <file_prefix> to each file copied to the tracks server.
+
+Input your genus and species separated by a period to see all NCBI taxa ids for that organism.  Genus must be Capitalized.  Use "Genus." to query all 
+species within a genus.  This uses approximate species matching: string queried is "species*".  Returned is a table with taxon ID, scientific name, and 
+three database parameters for the taxon id: gene count, gene label count, and GO term count.  Use "--novirus" to block viral results, i.e. any taxa 
+containing the string "virus" (there can be lots...)
+
+=item B<--getdbids [-x taxon_id] [-d db_name] [-h host_name] [-i id_list_file] [-f output_file] --clean --long>
+
+Get a table of all mappable gene identifiers AND their mapped terms for a specified organism.  Use "--clean" flag to discard all mappings to generic terms, 
+e.g. "biological process" or "biological process unknown".  Use "--long" to output one line per term, instead of one line per gene.  Use "-i <file>" to report results for only these identifiers (uses exact match against Symbol, Name, Xref).
+
+=item B<--findterms [-a GO_accession_list] [-d db_name] [-h host_name] [-f output_file]>
+
+Identify which GO DB a given accession (or file containing multiple accessions) came from.  Returns 3 cols: 1=database, 2=accession, 3=name.
+
+=item B<--termtable [-x taxon_id] [-d db_name] [-h host_name] [-f output_file] [-g grep] --noimputed>
+
+In-depth reporting for each GO term for the specified organism, either annotated directly or imputed by hierarchical relationships.  Includes accession, 
+name, level(s), numbers of parents, children, total downstream IDs, and annotated genes, etc.  Use --noimputed to restrict terms to only those with direct 
+gene annotations (this will probably return an incomplete hierarchy).  Use -g to restrict results based on a grep against term name.
+
+=item B<--slimmap [-a slim_list] [-x taxon_id] [-d db_name] [-h host_name] [-f output_file] --stats>
+
+Given a slim list (column 1 = GO accessions; any other columns ignored), returns one of two things.  If the --stats flag is used, returns mapping statistics: number of terms mapped to each slim term, number of overlaps between terms, parent/child relationships among slim terms, and number of terms which are unmappable to the slim list.  If --stats is not used, then a 4-column slim map is returned: cols 1-2 = mapped acc, name; cols 3-4 = slim acc, name.
+
+=item B<--slimtree [-a GO_accession] [-x taxon_id] [-d db_name] [-h host_name] [-f output_file] --genes>
+
+This option returns the downstream terms of a given GO accession, useful e.g. when using a slim list and you want to know what terms map to a 
+particular slim term.  Using --genes adds, for each output term, the list of all genes mapping to that term.
+
+=item B<--fulltree [-x taxon_id] [-d db_name] [-h host_name] [-f output_file]>
+
+Designed for building custom MeV annotation files.  This option gives a 5-column list (GO type, child acc, child name, parent acc, parent name) of all 
+terms with one degree of separation.  Results are constrained to the given organism.  The list contains the minimal information required to construct the
+entire GO graph for that organism.
+
+=item B<--children [-a GO_accession(s) or file] [-x taxon_id] [-d db_name] [-h host_name] [-f output_file]>
+
+Finds the immediate child terms for a GO accession or list of accessions.  List may be a file or a comma-delimited string of GO 
+accessions.
+
+=item B<--parents [-a GO_accession(s) or file] [-x taxon_id] [-d db_name] [-h host_name] [-f output_file]>
+
+Finds the immediate parent terms for a GO accession or list of accessions.  List may be a file or a comma-delimited string of GO 
+accessions.
+
+=item B<--allparents [-a GO_accession] [-x taxon_id] [-d db_name] [-h host_name] [-f output_file] --genes>
+
+UNDER CONSTRUCTION.  Sort of the opposite of --slimtree: this option returns all parents for the given term.
+
+=item B<--rootpaths [-a GO_accession] [-x taxon_id] [-d db_name] [-h host_name] [-f output_file] --genes>
+
+UNDER CONSTRUCTION.  The ordered version of --allparents: all parents for a given term, organized into paths leading back to the root.
+
+=item B<--nca [-a GO_accession(s) or file] [-x taxon_id] [-d db_name] [-h host_name] [-f output_file]>
+
+Finds the nearest common ancestor term for a list of GO accessions.  List may be a file or a comma-delimited string of GO accessions.
+
+=item B<--cache [-d db_name]>
+
+Create default GO_Tools / FatiClone cache files for a new GO database (only done once, at DB install time)
+
+=item B<--help>
+
+Display command line usage with options.
+
+=item B<--man>
+
+Display complete manual page and exit.
+
+=item B<--version> 
+
+Display the scripts version number and exit.
+
+=back
+
+
+=head1 EXAMPLES
+
+=over
+
+=item C< GO_Tools --man >
+
+print a manpage.
+
+=item C< GO_Tools --showtaxa >
+
+show the NCBI taxa numbers for the most common model organisms.
+
+=item C< GO_Tools --orgstats Bacillus.subtilis -d go_201001>
+
+show all NCBI taxa numbers associated with Bacillus subtilis* from database 'go_201001', and their associated DB statistics.
+
+=item C< GO_Tools --showdbs -h rho >
+
+show any GO databases (with name format go_yyyymm) on host rho.
+
+=back
+
+=head1 VERSION
+
+$Revision:  1.0$
+
+=head1 AUTHOR
+
+Ariel Paulson (apa@stowers.org)
+
+=head1 DEPENDENCIES
+
+perl
+
+=head1 AVAILABILITY
+
+Download at will.
+
+=cut
+
+
+
+
+
+my ($tracksdir, $prefix, $copy, $stranded, $color);
+GetOptions("d=s" => \$tracksdir, "p=s" => \$prefix, "copy" => \$copy, "stranded" => \$stranded, "color=s" => \$color);
+my @BW = @ARGV;
+
+die "No tracks specified!\n" unless @BW;
+die "No 'tracks' subdirectory specified! (-d)\n" unless $tracksdir;
+
+my (%coltable, $usetable);
+if (-e $color) {
+    ## Given color is actually (hopefully) a color table file, with sample names in col 1 and UCSC-ready RGB triplets in col 2
+    open my $IN, '<', $color or die "$0: Failed to open color file '$color': $!\n";
+    while (<$IN>) {
+	s/[\n\r]+$//;
+	my ($samp, $col) = split /\t/, $_;
+	$coltable{$samp} = $col;
+    }
+    close $IN;
+    $usetable = 1;
+}
+
+foreach my $file (@BW) {
+    my ($file2) = ($file =~ /([^\/]+)$/);
+    my $name = $file2;
+    my ($type, $args);
+    if ($name =~ s/\.bw$//) {
+	$type = 'bigWig';
+	$args = 'visibility=full alwaysZero=On';
+    } elsif ($name =~ s/\.bb$//) {
+	$type = 'bigBed';
+	$args = 'visibility=pack';
+    } elsif ($name =~ s/\.bam$//) {
+	$type = 'bam';
+	$args = 'visibility=squish pairEndsByName=On';
+    } else {
+	print STDERR "Unknown track extension for '$file2': skipping.\n";
+	next;
+    }
+    my $usecol;
+    if ($usetable) {
+	if (exists $coltable{$name}) {
+	    $usecol = $coltable{$name};
+	} else {
+	    print STDERR "Failed to find color for sample '$name' in color table file!  Getting default '0,0,0'.\n";
+	    $usecol = '0,0,0';
+	}
+    } elsif ($color) {
+	$usecol = $color;
+    } else {
+	$usecol = '0,0,0';
+    }
+    $args .= " color=$usecol";
+    print "track type=$type name=$name description=\"$name\" $args bigDataUrl=http://tracks.stowers.org/microarray/repo/$tracksdir/$prefix$file2\n";
+    system("bash","-c","cp $file $prefix$file") if $copy;
+}
+exit;
+
+
+## Expect (http://www.nist.gov/el/msid/expect.cfm) example:
+#sub copyover {
+#    $scp=Expect->spawn("/usr/bin/scp ${srcpath}/$file $who:${destpath}/$file");
+#    $scp->expect(30,"ssword: ") || die "Never got password prompt from $dest:$!\n";
+#    print $scp 'password' . "\n";
+#    $scp->expect(30,"-re",'$\s') || die "Never got prompt from parent system:$!\n";
+#    $scp->soft_close();
+#    return;
+#}

@@ -1,0 +1,3 @@
+#!/usr/bin/perl
+
+open IN, $ARGV[0] or die "Cannot read '$ARGV[0]': $!\n";

@@ -1,0 +1,442 @@
+#!/usr/bin/env Rscript
+
+source("/home/apa/apa_tools.R")
+source("/home/apa/local/bin/scriptutils/snpReveal_functions.R")
+
+
+
+##### FIXME: all documentation below needs to be revised.  Much has changed.
+##### ADD: show truncation % from start-loss or stop-gain mutations.
+
+
+
+### NEW OPERATIONS SCHEMA:
+### 1. Orthology-review mode (high-throughput): "--orthology"
+##   A. Provide a VCF or fraction thereof, source org, list of ortholog orgs, N cores for parallelization, output dir, min-ident value, and no-analysis switches.
+##   B. Parses VCF, gets required metadata from Ensembl, saves pre-analysis RData object, writes giant bash file with all analysis calls and 'parallel's it, merges results into single report.
+##     i. Analyzes each ref-alt pair individually, writing one report.txt per pair to subdir of output dir.
+##    ii. Capable of restarting from crash; tests for giant-bash completion, filters out completed reports, re-'parallel's remainder and completes.
+### 2. Structure-review mode (limited throughput, one transcript per call): "--structure"
+##   A. Provide a VCF fraction, a list of PDB files, target transcript, source org, PDB org, output file.
+##   B. Parses VCF, gets required metadata from Ensembl, saves pre-analysis RData object, runs analysis, produces a single report file.
+##     i. All ref-alt pairs of interest within the transcript are analyzed at once and included in final report.
+##    ii. No parallelization.  Crash recovery limited to re-starting from pre-analysis RData object.
+### 3. Combined mode (limited throughput, one transcript per call): "--structure --orthology"
+##   A. Must specify all args for both modes.
+##    i. Since only one transcript is analyzed per call, outputs and limitations are the same as for structure-only mode.
+
+
+
+
+## Foreach params file, pulls indicated sequences (from latest Ensembl), makes multiple alignment, 
+##  looks at variant position(s), and classifies variant(s).
+## If PDB files supplied, looks at variant pos in PDB (if exists) and checks for potential structural interactions
+## Outputs one multiple-aligned fasta and one MA PNG per params file
+## Outputs one variant-classification file for all variants in all params file(s)
+
+## Params files have 2 tab-delim columns: col 1 = key, col 2 = value, rows may be in any order.
+## Rows below describe the keys and their values, and the number of times each key may appear:
+## KEY    	TIMES	VALUE
+## SOURCE	  1   	Source org (where sequence is from), as "Genus species".
+## ORTHOLOG	1-N 	Organism(s) to take orthologous sequences from (do NOT include SOURCE), as "Genus species".
+## VARIANT	1-N 	Variant call string, as "chr:pos:ref:alt:transcript".  Transcript must be an Ensembl transcript ID.
+## MINIDENT	1   	Float on [0,1].  Minimum end-to-end identity percent for an ortholog (vs source transcript) to use ortholog in multiple alignment + downstream analysis
+## PDB		  1-N 	PDB object string, as "<Full path to PDB file, or URL>:chain:organism:transcript".  Chain is PDB chain to compare against.  Transcript must be from VARIANTs above; peptide associated with this chain.  Organism is "Genus species" for this chain.
+## MULTIALN	1   	Corrected multiple alignment fasta for orthologs.  Used only when muscle does not produce a correct default multiple alignment.
+## MULTIPDB	1   	Corrected multiple alignment fasta for orthologs+pdb chain.  Used only when muscle does not produce a correct default multiple alignment.
+## Values in column 1 may be preceded by some spaces for justification purposes.
+
+
+
+
+
+########################################
+########################################
+##########                    ##########
+########## BEGIN OBJECT SETUP ##########
+##########                    ##########
+########################################
+########################################
+
+
+
+angstroms <- c(4,3)  # for PDB distance filtering: c(max distance to report, max distance to call interaction)
+
+codons <- rbind(
+    c('TTT','F'),c('TTC','F'),c('TTA','L'),c('TTG','L'),
+    c('TCT','S'),c('TCC','S'),c('TCA','S'),c('TCG','S'),
+    c('TAT','Y'),c('TAC','Y'),c('TAA','*'),c('TAG','*'),
+    c('TGT','C'),c('TGC','C'),c('TGA','*'),c('TGG','W'),
+    c('CTT','L'),c('CTC','L'),c('CTA','L'),c('CTG','L'),
+    c('CCT','P'),c('CCC','P'),c('CCA','P'),c('CCG','P'),
+    c('CAT','H'),c('CAC','H'),c('CAA','Q'),c('CAG','Q'),
+    c('CGT','R'),c('CGC','R'),c('CGA','R'),c('CGG','R'),
+    c('ATT','I'),c('ATC','I'),c('ATA','I'),c('ATG','M'),
+    c('ACT','T'),c('ACC','T'),c('ACA','T'),c('ACG','T'),
+    c('AAT','N'),c('AAC','N'),c('AAA','K'),c('AAG','K'),
+    c('AGT','S'),c('AGC','S'),c('AGA','R'),c('AGG','R'),
+    c('GTT','V'),c('GTC','V'),c('GTA','V'),c('GTG','V'),
+    c('GCT','A'),c('GCC','A'),c('GCA','A'),c('GCG','A'),
+    c('GAT','D'),c('GAC','D'),c('GAA','E'),c('GAG','E'),
+    c('GGT','G'),c('GGC','G'),c('GGA','G'),c('GGG','G')
+)
+#c('TAA','#'),c('TAG','$'),c('TGA','%'),
+
+TLAs <- rbind(
+    c('ALA','A'),c('CYS','C'),c('ASP','D'),c('GLU','E'),
+    c('PHE','F'),c('GLY','G'),c('HIS','H'),c('ILE','I'),
+    c('LYS','K'),c('LEU','L'),c('MET','M'),c('ASN','N'),
+    c('PRO','P'),c('GLN','Q'),c('ARG','R'),c('SER','S'),
+    c('THR','T'),c('VAL','V'),c('TRP','W'),c('TYR','Y')
+)
+
+
+
+######################################
+######################################
+##########                  ##########
+########## END OBJECT SETUP ##########
+##########                  ##########
+######################################
+######################################
+
+
+
+
+
+
+##########################
+##########################
+##########      ##########
+########## MAIN ##########
+##########      ##########
+##########################
+##########################
+
+
+ca <- commandArgs(trailing=TRUE)
+
+## read vcf location and params file
+vcf.file <- ca[1]
+if (!file.exists(vcf.file)) stop("VCF file '",vcf.file,"' does not exist!\n")
+paramfile <- ca[2]
+params <- as.matrix(read.delim(paramfile, as.is=TRUE, header=FALSE))
+params[is.na(params)] <- ""  # prevent logical tests from getting NAs
+params[,1] <- sub("^ +","",params[,1])  # strip leading whitespace, if any
+
+## test geno/anno
+geno <- params[params[,1]=="GENO",2]
+anno <- params[params[,1]=="ANNO",2]
+idx <- paste0("/n/data1/genomes/indexes/",geno,"/",anno,"/")
+if (!dir.exists(idx)) stop("Expected genome/annotation index location '",idx,"' does not exist!\n")
+
+## set up output location
+clobber <- falsify(ca[3] == "--clobber")
+outdir <- sub("//$","/",paste0(params[params[,1]=="OUTDIR",2],"/"))
+datadir <- paste0(outdir,"data/")
+resultdir <- paste0(outdir,"results/")
+if (length(outdir)==0) outdir <- paste0(paramfile,".snpReveal")  # outdir = <full_file_path>.snpReveal
+if (dir.exists(outdir)) {
+    if (clobber) {
+        system(paste("rm -rf",outdir))
+    } else {
+        stop(paste0("Output location '",outdir,"' already exists!\n"))
+    }
+}
+system(paste("mkdir -p",outdir))
+if (dir.exists(outdir)) {
+    message(paste0("Writing to '",outdir,"'"))
+} else {
+    stop(paste0("Failed to create output location '",outdir,"'!\n"))
+}
+outprefix <- paste0(outdir,"/",sub("^.*/","",sub(".txt$","",paramfile)),".snpReveal.")  # outfiles = <outdir>/<file_base_name>.snpReveal.*
+RData <- paste0(outprefix,"RData")
+
+## After basic commandArgs testing, then load libraries
+
+suppressMessages(require(GenomicRanges))
+suppressMessages(require(Biostrings))
+suppressMessages(require(biomaRt))
+data(BLOSUM100)  # from Biostrings
+
+
+
+## Ensembl database and version, if any
+ensdb <- params[params[,1]=="ENSEMBL.DB",2]    # e.g. 'fungi', 'metazoa'
+ensver <- params[params[,1]=="ENSEMBL.VER",2]  # e.g. 'Ens_87', 'EnsGen_34' (although the latter is DOA, see below)
+if (length(ensdb)==0)  ensdb <- NA
+if (length(ensver)==0) ensver <- NA
+
+## corrected multiple alignments, if any
+multialn.orth <- ifelse(any(params[,1]=="MULTIALN"), params[params[,1]=="MULTIALN",2], NA)
+multialn.pdb  <- ifelse(any(params[,1]=="MULTIPDB"), params[params[,1]=="MULTIPDB",2], NA)
+
+## minimum end-to-end identity% between query and ortholog for ortholog to be used (else, ortholog ignored) -- default 0.7 (70%)
+min.ortho.idt <- ifelse(any(params[,1]=="MINIDENT"), as.numeric(params[params[,1]=="MINIDENT",2]), 0.7)
+
+## reorder org vector: source org must be #1 // make variants of sci names
+orgs <- c(params[params[,1]=="SOURCE",2], params[params[,1]=="ORTHOLOG",2])
+names(orgs) <- gsub(" ","_",orgs)
+orgs.gs <- lapply(orgs, function(x) unlist(strsplit(x," ")) )
+orgs.ens <- tolower(sapply(orgs.gs, function(x) paste0(substr(x[1],0,1),x[2])) )
+O <- length(orgs)
+
+## load gtf, gene & transcript metadata
+gtf <- read.delim(paste0(idx,geno,".",anno,".cuff.gtf"), as.is=TRUE, header=FALSE, comment="#")
+gdat <- read.delim(paste0(idx,geno,".",anno,".genedata.txt"), as.is=TRUE)
+tdat <- read.delim(paste0(idx,geno,".",anno,".transdata.txt"), as.is=TRUE)
+
+
+
+## extract variant data from VCF
+## chr1 18852102 WU00597985 T C 440 . 19 . AC=3;AF=0.750;AN=4;BaseQRankSum=1.501;DP=23;Dels=0.00;FS=0.000;HaplotypeScore=0.0000;MLEAC=3;MLEAF=0.750;MQ=60.00;MQ0=0;MQRankSum=0.689;QD=19.14;ReadPosRankSum=0.446;SOR=0.793;SNP;VARTYPE=SNP;ANN=C|intron_variant|MODIFIER|smc2|ENSDARG00000017744|transcript|ENSDART00000109416.3|protein_coding|8/23|c.1020+428T>C||||||
+vcf <- read.vcf(vcf.file)
+vcf <- lapply(1:nrow(vcf), function(i) {
+    ## x cols: "CHROM","POS","ID","REF","ALT","QUAL","FILTER","INFO"
+    x <- vcf[i,]
+    if (grepl(";ANN=",x[[8]])) {
+        s <- lapply(unlist(strsplit(sub(";.*","",sub(".*ANN=","",x[[8]])),",")), function(y) {
+            z <- unlist(strsplit(y,"\\|"))
+            ## A | missense_variant | MODERATE | CABZ01072487.1 | ENSDARG00000098214 | transcript | ENSDART00000166972.1 | protein_coding | 4/5 | c.664G>T | p.Val222Leu | 763/1428 | 664/1179 | 222/392 |
+            ## vars <- data.frame(Chr,Pos,RefNT.G,AltNT.G,Trans,TransBp,Phase,CdsBp,TransAa,MAPos,RefNT.T,AltNT.T,RefAA,AltAA)
+            if (z[[2]]=="missense_variant") {
+                c.2 <- unlist(strsplit(sub(".*[0-9]+","",z[[10]]),">"))
+                p.2 <- unlist(strsplit(sub("[0-9]+","|",sub("^p.","",z[[11]])),"\\|"))
+                c( x[[1]], x[[2]], x[[4]], z[[1]], z[[7]], sub("/.*","",z[[12]]), NA, sub("/.*","",z[[13]]), sub("/.*","",z[[14]]), NA, c.2, p.2 )
+            }
+        })
+        s <- s[listLengths(s)>0]
+        if (length(s)>0) do.call(rbind, s)
+    }
+})
+print(table(listLengths(vcf)))
+vcf <- as.data.frame(do.call(rbind, vcf[listLengths(vcf)>0]))
+for (i in c(2,6:12)) mode(vcf[[i]]) <- "numeric"
+colnames(vcf) <- c("Chr","Pos","RefNT.G","AltNT.G","Trans","TransBp","Phase","CdsBp","TransAa","MAPos","RefNT.T","AltNT.T","RefAA","AltAA")
+## remove transcript version numbers, if needed
+##IM("TRANSCRIPTS:",sort(unique(vcf[,5])))
+ttest <- vcf[,5] %in% tdat[,1]
+if (all(ttest)) {
+    message("All transcripts identified!")
+} else {
+    tlost <- which(!ttest)
+    tfix <- sub("\\.[0-9]+$","",vcf[tlost,5])
+    ttest2 <- tfix %in% tdat[,1]
+    if (all(ttest2)) {
+        vcf[tlost,5] <- tfix
+    } else {
+        tlost2 <- sort(unique(vcf[!ttest2,5]))
+        stop(paste0(length(tlost2)," vcf transcripts were not found in the specified annotations!  First few: ",paste(tlost2[1:min(c(5,length(tlost2)))],collapse=", "),"\n"))
+    }
+}
+
+
+
+
+## initialize variant-data dataframe
+## A | missense_variant | MODERATE | CABZ01072487.1 | ENSDARG00000098214 | transcript | ENSDART00000166972.1 | protein_coding | 4/5 | c.664G>T | p.Val222Leu | 763/1428 | 664/1179 | 222/392 |
+#vars <- data.frame(Chr,Pos,RefNT.G,AltNT.G,Trans,TransBp,Phase,TransAa,MAPos,RefNT.T,AltNT.T,RefAA,AltAA)
+#vars <- mat.split(vars[,c(1:4,10:13,5:9)], vars$Trans)
+vars <- mat.split(vcf,vcf$Trans)
+trans <- names(vars)
+names(trans) <- trans
+
+
+
+## get marts and available attributes for each org
+message("\nSetting up marts...")
+if (grepl("^EnsGen_",ensver)) {
+    if (is.na(ensdb)) message(paste0("You have specified an Ensembl Genome version without indicating the database!\n  But we're going to die anyway, because...\n"))
+    stop(paste0("Non-core Ensembl databases (i.e. ensemblgenomes.org) are not archived!  Can only go with current database version!\n"))
+} else if (is.na(ensdb) & is.na(ensver)) {
+    ## The expected case; current Ensembl-core
+    marts <- new.list(names(orgs))
+    mart.name <- "ensembl"   # "ENSEMBL_MART_ENSEMBL"
+    dataset.suffix <- "_gene_ensembl"
+    mart.host <-  "www.ensembl.org"
+} else if (!is.na(ensver)) {
+    ## Ensembl-core, archival version
+    archs <- do.call(rbind,strsplit(paste0("Ens_",system("/n/projects/apa/stuff/bowtie_building/code/_ENSEMBL_ARCHIVE_SERVERS.sh",intern=TRUE)),"\t"))
+    mart.host <- archs[archs[,1]==ensver,2]
+    ensvernum <- sub("^Ens_","",ensver)
+    if (length(mart.host)==0) stop(paste0("No archive servers could be found for Ensembl version '",ensvernum,"'!\n"))
+} else if (!is.na(ensdb)) {
+    ## Ensembl-ensdb, current version
+    mart.host <-  paste0(ensdb,".ensembl.org")
+    ensdb2 <- switch(ensdb, "fungi"="fungal", "protists"="protist", "metazoa"="metazoa", "plant"="plant")  ## bacteria?
+    ensdb.mart <- paste0(ensdb2,"_mart")
+    mart.name <- grep(ensdb.mart, listMarts(host=mart.host)[,1], value=TRUE)  # an ensemblgenomes.org mart
+    if (length(mart.name)==0) stop(paste("Cannot locate any marts starting with",ensdb.mart))
+    dataset.suffix <- "_eg_gene"
+} else {
+    ## DOA: non-core Ensembl DBs do not keep archives
+    stop(paste0("Non-core Ensembl databases are not archived!  Cannot retrieve '",ensdb,"' version '",ensver,"'!\n"))
+}
+for (i in 1:O) marts[[i]] <- useMart(mart.name, paste0(orgs.ens[i],dataset.suffix), mart.host, ensemblRedirect=FALSE)
+la <- lapply(marts, listAttributes)
+t(sapply(la,dim))
+
+
+
+
+
+
+
+
+
+
+
+#if (is.na(ensdb)) {
+#    mart.host <- paste0(arch,".ensembl.org")
+#    lm <- listMarts(host=mart.host)
+#    mart.name <- "ENSEMBL_MART_ENSEMBL"  # default ensembl.org mart
+#    dataset.suffix <- "_gene_ensembl"
+#    ftp.host <- "ftp.ensembl.org"
+#    ens.ver <- lm[lm[,1]==mart.name,2]  # e.g. "ENSEMBL GENES 84"
+#    message(paste0("using mart: '",ens.ver,"'"))
+#    mart.ens.num <- as.numeric(sub(".* ","",ens.ver))
+#    if (ens.num != mart.ens.num) stop(paste0("Given Ensembl version '",ens.num,"' does not match mart version '",mart.ens.num,"'!\n"))
+#    mart <- useMart(biomart=mart.name, host=mart.host, dataset=paste0(mart.org,dataset.suffix))
+#} else {
+#    mart.host <-  paste0(ensdb,".ensembl.org")
+#    lm <- listMarts(host=mart.host)
+#    ensdb2 <- switch(ensdb, "fungi"="fungal", "protists"="protist", "metazoa"="metazoa", "plant"="plant")  ## bacteria?
+#    ensdb.mart <- paste0(ensdb2,"_mart")
+#    mart.name <- grep(ensdb.mart,lm[,1],value=TRUE)  # an ensemblgenomes.org mart
+#    if (length(mart.name)==0) stop(paste("Cannot locate any marts starting with",ensdb.mart))
+#    dataset.suffix <- "_eg_gene"
+#    ftp.host <- "ftp.ensemblgenomes.org"
+#    ftp.root <- paste0(ftp.root,"/",ensdb)
+#    mart <- useMart(biomart=mart.name, host=mart.host, dataset=paste0(mart.org,dataset.suffix))
+#    vschema <- attributes(mart)$vschema
+#    for (i in 1:length(vschema)) message(paste0("vschema ",i,": ",vschema[i]))
+##    ens.ver <- attributes(mart)$vschema  # e.g. "metazoa_mart_30"
+##    mart.ens.num <- as.numeric(regmatches(ens.ver,regexpr("[0-9]+$",ens.ver)))  # version number
+##    if (ens.num != mart.ens.num) stop(paste0("Given Ensembl version '",ens.num,"' does not match mart version '",mart.ens.num,"'!\n"))
+#    
+#    ## FAIL: Ensembl no longer provides version numbers for ensemblgenomes marts
+#    ## WORKAROUND: get latest version number from FTP, e.g. ftp://ftp.ensemblgenomes.org/pub/fungi/release-31
+#    
+#    ftp.com0 <- paste(c(paste("ftp -i -nv",ftp.host,"<< EOF"),"user anonymous apa@stowers.org",paste("ls",ftp.root),"EOF\n"), collapse="\n")
+#    message(paste0("Running FTP command:\n'",ftp.com0,"'"))
+#    ftp.ls <- system(ftp.com0, intern=TRUE)
+#    ens.num <- as.numeric(sub(".*current -> release-","",grep("current",ftp.ls,value=TRUE)))
+#    ens.ver <- paste0(attributes(mart)$vschema,"_",ens.num)
+#}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## get variant-transcript NT and AA sequences, and associated Ensembl Gene IDs
+message("\nGetting transcript sequence...")
+genes <- getBM(attributes=qw(ensembl_transcript_id,ensembl_gene_id), filters="ensembl_transcript_id", values=trans, mart=marts[[1]])
+genes <- genes[match(trans,genes[,1]),]
+tseq <- tseq2 <- lapply(list(
+    nt=getSequence(id=trans, type="ensembl_transcript_id", seqType="cdna", mart=marts[[1]]),
+    aa=getSequence(id=trans, type="ensembl_transcript_id", seqType="peptide", mart=marts[[1]])
+), function(x){ y=split(x[,1],x[,2]); y[match(trans,names(y))] })
+for (i in 1:2) tseq2[[i]] <- lapply(tseq[[i]], function(x) unlist(strsplit(x,"")) )
+G <- nrow(genes)
+
+## get PDB data, if any
+do.PDB <- ifelse(any(params[,1]=="PDB"), TRUE, FALSE)
+if (do.PDB) {
+    pdbs <- nameless(as.data.frame(t(sapply(params[params[,1]=="PDB",2], function(x) c(unlist(strsplit(x,":")),0,0,0,0) ))))
+    pdbs <- cbind(sub(".pdb$","",sub("^.*/","",pdbs[,1])), pdbs)
+    colnames(pdbs) <- qw(ID,File,Chain,Organism,Transcript,QStart,QEnd,SStart,SEnd)  # Q positions are relative to PDB chain; S positions are relative to reference.  Reference will depend on chain organism.
+    pdb.dat <- new.list(pdbs[,1])  # 4-digit PDB IDs only
+    trans.pdb <- split(pdbs, pdbs$Transcript)
+    trans.pdb <- named.list(trans.pdb[match(genes[,1],names(trans.pdb))], genes[,1])
+    trans.pdb.dat <- new.list(genes[,1])
+    
+    for (i in 1:G) {
+        if (length(trans.pdb[[i]])==0) next
+        for (j in 1:nrow(trans.pdb[[i]])) {
+            trans.pdb.dat[[i]] <- new.list(trans.pdb[[i]]$ID)
+            if (grepl("^(ht|f)tp",trans.pdb[[i]]$File[j])) {
+                x <- tempfile()
+                download.file(trans.pdb[[i]]$File[j], x)  # , method, quiet = FALSE, mode = "w", cacheOK = TRUE, extra = getOption("download.file.extra"))
+            } else {
+                x <- trans.pdb[[i]]$File[j]
+            }
+            trans.pdb.dat[[i]][[j]] <- rownameless(t(sapply(sub("\r$","",scan(x,what="",sep="\n")), function(y) c( RECORD=gsub(" ","",substr(y,1,6)), DATA=sub(" +$","",substr(y,7,80)) ) )))  # in case of Mac/Win newlines)
+        }
+    }
+}
+
+save.image(RData)  # early checkpoint
+
+## build ortholog-data, multiple-alignment, and annotated-variant objects
+aligns <- vars2 <- pdb.report <- exons <- new.list(genes[,1])
+ortho <- new.list(genes[,1], elem=new.list(names(orgs)))
+
+for (i in 1:G) {
+    prefix <- paste0(outprefix,genes[i,1])
+    ortho[[i]] <- get.orthologs(i)
+    IM(genes[i,1], nrow(ortho[[i]]))
+    save.image(RData) 
+    
+#### FIXME DO NOT PROCEED UNLESS ORTHOLOGS!!!
+    
+    x <- align.orthologs(i)
+    if (length(x)>0) {
+        ortho[[i]] <- x$ortho  # updated
+        aligns[[i]] <- x$aligns
+        exons[[i]] <- x$exons
+        vars[[i]] <- x$vars    # updated
+        vars2[[i]] <- x$vars2
+    }
+    if (do.PDB) {
+        if ((genes[i,1] %in% pdbs$Transcript)) {
+            x <- process.pdb(i)
+            vars2[[i]] <- x$vars2  # updated
+            pdb.report[[i]] <- x$report
+        }
+    }
+}
+
+## Prepare and output PDB reports
+if (do.PDB) {
+    pdb.report2 <- pdb.report
+    for (i in 1:length(pdb.report)) {
+        for (p in 1:length(pdb.report[[i]])) {
+            x <- do.call(rbind, lapply(1:length(pdb.report[[i]][[p]]), function(j) suppressWarnings(cbind(Variant=names(pdb.report[[i]][[p]])[j], pdb.report[[i]][[p]][[j]])) ))
+            pdb.report2[[i]][[p]] <- x[order(x[,7]),]
+            pdb.report2[[i]][[p]][,7] <- round(pdb.report2[[i]][[p]][,7],3)
+        }
+        pdb.report2[[i]] <- do.call(rbind, lapply(1:length(pdb.report2[[i]]), function(p) suppressWarnings(cbind(PDB=names(pdb.report2[[i]])[p], pdb.report2[[i]][[p]])) ))
+    }
+    pdb.report2 <- rownameless(do.call(rbind, lapply(1:length(pdb.report2), function(i) suppressWarnings(cbind(Gene=genes[genes[,1]==names(pdb.report2)[i],2], pdb.report2[[i]])) )))
+    pdb.report2 <- pdb.report2[,c(1,3,2,4:ncol(pdb.report2))]
+    colnames(pdb.report2) <- sub("\\.1$",".NBR",colnames(pdb.report2))
+    write.table(pdb.report2, paste0(outprefix,"PDB_report.txt"), sep="\t", na="", quote=FALSE, row.names=FALSE)
+}
+
+## Write vars2 tables and exit
+vars3 <- lapply(1:G, function(i) if (length(vars2[[i]])>0) suppressWarnings(data.frame(Gene=genes[genes[,1]==names(vars2)[i],2],do.call(rbind,vars2[[i]]))) )
+vars3 <- vars3[listLengths(vars3)>0]
+vars3.cn <- c( colnames(vars3[[1]])[1:which(colnames(vars3[[1]])=="Alt.Comments")] , names(orgs) )
+vars3 <- rownameless(do.call(rbind2, lapply(vars3, function(x) do.call(data.frame, lapply(as.list(x)[match(vars3.cn,colnames(x))], function(y) if (length(y)==0) { rep(NA,nrow(x)) } else { y } )))))
+colnames(vars3) <- vars3.cn
+write.table(vars3, paste0(outprefix,"variation_table.txt"), sep="\t", na="", quote=FALSE, row.names=FALSE)
+save.image(RData)
+quit()
+
+

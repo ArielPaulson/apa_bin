@@ -1,0 +1,90 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+die;    ### UNDER CONSTRUCTION
+
+## Takes a GTF file and, for each gene, removes duplicate isoforms.
+## Exonic redundancy cutoffs < 100% may be specified.
+## For a set of redundant isoforms, only the longest will remain.
+## Ties are broken by taking the first sorted transcript ID.
+
+my ($ingtf, $outgtf, $minoverlap, $overwrite, $stdio);
+GetOptions("i=s"=>\$ingtf, "o=s"=>\$outgtf, "m=f"=>\$minoverlap, "overwrite"=>\$overwrite, ""=>\$stdio);
+
+die "$0: Cannot use '--overwrite' on stdio!\n" if $stdio && $overwrite;
+if ($ingtf eq $outgtf) {
+    $outgtf = undef;
+    $overwrite = 1;
+}
+if ($minoverlap) {
+    die "$0: -m value (min overlap %) must be > 0 and <= 100!\n" if $minoverlap <= 0 || $minoverlap > 100;
+} else {
+    $minoverlap = 100;  # percent
+}
+my $tmp = "tmp.stripRedundantIsoforms.$$";
+
+my $IN;
+if ($ingtf) {
+    open $IN, '<', $ingtf or die "$0: Cannot open input gtf '$ingtf': $!\n";
+} elsif ($stdio) {
+    open $IN, '<-';
+} else {
+    die "$0: No input specified!\n";
+}
+
+my %tdat;
+
+open my $TMP, '>', "$tmp.bed";
+while (<$IN>) {
+    $_ =~ s/[\n\r]+$//;
+    my @data = split /\t/, $_;
+    my ($gene, $trans) = ($data[8] =~ /gene_id "([^"]+)";\s+transcript_id "([^"]+)"/);
+    my ($chr, $start, $end, $strand) = @data[0,3,4,6];
+    push @{ $tdat{$trans}{O} }, "$_\n";   # output lines
+    $tdat{$trans}{L} += ($end-$start+1);  # spliced length
+    $tdat{$trans}{G} = $gene;             # parent gene
+    print $TMP "$chr\t$start\t$end\t$trans:",++$tdat{$trans}{X},"\t1\t$strand\n";  # N exons
+}
+close $IN;
+close $TMP;
+
+system "intersectBed -wo -s -a $tmp.bed -b $tmp.bed > $tmp.int";
+
+open my $INT, '<', "$tmp.int" or die "Failed to open intersection file '$tmp.int': $!\n";
+while (<$INT>) {
+    chomp;
+    my @data = split /\t/, $_;
+    my ($id1, $id2, $overlap) = @data[3,9,12];
+    next if $id1 eq $id2;
+    my ($trans1) = (split /:/, $id1)[0];
+    my ($trans2) = (split /:/, $id2)[0];
+    next unless $tdat{$trans1}{G} eq $tdat{$trans2}{G};  # only interested in overlaps within a locus
+    $tdat{$trans1}{I}{$trans2} += $overlap;  # intersection bp  # will get reciprocal overlap on some other line
+}
+close $INT;
+
+my %pass;
+foreach my $trans (sort keys %tdat) {
+    my $fail = 0;
+    foreach my $trans2 (keys %{ $tdat{$trans}{I} }) {  # may not be any
+	$fail = 1 if 100*$tdat{$trans}{I}{$trans2}/$tdat{$trans}{L} >= $minoverlap;
+    }
+    
+}
+
+my $OUT;
+if ($outgtf) {
+    open $OUT, '>', $outgtf;
+} elsif ($overwrite) {
+    unlink $ingtf;
+    open $OUT, '>', $ingtf;
+} else {
+    open $OUT, '>-';
+}
+
+print $OUT @{ $tdat{$trans}{O} } unless $fail;
+
+system "rm -f $tmp.*";
+exit;

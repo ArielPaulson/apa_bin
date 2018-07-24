@@ -1,0 +1,64 @@
+#!/usr/bin/env perl 
+require '/home/apa/apa_routines.pm';
+use Digest::MD5 qw/ md5_hex /;
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my $fasta;   # input fasta
+my $sort;    # sort decreasing by length (default no = keep output in input order)
+my $rmN;     # remove Ns from sequences before counting length
+my $strip;   # comma-delim of quoted characters to remove from sequences prior to counting length (e.g. --strip "-","."," ")
+my $MD5A;    # add a third column with sequence MD5sum values?
+my $MD5U;    # like $MD5A, but convert all characters to uppercase before calculating
+my $stdin;   # input from stdin?
+
+GetOptions("f=s"=>\$fasta, "sort"=>\$sort, "rmn"=>\$rmN, "strip=s"=>\$strip, "MD5sum-asis"=>\$MD5A, "MD5sum-upper"=>\$MD5U, ""=>\$stdin);
+
+die "$0: Cannot specify both --MD5sum-asis and --MD5sum-upper at the same time!\n" if $MD5A && $MD5U;
+my $MD5 = $MD5A || $MD5U;
+
+my ($header, @headers, %sequence, %length, $IN);
+if ($stdin) {
+    $IN = *STDIN;
+} else {
+    $IN = &open2('R', $fasta, 'Input fasta');
+}
+while (<$IN>) {
+    $_ =~ s/[\n\r]+$//g;
+    if ($_ =~ /^>(.*)/) {
+        $header = $1;
+        push @headers, $header;
+    } else {
+        $sequence{$header} .= $_;
+    }
+}
+close $IN;
+
+if ($rmN) {
+    print STDERR "Removing: n, N\n";
+    $sequence{$_} =~ s/N//ig foreach keys %sequence;
+}
+if ($strip) {
+    my %escape = map {($_=>1)} qw/ + * ? [ ] { } ( ) \ . /;  # regex special chars
+    foreach my $str (split /,/, $strip) {
+        $str =~ s/"//g;
+        $str = "\\".$str if exists $escape{$str};
+        print STDERR "Removing: '$str'\n";
+        $sequence{$_} =~ s/$str//g foreach keys %sequence;
+    }
+}
+
+my %lengths = map {($_=>length($sequence{$_}))} @headers;
+@headers = sort {$lengths{$b} <=> $lengths{$a}} keys %lengths if $sort;
+
+if ($MD5U) {
+    print join("\t", $_, $lengths{$_}, md5_hex(uc($sequence{$_}))),"\n" foreach @headers;
+} elsif ($MD5A) {
+    print join("\t", $_, $lengths{$_}, md5_hex($sequence{$_})),"\n" foreach @headers;
+} else {
+    print join("\t", $_, $lengths{$_}),"\n" foreach @headers;
+}
+
+## NO EXIT; can generate extremely large hashes
+

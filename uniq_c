@@ -1,0 +1,13 @@
+#!/usr/bin/env perl
+use strict;
+
+## input: pipe; single column of values
+## output: STDOUT; two columns a la 'uniq -c', "count\tvalue"
+
+my %x;
+while (<>) {
+  s/[\n\r]+$//;
+  $x{$_}++
+}
+print "$x{$_}\t$_\n" foreach sort { $x{$a} <=> $x{$b} } keys %x;
+exit;

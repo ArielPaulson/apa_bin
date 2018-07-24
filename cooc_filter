@@ -1,0 +1,42 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use strict;
+
+my ($incooc, $filter, $outcooc);  # later add cell min, max value filters
+
+GetOptions("i=s"=>\$incooc, "f=s"=>\$filter, "o=s"=>\$outcooc);
+
+my (%filter, %filtered, @indexes, @headers, %matrix);
+
+open IN, $filter or die "Cannot read '$filter': $!\n";
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    my @data = split /\t/, $_;  # this allows for annotation in filter file
+    $filter{$data[0]} = 1;
+}
+close IN;
+
+open IN, $incooc or die "Cannot read '$incooc': $!\n";
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    my @data = split /\t/, $_;
+    my $id = shift @data;
+    if ($. == 1) {
+	foreach (0..$#data) {
+	    if ($filter{$data[$_]}) {
+		push @indexes, $_;
+		push @headers, $data[$_];
+	    }
+	}
+    } else {
+	$filtered{$id} = [@data[@indexes]] if $filter{$id};
+    }
+}
+close IN;
+
+open OUT, "> $outcooc" or die "Cannot write '$outcooc': $!\n";
+print OUT (join "\t", ('', @headers)), "\n";
+print OUT (join "\t", ($_, @{ $filtered{$_} })), "\n" foreach sort keys %filtered;
+close OUT;
+exit;
+

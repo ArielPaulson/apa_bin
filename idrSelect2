@@ -1,0 +1,898 @@
+#!/usr/bin/env Rscript
+
+
+
+
+## ADDS: MAX.PEAKS
+##       DO SOMETHING WITH CLOBBER
+
+
+
+## Takes tables from idrPolish and applies filter criteria to select a final peaklist
+## Currently applies filters as 'any' not 'all', i.e. if one peak in a pair passes, then the pair passes.
+
+## RETAIN EXAMPLE ca BELOW FOR R&D
+
+## ca=c( "/n/core/Bioinformatics/analysis/Krumlauf/nps/cbio.nps.102/data/pipeline/output/AbdA/idr/best/true.idr-expanded.txt", "/n/core/Bioinformatics/analysis/Krumlauf/nps/cbio.nps.102/data/pipeline/output/AbdA/idr/peaks/idr-auto-selected", "--min=10", "--idr=0.01:0.05", "--p=1E-4:1E-3", "--q=1", "--fc=4,:2,", "--ht=10,:5,", "--wd=200,2000", "--pool", "--geno=dm6", "--heatmap=20" )
+
+## ca=c( "/n/core/Bioinformatics/analysis/Krumlauf/nps/cbio.nps.102/data/pipeline/output/AbdA_3/calls/true-1.macs2_peaks.sort100k.narrowPeakExt", "/n/core/Bioinformatics/analysis/Krumlauf/nps/cbio.nps.102/data/pipeline/output/AbdA_3/idr/peaks/macs2-auto-selected", "--min=10", "--p=1E-6:1E-3", "--q=1", "--fc=4,:2,", "--ht=10,:5,", "--wd=200,2000", "--macs2", "--geno=dm6", "--heatmap=20" )
+
+## ca=c( "/n/core/Bioinformatics/analysis/Krumlauf/bdk/cbio.bdk.116/data/pipeline/output/6G_IP/idr/best/true.idr-expanded.txt", "/n/core/Bioinformatics/analysis/Krumlauf/bdk/cbio.bdk.116/data/pipeline/output/6G_IP/idr/peaks/idr-auto-selected", "--geno=mm10", "--heatmap=40", "--min=100", "--p=1E-6:1E-4", "--fc=4:2", "--ht=10:5", "--wd=200,2000", "--idr=0.01:0.05", "--pool" )
+
+## ca=c( "/n/core/Bioinformatics/analysis/Krumlauf/bdk/cbio.bdk.116/data/pipeline/output/6G_IP/idr/best/true.idr-expanded.txt", "/n/core/Bioinformatics/analysis/Krumlauf/bdk/cbio.bdk.116/data/pipeline/output/6G_IP/idr/peaks/idr-auto-selected", "--geno=mm10", "--heatmap=60", "--min=100", "--p=1E-6:1E-4", "--fc=4:2", "--ht=10:5", "--wd=200,2000", "--idr=0.01:0.05", "--pool" )
+
+## ca=c( "/n/core/Bioinformatics/analysis/Krumlauf/bdk/cbio.bdk.116/data/pipeline/output/5A_IP/idr/best/true.idr-expanded.txt", "/n/core/Bioinformatics/analysis/Krumlauf/bdk/cbio.bdk.116/data/pipeline/output/5A_IP/idr/peaks/idr-auto-selected", "--geno=mm10", "--heatmap=70", "--min=100", "--p=1E-6:1E-4", "--fc=4:2", "--ht=10:5", "--wd=200,2000", "--idr=0.01:0.05", "--pool" )
+
+source("/home/apa/apa_tools.R")  # fixpath falsify bed2gr qw write.bed write.heatmap.bed write.vector ...
+
+ca <- commandArgs(trailing=TRUE)
+idrtable <- ca[1]   # if --macs2, then this is a narrowPeaks file
+outpref <- ca[2]
+#nreps <- as.numeric(ca[3])  # N replicates in the pooled bam, if applicable
+
+#if (is.na(nreps)) nreps <- as.numeric(system(paste("ls ",sub("/idr/.*","/replicates/*/bowtie2.bam",idrtable)," | wc -l"), intern=TRUE))  ## This only works in pipeline context
+
+if (!grepl("\\.$",outpref)) outpref <- paste0(outpref,".")
+qcdir <- paste0(outpref,"qc/")
+system(paste("mkdir",qcdir))
+outname <- sub(".*/","",outpref)
+qcpref <- paste0(qcdir,outname)
+
+min.peaks <- heat <- geno <- idr.v <- NA
+macs2 <- pool <- clobber <- no.images <- FALSE
+args <- c()
+if (length(ca)>2) {
+    w.min <- grep("--min=",ca)
+    w.geno <- grep("--geno=",ca)
+    w.idrv <- grep("--idr-ver=",ca)
+    w.heat <- grep("--heatmap=",ca)
+    w.macs2 <- which(ca=="--macs2")
+    w.pool <- which(ca=="--pool")
+    w.clob <- which(ca=="--clobber")
+    w.nimg <- which(ca=="--no-images")
+    if (length(w.min)>0) min.peaks <- as.numeric(sub("^--min=","",ca[w.min]))
+    if (length(w.geno)>0) geno <- sub("^--geno=","",ca[w.geno])
+    if (length(w.idrv)>0) idr.v <- as.numeric(sub("^--idr-ver=","",ca[w.idrv]))
+    if (length(w.heat)>0) heat <- as.numeric(sub("^--heatmap=","",ca[w.heat]))
+    if (length(w.macs2)>0) macs2 <- length(w.macs2)>0
+    pool <- length(w.pool)>0
+    clobber <- length(w.clob)>0
+    no.images <- length(w.nimg)>0
+    if (pool & macs2) stop("Cannot use --pool and --macs2 at the same time!  --macs2 implies single replicate, --pool implies multiple.\n")
+    args <- ca[setdiff(3:length(ca),c(w.min,w.geno,w.macs2,w.pool,w.heat,w.clob,w.idrv,w.nimg))]
+}
+do.images <- !no.images
+
+cmdline <- sub("--args ","",sub("^.*--file=","",paste(commandArgs(FALSE),collapse=" ")))
+
+filters <- c("idr","p","q","fc","ht","wd")  # 'idr' filters on IDR global p-value, NOT local.
+filters.cn <- list(idr="IDR.Pglobal", p="Pvalue", q="Qvalue", fc="FoldChange", ht="Height", wd="Width")   # matching colname suffixes in 'dat' (below)
+ranges <- new.list(filters)
+for (i in 1:3) ranges[[i]] <- list( H=c(0,1)  , L=c(0,1)   )  ## default values:
+for (i in 4:6) ranges[[i]] <- list( H=c(0,Inf), L=c(0,Inf) )  ##  no filtering
+
+unpack.range <- function(x, ranges) {
+    n <- sub("^--","",sub("=.*","",x))  # isolate arg name
+    if (!(n %in% filters)) stop(paste0("Unknown filter name '",n,"'!\n"))
+    x <- sub("^.*=","",x)   # remove arg tag
+    if (grepl(":",x)) {   
+        x <- as.list(unlist(strsplit(x,":")))  # backup value given ("main:backup")
+    } else {             
+        x <- list(x,x)        # no backup value; set backup = main
+    }
+    names(x) <- c("H","L")
+    for (i in 1:2) {
+        x[[i]] <- sub("^,","NA,",x[[i]])  # pad missing first elem
+        x[[i]] <- sub(",$",",NA",x[[i]])  # pad missing last elem
+        x[[i]] <- suppressWarnings(as.numeric(unlist(strsplit(x[[i]],","))))
+        if (length(x[[i]])==1) {
+            ## single values interpreted as a upper limit for idr, p, q; lower limit for fc, ht ,wd
+            x[[i]] <- if (n %in% c("idr","p","q")) { c(0,x[[i]]) } else { c(x[[i]],Inf) }
+        } else {
+            ## double values may be missing a value (e.g. '--fc=5,')
+            if (is.na(x[[i]][1])) x[[i]][1] <- 0
+            if (is.na(x[[i]][2])) x[[i]][2] <- ifelse(n %in% c("idr","p","q"), 1, Inf)
+        }
+    }
+    ranges[[n]] <- lapply(x, function(y) sapply(y,zapsmall) )
+    ranges
+}
+
+if (length(args)>0) for (i in seq(args)) ranges <- unpack.range(args[i], ranges)
+
+ranges2 <- ranges
+ranges2$idr <- lapply(ranges$idr, function(x) rev(-log10(x)) )
+ranges2$p   <- lapply(ranges$p, function(x)   rev(-log10(x)) )
+ranges2$q   <- lapply(ranges$q, function(x)   rev(-log10(x)) )
+
+## NOW INVERT RANGES
+ranges  <- list( H=lapply(ranges , "[[", "H"), L=lapply(ranges , "[[", "L") )
+ranges2 <- list( H=lapply(ranges2, "[[", "H"), L=lapply(ranges2, "[[", "L") )
+
+
+filter.macs2 <- function(HL) {
+    lapply(list(
+          p=(dat$Pvalue     >= ranges2[[HL]]$p[[1]] & dat$Pvalue     <= ranges2[[HL]]$p[[2]]),
+          q=(dat$Qvalue     >= ranges2[[HL]]$q[[1]] & dat$Qvalue     <= ranges2[[HL]]$q[[2]]),
+         fc=(dat$FoldChange >= ranges[[HL]]$fc[[1]] & dat$FoldChange <= ranges[[HL]]$fc[[2]]),
+         ht=(dat$Height     >= ranges[[HL]]$ht[[1]] & dat$Height     <= ranges[[HL]]$ht[[2]]),
+         wd=(dat$Width      >= ranges[[HL]]$wd[[1]] & dat$Width      <= ranges[[HL]]$wd[[2]])
+    ), falsify)
+}
+
+filter.pool <- function(HL) {
+    lapply(list(
+        idr=(dat$IDR.Pglobal     >= ranges2[[HL]]$idr[[1]] & dat$IDR.Pglobal     <= ranges2[[HL]]$idr[[2]]),
+          p=(dat$Pool.Pvalue     >= ranges2[[HL]]$p[[1]]   & dat$Pool.Pvalue     <= ranges2[[HL]]$p[[2]]),
+          q=(dat$Pool.Qvalue     >= ranges2[[HL]]$q[[1]]   & dat$Pool.Qvalue     <= ranges2[[HL]]$q[[2]]),
+         fc=(dat$Pool.FoldChange >= ranges[[HL]]$fc[[1]]   & dat$Pool.FoldChange <= ranges[[HL]]$fc[[2]]),
+         ht=(dat$Pool.Height     >= ranges[[HL]]$ht[[1]]   & dat$Pool.Height     <= ranges[[HL]]$ht[[2]]),
+         wd=(dat$Pool.Width      >= ranges[[HL]]$wd[[1]]   & dat$Pool.Width      <= ranges[[HL]]$wd[[2]])
+    ), falsify)   # convert all non-pool NAs to FALSE
+}
+
+filter.idr <- function(HL) {
+    lapply(list(
+        idr=(dat$IDR.Pglobal     >= ranges2[[HL]]$idr[[1]] & dat$IDR.Pglobal     <= ranges2[[HL]]$idr[[2]] ),
+          p=(dat$RepA.Pvalue     >= ranges2[[HL]]$p[[1]]   & dat$RepA.Pvalue     <= ranges2[[HL]]$p[[2]])  | (dat$RepB.Pvalue     >= ranges2[[HL]]$p[[1]] & dat$RepB.Pvalue     <= ranges2[[HL]]$p[[2]]),
+          q=(dat$RepA.Qvalue     >= ranges2[[HL]]$q[[1]]   & dat$RepA.Qvalue     <= ranges2[[HL]]$q[[2]])  | (dat$RepB.Qvalue     >= ranges2[[HL]]$q[[1]] & dat$RepB.Qvalue     <= ranges2[[HL]]$q[[2]]),
+         fc=(dat$RepA.FoldChange >= ranges[[HL]]$fc[[1]]   & dat$RepA.FoldChange <= ranges[[HL]]$fc[[2]])  | (dat$RepB.FoldChange >= ranges[[HL]]$fc[[1]] & dat$RepB.FoldChange <= ranges[[HL]]$fc[[2]]),
+         ht=(dat$RepA.Height     >= ranges[[HL]]$ht[[1]]   & dat$RepA.Height     <= ranges[[HL]]$ht[[2]])  | (dat$RepB.Height     >= ranges[[HL]]$ht[[1]] & dat$RepB.Height     <= ranges[[HL]]$ht[[2]]),
+         wd=(dat$RepA.Width      >= ranges[[HL]]$wd[[1]]   & dat$RepA.Width      <= ranges[[HL]]$wd[[2]])  | (dat$RepB.Width      >= ranges[[HL]]$wd[[1]] & dat$RepB.Width      <= ranges[[HL]]$wd[[2]])
+    ), falsify)
+}
+
+
+message("idrSelect initialized: ",Sys.time())
+
+if (macs2) {
+    
+    #ranges <- ranges[names(ranges)!="idr"]
+    #ranges2 <- ranges2[names(ranges2)!="idr"]
+    
+    dat <- read.narrowPeak(idrtable)
+    colnames(dat)[5] <- "Height"
+    dat <- cbind(dat, Width=dat[,3]-dat[,2])
+    nri <- nrow(dat)
+    idr.v <- 0
+    
+    ## 'dat' must be a narrowPeak file!  NOT idr table.
+    ## colnames:
+    ## 1-10: Chrom,Start,End,Name,Score,Strand,FoldChange,Pvalue,Qvalue,Summit
+    ## "Score" is actually Height, if running in pipeline context, i.e. macs2_postprocess.R has run.
+    
+    ## Main filter
+    pass <- filter.macs2("H")
+    all.pass <- macs.pass <- pass$p & pass$q & pass$fc & pass$ht & pass$wd
+    
+    ## Backup filter, in case main is too stringent
+    pass2 <- filter.macs2("L")
+    all.pass2 <- macs.pass2 <- pass2$p & pass2$q & pass2$fc & pass2$ht & pass2$wd
+    
+    ## Backup-backup filter, in case both fail
+    ## Just taking the top 'min.peaks' peaks by p-value
+    if (!is.na(min.peaks)) {
+        psort <- cbind(1:nri,dat$Pvalue)
+        psort <- psort[rev(order(psort[,2])),]       # decreasing by -log10 P
+        top.pass <- 1:nri %in% psort[1:min.peaks,1]  # positions of top-'min.peaks' peaks
+        pass3 <- lapply(filters, function(x) c(rep(TRUE,min.peaks),rep(FALSE,nri-min.peaks)) )  # dummy filters, just to get correct 'sum' numbers
+    } else {
+        top.pass <- rep(TRUE,nri)
+        pass3 <- lapply(filters, function(x) rep(TRUE,nri) )  # dummy filters, just to get correct 'sum' numbers
+    }
+    
+} else {
+    
+    dat <- read.delim(idrtable, as.is=TRUE)
+    nri <- nrow(dat)
+    rlit <- system(paste("readlink -f",idrtable),intern=TRUE)
+    if (is.na(idr.v)) idr.v <- ifelse(grepl("/IDR2/",rlit), 2, ifelse(grepl("/IDR1/",rlit), 1, NA))
+    if (any(dat$IDR.Pglobal<0)) stop("IDR P values cannot be negative!\n")
+    
+    ## 'dat' must be an idrPolish output table, i.e. *.expanded.txt
+    ## colnames:
+    ##  1-14: Chrom,Start,End,Name,Score,Strand,FoldChange,Pvalue,Qvalue,Summit,Width,Height,IDR.Plocal,IDR.Pglobal
+    ## 15-27: Pool.Chrom,Pool.Start,Pool.End,Pool.Name,Pool.Score,Pool.Strand,Pool.FoldChange,Pool.Pvalue,Pool.Qvalue,Pool.Summit,Pool.Width,Pool.Height,Pool.Rank
+    ## 28-39: RepA.Chrom,RepA.Start,RepA.End,RepA.Name,RepA.Score,RepA.Strand,RepA.FoldChange,RepA.Pvalue,RepA.Qvalue,RepA.Summit,RepA.Width,RepA.Height
+    ## 40-51: RepB.Chrom,RepB.Start,RepB.End,RepB.Name,RepB.Score,RepB.Strand,RepB.FoldChange,RepB.Pvalue,RepB.Qvalue,RepB.Summit,RepB.Width,RepB.Height
+    
+    pool.rank <- dat$Pool.Rank
+    if (!pool) pool.rank <- zerofy(pool.rank)  # eliminate NAs, if not filtering
+    pool.pass <- !is.na(pool.rank)
+    
+    ## OLD METHOD: Filter replicates, and add pool-only as a separate filter
+    ## This is still really good for QC, as you see specifically what impact the pool has in relation to everything else
+    ## Later try to work in with some other flag, like '--pool' vs '--pool-only' or something
+#    ## Main filter (high stringency)
+#    ## Only one replicate needs to pass
+#    pass <- filter.idr("H")
+#    macs.pass <- pass$p & pass$q & pass$fc & pass$ht & pass$wd
+#    all.pass <- pass$idr & macs.pass & pool.pass
+#    
+#    ## Backup filter, in case main is too stringent (low stringency)
+#    ## Only one replicate needs to pass
+#    pass2 <- filter.idr("L")
+#    macs.pass2 <- pass2$p & pass2$q & pass2$fc & pass2$ht & pass2$wd
+#    all.pass2 <- pass2$idr & macs.pass2 & pool.pass
+    
+    
+    ## Main filter (high stringency)
+    ## Backup filter, in case main is too stringent (low stringency)
+    if (pool) {
+        ## Only filtering on pooled stats
+        pass <- filter.pool("H")
+        pass2 <- filter.pool("L")
+    } else {
+        ## Filtering on both reps, but only one needs to pass
+        pass <- filter.idr("H")
+        pass2 <- filter.idr("L")
+    }
+    
+    ## These are applicable to both idr- and pool-filtered results
+    ## 'pool.pass' is redundant if already pool-filtered
+    macs.pass <- pass$p & pass$q & pass$fc & pass$ht & pass$wd
+    macs.pass2 <- pass2$p & pass2$q & pass2$fc & pass2$ht & pass2$wd
+    all.pass <- pass$idr & macs.pass & pool.pass
+    all.pass2 <- pass2$idr & macs.pass2 & pool.pass
+    
+    ## Backup-backup filter, in case both fail (no stringency, just top-N)
+    ## Just taking the top 'min.peaks' peaks by joint P/IDR values (after applying pool filter)
+    ## Since P and IDR values are somewhat independent, they are converted to ranks
+    ## Joint ranks (P rank + IDR rank) are sorted, and the top 'min.peaks' peaks selected
+    if (!is.na(min.peaks)) {
+        ranks <- cbind( Row=1:nri, P.rank=match(1:nri,order(dat$Pvalue)), IDR.rank=match(1:nri,order(dat$IDR.Pglobal)) )  # larger ranks = smaller p-values
+        ranks <- cbind( ranks, Joint.rank=ranks[,2]+ranks[,3] )   # joint rank = sum of P, IDR ranks (could be mean, but would not alter sort order, which is the critical thing)
+        ranks <- ranks[pool.pass,]                                # apply pool filter (does nothing unless pool=TRUE)
+        ranks <- ranks[rev(order(ranks[,4])),]                    # sort on joint rank decreasing
+        top.pass <- 1:nri %in% ranks[1:min.peaks,1]               # positions of top-'min.peaks' peaks
+        pass3 <- lapply(filters, function(x) c(rep(TRUE,min.peaks),rep(FALSE,nri-min.peaks)) )  # dummy filters, just to get correct 'sum' numbers
+    } else {
+        top.pass <- pool.pass
+        pass3 <- lapply(filters, function(x) rep(TRUE,sum(pool.pass)) )  # dummy filters, just to get correct 'sum' numbers
+    }
+    
+}
+
+
+## Set up some printables / sprintf stuff
+
+pranges <- lapply(ranges, function(x) lapply(x, function(y) paste(y,collapse=":")) )
+pranges$N <- lapply(ranges$H,function(x)NA)
+fw <- max(c(nchar(nri),7))
+top.name <- paste0("top-",min.peaks)
+rw12 <- max(c( nchar(unlist(pranges[1:2])), nchar(top.name), 5 ))
+
+show.scoreboard <- function(xpass, macs.xpass, all.xpass, prangesF, blurb) {
+    rw <- max(c(nchar(unlist(prangesF)),7))
+    if (is.na(rw)) {
+        rw <- 7
+        xpass <- lapply(filters.cn, function(x) NA)
+    }
+    scoreboard <- c(
+        blurb,
+        sprintf(paste0( "FILTERS    : %",rw,"s : %",fw,"s : %7s"  ), "RANGE"     , "PASSING"     , "PERCENT"             ),
+        sprintf(paste0( "INPUT      : %",rw,"s : %",fw,"i : %7.2f"), ""          , nri           , 100                   ),
+        sprintf(paste0( "Pvalue     : %",rw,"s : %",fw,"i : %7.2f"), prangesF$p  , sum(xpass$p)  , 100*sum(xpass$p)/nri  ),
+        sprintf(paste0( "Qvalue     : %",rw,"s : %",fw,"i : %7.2f"), prangesF$q  , sum(xpass$q)  , 100*sum(xpass$q)/nri  ),
+        sprintf(paste0( "FoldChange : %",rw,"s : %",fw,"i : %7.2f"), prangesF$fc , sum(xpass$fc) , 100*sum(xpass$fc)/nri ),
+        sprintf(paste0( "Height     : %",rw,"s : %",fw,"i : %7.2f"), prangesF$ht , sum(xpass$ht) , 100*sum(xpass$ht)/nri ),
+        sprintf(paste0( "Width      : %",rw,"s : %",fw,"i : %7.2f"), prangesF$wd , sum(xpass$wd) , 100*sum(xpass$wd)/nri )
+    )
+    if (!macs2) scoreboard <- c( scoreboard, sprintf(paste0( "All MACS2  : %",rw,"s : %",fw,"i : %7.2f"), "(above)", sum(macs.xpass), 100*sum(macs.xpass)/nri ) )
+    if (pool)   scoreboard <- c( scoreboard, sprintf(paste0( "Pool Only  : %",rw,"s : %",fw,"i : %7.2f"), pool, sum(pool.pass), 100*sum(pool.pass)/nri ) )
+    if (!macs2) scoreboard <- c( scoreboard, sprintf(paste0( "IDR Pglobal: %",rw,"s : %",fw,"i : %7.2f"), prangesF$idr, sum(xpass$idr), 100*sum(xpass$idr)/nri ) )
+                scoreboard <- c( scoreboard, sprintf(paste0( "FINAL      : %",rw,"s : %",fw,"i : %7.2f"), "", sum(all.xpass), 100*sum(all.xpass)/nri ) )
+    message(paste(scoreboard,collapse="\n"))
+}
+
+## Report on total pass rate and pass rate per filter
+
+passing <- sum(all.pass)
+passing2 <- sum(all.pass2)
+mpassing <- sum(macs.pass)
+mpassing2 <- sum(macs.pass2)
+
+show.scoreboard(pass,  macs.pass,  all.pass,  pranges$H, "\nMain Filter Results:")
+show.scoreboard(pass2, macs.pass2, all.pass2, pranges$L, "\nBackup Filter Results:")
+
+
+if (!is.na(min.peaks)) {
+    
+    ## min.peaks requirement means that a filter must return at least that many peaks, or else it has "failed"
+    if (passing>=min.peaks) {
+        filter.used <- "main"
+        xpass <- pass
+        macs.xpass <- macs.pass
+        all.xpass <- all.pass
+    } else {
+        message(paste("\nOnly",passing,"peaks left after main filters!  Using backup filter values..."))  # which, if not specified, == main values...
+        filter.used <- "backup"
+        if (passing2>=min.peaks) {
+            xpass <- pass2
+            macs.xpass <- macs.pass2
+            all.xpass <- all.pass2
+        } else {
+            message(paste("Only",passing2,"peaks left after backup filters!  Ignoring all filters, selecting minimum",min.peaks,"top peaks..."))  # second-worst-case scenario
+            filter.used <- top.name
+            xpass <- pass3
+            all.xpass <- macs.xpass <- top.pass  # top.pass is only the top 'min.peaks' peaks
+            show.scoreboard(pass3, top.pass, top.pass, pranges$N, "\nTop-Peaks Results:")
+        }
+    }
+    
+} else {
+    
+    ## No min.peaks requirement here, so if anything passes filter, then filter "succeeded".
+    if (any(passing)) {
+        filter.used <- "main"
+        xpass <- pass
+        macs.xpass <- macs.pass
+        all.xpass <- all.pass
+    } else {
+        message(paste("\nNo peaks left after main filters!  Using backup filter values..."))  # which, if not specified, == main values...
+        filter.used <- "backup"
+        if (any(passing2)) {
+            xpass <- pass2
+            macs.xpass <- macs.pass2
+            all.xpass <- all.pass2
+        } else {
+            message(paste("No peaks left after backup filters!  Ignoring all filters, returning all peaks..."))  # worst-case scenario
+            filter.used <- "none"
+            xpass <- pass3
+            all.xpass <- macs.xpass <- top.pass  # top.pass will include all peaks
+            show.scoreboard(pass3, top.pass, top.pass, pranges$N, "\nUnfiltered Results:")
+        }
+    }
+    
+}
+
+
+## Write outputs (beds, reports)
+
+dat2 <- dat[all.xpass,]   # filtered peaks only
+dat2 <- dat2[order(dat2[,1],dat2[,2]),]  # sort by chrom then start
+nro <- nrow(dat2)
+message(nro," peaks selected!")
+
+message("\nWriting outputs...")
+rewrite <- TRUE
+sel.peaks <- dat2[,4]
+## Note: all IDR data is narrowPeak-based, so start coords are already 0-based
+bed.np <- dat2[,1:10]
+bed.np[,5] <- dat2$Height  # "modern" pipeline np files have score=height, but older ones may not, so ensure score=height here...
+bed.6 <- cbind(dat2[,1:5],"+")
+
+outbed <- paste0(outpref,"bed")
+if (file.exists(outbed)) {
+    existing.peaks <- system(paste("cut -f4",outbed),intern=TRUE)
+    name.same <- suppressWarnings( sort(existing.peaks) == sort(sel.peaks) )
+    if (all(name.same)) {
+        message("Peak list has not changed since last time; skipping basic outputs...")
+        rewrite <- FALSE   # if same peak set, then don't bother rewriting it
+    }
+}
+if (rewrite) {
+    write.table2(dat2, paste0(outpref,"txt"), stabilize=TRUE)
+    write.bed(bed.np[,1:5], paste0(outpref,"bed"), format="bed6")
+    write.bed(bed.np, paste0(outpref,"narrowPeak"), format="narrowPeak")
+    
+    sprintf.filter <- function(i) {
+        n <- names(ranges$H)[i]; N <- filters.cn[[n]]
+        sprintf(pfmt2, N, pranges$H[[i]], sum(pass[[n]]), 100*sum(pass[[n]])/nri, pranges$L[[i]], sum(pass2[[n]]), 100*sum(pass2[[n]])/nri )
+    }
+
+    pfmt1 <- paste0("%-14s | %",rw12+1,"s | %",fw+1,"i | %8.4f")
+    hfmt1 <- paste0("%-14s | %",rw12+1,"s | %",fw+1,"s | %8s"  )
+    pfmt2 <- paste0("%-14s | %",rw12+1,"s | %",fw+1,"i | %8.4f | %",rw12+1,"s | %",fw+1,"i | %8.4f")
+    hfmt2 <- paste0("%-14s | %",rw12+1,"s | %",fw+1,"s | %8s | %"  ,rw12+1,"s | %",fw+1,"s | %8s"  )
+    params <- c(
+        "### idrSelect peak list report",
+        paste0("Command line ","  ",cmdline),
+        paste0("Input table  ","  ",idrtable),
+        paste0("Output prefix","  ",outpref),
+        "",
+        sprintf(hfmt1,"KEY","VALUE","PASSING","PERCENT"),
+        sprintf(pfmt1,"Initial peaks",nri,NA,100),
+        sprintf(pfmt1,"Mininum peaks",min.peaks,NA,100*min.peaks/nri),
+        sprintf(pfmt1,"Filter used",filter.used,nro,100*nro/nri),
+        "",
+        sprintf(hfmt2,"PRIORITY","MAIN","MAIN","MAIN","BACKUP","BACKUP","BACKUP"),
+        sprintf(hfmt2,ifelse(macs2,"MACS2 FILTERS","FILTER"),"VALUE","PASSING","PERCENT","VALUE","PASSING","PERCENT"),
+        sprintf(pfmt2,"Final","(all)",passing,100*passing/nri,"(all)",passing2,100*passing2/nri)
+    )
+    ## print IDR filter + ALL-MACS2, unless all we had was MACS2
+    if (!macs2) params <- c( params, sprintf.filter(1) )
+    if (pool)   params <- c( params, sprintf(pfmt2,"Pool-Only",pool,sum(pool.pass),100*sum(pool.pass)/nri,pool,sum(pool.pass),100*sum(pool.pass)/nri) )
+    if (!macs2) params <- c( params, sprintf(pfmt2,"All MACS2","(below)",mpassing,100*mpassing/nri,"(below)",mpassing2,100*mpassing2/nri) )
+    if (!macs2) params <- c( params, "", sprintf(hfmt2,"MACS2 FILTERS","VALUE","PASSING","PERCENT","VALUE","PASSING","PERCENT") )
+    params <- c( params, sapply(2:length(ranges$H), sprintf.filter) )
+    params <- gsub("NA","  ",params)
+    write.vector(params, paste0(qcpref,"report.txt"))
+}
+
+abvals <- ranges
+mains <- filters.cn
+colors <- vnames <- xlims <- ranges$H
+pmat <- new.list(filters)
+
+## Add peaks ht vs fc, p vs fc, cross-colored or flagged or something
+dat.sel <- dat[,4] %in% dat2[,4]
+hpf <- as.matrix(dat[,c("Height","Pvalue","FoldChange")])
+
+plot.points <- function(x, main) {
+    plot(x, col=0, main=main)
+    points(x[!dat.sel,], col="#00000044")
+    points(x[ dat.sel,], col="#FF000055")
+}
+
+png1 <- paste0(qcpref,"report_fc_vs_htp.png")
+if (clobber | rewrite | !file.exists(png1)) {
+    png(png1, 1500, 500)
+    par(mfrow=c(1,3), cex=1.2, las=1)
+    plot.points(hpf[,2:3], main="FoldChange vs Pvalue")
+    plot.points(hpf[,c(1,3)], main="FoldChange vs Height")
+    plot.points(hpf[,1:2], main="Pvalue vs Height")
+    dev.off()
+}
+
+if (FALSE) {
+    
+    ## More-complex methods for another day...
+    ## Testing with AbdA
+    
+    hpfq <- apply(hpf,2,quantile, c(0.1,0.99))
+    ok <- hpf[,2]>4 & hpf[,3]>2 & hpf[,1]>10; sum(ok); nrow(hpf)
+    trim <- hpf[,1] %within% hpfq[,1] & hpf[,2] %within% hpfq[,2] & hpf[,3] %within% hpfq[,3]; sum(trim); nrow(hpf)
+    
+    ## smoothScatter2(hpf[ok,2:3], main="FoldChange vs Pvalue", col="#00000055")
+    ## library(rgl); plot3d(dat[,c("Height","FoldChange","Pvalue")], type="p")
+    ## library(mclust); m <- Mclust(hpf[ok,2:3], G=1:2)
+    ## mclust2Dplot(hpf[ok,2:3], m$parameters, NULL, m$classification, NULL, m$uncertainty, addEllipses=TRUE)
+    
+    #lm1 <- lm(hpf[ok,3]~hpf[ok,2])
+    lm1 <- lm(hpf[trim,3]~hpf[trim,2])
+    m2 <- -1/lm1[[1]][[2]]
+    mv <- 100*c(1,-1/lm1[[1]][[2]])
+    p2 <- c((hpf[10,2:3] %*% mv) / (mv %*% mv)) * mv   ## Thanks to https://en.wikibooks.org/wiki/Linear_Algebra/Orthogonal_Projection_Onto_a_Line
+    hpf2 <- (hpf[,2:3] %*% mv) / c(mv %*% mv)
+    hpf2 <- cbind(hpf2*mv[1], hpf2*mv[2])
+    theta <- -1 * thetacon(m2,"slope","radian") + 2* thetacon(lm1[[1]][[2]],"slope","radian")
+    rmat <- matrix(c(cos(theta),sin(theta),-sin(theta),cos(theta)),2)
+    hpf3 <- (hpf2 %*% rmat) * -1
+    hpf3q <- quantile(hpf3[,1], c(0.01,0.97))
+    xyr <- range(c(hpf,hpf2))
+    xyr2 <- range(c(hpf2,1,100))
+    
+    par(mfrow=c(2,2))
+    plot(hpf[ok,2:3], main="FoldChange vs Pvalue", col="#00000001", xlim=xyr2, ylim=xyr2)   # 90% of the data is basically one straight line...
+    abline(h=0); abline(lm1, col=5); abline(0, m2, col=6); abline(v=hpfq[,2], col=2)
+    plot(hpf[,2:3], main="FoldChange vs Pvalue", col="#00000055", xlim=xyr2, ylim=xyr2)
+    abline(h=0); abline(lm1, col=5); abline(0, m2, col=6)
+    points(p2[1], p2[2], col=4)
+    points(hpf2, col=4)
+    points(hpf3, col=3)
+    d <- dhist(hpf3[hpf3[,1]>hpf3q[1]&hpf3[,1]<hpf3q[2],1])
+    abline(h=deciles(d$density[[1]]$y), col=2)
+    plot(hpf[,2:3], main="FoldChange vs Pvalue", col="#00000055", xlim=xyr, ylim=xyr)
+    abline(h=0); abline(lm1, col=5); abline(0, m2, col=6)
+    points(p2[1], p2[2], col=4)
+    points(hpf2, col=4)
+    points(hpf3, col=3)
+    
+}
+
+
+png2 <- paste0(qcpref,"report_dhist.png")
+if (clobber | rewrite | !file.exists(png2)) {
+    png(png2, 1500, 1000)
+    par(mfrow=c(2,3), cex=1.2, las=1)
+    for (i in 1:6) {
+        if (i==1 & macs2) { null.plot(); next }
+        w <- grep(filters.cn[[i]],colnames(dat))
+        if (length(w)==1) {
+            vnames[[i]] <- colnames(dat)[w]
+            if (vnames[[i]]=="IDR.Pglobal") vnames[[i]] <- "IDR"
+        } else {
+            vnames[[i]] <- c("IDR","Pool","RepA","RepB")
+        }
+        
+        islog2 <- (i %in% 5:6)  # height, width are shown in log2
+        pmat[[i]] <- as.matrix(dat[,w])
+        if (islog2) pmat[[i]] <- log2(pmat[[i]])
+        
+        abvals$H[[i]] <- if (i<=3) { ranges2$H[[i]] } else { ranges$H[[i]] }
+        abvals$L[[i]] <- if (i<=3) { ranges2$L[[i]] } else { ranges$L[[i]] }
+        if (islog2) {
+            abvals$H[[i]] <- log2(abvals$H[[i]])
+            abvals$L[[i]] <- log2(abvals$L[[i]])
+        }
+        xlims[[i]] <- range(real(c(abvals$H[[i]],abvals$L[[i]],pmat[[i]])))
+        xext <- diff(xlims[[i]])
+        if (xlims[[i]][1]>0) xlims[[i]][1] <- xlims[[i]][1]-xext*0.1
+        if (is.infinite(abvals$H[[i]][1])) abvals$H[[i]][1] <- xlims[[i]][1]-xext*0.25
+        if (is.infinite(abvals$H[[i]][2])) abvals$H[[i]][2] <- xlims[[i]][2]+xext*0.25
+        if (is.infinite(abvals$L[[i]][1])) abvals$L[[i]][1] <- xlims[[i]][1]-xext*0.25
+        if (is.infinite(abvals$L[[i]][2])) abvals$L[[i]][2] <- xlims[[i]][2]+xext*0.25
+        colors[[i]] <- if (macs2) { 5 } else { 1:length(w)+1 }
+        mains[[i]] <- paste("Peak Statistic:",filters.cn[[ names(ranges$H)[i] ]], ifelse(islog2," (log2)",ifelse(i<=3," (-log10)","")) )
+        d <- dhist(pmat[[i]], points=TRUE, xlim=xlims[[i]], lwd=2, col=colors[[i]], vnames=vnames[[i]], legend=NA, main=mains[[i]])
+        yext <- diff(d$ylim)*0.25
+        rect(abvals$H[[i]][1],0, abvals$H[[i]][2],d$ylim[2]+yext, angle=-45, density=10, col="#00000033")
+        rect(abvals$L[[i]][1],0, abvals$L[[i]][2],d$ylim[2]+yext, angle= 45, density=10, col="#00000033")
+        if (!macs2) legend("topright", bg="white", box.col="white", col=colors[[i]], lty=1, lwd=2, legend=vnames[[i]])
+    }
+    dev.off()
+}
+
+if (!macs2) {
+    
+    ## Scatterplots require replicates
+    
+    ## Replicates scatterplot, colored by pool rank (rank of pending statistic)
+    png3 <- paste0(qcpref,"report_scatter_RepA-RepB.png")
+    if (clobber | rewrite | !file.exists(png3)) {
+        png(png3, 1500, 1000)
+        par(mfrow=c(2,3), cex=1.2, las=1)
+        null.plot()
+        for (i in 2:6) {
+            uranges <- if (i<=3) { ranges2 } else { ranges }
+            abr <- c(uranges$L[[i]],uranges$H[[i]])
+            if (i>=5) abr <- log2(abr)
+            x <- pmat[[i]][,grep("^Rep[AB]\\.",colnames(pmat[[i]]))]
+            p <- pmat[[i]][,grep("Pool",colnames(pmat[[i]]))]
+            rp <- rank(p,TRUE,"first")
+            rp[is.na(p)] <- min(rp[is.na(p)])
+            rpq <- quantize(rp, seq(1,max(rp),length.out=256), indices=TRUE)
+            cols <- paste0(palettizer("rainblo.k", 256),"55")[rpq]
+            lims <- range(real(c(x,abr)))
+            plot(x, xlim=lims, ylim=lims, main=mains[[i]], col=cols)
+            abline(0, 1, col=4)
+            abr[is.infinite(abr)] <- max(x)*2
+            abline(h=abr, lty=c(2,2,1,1))
+            abline(v=abr, lty=c(2,2,1,1))
+        }
+        dev.off()
+    }
+    
+    ## IDR Pglobal vs Pooled-peak stats
+    png4 <- paste0(qcpref,"report_scatter_IDR-Pool.png")
+    if (clobber | rewrite | !file.exists(png4)) {
+        png(png4, 1500, 1000)
+        par(mfrow=c(2,3), cex=1.2, las=1)
+        null.plot()
+        ibr <- c(ranges2$L$idr,ranges2$H$idr)
+        for (i in 2:6) {
+            uranges <- if (i<=3) { ranges2 } else { ranges }
+            abr <- c(uranges$L[[i]],uranges$H[[i]])
+            if (i>=5) abr <- log2(abr)
+            ibr2 <- ibr
+            x <- cbind(IDR.Pglobal=dat$IDR.Pglobal, pmat[[i]][,grep("Pool",colnames(pmat[[i]])),drop=FALSE])
+            lims <- list( x=range(real(c(x[,1],ibr))), y=range(real(c(x[,2],abr))) )
+            plot(x, xlim=lims$x, ylim=lims$y, main=mains[[i]])
+            abline(0, 1, col=4)
+            abr[is.infinite(abr)] <- max(x)*2
+            ibr2[is.infinite(ibr2)] <- max(x)*2
+            abline(h=abr, col=2, lty=c(2,2,1,1))
+            abline(v=ibr, col=2, lty=c(2,2,1,1))
+        }
+        dev.off()
+    }
+  
+}
+
+
+
+if (!is.na(heat)) {
+    message("Preparing heatmap datasets...")
+    
+    ## IDR version required for IDR color tranches, since 2 versions produce different value ranges
+    ## "Version 0" is OK, which means MACS2, i.e. no IDR
+    if (is.na(idr.v)) stop("Cannot determine IDR version number from input filename, and not specified with --idr-ver!  Halting.\n")
+    
+    cores <- heat  # this is actually the N cores to run CoverageView with
+    kval <- 2.5
+    flank <- 2500
+    suppressMessages(require(CoverageView))
+    cmdir <- paste0(qcdir,"cov.mats/",kval,"k/")
+    hmdir.t <- paste0(cmdir,"heatmaps.total/")
+    hmdir.s <- paste0(cmdir,"heatmaps.select/")
+    hmdir.z <- paste0(cmdir,"heatmaps.select.zoom/")
+    for (dir in c(hmdir.t,hmdir.s,hmdir.z)) system(paste("mkdir -p",dir))
+    
+    tr.cols <- c("red","darkorange","goldenrod1","yellow","chartreuse","green3","cyan","dodgerblue","blue","purple3","sienna4","grey35")
+    sub2i <- lapply( list( c(0.01,0.05), c(0.05,0.1), c(0.1,0.2), c(0.2,0.3), c(0.3,0.4), c(0.4,0.5), c(0.5,1) ), nlog10 )  # for IDR p
+    nl05 <- -log10(0.05)
+    pq.tranches <- list( c(Inf,100), c(100,50), c(50,24), c(24,18), c(18,14), c(14,12), c(12,10), c(10,8), c(8,6), c(6,4), c(4,2), c(2,0) )
+    
+    tranches <- list(
+               IDR=c( list( c(Inf,6), c(6,5), c(5,4), c(4,3), c(3,2) ), sub2i ),
+            Pvalue=pq.tranches,
+            Qvalue=pq.tranches,
+        FoldChange=list( c(Inf,20),   c(20,16),     c(16,12),     c(12,10),     c(10,8),      c(8,7),       c(7,6),      c(6,5),     c(5,4),     c(4,3),     c(3,2),     c(2,0)   ), 
+            Height=list( c(Inf,100),  c(100,90),    c(90,80),     c(80,70),     c(70,60),     c(60,50),     c(50,40),    c(40,30),   c(30,20),   c(20,10),   c(10,5),    c(5,0)   ), 
+             Width=list( c(Inf,3000), c(3000,2400), c(2400,2000), c(2000,1600), c(1600,1200), c(1200,1000), c(1000,800), c(800,600), c(600,400), c(400,200), c(200,100), c(100,0) )
+    )
+    if (macs2) tranches <- tranches[names(tranches)!="IDR"]
+    
+    TR <- length(tranches); TR
+    NT <- length(tranches[[1]])
+    for (i in 1:TR) names(tranches[[i]]) <- tr.cols
+    tx.col <- rev(c("white","black")[c(2,2,2,2,2,2,2,2,1,1,1,1)])
+    
+    png(paste0(cmdir,"heatmap_color_key.png"), 800, 700)
+    null.plot(xlim=c(0,TR), ylim=c(0,NT))
+    mtext(names(tranches), 3, 0, F, 1:TR-0.5, font=2)
+    for (i in 1:TR) {
+        for (j in 1:NT) {
+            rect(i-1,j-1, i-0.1,j, border=NA, col=rev(tr.cols)[j])
+            tx <- rev(tranches[[i]])[[j]][2:1]
+            if (i <= 4) tx <- sapply(rev(tranches[[i]])[[j]][2:1], function(x) sub("-","",sprintf("%0.3f",x)) )
+            tx <- paste0(c("    ","< "),tx)
+            text(c(i,i)-0.55, c(j-0.75,j-0.25), tx, col=tx.col[j])
+        }
+    }
+    dev.off()
+    
+    
+    ## Choose some maximum peak list which is NOT the idr total... (any with one p<=0.05??)
+    ## Write N-kb bed(s)
+    ## make temp dir (?) or permanent QC dir
+    ## Find bams
+    ## Run cov.matrix
+    ## HM sorted on FC, HT, PV, with all as att cols + is.pool
+    
+    ## Get complete bed, and what rows were filtered for
+    hm.bed.file <- writefile <- paste0(qcpref,flank,".bed")
+    if (file.exists(hm.bed.file) & !clobber & !rewrite) writefile <- NULL  # don't re-write heatmap bed unless necessary
+    hm.bed <- write.heatmap.bed(dat[,1:5], geno, writefile, flank*2, no.mito=TRUE, summits=dat[,10])
+    dat3 <- dat[match(hm.bed[,4],dat[,4]),]  # in hm.bed (genomic sorted) order
+    ## extend hm.bed to narrowPeak+2 format, add back OK, add SELECTED, add IDR & Pool if possible
+    if (macs2) {
+        hm.bed <- cbind(hm.bed[,1:6], dat3[,c(7:10,5,11)], OK=hm.bed$OK, SELECTED=dat3[,4] %in% sel.peaks)
+    } else {
+        hm.bed <- cbind(hm.bed[,1:6], dat3[,7:12]        , OK=hm.bed$OK, SELECTED=dat3[,4] %in% sel.peaks, IDR=dat3$IDR.Pglobal, Pool=dat3$Pool.Rank)
+    }
+    hm.bed.ok <- hm.bed[hm.bed$OK,]
+    
+    ## Find bigWigs
+    bam2bw <- function(x) name(sub("bam$", "APM.bw", sapply(x, function(bam) system(paste("readlink -f",bam),intern=TRUE) )), names(x))
+    if (macs2) {
+        ## "/path/to/true-1-self-pseudo-1.macs2_peaks.sort100k.narrowPeak" or something
+        pref <- sub(".macs2_peaks.sort100k.narrowPeak","",idrtable)
+        bams <- paste0(sub("(idr|calls)","bams",pref),".bam")
+        pref <- sub(".*/","",pref)
+        names(bams) <- pref
+        peakset <- sub("\\.(idrValues|IDR)","",sub("-[0-9]$","",pref))
+        reps <- as.numeric(sub(".*-","",pref))
+    } else {
+        ## "/path/to/true-1-self-pseudo.idrValues_2-1.expanded.txt" or something
+        orig <- system(paste("readlink -f",idrtable),intern=TRUE)
+        peakset <- sub("\\.(idrValues|IDR)","",sub(".*/","",sub("_([0-9]-[0-9])[-\\.].*","",orig)))
+        reps <- as.numeric(unlist(strsplit(sub(".*_([0-9]-[0-9])[-\\.].*","\\1",orig),"-")))
+        bams <- paste0(sub("/idr/.*","/bams/",idrtable),peakset,"-",reps,".bam")
+        names(bams) <- paste0(peakset,"-",reps)
+        pool.bam <- name( system(paste0("readlink -f ",sub("[^/]+$","pooled.bam",bams[1])),intern=TRUE), "pooled" )
+        pool.bw  <- bam2bw(pool.bam)
+    }
+    bws  <- bam2bw(bams)
+    B <- length(bams)
+    
+    inp.bam <- name( system(paste0("readlink -f ",sub("[^/]+$","input.bam",bams[1])),intern=TRUE), "input" )
+    inp.bw  <- bam2bw(inp.bam)
+    have.inp <- file.exists(inp.bw)
+    clobber <- !do.images
+    
+    if (have.inp) {
+        IM(names(inp.bw))
+        ## ########## INPUT MUST RUN FIRST !!!!!!!!!!!
+        inp.rd <- coverage.matrix.generate(inp.bw, hm.bed.file, cmdir, nwin=100, ncpu=cores, skip=TRUE, clobber=clobber, is.rpm=TRUE)
+        input.value <- rep("input",B)
+    } else {
+        input.value <- NULL
+    }
+    ## Then IPs can run (which require the input RDatas)
+    IP.rd <- coverage.matrix.generate(bws, hm.bed.file, cmdir, nwin=100, ncpu=cores, skip=TRUE, clobber=clobber, is.rpm=TRUE, inputs=input.value)
+    w.true <- 1:length(IP.rd)
+    if (!macs2) {
+        pool.rd <- coverage.matrix.generate(pool.bw, hm.bed.file, cmdir, nwin=100, ncpu=cores, skip=TRUE, clobber=clobber, is.rpm=TRUE, inputs=input.value[1])
+        IP.rd <- c(pool.rd, IP.rd)
+    }
+    all.rd <- c(IP.rd,inp.rd)
+    if (!macs2) w.true <- w.true+1
+    
+    
+    if (do.images) {
+        
+        cent.col <- c(41:60)   # targeting central 20% (1000bp, if +-2500) for rowSum calc (sum of peak signal, not rest of window)
+        w.inp <- which(names(all.rd)=="input")
+        samp.n <- sum(hm.bed$OK)*length(cent.col)
+        samp.n <- ifelse(samp.n>1E5, 1E5, samp.n)
+        
+        all.rpm <- lapply(coverage.matrix.compile(all.rd, format="rpm"), function(x) x[match(hm.bed.ok$name,rownames(x)),] )
+        rpm.q95 <- quantile(unlist(lapply(all.rpm[-w.inp], function(x) c(x[,cent.col]))), 0.95, na.rm=TRUE)
+        all.rpm <- lapply(all.rpm, threshold, rpm.q95, "gt")
+        message("RPM central q95: ",rpm.q95)
+        
+        sigdens <- paste0(cmdir,"heatmap_signal_density.png")
+        write.sigdens <- TRUE   #clobber|rewrite|!file.exists(sigdens)
+        
+        if (have.inp) {
+            
+            all.lfc <- lapply(coverage.matrix.compile(IP.rd, format="normLFC", adjust=TRUE), function(x) x[match(hm.bed.ok$name,rownames(x)),] )
+            lfc.q99 <- quantile(unlist(lapply(all.lfc, function(x){ y=c(x[,cent.col]); y[y>0] })), 0.99, na.rm=TRUE)
+            all.lfc <- lapply(all.lfc, threshold, lfc.q99, "gt")
+            message("LFC central>0 q99: ",lfc.q99)
+            
+            if (write.sigdens) {
+                sub95 <- "(capped at 95th percentile)"
+                sub99 <- "(capped at 99th percentile)"
+                xlrpm <- "Bin Mean RPM"
+                xllfc <- "Bin LFC"
+                message("Plotting heatmap signal densities... (this takes a minute)")
+                png(sigdens, 1200, 1200)
+                par(mfrow=c(2,2), cex=1.2, las=1)
+                dhist(lapply(all.rpm, function(x) sample(c(x)           ,samp.n) ), main="Total RPM Distributions"      , xlab=xlrpm, sub=sub95)
+                dhist(lapply(all.rpm, function(x) sample(c(x[,cent.col]),samp.n) ), main="Central 20% RPM Distributions", xlab=xlrpm, sub=sub95)
+                dhist(lapply(all.lfc, function(x) sample(c(x)           ,samp.n) ), main="Total LFC Distributions"      , xlab=xllfc, sub=sub99); abline(v=0, lty=3)
+                dhist(lapply(all.lfc, function(x) sample(c(x[,cent.col]),samp.n) ), main="Central 20% LFC Distributions", xlab=xllfc, sub=sub99); abline(v=0, lty=3)
+                dev.off()
+            }
+            
+            ## **AFTER** histograms, then threshold LFC -> LFC0 (ignoring all positions < 1FC)        ## was: LFC1 (ignoring all positions < 2FC)
+            if (have.inp) all.lfc <- lapply(all.lfc, threshold, 0, "lt")
+            
+        } else {
+            
+            if (write.sigdens) {
+                message("Plotting heatmap signal densities... (this takes a minute)")
+                png(sigdens, 1200, 600)
+                par(mfrow=c(1,2), cex=1.2, las=1)
+                dhist(lapply(all.rpm, function(x) sample(c(x)           ,samp.n) ), main="Total RPM Distributions"      , xlab="Bin Mean RPM", sub="(capped at 95th percentile)")
+                dhist(lapply(all.rpm, function(x) sample(c(x[,cent.col]),samp.n) ), main="Central 20% RPM Distributions", xlab="Bin Mean RPM", sub="(capped at 95th percentile)")
+                dev.off()
+            }
+            
+        }
+        
+        message("Constructing heatmaps and attributes...")
+        nc.rpm <- sum(sapply(all.rpm,ncol)+10)   # +10 to include spacers (incl. final before att.mat)
+        nc.lfc <- sum(sapply(all.lfc,ncol)+10)   # +10 to include spacers (incl. final before att.mat)
+        rs.rpm <- rowSums(do.call(cbind,lapply(all.rpm[w.true],"[",,cent.col)))  # rowSums ONLY include reps involved in this IDR, i.e. the two (or 1?) labeled "true".  Or at least, not the pool or the input.
+        rs.lfc <- rowSums(do.call(cbind,lapply(all.lfc[w.true],"[",,cent.col)))  # "
+        
+        map2tranch <- function(x) {
+            tranched <- rep(NA,nrow(hm.bed.ok))
+            for (j in 1:NT) tranched[which(hm.bed.ok[,x]<tranches[[x]][[j]][1] & hm.bed.ok[,x]>=tranches[[x]][[j]][2])] <- j
+            if (any(is.na(tranched))) message("\n*** WARNING: column '",x,"' did not fully map to its tranches!\n")
+            tranched
+        }
+        v1 <- c("FoldChange","Pvalue","Qvalue","Height","Width")
+        V <- length(v1)
+        att.mat <- lapply(name(v1,v1), map2tranch)
+        if (!macs2) att.mat <- c( att.mat, list(IDR=map2tranch("IDR"), Pool=0+!is.na(hm.bed.ok$Pool)) )
+        att.mat <- c( att.mat, list(SELECTED=0+hm.bed.ok$SELECTED) )
+        Natt <- length(att.mat)
+        att.mat1 <- do.call(cbind, att.mat)      # only OK peaks in the final heatmap!  //  single-column version for attrib palette work
+        ##apply(att.mat1,2,luniq)
+        att.mat <- do.call(cbind, lapply(att.mat, colrep, 10))   # only OK peaks in the final heatmap!
+        all.rpm <- coverage.matrix.cbind(c(all.rpm,list(att.mat)))
+        all.lfc <- coverage.matrix.cbind(c(all.lfc,list(att.mat)))
+        
+        aS.rpm <- nc.rpm+seq(1,Natt*10,10)
+        aS.lfc <- nc.lfc+seq(1,Natt*10,10)
+        aE.rpm <- nc.rpm+seq(0,Natt*10,10)[1:Natt+1]
+        aE.lfc <- nc.lfc+seq(0,Natt*10,10)[1:Natt+1]
+        rainbow.key <- data.frame(1:NT,tr.cols)
+        bw.key <- data.frame(0:1,c("white","black"))
+        attribs.rpm <- name(lapply(1:V, function(i) list(cols=aS.rpm[i]:aE.rpm[i],palette.key=rainbow.key) ), v1)
+        attribs.lfc <- name(lapply(1:V, function(i) list(cols=aS.lfc[i]:aE.lfc[i],palette.key=rainbow.key) ), v1)
+        if (!macs2) {
+            attribs.rpm <- c(
+                attribs.rpm,
+                list(IDR=list(cols=aS.rpm[V+1]:aE.rpm[V+1],palette.key=rainbow.key)),
+                list(Pool=list(cols=aS.rpm[V+2]:aE.rpm[V+2],palette.key=bw.key))
+            )
+            attribs.lfc <- c(
+                attribs.lfc,
+                list(IDR=list(cols=aS.lfc[V+1]:aE.lfc[V+1],palette.key=rainbow.key)),
+                list(Pool=list(cols=aS.lfc[V+2]:aE.lfc[V+2],palette.key=bw.key))
+            )
+        }
+        attribs.rpm <- c( attribs.rpm, list(SELECTED=list(cols=aS.rpm[Natt]:aE.rpm[Natt],palette.key=bw.key)) )
+        attribs.lfc <- c( attribs.lfc, list(SELECTED=list(cols=aS.lfc[Natt]:aE.lfc[Natt],palette.key=bw.key)) )
+        
+        message("Creating sort orders...")
+        sort.ord <- list(
+            rrs.rpm=rev(order(rs.rpm)),
+            rrs.lfc=rev(order(rs.lfc)),
+            fc=rev(order(hm.bed.ok$FoldChange)),
+            p=rev(order(hm.bed.ok$Pvalue)),
+            q=rev(order(hm.bed.ok$Qvalue)),
+            ht=rev(order(hm.bed.ok$Height)),
+            wd=rev(order(hm.bed.ok$Width))
+        )
+        if (!macs2) sort.ord <- c( sort.ord, list(idr=rev(order(hm.bed.ok$IDR))) )
+        
+        which.sel <- which(hm.bed.ok$SELECTED)
+        N.sel <- length(which.sel)
+        main <- paste0(sub("\\.$","",outname),"\n",N.sel,"/",nrow(hm.bed.ok)," peaks selected")
+        sel.ex <- ifelse(N.sel<=500,1000,ifelse(N.sel>=10000,N.sel+2000,ifelse(N.sel>=1000,N.sel+1000,N.sel*2)))
+        sort.ord.t <- lapply(sort.ord,   function(x) c(x[x %in% which.sel],x[x %nin% which.sel]) )  # split into two sorted blocks: selected and non
+        sort.ord.s <- lapply(sort.ord.t, function(x) x[1:sel.ex] )                                  # the selected block + leading non-selected
+        sort.ord.z <- lapply(sort.ord.t, function(x) x[1:500] )                                     # only the top 500 (starting with selected block; perhaps running into non)
+        
+        colnames.rpm <- names(all.rd)
+        colnames.lfc <- names(IP.rd)
+        imgwd.rpm  <- 400+150*length(all.rd)
+        imgwd.lfc <- 400+150*length(IP.rd)
+        imght.t <- max(c( 1500, trunc(nrow(hm.bed.ok)/20) ))
+        imght.s <- max(c( 1500, trunc(sel.ex/10) ))
+        imght.z <- 1500
+        
+        ##source("~/lbin/apa_tools/code/myImagePlotUltra/myImagePlotUltra.R")
+        ##mipu(al[so$pv,], palette="Reds0", cex=1.2, pmar=c(1,1,6), main=mn, stagger.main=2, attrib=at)
+        ##x <- head(all.lfc[sort.ord.z$pv,1:300],30); mipu(x, pal="Reds"); hm.bed.ok[match(rownames(x),hm.bed.ok$name),]
+        
+#        for (tsz in c("s")) {
+        for (tsz in c("z","t")) {
+            for (rl in c("rpm","lfc")) {
+                msg.head <- paste0("Writing ",ifelse(tsz=="z","zoomed",ifelse(tsz=="s","selected","total"))," ",rl)
+                lab <- ifelse(rl=="rpm","RPM","LFC")
+                od <- get(paste0("hmdir.",tsz))
+                so <- get(paste0("sort.ord.",tsz))
+                ih <- get(paste0("imght.",tsz))
+                iw <- get(paste0("imgwd.",rl))
+                cn <- get(paste0("colnames.",rl))
+                at <- get(paste0("attribs.",rl))
+                al <- get(paste0("all.",rl))
+                stagger <- 1
+                xasp <- ifelse(length(cn)==1, 4, 6)
+                message(paste(msg.head,"byRowSum heatmap..."))
+                png(paste0(od,lab,".byRepRowSum.png"), iw, ih)
+                mipu(al[so[[paste0("rrs.",rl)]],], palette="Reds0", cex=1.2, pmar=c(1,1,6), x.aspect=c(xasp,1), main=main, col.names=cn, stagger.colnames=stagger, attrib=at)
+                dev.off()
+                message(paste(msg.head,"byFoldChange heatmap..."))
+                png(paste0(od,lab,".byFoldChange.png"), iw, ih)
+                mipu(al[so$fc,], palette="Reds0", cex=1.2, pmar=c(1,1,6), x.aspect=c(xasp,1), main=main, col.names=cn, stagger.colnames=stagger, attrib=at)
+                dev.off()
+                message(paste(msg.head,"byPvalue heatmap..."))
+                png(paste0(od,lab,".byPvalue.png"), iw, ih)
+                mipu(al[so$p,], palette="Reds0", cex=1.2, pmar=c(1,1,6), x.aspect=c(xasp,1), main=main, col.names=cn, stagger.colnames=stagger, attrib=at)
+                dev.off()
+                message(paste(msg.head,"byQvalue heatmap..."))
+                png(paste0(od,lab,".byQvalue.png"), iw, ih)
+                mipu(al[so$q,], palette="Reds0", cex=1.2, pmar=c(1,1,6), x.aspect=c(xasp,1), main=main, col.names=cn, stagger.colnames=stagger, attrib=at)
+                dev.off()
+                message(paste(msg.head,"byHeight heatmap..."))
+                png(paste0(od,lab,".byHeight.png"), iw, ih)
+                mipu(al[so$ht,], palette="Reds0", cex=1.2, pmar=c(1,1,6), x.aspect=c(xasp,1), main=main, col.names=cn, stagger.colnames=stagger, attrib=at)
+                dev.off()
+                message(paste(msg.head,"byWidth heatmap..."))
+                png(paste0(od,lab,".byWidth.png"), iw, ih)
+                mipu(al[so$wd,], palette="Reds0", cex=1.2, pmar=c(1,1,6), x.aspect=c(xasp,1), main=main, col.names=cn, stagger.colnames=stagger, attrib=at)
+                dev.off()
+                if (!macs2) {
+                    message(paste(msg.head,"byIDR heatmap..."))
+                    png(paste0(od,lab,".byIDR.png"), iw, ih)
+                    mipu(al[so$idr,], palette="Reds0", cex=1.2, pmar=c(1,1,6), x.aspect=c(xasp,1), main=main, col.names=cn, stagger.colnames=stagger, attrib=at)
+                    dev.off()
+                }
+            }
+        }
+        rm(tsz,rl,lab,od,so,ih,iw,cn,at,al,xasp,stagger)
+        
+        ##coverage.matrix.bound(heatmap, orig.bed, bam.bed, matrix.bed, extend=0, meta.data=NULL, ignore=FALSE)
+        ##coverage.matrix.boundcolor(full, binary)
+        ##coverage.matrix.compress(x, reduce=10, spacer=NULL, binary=FALSE)
+        ## sample.peaks <- list( data=new.list(samps), files=name(rep("",S),samps) )
+        ## REFER TO: coverage.matrix.image(samp.df, cov.mat.paths, cov.mat.beds, sample.peaks, imgpref, bedname, kname="k5", extend=0, smooth=FALSE, spacer=10, ignore=FALSE)
+        
+    }   ## END if (do.images) {
+    
+    save.image(paste0(qcdir,"idrSelect.RData"))
+    
+}
+
+
+message("idrSelect ",outpref,"* complete! ",Sys.time())
+quit()

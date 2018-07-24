@@ -1,0 +1,1074 @@
+#!/usr/bin/env perl
+
+
+###
+### Contrary to appearances, this is NOT a member of the alignTo* script family
+### MAINTENANCE PROGRAMMING: See notes at end of script
+###
+
+
+
+=pod
+
+=head1 SYNOPSIS
+
+This is a one-script pipeline to align a set of fastqs to a housekeeping-ncRNA database (organism-specific), and do basic analysis on the results.
+
+alignToRNA [-t targets.txt] [-g genome_build] [-a annot_build] [-o/-oc output_folder] [-d design.txt] [--restart output_folder] [-c bowtie2_cores] --genome --genome-only --no-trim --no-analysis --scripts --verbose
+
+=head1 OPTIONS
+
+=over
+
+=item B<-t targets.txt>
+
+2- or 3-column tab-delimited file WITH HEADER: col 1 = fastq path, col 2 = sample name, optional col 3 = band name.  Col 3 intended for separating dual-band small-RNA samples, i.e. one band is "Small" (120-160bp) and one is "Large" (160-300bp).  If col 3 is present, results will be reported both by sample and sample-band.
+
+=item B<-g genome_build>
+
+Name of a genome build directory in /n/data1/genomes/bowtie-index/, e.g. 'mm10' or 'Pombe_ASM294v2'
+
+=item B<-a annot_build>
+
+Name of an annotation build directory in /n/data1/genomes/bowtie-index/<genome_build>/Hskp_ncRNA/, e.g. 'Ens_73'.
+
+=item B<-o output_directory>
+
+Output directory name; WILL NOT overwrite (default: .)
+
+=item B<-oc output_directory>
+
+Output directory name; WILL overwrite.
+
+=item B<--restart output_directory>
+
+Output directory name of a run that was interrupted; pipeline will restart where it left off.
+
+=item B<-c N_cores>
+
+An integer specifying the number of CPUs to use for bowtie2 and samtools sort (default: 1)
+
+=item B<-m samtools_mem>
+
+A string like '10G' or '500M' indicating how much RAM each samtools sort job can take  (default: '50G', unless called with '--scripts', implying parallel runs: then, '1G')
+
+=item B<-d design.txt>
+
+A text file describing experimental design; if specified; EdgeR will be run on ncRNA counts and DE analysis performed.  
+
+The file contains two types of lines: REPLICATES and CONTRAST; REPLICATES is optional.  Lines are tab-delimited.  
+REPLICATES indicates which replicates get grouped into samples; CONTRAST specifies which sets of samples to compare to each other.  
+For REPLICATES, <sample>s must correspond to targets.txt sample names.  
+For CONTRAST, <metasample>s are given by REPLICATE lines, if any; otherwise they must be sample names from targets file. 
+Formats below:
+
+REPLICATES  <metasample>  <sample1>;<sample2>;...;<sampleN>
+
+CONTRAST  <label>  <metasample1>  <metasample2>
+
+ An example minimal design file:
+ REPLICATES      Mut    Mut.1;Mut.2;Mut.3
+ REPLICATES      WT     WT.1;WT.2;WT.3
+ CONTRAST        Mut/WT Mut    WT
+
+=item B<--genome> 
+
+Produces a genomic alignment of the trimmed reads, as well as the ncRNA-only alignment.  IN DEVELOPMENT: analyze whole-genome alignments like regular RNAseq.
+
+=item B<--no-trim> 
+
+DO NOT run small-RNA adapter trimming on reads before alignment.
+
+=item B<--no-analysis> 
+
+Do trimming/alignments only; do not run the standard analysis script.
+
+=item B<--scripts> 
+
+Will NOT run anything, just writes out all operations to a series of shell scripts that you can run on your own.
+
+=item B<--verbose> 
+
+Print pipeline commands to screen as they run.
+
+=back
+
+=head1 VERSION
+
+$Revision: 1.0$
+
+=head1 AUTHOR
+
+Ariel Paulson [apa@stowers.org]
+
+	=head1 DEPENDENCIES
+
+	Perl 5.8; Bowtie2; R; Excel::Writer::XLSX; Getopt::Long; Pod::Usage; Cwd; Excel::Writer::XLSX;
+
+=cut 
+
+
+
+
+#################################################################################################################
+#################################################################################################################
+##############################################                     ##############################################
+##############################################  BEGIN ACTUAL CODE  ##############################################
+##############################################                     ##############################################
+#################################################################################################################
+#################################################################################################################
+
+
+
+use Excel::Writer::XLSX;
+use Getopt::Long;
+use Pod::Usage;
+use Cwd 'abs_path';
+use strict;
+no strict 'refs';
+
+## Inputs
+my $targets;    # a 2-col file with col 1 = fastq path, col 2 = alias to display instead of filename
+my $design;     # a text file with REPLICATES and CONTRAST lines which describes the experimental design for EdgeR; see POD above for format description. 
+my $geno;       # Name of a genome build
+my $anno;       # Name of an annotation build   ## Note: the path /n/data1/genomes/bowtie-index/$geno/$anno/smallRNA/ must be built.
+my $outdir;     # output directory, do not clobber
+my $clobber;    # output directory, clobber
+my $scripts;    # do not run pipeline; instead write out bash scripts to run manually
+my $notrim;     # deactivate adapter trimming
+my $noAnalysis; # do not run the automatic analysis script after alignments
+my $aln_genome; # align to genome as well as hskp RNA set
+
+## Inputs with defaults (incl. off-by-default)
+my $cores = 1;  # number of CPUs to use for bowtie2 and samtools sort
+my $mem;        # amount of RAM per samtools sort job (defaults specified in Stage 4)
+my $verbose;    # echo system commands?
+my $restart;    # restart from interrupted run, given this previous $outdir value (will ignore and -o, -oc values)
+
+my $help;  # the usual
+
+GetOptions("t=s" => \$targets, "o=s" => \$outdir, "oc=s" => \$clobber, "g=s" => \$geno, "a=s" => \$anno, "c=i" => \$cores, "m=s" => \$mem, "d=s" => \$design, "genome" => \$aln_genome, "verbose" => \$verbose, "restart=s" => \$restart, "no-trim" => \$notrim, "no-analysis" => \$noAnalysis, "scripts" => \$scripts, "help" => \$help) || pod2usage(2);
+
+pod2usage(1) if ($help || !$targets);
+#pod2usage(-exitstatus => 0, -verbose => 2) if $man;
+
+## Globals
+my $bin = '/home/apa/local/bin';
+my $rrna = "/n/data1/genomes/bowtie-index/$geno/$anno/ribosomes/$geno.$anno.ribosomes";  # file prefix for the ribosome build
+my $frna = "/n/data1/genomes/bowtie-index/$geno/$anno/funcRNA/$geno.$anno.funcRNA";      # file prefix for the funcRNA build
+my $gbwti = "/n/data1/genomes/bowtie-index/$geno/$geno";  # name of genome bowtie2 index
+my $abwti = "/n/data1/genomes/bowtie-index/$geno/$anno/$geno.$anno.cuff.gtf.index/$geno.$anno.cuff";  # name of transcriptome bowtie2 index
+my $adapfa = "$bin/scriptutils/alignToRNA_adapters.fa";  # should be sufficient
+#my $adapfa = "$bin/scriptutils/adapter_collection.fa";  # the COMPLETE adapter collection, including many unnecessary ones
+my $trimmomatic = '/n/apps/CentOS7/bin/trimmomatic-0.30.jar';   # '/n/local/stage/trimmomatic/Trimmomatic-0.30/trimmomatic-0.30.jar';
+my %restricted = map {($_=>1)} qw/ ALL ANY REPLICATES /;  # restricted library names
+my $results;   # output dir for analysis results
+my $bigWigs;   # output dir for bigWig symlinks (if $aln_genome)
+my @fastqs;    # sample fastq paths
+my @samples;   # sample names
+my @usamples;  # unique sample names
+my @bands;     # sample bands
+my $useBands;  # are bands being used in the analysis? (1/0)
+my $N;         # N rows in $targets (0-based)
+my $M;         # N unique samples (0-based)
+my @ncRNAs;    # ncRNA names for this index
+my %idxData;   # idxstats data
+my %sumData;   # summarized idxstats data
+my %rnaData;   # ncRNA data
+my %errData;   # bowtie.err data, etc
+my %trmData;   # trimmomatic summary
+my %allnames;  # sample/replicate alias tracking
+my @classes;   # RNA classes
+my @stats;     # bowtie.err fields
+my $fatal;     # fatal error encountered
+
+die "$0: Must specify -t!\n" unless $targets;
+die "$0: No smallRNA indexes exist for '$frna'!\n" unless -e "$frna.1.bt2";
+die "$0: No genome indexes found for '$gbwti'!\n" if ($aln_genome && !-e "$gbwti.1.bt2");
+print "\n";
+
+## Parse targets file
+## Determine if 'band' column is present -- substitute '1' if not, just as a placeholder
+## Make targets-ordered arrays of fastq files, sample IDs, and bands
+## Make unique-sample-IDs array
+my %already;
+$targets = abs_path($targets);
+open my $IN1, '<', $targets or die "$0: Cannot open targets file '$targets' for reading: $!\n";
+while (<$IN1>) {
+    next if $. == 1;  ##### EXPECTS HEADER
+    $_ =~ s/[\n\r]+$//;
+    my @data = split /\t/, $_;
+    die "$0: Targets file must be 2 or 3 columns: fastq path, sample name, optional band name!\n" if $#data < 1;
+    push @fastqs, $data[0];
+    push @samples, $data[1];
+    my $band = $data[2] || 1;
+    push @bands, $band;
+    $allnames{$band}{$data[1]}++;
+    $allnames{ANY}{$data[1]} = 1;  # '1' means single sample
+    die "$0: '$data[2]' is a restricted library name: use something else!\n" if $restricted{$data[2]};
+    push @usamples, $data[1] unless $already{$data[1]};
+    $already{$data[1]} = 1;
+}
+$N = $.-2;  # -header & 0-based
+$M = $#usamples;
+close $IN1;
+
+foreach my $band (keys %allnames) {
+    foreach my $alias (keys %{ $allnames{$band} }) {
+		if ($allnames{$band}{$alias} > 1) {
+			$fatal = 1;
+			print "$0: Sample alias '$alias' present ",$allnames{$band}{$alias}," times for band ",$band,"!\n";
+		}
+    }
+}
+die "Duplicate sample names detected!\n" if $fatal;
+
+## Did the user specify bands or not?  If not, no band-wise output will be generated, and fastq aliases will lack the band field.
+my $ubands = scalar keys %{ {map {($_=>1)} @bands} };
+$useBands = $ubands == 1 && $bands[0] == 1 ? 0 : 1;
+
+## Validate design file, if given
+if ($design) {
+    my (%metasample, $haveReps);
+    $design = abs_path($design);
+    open my $IN2, '<', $design or die "$0: Failed to open design file '$design': $!\n";
+    while (<$IN2>) {
+		$_ =~ s/[\n\r]+$//;
+		my ($linetype, $label, $etc) = split /\t/, $_, 3;
+		if ($linetype eq 'REPLICATES') {
+			$allnames{ANY}{$label} = 2;  # '2' means merged-replicates
+			$allnames{$linetype}{$label}++;
+			$metasample{$label} = 1;
+			$haveReps = 1;
+			my $pass = 1;
+			foreach my $sample (split /;/, $etc) {
+				unless ($already{$sample}) {
+					$pass = 0;
+					print "Unknown sample name '$sample'!\n";
+				}
+			}
+			die "$0: Design file contains unknown sample names on line $.:  $_\n" unless $pass;
+		} elsif ($linetype eq 'CONTRAST') {
+			my @metasamples = split /\t/, $etc;
+			die "$0: Cannot have > 2 samples to contrast; design file line $.:  $_\n" if $#metasamples > 1;
+			foreach my $sample (@metasamples) {
+				if ($allnames{ANY}{$sample} == 2) {
+					print "CONTRAST '$label': Metasample '$sample' OK\n";
+				} elsif ($allnames{ANY}{$sample} == 1) {
+					print "CONTRAST '$label': Sample '$sample' OK\n";
+				} else {
+					die "$0: Design file contains unknown sample names on line $.:  $_\n" unless $already{$sample};
+				}
+			}
+		} elsif (!$_) {
+			# blank line
+		} else {
+			die "$0: Design file contains unknown line type '$linetype'\n";
+		}
+    }
+    close $IN2;
+    
+    foreach my $alias (keys %{ $allnames{REPLICATES} }) {
+		if ($allnames{REPLICATES}{$alias} > 1) {
+			$fatal = 1;
+			print "$0: Replicate alias '$alias' present ",$allnames{REPLICATES}{$alias}," times!\n";
+		}
+    }
+    die "Duplicate metasample names detected!\n" if $fatal;
+}
+
+## Read ncRNA fasta to which reads will be aligned
+## Group ncRNAs by class, e.g. rRNA, snoRNA, miRNA, etc: fasta headers are always "class|gene"
+## Initialize reporting objects with zeroes to ensure printable values
+## Calculate ncRNA lengths
+open my $IN3A, '<', "$frna.genedata.txt" or die "$0: Failed to open funcRNA genedata file '$frna.genedata.txt': $!\n";
+my @colnames;
+while (<$IN3A>) {
+	s/[\n\r]+$//;
+	my @data = split /\t/, $_;
+	if ($. == 1) {
+		@colnames = @data;
+		next;
+	}
+	my %x = map { ($colnames[$_]=>$data[$_]) } 0..$#data;
+	my $ncRNA = $x{'Fasta.Header'};
+	push @ncRNAs, $ncRNA;
+	my ($class, $biotype, $symbol, $chr, $gene, $trans) = split /\|/, $ncRNA;
+	$rnaData{$ncRNA} = [$class, $biotype, $symbol, $chr, $gene, $trans, $x{'cDNA.Length'}, $x{'GC.Percent'}];
+	foreach my $i (0..$N) {
+		my $samp = $samples[$i];
+		my $band = $bands[$i];
+		$idxData{$ncRNA}{$samp}{$band} = [0, 0];  # ensure printable values
+		$sumData{$class}{$samp}{$band} = [0, 0];
+		$idxData{$ncRNA}{$samp}{ALL} = [0, 0];
+		$sumData{$class}{$samp}{ALL} = [0, 0];
+	}
+}
+close $IN3A;
+
+## Read rRNA bed file annotations for rRNA reference
+open my $IN3B, '<', "$rrna.known.bed" or die "$0: Failed to open complete-rRNA bed annotations '$rrna.complete.bed': $!\n";
+while (<$IN3B>) {
+	s/[\n\r]+$//;
+	my @data = split /\t/, $_;
+	$ncRNA = $data[3];
+	$rnaData{$ncRNA}->[2] = length($seq);
+	push @ncRNAs, $ncRNA;
+	my ($class, $gene) = (split /\|/, $ncRNA, 2);
+	$rnaData{$ncRNA} = [$class, $gene, 0];
+	foreach my $i (0..$N) {
+		my $samp = $samples[$i];
+		my $band = $bands[$i];
+		$idxData{$ncRNA}{$samp}{$band} = [0, 0];  # ensure printable values
+		$sumData{$class}{$samp}{$band} = [0, 0];
+		$idxData{$ncRNA}{$samp}{ALL} = [0, 0];
+		$sumData{$class}{$samp}{ALL} = [0, 0];
+	}
+}
+close $IN3B;
+
+
+## Unique classes; stat field names from bowtie-error files
+@classes = sort keys %sumData;
+@stats = qw/ READS UNALIGNED ALL_ALIGNED MONO_ALIGNED MULTI_ALIGNED /;
+
+
+## Begin (or restart) processing
+my $pre_scripts;
+$outdir = undef if $outdir eq '.';   # if for some reason someone explicitly indicated "-o .", erase the flag
+$clobber = undef if $clobber eq '.';
+$restart = undef if $restart eq '.';
+if ($restart) {
+    # restart from this directory
+    die "$0: restart-from directory '$restart' not found!\n" unless -d $restart;
+    $outdir = abs_path($restart);
+} elsif ($clobber) {
+    # write to this directory; destroy if exists
+    $clobber = abs_path($clobber);
+    system "rm -Rf $clobber";
+    system "mkdir -p $clobber";
+    $outdir = $clobber;
+} elsif ($outdir) {
+    # write to this directory, unless already exists
+    die "$0: output directory '$outdir' already exists!\n" if -d $outdir;
+    $outdir = abs_path($outdir);
+    system "mkdir -p $outdir";
+} else {
+    # no dir specified: write to here
+    $outdir = abs_path('.');
+}
+die "$0: Unable to create output directory '$outdir'!\n" unless -d $outdir;
+$results = "$outdir/Results";
+mkdir $results;
+$bigWigs = "$outdir/bigWigs";
+mkdir $bigWigs if $aln_genome;
+print "\n";
+
+
+## pipeline scripts and filehandles, if calling with --scripts
+my ($ANA, $LAU);
+if ($scripts) {
+    open $ANA, "> $outdir/analysis.sh";
+    open $LAU, "> $outdir/launch.sh";
+    print $ANA "#!/bin/bash\n\ncd $outdir\n\n";
+    print $LAU "#!/bin/bash\n\ncd $outdir\n\n";
+}
+
+
+## Progress tracking: 7 stages, incl. the "nothing-yet" stage (0)
+my %stages = ('',0, 'MERGE',1, 'TRIM',2, 'BOWTIE',3, 'BAM',4, 'INDEX',5, 'STATS',6);
+
+
+## For each fastq file in the targets.txt, run the following block
+foreach my $i (0..$N) {
+    
+    my $path = $fastqs[$i];
+    my $samp = $samples[$i];
+    my $band = $bands[$i];
+    my ($mergefq, $fastq);
+    
+    ## alias: include band data or not?
+    my ($alias, $alias, $blurb);
+    if ($useBands) {
+		$alias = "$samp.$band";
+		$blurb = "'$samp $band'";
+    } else {
+		$alias = $samp;
+		$blurb = "'$samp'";
+    }
+    my $aliasdir = "$outdir/$alias";
+    
+    ## pipeline script filehandle for this sample, if calling with --scripts
+    my $PER;
+    if ($scripts) {
+		print $LAU "$outdir/run.$alias.sh &\n";
+		open $PER, "> $outdir/run.$alias.sh";
+		print $PER "#!/bin/bash\n\n";
+		print $PER "mkdir -p $aliasdir\n\ncd $aliasdir\n\n";
+    } else {
+		system "mkdir -p $aliasdir";
+    }
+    my $prefix = "$aliasdir/$alias";
+    my $genodir = "$prefix.genome";
+    
+    ## trimmomatic stats files
+    my $allhisto = "$prefix.trim.histo.txt";
+    my $alnhisto = "$prefix.align.histo.txt";
+    my $unahisto = "$prefix.unaln.histo.txt";
+    my $trimlog = "$prefix.trimmomatic.log";
+    my $trimtxt = "$prefix.trimmomatic.txt";
+    
+    ## alignment output files etc.
+    my $logfile = "$prefix.log";
+    my $alignlog = "$prefix.align_summary.txt";
+    my $galignlog = "$genodir/align_summary.txt";
+    my $idxfile = "$prefix.idxstats.txt";
+    my $gidxfile = "$genodir/accepted_hits.idxstats.txt";
+    my $pidxfile = "$genodir/accepted_hits_primary.idxstats.txt";
+    my $genobam = "$genodir/accepted_hits.bam";
+    my $primbam = "$genodir/accepted_hits_primary.bam";
+    my $mapfq = "$prefix.mapped.fq.gz";
+    my $unmapfq = "$prefix.unmapped.fq.gz";
+    my $primbw = "$genodir/accepted_hits_primary.APM.bw";
+    
+    ## based on log file, what was the last stage (0-5) completed?
+    ## then restart from last completed stage
+    my $stage = $scripts ? 0 : $stages{ &readlog($logfile) };
+    $restart && !$scripts ? print "Restarting $alias: Stage $stage\n" : print "Starting $alias\n";
+    
+    if ($stage < 1) {
+		if ($path =~ /;/) {   # multiple fastqs to be merged
+			(my $path2 = $path) =~ s/;/ /g;
+			$mergefq = "$prefix.fastq.gz";
+			my $mergecmd = "gunzip -c $path2 | gzip > $mergefq";
+			if ($scripts) {
+				print $PER "$mergecmd\n\n";
+			} else {
+				print " Merging ",scalar(split /;/, $path)," $blurb fastqs: ".`date`;
+				&execute($mergecmd);
+			}
+		} else {
+			$mergefq = $path;
+		}
+		&writelog($logfile, 'MERGE') unless $scripts;  # even if no merging -- just to say that 'stage was passed'
+    }
+    
+    if ($stage < 2) {
+		if ($notrim) {
+			$fastq = $mergefq;
+		} else {
+			$fastq = "$prefix.trimmed.fastq.gz";
+			my $trimcmd = "java -jar $trimmomatic SE -trimlog $trimlog -threads $cores $mergefq $fastq ILLUMINACLIP:$adapfa:2:14:7 MINLEN:10 2> $trimtxt";
+			my $zipcmd = "gzip $trimlog";
+			if ($scripts) {
+				print $PER "$trimcmd\n\n";
+				print $PER "$zipcmd\n\n";
+			} else {
+				print " Trimming $blurb: ".`date`;
+				&execute($trimcmd);
+				#		&execute("gunzip -c $fastq | sed -n '2~4p' | awk '{print length(\$1)}' | /home/apa/local/bin/colTally - | sort -n -k2,2 > $allhisto");
+				&execute($zipcmd);
+				#		my @trimstats = split / /, `grep ^Input $trimtxt`;  # e.g. "Input Reads: 5636013 Surviving: 5061126 (89.80%) Dropped: 574887 (10.20%)"
+				#		$trimstats[$_] =~ s/[\(\)%]//g foreach (5,8);
+				#		$trmData{INPUT}{$samp}{$band} = [$trimstats[2], 1];
+				#		$trmData{KEEP}{$samp}{$band} = [$trimstats[4], $trimstats[5]/100];
+				#		$trmData{DROP}{$samp}{$band} = [$trimstats[7], $trimstats[8]/100];
+			}	    
+		}
+		&writelog($logfile, 'TRIM') unless $scripts;  # even if no trimming -- just to say that 'stage was passed'
+    }
+    
+    if ($stage < 3) {
+		my $frna_aln = "bowtie2 -p $cores -x $frna -U $fastq -S $prefix.sam --very-sensitive-local --al-gz $mapfq --un-gz $unmapfq 2> $alignlog";
+		my $geno_aln = "tophat -p $cores --transcriptome-index $abwti -o $genodir -x 300 -g 300 $gbwti $fastq";
+		if ($scripts) {
+			print $PER "$frna_aln\n\n";
+			print $PER "$geno_aln\n\n" if $aln_genome;
+		} else {
+			print " Aligning $blurb: ".`date`;
+			&execute($frna_aln);
+			&execute($geno_aln) if $aln_genome;
+			&writelog($logfile, 'BOWTIE');
+		}
+    }
+    if ($stage < 4) {
+		unless ($mem) {
+			$mem = $scripts ? '1G' : '50G';
+		}
+		my $frna_sort = "samtools view -F 4 -Sb $prefix.sam | samtools sort -@ $cores -m $mem - $prefix";   # set $mem high to guarantee that the sort does not require > 1 file
+		my $geno_prim = "samtools view -F 256 -h $genobam | samtools view -bS - > $primbam";
+		if ($scripts) {
+			print $PER "$frna_sort\n\n";
+			print $PER "$geno_prim\n\n" if $aln_genome;
+		} else {
+			print " Converting $blurb: ".`date`;
+			&execute($frna_sort);
+			&execute($geno_prim) if $aln_genome;
+			&writelog($logfile, 'BAM');
+		}
+    }
+    if ($stage < 5) {
+		my $frna_idx = "samtools index $prefix.bam";
+		my $geno_idx = "samtools index $genobam";
+		my $prim_idx = "samtools index $primbam";
+		if ($scripts) {
+			print $PER "$frna_idx\n\n";
+			print $PER "$geno_idx\n\n" if $aln_genome;
+			print $PER "$prim_idx\n\n" if $aln_genome;
+		} else {
+			print " Indexing $blurb: ".`date`;
+			&execute($frna_idx);
+			&execute($geno_idx) if $aln_genome;
+			&execute($prim_idx) if $aln_genome;
+			&writelog($logfile, 'INDEX');
+		}
+    }
+    if ($stage < 6) {
+		my $frna_idxs = "samtools idxstats $prefix.bam > $idxfile";
+		my $geno_idxs = "samtools idxstats $genobam > $gidxfile";
+		my $prim_idxs = "samtools idxstats $primbam > $pidxfile";
+		if ($scripts) {
+			print $PER "$frna_idxs\n\n";
+			print $PER "$geno_idxs\n\n" if $aln_genome;
+			print $PER "$prim_idxs\n\n" if $aln_genome;
+		} else {
+			print " Postprocessing $blurb: ".`date`;
+			&execute($frna_idxs);
+			&execute($geno_idxs) if $aln_genome;
+			&execute($prim_idxs) if $aln_genome;
+		}
+		## knocking this block out for now (deprecated)
+		##	if (0 && !$notrim) {
+		##	    &execute("gunzip -c $mapfq | sed -n '2~4p' | awk '{print length(\$1)}' | /home/apa/local/bin/colTally - | sort -n -k2,2 > $alnhisto");
+		##	    &execute("gunzip -c $unmapfq | sed -n '2~4p' | awk '{print length(\$1)}' | /home/apa/local/bin/colTally - | sort -n -k2,2 > $unahisto");
+		##	    my %tmp;
+		##	    $tmp{TOTAL} = histoparse($allhisto);
+		##	    $tmp{ALIGN} = histoparse($alnhisto);
+		##	    $tmp{UNALN} = histoparse($unahisto);
+		##	    my ($Lmin, $Lmax) = (sort {$a <=> $b} keys %{ $tmp{TOTAL} })[0,-1];
+		##	    open my $OUT1, '>', $allhisto or die "$0: Cannot open histogram file '$allhisto' for writing: $!\n";   # OVERWRITE
+		##	    print $OUT1 "ReadLen\tTRIMMED\tALIGNED\tUNALIGNED\n";
+		##	    print $OUT1 "$_\t". ($tmp{TOTAL}{$_}||0) ."\t". ($tmp{ALIGN}{$_}||0) ."\t". ($tmp{UNALN}{$_}||0) ."\n" foreach ($Lmin..$Lmax);
+		##	    close $OUT1;
+		##	    &execute("rm -f $alnhisto $unahisto");
+		##	}
+		unless ($notrim) {
+			my $histo_cmd = "$bin/scriptutils/alignToRNA_trimhisto.pl $aliasdir $allhisto";
+			if ($scripts) {
+				print $PER "$histo_cmd\n\n";
+			} else {
+				&execute($histo_cmd);
+				
+				if (0) {   ## %trmData is not used by anything at this point
+					open my $IN4, '<', $allhisto or die "$0: Cannot open aligned read-length histogram file '$allhisto': $!\n";
+					while (<$IN4>) {
+						next if $. == 1;
+						$_ =~ s/[\n\r]+$//;
+						my ($readlen, $class, $multi) = split /\t/, $_;
+						$trmData{BYLEN}{$readlen}{$samp}{$band}{TOTAL}{ALL}++;
+						if ($class eq '*') {  # not aligned
+							$trmData{BYLEN}{$readlen}{$samp}{$band}{UNALIGN}{ALL}++;
+						} else {
+							$trmData{BYLEN}{$readlen}{$samp}{$band}{ALIGN}{ALL}++;
+							$trmData{BYLEN}{$readlen}{$samp}{$band}{ALIGN}{$class}++;
+							if ($multi) {
+								$trmData{BYLEN}{$readlen}{$samp}{$band}{MULTI}{ALL}++;
+								$trmData{BYLEN}{$readlen}{$samp}{$band}{MULTI}{$class}++;
+							} else {
+								$trmData{BYLEN}{$readlen}{$samp}{$band}{MONO}{ALL}++;
+								$trmData{BYLEN}{$readlen}{$samp}{$band}{MONO}{$class}++;
+							}
+						}
+					}
+					close $IN4;
+				}  # end if 0
+			}
+		}
+		
+		my $bw_cmd = "/home/apa/local/bin/bam2track -b $primbam -g $geno -n APM --BW";  # SHOULD PRODUCE OUTPUT FILE '$primbw'
+		my $sym_bw = "ln -sf $primbw $bigWigs/$samp.APM.bw";
+		if ($scripts) {
+			print $PER "$bw_cmd\n\n" if $aln_genome;
+			print $PER "$sym_bw\n\n" if $aln_genome;
+			print $PER "rm -f *.sam\n\n";
+		} else {
+			&execute("$bw_cmd") if $aln_genome && ! -s "$primbw";
+			&execute("$sym_bw") if $aln_genome;
+			&execute("rm -f *.sam");
+			&writelog($logfile, 'STATS');
+		}
+    }
+    if (0) {
+		## parse bowtie-err file for overall alignment stats
+		## record as [N reads, % Total]
+		open my $IN5, '<', $alignlog or die "$0: Cannot open bowtie error file '$alignlog': $!\n";
+		while (<$IN5>) {
+			$_ =~ s/%//;
+			if ($_ =~ /^(\d+) reads/) {
+				$errData{READS}{$samp}{$band} = [$1, 1];    ### KEY NAMES MUST MATCH @stats ENTRIES
+			} elsif ($_ =~ /^\s+(\d+) \(([\d.]+)\) were unpaired/) {
+				##	    $errData{UNPAIRED}{$samp}{$band} = [$1, $2/100];  # all treated as unpaired...
+			} elsif ($_ =~ /^\s+(\d+) \(([\d.]+)\) aligned 0/) {
+				$errData{UNALIGNED}{$samp}{$band} = [$1, $2/100];
+			} elsif ($_ =~ /^\s+(\d+) \(([\d.]+)\) aligned exactly/) {
+				$errData{MONO_ALIGNED}{$samp}{$band} = [$1, $2/100];
+			} elsif ($_ =~ /^\s+(\d+) \(([\d.]+)\) aligned >1/) {
+				$errData{MULTI_ALIGNED}{$samp}{$band} = [$1, $2/100];
+			} elsif ($_ =~ /^([\d.]+) overall/) {
+				$errData{ALL_ALIGNED}{$samp}{$band} = [$errData{MONO_ALIGNED}{$samp}{$band}->[0]+$errData{MULTI_ALIGNED}{$samp}{$band}->[0], $1/100];
+			}
+		}
+		close $IN5;
+		
+		## ncRNAs quantitated by samtools idxstats; parse this result
+		## record as [N aligns, RPKM]
+		## sumData just racking up counts
+		open my $IN6, '<', $idxfile or die "$0: Cannot open idxstats output '$idxfile' for reading: $!\n";
+		while (<$IN6>) {
+			$_ =~ s/[\n\r]+$//;
+			my ($ncRNA, $len, $aligns, $unaligns) = (split /\t/, $_);
+			unless ($ncRNA eq '*') {
+				$idxData{$ncRNA}{$samp}{$band} = [$aligns, (1E9*$aligns)/($rnaData{$ncRNA}->[2]*$errData{ALL_ALIGNED}{$samp}{$band}->[0])];
+				$sumData{ $rnaData{$ncRNA}->[0] }{$samp}{$band}->[0] += $aligns;
+			}
+		}
+		close $IN6;
+		
+		## add RPKMs to sumData, after all counting finished
+		$sumData{$_}{$samp}{$band}->[1] = $sumData{$_}{$samp}{$band}->[0] / $errData{ALL_ALIGNED}{$samp}{$band}->[0] foreach keys %sumData;
+		
+		## whole-sample counts; above were for sample+band
+		$idxData{$_}{$samp}{ALL}->[0] += $idxData{$_}{$samp}{$band}->[0] foreach keys %idxData;
+		$errData{$_}{$samp}{ALL}->[0] += $errData{$_}{$samp}{$band}->[0] foreach keys %errData;
+		$sumData{$_}{$samp}{ALL}->[0] += $sumData{$_}{$samp}{$band}->[0] foreach keys %sumData;
+    }  ## END IF 0
+    close $PER if $scripts;
+}
+
+if (0) {  ## THE BIG IF-0
+
+	## Whole-sample percents and RPKMs; above were for sample+band
+	foreach my $samp (@usamples) {
+		$idxData{$_}{$samp}{ALL}->[1] = (1E9*$idxData{$_}{$samp}{ALL}->[0])/($rnaData{$_}->[2]*$errData{ALL_ALIGNED}{$samp}{ALL}->[0]) foreach keys %idxData;
+		$errData{$_}{$samp}{ALL}->[1] = $errData{$_}{$samp}{ALL}->[0] / $errData{READS}{$samp}{ALL}->[0] foreach keys %errData;
+		$sumData{$_}{$samp}{ALL}->[1] = $sumData{$_}{$samp}{ALL}->[0] / $errData{ALL_ALIGNED}{$samp}{ALL}->[0] foreach keys %sumData;
+	}
+
+
+
+	########## OUTPUT
+
+
+
+	## Excel layout prep: file names, header sizes, column widths, levels to summarize
+	my %levelData = ('band' => ["$results/ByBand.xlsx", 2, $N], 'sample' => ["$results/BySample.xlsx", 1, $M], 'trim' => ["$results/TrimStats.xlsx", 1, $M]);  # [output file, N header lines, N data sets]
+	my ($sampleWidth, $spacer, $summColWidth, $classWidth, $ncrnaWidth, $lenWidth) = (14, 6, 20, 10, 70, 10);
+	my (%colwidths, %headers);
+	my @useLevels = $useBands ? qw/ band sample / : qw/ sample /;
+
+
+	## Produce one file per level (per sample, and per band if using bands)
+	foreach my $level (@useLevels) {
+		
+		## Set up 
+		my ($h, $n) = @{ $levelData{$level} }[1,2];  # N header lines, N data sets
+		my @cg = ('Class','Gene','Length');
+		my @blank = ('','','');
+		my @cg1 = $level eq 'sample' ? @cg : @blank;
+		my @levelSamples = $level eq 'sample' ? @usamples : @samples;
+		
+		## Different header structures if using global+local or local-only
+		$colwidths{sum}  = [$summColWidth, (map {$sampleWidth} (0..$n))];
+		$headers{sum}{1} = ['', @levelSamples];
+		$headers{sum}{2} = ['', @bands];  # only used for 'band' level
+		$colwidths{rna}  = [$classWidth, $ncrnaWidth, $lenWidth, (map {$sampleWidth} (0..$n))];
+		$headers{rna}{1} = [@cg1, @levelSamples];
+		$headers{rna}{2} = [@cg, @bands];  # only used for 'band' level
+		
+		## Initialize workbook
+		## Create formats
+		unlink $levelData{$level}->[0];   # ABSOLUTELY ENSURE WORKBOOK IS CLOSED, at least from the filesystem's perspective
+		my $workbook = Excel::Writer::XLSX->new($levelData{$level}->[0]);
+		my $header_format = $workbook->add_format();
+		my $count_format = $workbook->add_format();
+		my $percent_format = $workbook->add_format();
+		my $float_format = $workbook->add_format();
+		$header_format->set_bold(1);
+		$header_format->set_align('center');
+		$count_format->set_num_format(3);
+		$percent_format->set_num_format(10);
+		$float_format->set_num_format('0.0000');
+		
+		## Initialize 'Summary' sheet
+		my $worksheet = $workbook->add_worksheet("Summary");
+		$worksheet->set_column($_, $_, $colwidths{sum}->[$_]) foreach (0..$#{ $colwidths{sum} });
+		$worksheet->freeze_panes($h, 0);
+		my $row = -1;
+		
+		## Write 'Summary' header lines
+		foreach my $i (1..$h) {
+			$worksheet->write_row(++$row, 0, $headers{sum}{$i}, $header_format);
+		}
+		
+		## Write 'Summary' data set 1: bowtie err stats, as counts
+		foreach my $stat (@stats) {
+			my @dat = @{ &excelify($errData{$stat}, 0, $level) };
+			$worksheet->write_row(++$row, 0, [$stat, @dat], $count_format);
+		}
+		
+		## Write 'Summary' data set 2: ncRNA class-wise stats, as counts
+		$row++;  # spacer
+		foreach my $class (@classes) {
+			my @dat = @{ &excelify($sumData{$class}, 0, $level) };
+			$worksheet->write_row(++$row, 0, [$class, @dat], $count_format);
+		}
+		
+		## Write 'Summary' data set 3: bowtie err stats, as percents
+		$row += 2;  # double spacer
+		foreach my $stat (@stats) {
+			my @dat = @{ &excelify($errData{$stat}, 1, $level) };
+			$worksheet->write_row(++$row, 0, [$stat, @dat], $percent_format);
+		}
+		
+		## Write 'Summary' data set 4: ncRNA class-wise stats, as percents
+		$row++;  # spacer
+		foreach my $class (@classes) {
+			my @dat = @{ &excelify($sumData{$class}, 1, $level) };
+			$worksheet->write_row(++$row, 0, [$class, @dat], $percent_format);
+		}
+		$worksheet->write(++$row, 0, '(as % ALL_ALIGNED)');
+		
+		
+		## WRITE NCRNA-COUNTS, NCRNA-FPKMS SHEETS
+		
+		## ncRNA sheet names, formats
+		my @rnaSheets = (['ncRNA_Counts', 0, $count_format], ['ncRNA_RPKMs', 1, $float_format]);
+		
+		## Two sheets: '0' = counts, '1' = FPKMs
+		foreach my $i (0,1) {
+			
+			## Initialize sheet
+			my $worksheet = $workbook->add_worksheet($rnaSheets[$i][0]);
+			$worksheet->set_column($_, $_, $colwidths{rna}->[$_]) foreach (0..$#{ $colwidths{rna} });
+			$worksheet->freeze_panes($h, 0);
+			my $row = -1;
+			
+			## Write header
+			foreach my $i (1..$h) {
+				$worksheet->write_row(++$row, 0, $headers{rna}{$i}, $header_format);
+			}
+			
+			## Write counts/FPKMs data per ncRNA
+			foreach my $ncRNA (@ncRNAs) {
+				my @dat = @{ &excelify($idxData{$ncRNA}, $rnaSheets[$i][1], $level) };
+				$worksheet->write_row(++$row, 0, [@{ $rnaData{$ncRNA} }, @dat], $rnaSheets[$i][2]);
+			}
+		}
+		
+		## CLOSE ENTIRE WORKBOOK
+		$workbook->close();
+	}
+
+
+	unless ($notrim) {
+		#    		$trmData{INPUT}{$samp}{$band} = [$trimstats[2], 1];
+		#		$trmData{KEEP}{$samp}{$band} = [$trimstats[4], $trimstats[5]/100];
+		#		$trmData{DROP}{$samp}{$band} = [$trimstats[7], $trimstats[8]/100];
+		#		$trmData{BYLEN}{$readlen}{$samp}{$band}{TOTAL}{ALL}++;
+		#		$trmData{BYLEN}{$readlen}{$samp}{$band}{UNALIGN}{ALL}++;
+		#		$trmData{BYLEN}{$readlen}{$samp}{$band}{ALIGN}{ALL}++;
+		#		$trmData{BYLEN}{$readlen}{$samp}{$band}{ALIGN}{$class}++;
+		#		$trmData{BYLEN}{$readlen}{$samp}{$band}{MULTI}{ALL}++;
+		#		$trmData{BYLEN}{$readlen}{$samp}{$band}{MULTI}{$class}++;
+		#		$trmData{BYLEN}{$readlen}{$samp}{$band}{MONO}{ALL}++;
+		#		$trmData{BYLEN}{$readlen}{$samp}{$band}{MONO}{$class}++;
+
+		if (0) {
+			
+			## Set up
+			my $level = 'trim';
+			my ($h, $n) = @{ $levelData{$level} }[1,2];  # N header lines, N data sets
+			my @cg = ('Class','Gene','Length');
+			my @blank = ('','','');
+			my @cg1 = $level eq 'sample' ? @cg : @blank;
+			my @levelSamples = $level eq 'sample' ? @usamples : @samples;
+			
+			## Different header structures if using global+local or local-only
+			# use $colwidths{sum}, $headers{sum} as above
+			$colwidths{rna}  = [$classWidth, $ncrnaWidth, $lenWidth, (map {$sampleWidth} (0..$n))];
+			$headers{rna}{1} = [@cg1, @levelSamples];
+			$headers{rna}{2} = [@cg, @bands];  # only used for 'band' level
+			
+			## Initialize workbook
+			## Create formats
+			unlink $levelData{$level}->[0];   # ABSOLUTELY ENSURE WORKBOOK IS CLOSED, at least from the filesystem's perspective
+			my $workbook = Excel::Writer::XLSX->new($levelData{$level}->[0]);
+			my $header_format = $workbook->add_format();
+			my $count_format = $workbook->add_format();
+			my $percent_format = $workbook->add_format();
+			my $float_format = $workbook->add_format();
+			$header_format->set_bold(1);
+			$header_format->set_align('center');
+			$count_format->set_num_format(3);
+			$percent_format->set_num_format(10);
+			$float_format->set_num_format('0.0000');
+			
+			## Initialize 'Summary' sheet
+			my $worksheet = $workbook->add_worksheet("Summary");
+			$worksheet->set_column($_, $_, $colwidths{sum}->[$_]) foreach (0..$#{ $colwidths{sum} });
+			$worksheet->freeze_panes($h, 0);
+			my $row = -1;
+			
+			## Write 'Summary' header lines
+			foreach my $i (1..$h) {
+				$worksheet->write_row(++$row, 0, $headers{sum}{$i}, $header_format);
+			}
+			
+			## Write 'Summary' data set 1: bowtie err stats, as counts
+			foreach my $stat (@stats) {
+				my @dat = @{ &excelify($errData{$stat}, 0, $level) };
+				$worksheet->write_row(++$row, 0, [$stat, @dat], $count_format);
+			}
+			
+			## Write 'Summary' data set 2: ncRNA class-wise stats, as counts
+			$row++;  # spacer
+			foreach my $class (@classes) {
+				my @dat = @{ &excelify($sumData{$class}, 0, $level) };
+				$worksheet->write_row(++$row, 0, [$class, @dat], $count_format);
+			}
+			
+			## Write 'Summary' data set 3: bowtie err stats, as percents
+			$row += 2;  # double spacer
+			foreach my $stat (@stats) {
+				my @dat = @{ &excelify($errData{$stat}, 1, $level) };
+				$worksheet->write_row(++$row, 0, [$stat, @dat], $percent_format);
+			}
+			
+			## Write 'Summary' data set 4: ncRNA class-wise stats, as percents
+			$row++;  # spacer
+			foreach my $class (@classes) {
+				my @dat = @{ &excelify($sumData{$class}, 1, $level) };
+				$worksheet->write_row(++$row, 0, [$class, @dat], $percent_format);
+			}
+			$worksheet->write(++$row, 0, '(as % ALL_ALIGNED)');
+			
+			
+			## WRITE NCRNA-COUNTS, NCRNA-FPKMS SHEETS
+			
+			## ncRNA sheet names, formats
+			my @rnaSheets = (['ncRNA_Counts', 0, $count_format], ['ncRNA_RPKMs', 1, $float_format]);
+			
+			## Two sheets: '0' = counts, '1' = FPKMs
+			foreach my $i (0,1) {
+				
+				## Initialize sheet
+				my $worksheet = $workbook->add_worksheet($rnaSheets[$i][0]);
+				$worksheet->set_column($_, $_, $colwidths{rna}->[$_]) foreach (0..$#{ $colwidths{rna} });
+				$worksheet->freeze_panes($h, 0);
+				my $row = -1;
+				
+				## Write header
+				foreach my $i (1..$h) {
+					$worksheet->write_row(++$row, 0, $headers{rna}{$i}, $header_format);
+				}
+				
+				## Write counts/FPKMs data per ncRNA
+				foreach my $ncRNA (@ncRNAs) {
+					my @dat = @{ &excelify($idxData{$ncRNA}, $rnaSheets[$i][1], $level) };
+					$worksheet->write_row(++$row, 0, [@{ $rnaData{$ncRNA} }, @dat], $rnaSheets[$i][2]);
+				}
+			}
+			
+			## CLOSE ENTIRE WORKBOOK
+			$workbook->close();
+			
+		}  # END IF 0
+		
+	} # END UNLESS $NOTRIM
+
+} ## END THE BIG IF-0
+
+
+## Launch R analysis script (from local copy)
+## Processes data from 'BySample.xlsx' ONLY -- thus all plots are whole-sample, not by sample+band
+## And exit
+my $desflag = $design ? $design : 'NA';
+my $sumcmd = "$bin/scriptutils/alignToRNA_summary.pl $targets $frna.fa $outdir";
+$sumcmd .= " --no-trim" if $notrim;
+if ($scripts) {
+    print $ANA "$sumcmd\n\ncd $results\n\n";
+    print $ANA "cp $bin/scriptutils/alignToRNA_analysis.R .\n\n";
+    print $ANA "./alignToRNA_analysis.R $targets $frna.genedata.txt $desflag\n\n";
+    close $ANA;
+    close $LAU;
+} else {
+    &execute($sumcmd);
+    &execute("cp $bin/scriptutils/alignToRNA_analysis.R $results");
+    chdir $results;
+    print "R arguments: $targets $frna.genedata.txt $desflag\n";
+    &execute("./alignToRNA_analysis.R $targets $frna.genedata.txt $desflag") unless $noAnalysis;
+    print "alignToRNA complete!\n";
+}
+exit;
+
+
+
+
+
+#################################################################################################################
+#################################################################################################################
+#################################################               #################################################
+#################################################  SUBROUTINES  #################################################
+#################################################               #################################################
+#################################################################################################################
+#################################################################################################################
+
+
+
+
+
+sub execute {  
+    
+    # print and run command
+    
+    my $cmd = shift;
+    print "$cmd\n" if $verbose; 
+    system $cmd;
+}
+
+
+sub readlog {
+    
+    # read alias log file to see which was the last successful run stage
+    
+    my $log = shift;
+    my $last;
+    if (-e $log) {
+		open my $LOGIN, '<', $log;
+		while (<$LOGIN>) {
+			$_ =~ s/[\n\r]+$//;  # in case anyone has altered the logs in windows
+			$last = $_;
+		}
+		close $LOGIN;
+    }
+    return $last;
+}
+
+
+sub writelog {
+    
+    # write each successful stage to alias log file
+    
+    my ($log, $stage) = @_;
+    open my $LOGOUT, '>>', $log or die "$0: Cannot open logfile '$log' for writing: $!\n";
+    print $LOGOUT "$stage\n";
+    close $LOGOUT;
+}
+
+
+sub excelify {
+    
+    # turn specific data slices into hashes of Excel-printable arrays
+    
+    my ($HASH, $J, $LEVEL) = @_;
+    my @DAT;
+    if ($LEVEL eq 'band') {
+		push @DAT, $$HASH{ $samples[$_] }{ $bands[$_] }->[$J] foreach (0..$N);
+    } elsif ($LEVEL eq 'sample') {
+		push @DAT, $$HASH{$_}{ALL}->[$J] foreach @usamples;
+    } else {
+		die "$0: unknown level type '$LEVEL'!\n";
+    }
+    return \@DAT;
+}
+
+
+sub histoparse {
+    
+    # hashify a trimmomatic read-length histogram file
+    
+    my $HIST = shift;
+    my %HASH;
+    
+    open my $IN7, '<', $HIST or die "$0: Cannot open histogram file '$HIST': $!\n";
+    while (<$IN7>) {
+		$_ =~ s/[\n\r]+$//;
+		my ($N, $L) = split /\t/, $_;
+		$HASH{$L} = $N;
+    }
+    close $IN7;
+    
+    return \%HASH;
+}
+
+
+
+
+
+#################################################################################################################
+#################################################################################################################
+##############################################                     ##############################################
+##############################################  MAINTENANCE NOTES  ##############################################
+##############################################                     ##############################################
+#################################################################################################################
+#################################################################################################################
+
+
+# 1. The pipeline intends to align fastqs to indexes of ONLY housekeeping ncRNAs, and automate perfunctory analyses thereon.
+#    A. The inception of the pipeline was for fast analysis of modified small-RNA protocol sequencing, which targeted non-miRNAs like snoRNAs, ribosomes, etc.
+#    B. Here at SIMR, the method settled on is cutting 2 bands from the small-RNA gel, the standard 120-160bp band and a larger 160-300bp band.
+#    C. The pipeline is designed to handle sequence from any protocol, but has options built in to allow summarization of multi-band protocols at both the band and sample levels.
+#    D. As adapter and primer sequence is a frequent problem in this size range, read trimming is built in to the pipeline, but by default ONLY for Illumina small-RNA primers and adapters.
+#       i.   Adapters and primers are located in adapters.fa, in the bowtie-index archive location (see #4 below).
+#       ii.  These were hand-selected from the standard FastQC contaminants file, based both on adapter name and actual presence in sequencing runs.
+#       iii. Revcomps and fragments from the FastQC set were collapsed.  The adapters fasta may be incomplete, but trimming is working very well at the moment.
+# 
+# 2. Index sets are built from Ensembl ncRNA annotations, if necessary supplemented from other sources.
+#    A. The housekeeping ncRNA indexes consist of bowtie2 indexes and companion files
+#       i.  These are highly standardized and can be built for any Ensembl organism, provided certain conditions are met.
+#       ii. Some Ensembl Genomes organisms, e.g. Nematostella, have no ncRNA annotations and thus are not pipelinable under current infrastructure.
+#    B. External supplements, at the moment, are only necessary for vertebrates, and are of two types:
+#       i.  Non-5S ribosomal sequence from NCBI nucleotide DB (since larger ribosomes are not assembled into the golden path, thus invisible to Ensembl).
+#       ii. tRNA annotations, currently from the Genomic tRNA Database which hosts tRNAScan-SE predictions.  
+#           a. Ensembl does not import tRNA annotations for vertebrates, and when it does so for invertebrates, these are always tRNAScan-SE predictions.
+# 
+# 3. The complete pipeline consists of 4 scripts, all located in /home/apa/local/bin:
+#    A. "ncrnaBuild" -- builds ncRNA indexes, given a config file or two (and an internet connection).
+#    B. "alignToRNA" -- handles trimming, alignment, quantitation, summary-excel-file creation, and analysis launch.
+#    C. "scriptutils/alignToRNA.analysis.R" -- does the analysis, including QC, barplots, heatmaps, and also DE if specified.  Launched by alignToRNA at exit time.
+#    D. "scriptutils/alignToRNA_trimhisto.pl" -- generates pre-histogram datasets for analysis of trimming impact.  Called within alignToRNA.
+# 
+# 4. The indexes themselves are archived at /n/data1/genomes/indexes/<geno>/<anno>/smallRNA.
+# 
+# 5. Companion datasets for the indexes currently include:
+#    A. The fasta the indexes were built from.
+#    B. The fasta index (.fai).
+#    C. A genedata.txt file, which provides metadata for every transcript in the index.
+#       i.   This is a subset of the gene_master config file, which is documented in the ncrnaBuild script.
+#       ii.  All columns from the genedata.txt file are imported by alignToRNA.analysis.R and written to the DE analysis Excel files.
+#       iii. The Excel files have a "README" tab which describes each column in the data sheets.  ANY changes to genedata.txt format MUST be reflected in the README text.
+# 
+# 6. There are only 8 classes of housekeeping ncRNAs considered by the analysis portions of the pipeline: miRNA, misc_RNA, Mt_rRNA, Mt_tRNA, rRNA, snoRNA, snRNA, tRNA.
+#    A. There are many other types of ncRNAs, but these are not considered 'housekeeping' for purposes of the analysis.
+#    B. Not all 8 are present in all organisms; e.g. yeasts do not have miRNAs.
+#    C. Many organisms (esp. invertebrates) have other, usually less-specific, ncRNA biotypes in Ensembl; these must be converted or dropped.
+#    D. For index-building purposes, some examples of the above issues:
+#       i.   Drosophila melanogaster annotates 'pre_miRNA' and not 'miRNA'.  So 'pre_miRNA' is converted to 'miRNA' in the Drosophila config files for ncrnaBuild.
+#       ii.  Yeasts have a generic 'ncRNA' biotype, which must be reannotated to other biotypes on a gene-by-gene basis (again, in the ncrnaBuild config files).
+#       iii. Occasionally, Mt_rRNA and Mt_tRNA will show up as the non-mitochondrial biotype.  These too should be corrected.
+#    E. In general, the 'misc_RNA' category contains lots of non-housekeeper material that must be flagged as ignorable.  This can get subjective:
+#       i.   Only "housekeeping" misc_RNAs should be retained, and these are generally the 7SK/L, Y, Vault, and RNAseH/P RNAs.
+#       ii.  Non-hskp misc_RNAs like long-intergenic and antisense RNAs, also ANY ncRNA of unknown function, are obviously ignorable.
+#       iii. Other material exists and it is not always clear if this should be defined as 'housekeeping', e.g. heat-shock RNAs and hammerhead ribozymes.
+#            The author tends to be generous with the definition and include these, since the misc_RNA category usually doesn't get many alignments anyway.
+#    F. These 8 classes are hardcoded into alignToRNA.analysis.R and alignToRNA_trimhisto.pl.  Any conceptual changes to these biotypes will have to be reflected in the code.
+#
+# 7. "Config files" were mentioned above:
+#    A. These are only for ncrnaBuild, and are of two types:
+#       i.  "config.<Genus_species>.txt" -- basic config file for given organism, specifying annotation sources.
+#       ii. "gene_master.<Genus_species>.<version>.txt" -- gene-level annotation tracking and modification.
+#    B. These are documented in detail at the end of ncrnaBuild.
+#    C. The default build location is /n/projects/apa/stuff/bowtie_building/ncRNA_builds.
+#       i.  Subdirectory 'config_files' holds the default config files.
+#       ii. More-recent config files may be found in the individual build subdirectories.  The pipeline uses the configs from the most-recent build version to seed the next version.
+#

@@ -1,0 +1,19 @@
+#!/usr/bin/env perl
+use strict;
+
+## A wrapper on muscle + /home/apa/local/bin/reshapeMultialign
+
+my $bin = '/home/apa/local/bin';
+my ($prefix, @fastas) = @ARGV;
+
+if ($#ARGV == 0) {
+    my ($name) = ($ARGV[0] =~ /([^\/]+)\.f[asta]+$/);
+    system "muscle -in $ARGV[0] -out $name.aligned.fa";
+    system "$bin/reshapeMultialign -f $name.aligned.fa --flat > $name.aligned.txt";
+} else {
+    my ($prefix, @fastas) = @ARGV;
+    system "cat @fastas > $prefix.fa";
+    system "muscle -in $prefix.fa -out $prefix.aligned.fa";
+    system "$bin/reshapeMultialign -f $prefix.aligned.fa --flat > $prefix.aligned.txt";
+}
+exit;

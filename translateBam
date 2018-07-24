@@ -1,0 +1,267 @@
+#!/usr/bin/env perl
+require '/home/apa/local/bin/apa_routines.pm';
+use Getopt::Long;
+use Pod::Usage;
+use Data::Dumper;
+use strict;
+
+## Translates reads in a bam and returns various outputs based on translated reads
+
+## STILL REQUIRED FOR GENERAL USE:
+## standard stage announcements, warnings, dies, etc.
+
+my $bam;
+my $ref_fa;
+my $outdir;
+
+GetOptions("b=s"=>\$bam, "r=s"=>\$ref_fa, "o=s"=>\$outdir);
+
+die "Output path '$outdir' already exists!\n" if -d $outdir;
+system "mkdir -p $outdir";
+die "Output path '$outdir' could not be created!\n" unless -d $outdir;
+
+
+my (%stats, %events, %eventseq, %x, @headers, %refseq, %refout, %refpfa);
+my @frame_offset = (-1, 1, 0);
+
+open my $REF, '<', $ref_fa or die;
+my $header;
+while (<$REF>) {
+    s/[\n\r]+$//;
+    if (/^>(.*)/) {
+	$header=$1;
+	push @headers, $header;
+    } else {
+	$refseq{$header} .= $_;
+    }
+}
+close $REF;
+
+my %refntlen = map {( $_=>length($refseq{$_}) )} @headers;
+my %refaalen = map {( $_=>int($refntlen{$_}/3) )} @headers;
+
+foreach my $ref (@headers) {
+    system "mkdir -p $outdir/$ref";
+    open $refout{$ref}, '>', "$outdir/$ref/reads_table.txt";
+    open $refpfa{$ref}, '>', "$outdir/$ref/reads_aa.fa";
+    my $OUT = $refout{$ref};
+    print $OUT "Header\tRef\tNTStart\tNTEnd\tStrand\tAAStart\tNTSequence\tAASequence\tClip5\tClip3\tInsN\tInsBp\tDelN\tDelBp\tMis\tIdt\tAln\tLen\n";
+}
+
+open my $IN, '-|', "samtools view $bam | cut -f1-4,6,10";
+#print $OUT "Header\tChrom\tNTStart\tAAStart\tNTSequence\tAASequence\n";
+while (my $line = <$IN>) {
+    chomp($line);
+    my ($header, $flags, $ref, $start, $cigar, $read) = split /\t/, $line;
+    my $strand = $flags & 16 ? '-' : '+';
+    my $frame = ($start-1) % 3;
+    $stats{$ref}{READS}++;
+    $stats{$ref}{"FRAME_$frame"}++;
+    my $pframe = '+'.(0,2,1)[$frame];  # basically, switch frames 1 & 2 only.  For whatever reason, +0 is fine, but +1 is translating best in +2 and vice versa.
+    my $aastart = ($start+$frame_offset[$frame])/3+1;
+    my ($clip5, $clip3, $gap5, $gap3, $read2, $read3);
+    my %readevents = ('C5'=>'', 'C3'=>'', 'INSN'=>0, 'INSBP'=>0, 'DELN'=>0, 'DELBP'=>0, 'MIS'=>0, 'IDT'=>0, 'ALN'=>0, 'LEN'=>length($read));
+    $clip5 = $cigar =~ /^(\d+)S/ ? $1 : 0;
+    $clip3 = $cigar =~ /(\d+)S$/ ? $1 : 0;
+    if ($clip5) {
+	my $clipseq = substr($read, 0, $clip5);
+	$events{$ref}{$start}{C5}++;
+	$eventseq{$ref}{$start}{C5}{$clipseq}++;
+	$readevents{C5} = $clipseq;
+    }
+    if ($clip3) {
+	my $clipseq = substr($read, length($read)-$clip3, length($read));
+	$events{$ref}{$start}{C3}++;
+	$eventseq{$ref}{$start}{C3}{$clipseq}++;
+	$readevents{C3} = $clipseq;
+    }
+    my $read2 = substr($read, $clip5, length($read)-$clip5-$clip3);
+    my @readbp2 = split //, $read2;
+    (my $cigar2 = $cigar) =~ s/(\d+)S//g;  # remove clipping info from cigar -- $cigar2 corresponds to $read2
+    my $readpos = 1;      # readpos is 1-based
+    my $refpos = $start;  # refpos is 1-based
+    while ($cigar2 =~ /(\d+)([MID])/g) {
+	if ($2 eq 'M') {
+	    my @refblock = split //, substr($refseq{$ref}, $refpos, $1);
+	    my @readblock = split //, substr($read2, $readpos, $1);
+	    my $blockidt;
+	    for (my $L = 0; $L < $1; $L++) {
+		$blockidt++ if $refblock[$L] eq $readblock[$L];
+	    }
+#	    $events{$ref}{$pos++}{M}++ foreach (1..$1);
+	    $events{$ref}{$refpos++}{M}++ foreach (1..$1);
+	    $readpos += $1;
+	    $readevents{ALN} += $1;
+	    $readevents{MIS} += $1-$blockidt;
+	    $readevents{IDT} = $blockidt;
+	} elsif ($2 eq 'I') {
+	    ## Insertion in read (deletion in reference)
+	    my $I = $1 % 3 == 0 ? 'IFI' : 'I';  # separating in-frame insertions from non
+#	    $events{$ref}{$pos}{$I}++;
+#	    $eventseq{$ref}{$pos}{$I}{ substr($read2, $pos-1, $1) }++;
+	    $events{$ref}{$refpos}{$I}++;
+	    $eventseq{$ref}{$refpos}{$I}{ substr($read2, $readpos-1, $1) }++;
+	    $readbp2[$readpos-1+$_] = 'I' foreach (1..$1);   # relying on the fact that Illumina sequencers only output ACGTN
+	    $readpos += $1;
+	    $readevents{INSN}++;
+	    $readevents{INSBP} += $1;
+	} elsif ($2 eq 'D') {
+	    ## Insertion in reference (deletion in read)
+	    my $D = $1 % 3 == 0 ? 'IFD' : 'D';  # separating in-frame deletions from non
+#	    $events{$ref}{$pos}{$D}++;  
+#	    $eventseq{$ref}{$pos}{$D}{ substr($refseq{$ref}, $refpos-1, $1) }++;
+	    $events{$ref}{$refpos}{$D}++;  
+	    $eventseq{$ref}{$refpos}{$D}{ substr($refseq{$ref}, $refpos-1, $1) }++;
+	    @readbp2 = (@readbp2[0..$readpos-1], (map {'D'} 1..$1), @readbp2[$readpos..$#readbp2]);   # relying on the fact that Illumina sequencers only output ACGTN
+	    $refpos += $1;
+	    $readevents{DELN}++;
+	    $readevents{DELBP} += $1;
+	}
+    }
+    my $end = $refpos-1;
+    $read2 = $read3 = join('', @readbp2);  # may contain I, D characters
+    my $lr = length($read);
+    my $lr2 = length($read2);
+#    print "\n$line\t$read2\t$lr\t$lr2\n@readbp2\n" if $read2 =~ /[ID]/;    ##### REPORTER
+    $read3 =~ tr/ID/NN/;    # contains only Ns instead of I, D characters
+    my %translated = %{ &translate({sequence=>$read3, from_frame=>$pframe, orfs=>0, stats=>0}) };
+#    my %translated = %{ &translate({sequence=>$read3, mode=>3, orfs=>0, stats=>1}) };   # required to populate %x
+#    my $aclip5 = $clip5 ? 1 : 0;
+#    $x{$pframe}{ISTOPS}{$aclip5}{ $translated{$pframe}{N_STOPS} }++;
+#    $x{$pframe}{N}++;
+#    foreach my $f (0..2) {
+#	next if $pframe eq "+$f";
+#	$x{$pframe}{OSTOPS}{"+$f"}{$aclip5}{ $translated{"+$f"}{N_STOPS} }++;
+#    }
+    my $AA = $translated{$pframe}{SEQUENCE_AA};
+    ($AA =~ /[*][A-Z*]/) ? $stats{$ref}{ORF_N}++ : $stats{$ref}{ORF_Y}++;   # checking for non-terminal stops (is read 100% ORF)
+    if ($aastart==1) { 
+	($AA =~ /^M/) ? $stats{$ref}{START_Y}++ : $stats{$ref}{START_N}++;  # checking for M at reference start
+    } elsif ($aastart+length($AA)-1==$refaalen{$ref}) {
+	($AA =~ /\*$/) ? $stats{$ref}{END_Y}++ : $stats{$ref}{END_N}++;     # checking for stop at reference end
+    }
+    my $OUT = $refout{$ref};
+    my $PFA = $refpfa{$ref};
+    print $OUT join("\t",$header,$ref,$start,$end,$strand,$aastart,$read3,$AA,(map {$readevents{$_}} qw/ C5 C3 INSN INSBP DELN DELBP MIS IDT ALN LEN /)),"\n";
+    print $PFA ">$header\n$AA\n";
+    
+#    print "$frame, $pframe, $aastart | $line | $read2 | $AA\n" if $AA eq 'LIFRDPKDPCSVLFKC*';  # ICTLVLIFRDPKDPCSVLFKC*    ##### REPORTER
+###    $AA =~ s/\*.*$//;   ############ AUTOMATICALLY TRUNCATES READ AT FIRST STOP
+##    print $OUT "$header\t$ref\t$start\t$pframe\t$aastart\t$AA\n";
+#    print "$header\t$ref\t$start\t$pframe\t$clip5\t$aastart\t$AA\n";
+##    $gap5 = ' 'x$clip5;
+##    $gap3 = ' 'x$clip3;
+##    print "$cigar\n$read\n$gap5$read2$gap3\n\n";
+##    print Dumper(\%translated),"\n";
+}
+close $IN;
+
+foreach my $ref (@headers) {
+    my $OUT = $refout{$ref};
+    my $PFA = $refpfa{$ref};
+    close $OUT;
+    close $PFA;
+}
+
+#die Dumper(\%x), "\n";
+
+foreach my $ref (@headers) {
+    
+    my $out = "$outdir/$ref/reads_table.txt";  ## ALREADY WRITTEN -- NOW READ
+    my $log = "$outdir/$ref/translateBam.log";
+    my $aln_aa = "$outdir/$ref/reads_aligned_AA.txt";
+    my $aln_nt = "$outdir/$ref/reads_aligned_NT.txt";
+    my $pwm_aa = "$outdir/$ref/pwm_AA.txt";
+    my $pwm_nt = "$outdir/$ref/pwm_NT.txt";
+    my $posevents = "$outdir/$ref/events_per_position.txt";
+    
+    open my $IN2, '<', $out;
+    open my $OUT2A, '>', $aln_aa;
+    open my $OUT2N, '>', $aln_nt;
+    print $OUT2A "AAStart\tFrequency\tAligned Sequence\n";
+    print $OUT2N "NTStart\tFrequency\tAligned Sequence\n";
+    my $prev_aa_start = my $prev_nt_start = 1;
+    my (@aaset, @ntset, %freqs);
+    
+    while (<$IN2>) {
+	chomp;
+	next if $. == 1;
+	
+	## $IN2 data stucture: "Header\tRef\tNTStart\tNTEnd\tStrand\tAAStart\tNTSequence\tAASequence\tClip5\tClip3\tInsN\tInsBp\tDelN\tDelBp\tMis\tIdt\tAln\tLen\n";
+	my @data = split /\t/, $_, ;
+	my ($header, $ref1, $ntstart, $ntend, $strand, $aastart, $ntseq, $aaseq) = @data[0..7];
+	
+	## AA alignment
+	if ($aastart > $prev_aa_start) {
+	    my (%histo);
+	    $histo{$_}++ foreach @aaset;
+	    my $gap = ' 'x$prev_aa_start;
+	    foreach my $seq (sort keys %histo) {
+		print $OUT2A "$prev_aa_start\t$histo{$seq}\t$gap$seq\n";
+		my $aastart2 = $prev_aa_start-1;
+		foreach my $aa (split //, $seq) {
+		    $freqs{AA}{++$aastart2}{$aa} += $histo{$seq};
+		}
+	    }
+	    @aaset = ();
+	}
+	push @aaset, $aaseq;
+	$prev_aa_start = $aastart;
+	
+	## NT alignment
+	if ($ntstart > $prev_nt_start) {
+	    my %histo;
+	    $histo{$_}++ foreach @ntset;
+	    my $gap = ' 'x$prev_nt_start;
+	    foreach my $seq (sort keys %histo) {
+		print $OUT2N "$prev_nt_start\t$histo{$seq}\t$gap$seq\n";
+		my $ntstart2 = $prev_nt_start-1;
+		foreach my $nt (split //, $seq) {
+		    $freqs{NT}{++$ntstart2}{$nt} += $histo{$seq};
+		}
+	    }
+	    @ntset = ();
+	}
+	push @ntset, $ntseq;
+	$prev_nt_start = $ntstart;
+    }
+    close $IN2;
+    
+    open my $LOG, '>', $log;
+    print $LOG "$_\t$stats{$ref}{$_}\n" foreach sort keys %{ $stats{$ref} };
+    close $LOG;
+    
+    open my $PWMA, '>', $pwm_aa;
+    print $PWMA join("\t", '', (1..$refaalen{$ref})),"\n";
+    foreach my $AA (qw/ A C D E F G H I K L M N P Q R S T V W Y * X /) {
+	print $PWMA $AA;
+	print $PWMA "\t".($freqs{AA}{$_}{$AA}||0) foreach (1..$refaalen{$ref});
+	print $PWMA "\n";
+    }
+
+    close $PWMA;
+    
+    open my $PWMN, '>', $pwm_nt;
+    print $PWMN join("\t", '', (1..$refntlen{$ref})),"\n";
+    foreach my $NT (qw/ A C G T N /) {
+	print $PWMN $NT;
+	print $PWMN "\t".($freqs{NT}{$_}{$NT}||0) foreach (1..$refntlen{$ref});
+	print $PWMN "\n";
+    }
+    close $PWMN;
+    
+    open my $EVT, '>', $posevents;
+    print $EVT "Pos\tEvent\tN\tSequences\n";
+    foreach my $pos (sort {$a <=> $b} keys %{ $events{$ref} }) {
+	foreach my $evtype (qw/ M I IFI D IFD C5 C3 /) {
+	    my $seqstr = join(' ', map {"$_ ($eventseq{$ref}{$pos}{$evtype}{$_})"} sort keys %{ $eventseq{$ref}{$pos}{$evtype} });  # sequence (occurrences)
+	    print $EVT "$pos\t$evtype\t",($events{$ref}{$pos}{$evtype}||0),"\t$seqstr\n";
+	}
+    }
+    close $EVT;
+}
+exit;
+
+
+
+

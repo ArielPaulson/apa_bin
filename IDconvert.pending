@@ -1,0 +1,14 @@
+#!/usr/bin/env perl
+
+## ACCESS MODE:
+# Go to DB on mysql-dev and find latest-timestamped tables
+# Dump table for organism into memory
+# Given inputs, return outputs as specified in other params
+
+## UPDATE MODE:
+# Go to predefined locations at MGI, SGD, FB and get predefined files
+# Parse files into ID equivalency tables
+# If parsing considered successful:
+# Create DB tables with run date; load equivalencies into these tables
+# Stash "LKG" files as blob in DB as well?
+

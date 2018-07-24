@@ -1,0 +1,16 @@
+bamReads
+blat2consensus
+convert2fastq
+fasta2tab
+featureMapper
+featureMapper-1.0
+featureMapper-1.1
+featureMapper-2.0
+featureMapper-2.1
+fqSample
+mergePeaks
+readFate
+snpSubtract
+stripMultireads
+tab2fasta
+validateHiC

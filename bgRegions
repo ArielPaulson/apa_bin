@@ -1,0 +1,162 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use strict;
+
+## Uses a bed file to extract regions from a bedGraph file.
+## May input either a bigWig (-bw), bedGraph (-bg), or BAM (-bam) file.
+## Redirect output to some file.
+## Output is either:
+##  1. Default: bedgraph with an extra prepended column, that being the line # of the bed file for the extracted region.
+##  2. Matrix: rows = N bed entries (in order) and cols = positions per entry (values = depths @ positions); this requires all bed entries have same width.
+## Use '--matrix' to toggle matrix output.  Fails if bed entries do not all have same width.
+
+my ($bed, $bam, $bg, $bw, $genome, $outfile, $matrix, $rmdup);
+GetOptions("i=s" => \$bed, "bam=s" => \$bam, "bg=s" => \$bg, "bw=s" => \$bw, "g=s" => \$genome, "o=s" => \$outfile, "matrix" => \$matrix, "rmdup" => \$rmdup);
+my $tmp1 = "bgRegions.$$.tmp.bam";
+my $tmp2 = "bgRegions.$$.tmp.bg";
+my $tmp3 = "bgRegions.$$.tmp.bw";
+
+my $coords;   # bg-style output that gets parsed: 1 for 1-based | 0 for 0-based (filled below)
+
+my (%regions, %regionWidths, %allWidths, %allFields, $maxWidth, $R);
+open my $IN1, '<', $bed or die "Could not open bed file '$bed': $!\n";
+while (<$IN1>) {
+    next if ($_ =~ /^#/ || $_ =~ /^track/);
+    $_ =~ s/[\n\r]+$//;
+    my @fields = split /\t/, $_;
+    $regions{++$R} = \@fields;
+    $allFields{$#fields} = 1;
+    my $width = $regions{$R}->[2] - $regions{$R}->[1];
+    $regionWidths{$R} = $width;
+    $allWidths{$width}++;
+    $maxWidth = $width if $width > $maxWidth;
+}
+close $IN1;
+my $Nregions = $R;  # number of BED entries
+
+die "Not all BED entries had the same number of columns!\n" if scalar (keys %allFields) > 1;  # bad data formatting
+die "Not all BED entries had same width: cannot use '--matrix'!\n" if $matrix && scalar (keys %allWidths) > 1;   # merely enforcing the correctness of assumptions -- doesn't actually affect generation of output
+
+my (%rawCoverage, %regionCoverage);
+
+if ($bam) {
+    
+    (my $rdbam = $bam) =~ s/bam$/rmdup.bam/i;
+    my $target = $bam;
+    
+    if ($rmdup) {
+	unless (-s $rdbam) {
+	    my $cmd = "samtools rmdup $bam $rdbam";
+	    print "$cmd\n"; system $cmd;
+	}
+	unless (-s "$rdbam.bai") {
+	    my $cmd = "samtools index $rdbam";
+	    print "$cmd\n"; system $cmd;
+	}
+	$target = $rdbam;
+    }
+
+    if (0) {   # method 1 -- SLOW
+	foreach my $R (1..$Nregions) {
+	    my $coord = $regions{$R}->[0].':'.$regions{$R}->[1].'-'.$regions{$R}->[2];
+	    my $cmd = "samtools view -h $target $coord | samtools view -bS - > $tmp1";
+	    print "$cmd\n"; system $cmd;
+	    my $cmd = "samtools index $tmp1";
+	    print "$cmd\n"; system $cmd;
+	    my $cmd = "genomeCoverageBed -d -ibam $tmp1 -g $genome > $tmp2";
+	    print "$cmd\n"; system $cmd;
+	    open my $IN2, '<', $tmp2;
+	    while (<$IN2>) {
+		chomp;
+		my ($chr, $pos, $depth) = split /\t/, $_;
+		next if $pos < $regions{$R}->[1];
+		next if $pos > $regions{$R}->[2];
+		my $relative = $pos - $regions{$R}->[1];
+		$regionCoverage{$R}{$relative} = [$pos, $depth];
+	    }
+	    close $IN2;
+	    system "rm -f bgRegions.$$.tmp.*";
+	    sleep 1;  # for killing
+	}
+    }
+
+    if (0) {   # method 2 -- SLOW
+	my $cmd = "intersectBed -wa -u -abam $target -b $bed | samtools view -h - | samtools view -bS - > $tmp1.1";
+	print "$cmd\n"; system $cmd;
+	my $cmd = "samtools view -H $target > $tmp1.2";
+	print "$cmd\n"; system $cmd;
+	my $cmd = "samtools reheader $tmp1.2 $tmp1.1 > $tmp1";
+	print "$cmd\n"; system $cmd;
+	my $cmd = "samtools index $tmp1";
+	print "$cmd\n"; system $cmd;
+	my $cmd = "genomeCoverageBed -d -ibam $tmp1 -g $genome > $tmp2";
+	print "$cmd\n"; system $cmd;
+    }
+
+    if (1) {   # method 3 -- fastest of the three
+	my $cmd = "samtools depth -b $bed $target > $tmp2";   # METHOD 3 RETURNS 1-BASED COORDS
+	print "$cmd\n"; system $cmd;
+    }
+    
+    $bg = $tmp2;
+    $coords = 1;
+   
+} elsif ($bg) {
+
+    $coords = 0;
+
+} elsif ($bw) {
+    
+    foreach my $R (1..$Nregions) {
+	my ($chr, $start, $end) = @{ $regions{$R} };
+	system "bigWigToBedGraph -chrom=$chr -start=$start -end=$end $bw $tmp3";
+	system "cat $tmp3 >> $tmp2";
+    }
+    $bg = $tmp2;
+    $coords = 0;
+    
+} else {
+    
+    die "$0: must specify a bam, bedGraph, or bigWig file!\n";
+
+}
+
+open my $IN3, '<', $bg;
+while (<$IN3>) {
+    chomp;
+    my @fields = split /\t/, $_;
+    my ($chr, $pos, $depth, $start, $end);
+    if ($#fields==2) {
+	($chr, $pos, $depth) = @fields;
+	$rawCoverage{$chr}{$pos} = $depth;
+    } elsif ($#fields==3) {
+	($chr, $start, $end, $depth) = @fields;
+	$start++ if $coords == 0;  # OTHERWISE OVERWRITES $end POSITION VALUE FROM PREVIOUS ENTRY
+	$rawCoverage{$chr}{$_} = $depth foreach ($start..$end);
+    } else {
+	die "$0: bedgraph input file '$bg' is not in 3- or 4-column format!\n";
+    }
+}
+close $IN3;
+
+system "rm -f bgRegions.$$.tmp.*";
+
+foreach my $R (1..$Nregions) {
+    my ($chr, $start, $end) = @{ $regions{$R} }[0..2];
+    foreach my $pos ($start+1..$end) {
+	$regionCoverage{$R}{$pos-$start} = [$pos, $rawCoverage{$chr}{$pos}];  # $pos-$start means that values are stored as regional coords 1..N, not as chromosomal coords $start..$end.
+    }
+}
+
+open my $OUT, '>', "$outfile";
+my $nBedCols = (keys %allFields)[0] + 1;
+print $OUT join("\t", map {"BED$_"} (1..$nBedCols)), "\t";
+print $OUT join("\t", (1..$maxWidth)), "\n";  # max width of any entry, mainly for reading into R -- where N cols is determined by first line or width of header -- so this header will ensure no row truncation.
+foreach my $R (1..$Nregions) {
+    print $OUT join("\t", @{ $regions{$R} }), "\t";   # original BED entry comes first
+    print $OUT join("\t", map { $regionCoverage{$R}{$_}->[1] || 0 } (1..$regionWidths{$R})), "\n";  # then, tab-delimited, the height-per-bp vector for the BED coordinates.  Print 0 if no coverage for a position.
+}
+close $OUT;
+
+sleep 1;  # for killability
+exit;

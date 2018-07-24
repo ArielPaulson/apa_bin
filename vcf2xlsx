@@ -1,0 +1,61 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+## Fractionates a VCF file and writes as a tabbed xlsx file.
+## Basically just a wrapper for: vcfFractionate -> vcf2tab -> txt2xls (-> xls2xlsx)
+
+
+## FIXME: need a away to incorporate the header tab (via txt2xls)
+
+
+## Required args
+my $invcf;    # input VCF
+my $outxlsx;  # output XLSX
+my $geno;     # geno label (e.g. "mm10")
+my $anno;     # anno label (e.g. "Ens_80")
+
+## Optional args
+my $header;   #    NOT READY YET
+my $rpkms;    # 1|0 does input VCF contain RPKMs in the INFO field (from vcfAddRpkm)
+my $runmode;  # $runmode arg to pass to txt2xls (if specified, usually "GATK-MW")
+my $usefrac;  # specific snpEff-effect fractions to output, as an integer, a CSV list like "1,6,7", or a range like "1-4" (default: outputs them all)
+my $expr;     # expression, DE, or other genewise data table to incorporate (gene IDs in column 1)
+my $windows;  # restrict output to only records within these intervals (BED format)
+my $txt2xls_args;  # optional string of non-default args for 'txt2xls'
+
+GetOptions("i=s"=>\$invcf, "o=s"=>\$outxlsx, "g=s"=>\$geno, "a=s"=>\$anno, "f=s"=>\$usefrac, "m=s"=>\$runmode, "x=s"=>\$expr, "w=s"=>\$windows, "t=s"=>\$txt2xls_args, "rpkms"=>\$rpkms, "header"=>\$header);
+die "$0: input vcf '$invcf' does not exist!\n" unless -e $invcf;
+die "$0: no output file specified!\n" unless $outxlsx;
+
+if ($usefrac) {
+    if ($usefrac =~ /^(\d)-(\d)$/) {
+        $usefrac = join(',', $1..$2);
+    }
+} else {
+    $usefrac = join(',', 0..9);  # current available range is only 1..8, but this covers all single-digit possibilities
+}
+
+my $bin = '/home/apa/local/bin';
+my $tmp = "vcf2xlsx.$$.tmp";
+&execute("mkdir -p $tmp", 1);
+my $pref = "$tmp/temp";
+
+&execute("$bin/vcfFractionate $invcf $pref", 1);
+chomp(my @fracs = `ls $pref.*.vcf.gz`);
+&execute("$bin/vcf2tab -i $_ --row-effects --alleles", 1) foreach @fracs;
+
+my $cmd = "$bin/txt2xls $outxlsx $pref.{$usefrac}.*.txt.gz --skip=1 --no-cell-formatting --names=\"\.[0-9]\.([^\.]+)\" --split-on-depth=10 --split-on-id";
+$cmd .= " --mode=$runmode" if $runmode;
+$cmd .= " --geno-anno=$geno,$anno" if $geno && $anno;
+$cmd .= " --expr=$expr" if $expr;
+$cmd .= " --windows=$windows" if $windows;
+$cmd .= " $txt2xls_args" if $txt2xls_args;
+
+&execute($cmd, 1);
+&execute("rm -rf $tmp", 1);
+print "$0 $invcf complete!\n";
+

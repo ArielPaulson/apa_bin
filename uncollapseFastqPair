@@ -1,0 +1,76 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use strict;
+
+## Takes a fastq with "/1, "/2" suffixes on headers, and returns up to four fastqs: E1 paired, E2 paired, E1 orphaned, E2 orphaned.
+## Outputs are compressed.
+
+my ($infq, $outpref) = @ARGV;
+
+my (%ends, %fq, $i, $end, $header, @rec, %stats);
+
+my $IN = &open2('R', $infq, 'input fastq');
+while (<$IN>) {
+	$i++;
+	if ($i == 1) {
+		$_ =~ s!/([12])$!!;
+		$end = $1;
+		$ends{$end}++;
+		die "$0: input line $.: illegal end value '$end', must be 1 or 2!\n" if $end != 1 && $end != 2;
+		chomp($header = $_);
+		push @rec, $_;
+	} else {
+		push @rec, $_;
+		if ($i == 4) {
+			$fq{$header}{$end} = [@rec];
+			@rec = ();
+			$i = 0;
+		}
+	}
+}
+close $IN;
+
+print "END\tTIMES\n";
+print "$_\t$ends{$_}\n" foreach sort keys %ends;
+
+open my $P1, '|-', "gzip > ${outpref}_1.fastq.gz";
+open my $P2, '|-', "gzip > ${outpref}_2.fastq.gz";
+open my $O1, '|-', "gzip > ${outpref}_1_orphans.fastq.gz";
+open my $O2, '|-', "gzip > ${outpref}_2_orphans.fastq.gz";
+foreach my $header (keys %fq) {
+	$stats{H}++;
+	if (scalar(keys %{ $fq{$header} })==2) {
+		print $P1 @{ $fq{$header}{1} };
+		print $P2 @{ $fq{$header}{2} };
+		$stats{P}++;
+	} else {
+		my $end = (keys %{ $fq{$header} })[0];
+		if ($end == 1) {
+			print $O1 @{ $fq{$header}{1} };
+			$stats{1}++;
+		} else {
+			print $O2 @{ $fq{$header}{2} };
+			$stats{2}++;
+		}
+	}
+}
+close $_ foreach ($P1, $P2, $O1, $O2);
+
+print "\nSTAT\tVALUE\n";
+print "$_\t$stats{$_}\n" foreach qw/ H P 1 2 /;
+
+unless ($stats{P}) {
+	print "No paired reads!  Removing paired output fastqs.\n";
+	system "rm -f ${outpref}_1.fastq.gz ${outpref}_2.fastq.gz";
+}
+unless ($stats{1}) {
+	print "No end-1 orphans!  Removing end-1 orphans fastq.\n";
+	system "rm -f ${outpref}_1_orphans.fastq.gz";
+}
+unless ($stats{2}) {
+	print "No end-2 orphans!  Removing end-2 orphans fastq.\n";
+	system "rm -f ${outpref}_2_orphans.fastq.gz";
+}
+
+print "$0 $infq complete!\n";
+exit;

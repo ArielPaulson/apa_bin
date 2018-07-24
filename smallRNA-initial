@@ -1,0 +1,500 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Data::Dumper;
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+
+## NEW Workflow:
+## 0. combine gene models and repeats
+## 1. trim input fastq
+## 2. remove too-short fragments
+## 3. align everything with ShortStack
+## 4. align leftovers with Tophat2
+## 5. merge bam + assign length groups
+## 6. quantitate + bigWig total bam
+## 7. size-fractionate bam and quantitate by size
+
+## OPTIONAL PIRNA POST-WORKFLOW
+## 8. given size range, extract pi-size.bam + assign signatures
+## 9. bigWig piRNA fractions
+## 10. detect piRNA clusters
+## 11. quantitate piRNA counts in genes+TEs (total & signatures)
+## 12. quantitate piRNA clusters in genes+TEs
+
+
+### Dependencies
+my $bin = '/home/apa/local/bin';
+my $indexes = '/n/data1/genomes/indexes';
+my $SmallRnaQuantitate3 = "$bin/smallRNA-quantitate3";
+my $readCount = "$bin/readCount";
+my $bam2track = "$bin/bam2track";
+my $sortBedCoord = "$bin/sortBedCoord";
+my $stripMultireads = "$bin/stripMultireads";
+my $mergeIdxStats = "$bin/mergeIdxStats";
+my $mergeMatrix = "$bin/mergeMatrix";
+my $fqrTotal = "$bin/fqrTotal";
+my $bed2BigBed = "$bin/scriptutils/bedToBigBed";
+my $splitBam = "$bin/splitBam";
+my $tracks2hub = "$bin/tracks2hub";
+my $trimadap = "$bin/scriptutils/adapter_collection.fa";   # adapter fasta for trimming; may specify non-default with '-t'
+my $trimmomatic = '/n/local/stage/trimmomatic/Trimmomatic-0.30/trimmomatic-0.30.jar';
+my $ShortStack = "$bin/scriptutils/ShortStack/ShortStack-smallRNApipeline";
+my $java = 'java';
+my $tophat2 = 'tophat';
+my $bowtie1 = 'bowtie';
+my $bowtie1_build = 'bowtie-build';
+my $samtools = 'samtools';
+
+
+
+### Inputs
+
+## Mandatory
+my $inputfq;   # input fastq
+my $outdir;    # output location, if not clobbering
+my $geno;      # genome index label, e.g. 'dm6', 'mm10'  ### REQUIRES $anno
+my $anno;      # genome-annotation label, e.g. 'Ens_80'  ### REQUIRES $geno
+my $TEidx;     # file prefix for TE dataset: *.ebwt, .fa, .fai files
+
+## Optional, for fastq handling
+my $lenmin;    # smallest post-trimming fragment length to analyze, default 16
+my $lenmax;    # largest post-trimming fragment length to analyze, default 41
+my $alnmax;    # maximum allowed alignments before a read is ignored; default 100
+my $ranmax;    # ShortStack --ranmax argument; default int($alnmax/10)
+my $notrim;    # indicate that input fastq is ALREADY TRIMMED.
+my $nountrim;  # exclude untrimmed reads from analysis?
+
+## Optional, other
+my $cores;     # N cores for bowtie2 alignment, default 1 (if running alignments)
+my $mem;       # mem arg for 'samtools sort', default '5G' (if running alignments)
+my $clobber;   # overwrite existing outputs when re-running pipeline?
+
+
+
+### Get arguments
+GetOptions("i=s"=>\$inputfq, "o=s"=>\$outdir, "TE=s"=>\$TEidx, "ln=i"=>\$lenmin, "lx=i"=>\$lenmax, "ax=i"=>\$alnmax, "rx=i"=>\$ranmax, "g=s"=>\$geno, "a=s"=>\$anno, "c=i"=>\$cores, "m=s"=>\$mem, "t=s"=>\$trimadap, "no-trim"=>\$notrim, "no-untrimmed"=>\$nountrim, "clobber"=>\$clobber);
+
+
+
+### Globals
+my $genodir   = "$indexes/$geno";   # may not be specified
+my $annodir   = "$genodir/$anno";   # may not be specified
+my $genoidx   = "$genodir/$geno";   # prefix only
+my $srnadir   = "$annodir/smallRNA";
+my $srnaidx   = "$srnadir/$geno.$anno.smallRNA";  # prefix only
+my $genofa    = "$genodir/$geno.fa";
+my $gtf       = "$annodir/$geno.$anno.cuff.gtf";
+my $gtfidx    = "$annodir/$geno.$anno.cuff.gtf.index/$geno.$anno.cuff";  # prefix only
+my $cmdline   = (split /\n/, qx/ps -o args $$/)[1];  # just for reporting
+my $restart;  # flag if pipeline is restarting or not
+my %trimlens; # post-trim length histogram
+my %stats;    # counts for various read fractions
+my %pstats;   # counts, as % total
+my %pstats2;  # counts, as % reads in size range
+my %LFQ;
+my $LKG;
+
+
+### Test arguments; initialize workspace and some globals
+die "$0: No input specified!\n" unless $inputfq;
+chomp($inputfq = `readlink -f $inputfq`);
+die "$0: Cannot find input fastq '$inputfq'!\n" unless -e $inputfq;
+if ($anno || $geno) {
+    die "$0: Must specify -g along with -a!\n" if $anno && !$geno;
+    die "$0: Must specify -a along with -g!\n" if $geno && !$anno;
+    die "$0: Geno/anno combination '$annodir' not found!\n" unless -d $annodir;
+    die "$0: Geno/anno combination has no smallRNA build!\n" unless -d $srnadir;
+    die "$0: Cannot resolve genome/annotation GTF file '$gtf'!\n" unless -e $gtf;
+}
+die "$0: Cannot find indicated adapter fasta '$trimadap'!\n" if $trimadap && ! -e $trimadap;
+die "$0: -ln must be a positive integer!\n" if $lenmin =~ /\D/;
+die "$0: -lx must be a positive integer!\n" if $lenmax =~ /\D/;
+die "$0: -ax must be a positive integer!\n" if $alnmax =~ /\D/;
+$lenmin = 15 unless $lenmin;    # default minimum post-trim fragment length (smallest miRNA length, basically)
+$lenmax = 40 unless $lenmax;    # default maximum post-trim fragment length (41 is smallest trimmed fragment size, given Trimmomatic settings below, basically -- 42+ = untrimmable)
+$alnmax = 100 unless $alnmax;   # default maximum alignments per read (before read is ignored)
+$ranmax = int($alnmax/10) unless $ranmax;  # ShortStack --ranmax param
+
+$cores = 1 unless $cores;
+die "$0: Invalid number of cores '$cores'!\n" if $cores <=0 || $cores =~ /\D/;
+$mem = '5G' unless $mem;
+die "$0: Invalid memory string '$mem'!  Try something like '5G'.\n" if $mem !~ /^\d+[KMG]$/;
+
+
+### Reference and filename stuff
+my %refdata = (
+	'T' => { 'NAME','TE',     'IDX',$TEidx,   'FA',"" },  # leave 'FA' values blank for now
+	'S' => { 'NAME','sRNA',   'IDX',$srnaidx, 'FA',"" },
+	'G' => { 'NAME','Genome', 'IDX',$genoidx, 'FA',"" }
+);
+my @refs = qw/ T S G /;   # IN ORDER OF USE
+foreach my $ref (@refs) {
+	my $fa = "$refdata{$ref}{IDX}.fa";
+	my $fasta = "$refdata{$ref}{IDX}.fasta";
+	if (-e $fa) {
+		$refdata{$ref}{FA} = $fa;
+	} elsif (-e $fasta) {
+		$refdata{$ref}{FA} = $fasta;
+	} else {
+		die "$0: Fasta file for reference '$ref' not found!\n";
+	}
+}
+
+
+### Output directory stuff
+chomp($outdir = `readlink -f $outdir`);
+my $trackdir = "$outdir/tracks";
+my $fastqdir = "$outdir/fastq";
+my $aligndir = "$outdir/alignments";
+my $splitdir = "$outdir/split";
+#die "$0: Output location '$outdir' already exists!\n" if -d $outdir;   ##### FIXME: PIPELINE-RESTARTING MECHANISM NOT WORKING YET *****
+system "mkdir $outdir";
+foreach my $subdir ($trackdir, $fastqdir, $splitdir) {  # NOT $ALIGNDIR !!!! ShortStack will die
+    system "mkdir $subdir";
+    die "$0: Failed to create subdirectory '$subdir'!\n" unless -d $subdir;
+}
+
+
+### Logfile stuff
+my $log = "$outdir/smallRNA-pipeline2.log";
+my $last = "$outdir/smallRNA-pipeline2.last";
+my $LOG;  # $log filehandle
+if (-e $log) {
+    $restart = 1;
+    open $LOG, '>>', $log or die "$0: Failed to reopen log file '$log': $!\n";
+} else {
+    open $LOG, '>', $log or die "$0: Failed to open log file '$log': $!\n";
+}
+system "rm -f $last" if $clobber;
+if (-e $last) {
+	chomp($LKG = `cat $last`);
+	print STDERR "Restarting pipeline: Last completed stage was '$LKG'\n";
+}
+
+
+
+### Filenames
+
+## input fractions
+my $inputfq2 = $inputfq =~ /\.gz$/ ? "$fastqdir/input.fastq.gz" : "$fastqdir/input.fastq";  # input may not have been gzipped?
+system "ln -sf $inputfq $inputfq2";  # Always keep the input as a symlink in the output directory
+chomp(my $readlen = `head -2 $inputfq2 | tail -1 | wc -c`);
+$readlen--;  # remove newline contribution
+my $unalfq = "$fastqdir/unaligned.fastq.gz";  # single master unaligned fastq (subset $frac/$aln UFQs will still exist)
+my $untrimfq = "$fastqdir/untrimmed.fastq.gz";
+my $trimfq = "$fastqdir/trimmed.fastq.gz";
+my $trimerr = "$outdir/trimmed.stderr.txt";
+my $trimlog = "$outdir/trimmed.trimlog.txt";
+my $trimhist = "$outdir/trimmed.histogram.txt";
+my $trimfqr = "$outdir/trimmed.fqReads.txt";
+my $alignfqr = "$outdir/aligned.fqReads.txt";
+
+my $alignfq = "$fastqdir/trimmed.alignable.fastq.gz";
+my $smallfq = "$fastqdir/trimmed.too-small.fastq.gz";
+my $largefq = "$fastqdir/trimmed.too-large.fastq.gz";
+
+my $mergebam = "$outdir/merge.bam";
+my $allpref = "$outdir/final";
+my $unqpref = "$outdir/final.unique";
+my $allbam = "$allpref.bam";
+my $unqbam = "$unqpref.bam";
+
+if ($notrim) {
+	&execute("ln -sf $inputfq $trimfq", 1, $LOG, 3);
+} else {
+	&logreport("Trimming input fastq: ".`date`, 1, $LOG);
+
+## Trimmomatic manual: http://www.usadellab.org/cms/uploads/supplementary/Trimmomatic/TrimmomaticManual_V0.32.pdf
+## See also: http://seqanswers.com/forums/showthread.php?t=11186 for discussion on simpleClip value -- '6' will require something like 10 high-quality base matches
+	my $trimcmd = "$java -Xmx$mem -jar $trimmomatic SE -threads $cores -trimlog $trimlog $inputfq $trimfq ILLUMINACLIP:$trimadap:2:12:6 MINLEN:1 2> $trimerr";
+
+####### FIXME: recalibrate trim cmd to require only 6bp at end
+#######        and test this w/ artificial reads!  Ensure min matches occur ONLY at 3' ends.
+
+	&logreport("Trimmomatic Line: \"$trimcmd\"\n\n", 1, $LOG);
+	system('bash','-c',$trimcmd);
+	&execute("cat $trimlog | rev | cut -f4 -d' ' | rev | sort -n | uniq -c | awk '{ print \$2\"\\t\"\$1 }' > $trimhist", 1, $LOG, 2);
+	&execute("rm -f $trimlog", 1, $LOG, 3);   # massive file; only need a few stats from it
+	system "echo TRIM > $last";
+}
+
+&evaluate_trimming;  # loads %stats, %pstats, %trimlens
+my ($mintrim, $maxtrim) = (sort {$a <=> $b} keys %trimlens)[0,-1];
+my $toosmall = $lenmin && $mintrim < $lenmin ? 1 : 0;  # too-small fraction exists
+my $toolarge = $lenmax && $maxtrim > $lenmax ? 1 : 0;  # too-large fraction exists
+my $untrimmed = $nountrim && $maxtrim == $readlen ? 1 : 0;
+
+if (0==1) {
+&logreport("Filtering trimmed fastq...", 1, $LOG);
+foreach my $len (keys %trimlens) {
+	$LFQ{$len}{FQ} = "$splitdir/${len}bp.fastq.gz";
+	open my $FH, '|-', "gzip > $LFQ{$len}{FQ}";
+	$LFQ{$len}{FH} = $FH;
+}
+
+my $TFI = &open2('R', $trimfq, 'Trimmed fastq');
+my $TFA = &open2('W', $alignfq, 'Alignable fastq');
+my $TFU = &open2('W', $untrimfq, 'Untrimmed fastq') if $untrimmed;
+my ($i, $len, @rec);
+while (<$TFI>) {
+	$i++;
+	push @rec, $_;
+	if ($i == 4) {
+		if ($len == $readlen && $nountrim) {
+			print $TFU @rec;
+		} elsif ($len >= $lenmin && $len <= $lenmax) {
+			print $TFA @rec;
+		}
+		my $FH = $LFQ{$len}{FH};
+		print $FH @rec;
+		@rec = ();
+		$i = 0;
+	} elsif ($i == 2) {
+		$len = length($_)-1;   # -1 because of newline
+	}
+}
+close $TFI;
+close $TFA;
+close $TFU if $untrimmed;
+
+foreach my $len (keys %LFQ) {
+	my $FH = $LFQ{$len}{FH};
+	close $FH;
+}
+
+chomp(my $now = `date`);
+&logreport("$stats{TOTAL} reads | $stats{TRIMLOST} lost to trimming ($pstats{TRIMLOST}%)\n\nSTAGE 1 COMPLETE: $now\n\n", 1, $LOG);
+
+if ($notrim) {
+	$stats{TOTAL} = $stats{ALLFRAC};  # If trimming, we already have TOTAL.  Otherwise, ALLFRAC will be the first total we see.
+	&logreport("$stats{TOTAL} reads; no trimming took place\n", 1, $LOG);
+}
+my $msgblock = "\nFraction\tReads\tPctTotal\n";
+#foreach my $frac (@alnfracs) {
+#	$pstats{$frac} = sprintf("%0.2f", 100*$stats{$frac}/$stats{TOTAL});
+#	$msgblock .= "$frac\t$stats{$frac}\t$pstats{$frac}\n";
+#}
+&logreport("$msgblock\n", 1, $LOG);
+
+
+
+## PER-LENGTH FQRS -> MERGE INTO SEPARATE TOTAL FQR
+my $fqlist;
+$fqlist .= " $LFQ{$_}{FQ}" foreach sort {$a <=> $b} keys %LFQ;
+&execute("$readCount --uhisto $fqlist | perl -pe 's!$splitdir/!!' | perl -pe 's!.fastq.gz!!' > $outdir/tmp.fqr", 1, $LOG, 2);
+&execute("$fqrTotal -i $outdir/tmp.fqr -h 1 -l 1 > $trimfqr", 1, $LOG, 2);
+&execute("rm -f $outdir/tmp.fqr", 1, $LOG, 2);
+
+
+
+## https://github.com/MikeAxtell/ShortStack
+## ShortStack core params -- NOT involving fraction/reference
+
+my ($ref, $SSpref);  # let these carry on after the loop below
+foreach my $r (0..$#refs) {
+	
+	$ref = $refs[$r];
+	my $prev_ref = $refs[$r-1];
+	my $SSname = "$refdata{$ref}{NAME}.ShortStack";
+	$SSpref = "$aligndir/$SSname";
+    my $SSfqin = $r == 0 ? $alignfq : "$refdata{$prev_ref}{NAME}.ShortStack.unaligned.fastq";  # T gets initial read set; S gets unaligned from T, G gets unaligned from S.
+	
+	&execute("$ShortStack --align_only --nostitch --nohp --bowtie_cores $cores --sort_mem $mem --mismatches 2 --mmap u --bowtie_m $alnmax --ranmax $ranmax --readfile $SSfqin --bowtie_un $SSpref.unaligned.fastq --outprefix $SSname --outdir $aligndir --genomefile $refdata{$ref}{FA}", 1, $LOG, 3);
+	&execute("samtools index $SSpref.bam", 1, $LOG, 3);
+	&execute("samtools idxstats $SSpref.bam > $SSpref.idxstats.txt", 1, $LOG, 2);
+	&execute("$stripMultireads --mode2 --shortstack --index $SSpref.bam", 1, $LOG, 3);
+	&execute("rename stripMultireads unique $SSpref.stripMultireads.*", 1, $LOG, 3);
+	&execute("samtools idxstats $SSpref.unique.bam > $SSpref.unique.idxstats.txt", 1, $LOG, 3);
+	
+}
+
+&execute("gzip -f $aligndir/*.unaligned.fastq", 1, $LOG, 2);
+
+my $ref = 'G';
+my $THname = "$refdata{$ref}{NAME}.Tophat";
+my $THpref = "$aligndir/$THname";
+
+## Tophat runs mop up the splice junctions, ensuring that the unaligned fastqs really are unalignable.
+## Splice junction aligns will also be added back to the genomic bams
+## Total and unique fractions must be extracted from genomic and junction bams separately, then merged separately, since Tophat multiread filters differ from ShortStack
+## https://ccb.jhu.edu/software/tophat/manual.shtml
+## Tophat2 core params -- NOT involving fraction/reference
+
+## Initial Tophat2 workflow
+&execute("$tophat2 -p $cores -g 1 -x 1 -N 2 --bowtie1 --segment-length 10 --no-novel-juncs --no-coverage-search --transcriptome-index $gtfidx -o $aligndir $genoidx $aligndir/$refdata{$ref}{NAME}.ShortStack.unaligned.fastq.gz", 1, $LOG, 3);
+&execute("mv -f $aligndir/accepted_hits.bam $THpref.bam", 1, $LOG, 3);
+&execute("samtools index $THpref.bam", 1, $LOG, 3);
+&execute("samtools idxstats $THpref.bam > $THpref.idxstats.txt", 1, $LOG, 2);
+&execute("samtools bam2fq -n -s >(gzip -f > $unalfq) $aligndir/unmapped.bam", 1, $LOG, 3, 1);  # REQUIRES BASH
+&execute("rm -f $aligndir/unmapped.bam", 1, $LOG, 3);
+&execute("mv $aligndir/$_ $THpref.$_", 1, $LOG, 2) foreach qw/ deletions.bed insertions.bed junctions.bed prep_reads.info align_summary.txt logs /;
+&execute("$stripMultireads --mode2 --tophat --index $THpref.bam", 1, $LOG, 3);
+&execute("rename stripMultireads unique $THpref.stripmultireads.*", 1, $LOG, 3);
+&execute("samtools idxstats $THpref.unique.bam > $THpref.unique.idxstats.txt", 1, $LOG, 3);
+
+##### FIXME: mergeAlignSummary on ShortStack and Tophat, then add together (maybe have small R script just for this purpose?)
+
+## After Tophat2 completes, merge earlier ShortStack genome results with Tophat2's junction results
+&execute("samtools merge $mergebam $SSpref.bam $THpref.bam", 1, $LOG, 3) unless -e $mergebam;
+
+
+
+
+### WORKING HERE 
+
+
+
+
+&execute("samtools merge $unqbam $SSpref.unique.bam $THpref.unique.bam", 1, $LOG, 3);
+
+open my $SAM, '-|', "samtools view -h -F 4 $mergebam";
+open my $BAM, '|-', "samtools view -bS - > $allbam";
+my ($prev_type, %RG);
+while (my $line = <$SAM>) {
+	if ($line =~ /^@/) {
+		my ($type) = ($line =~ /^(\S+)/);
+		if ($type ne '@SQ' && $prev_type eq '@SQ') {
+			## End of @SQ lines
+			## Add @RG header lines AFTER @SQ lines
+			foreach my $bp (sort {$a <=> $b} keys %trimlens) {
+				next if $bp == 0;
+				print $BAM "\@RG\tID:$bp\tPU:1\tLB:1\tSM:${bp}bp\tPL:illumina\n";
+			}
+		}
+		print $BAM $line unless $line =~ /trimmed.alignable/;  # eliminate ShortStack's (incorrect) default read group
+		$prev_type = $type;
+	} else {
+		chomp($line);
+		my @data = (split /\t/, $line, 12);         # all post-quality tags retained in one string
+		$data[11] =~ s/\tRG:Z:trimmed.alignable//;  # discard ShortStack's incorrect read group
+		my $bp = length($data[9]);
+		print $BAM join("\t", @data, "RG:Z:$bp\n");
+	}
+}
+close $SAM;
+close $BAM;
+&execute("rm -f $mergebam", 1, $LOG, 3);
+
+
+## NEW Workflow:
+## 0. combine gene models and repeats
+## 1. trim input fastq
+## 2. remove too-short fragments
+## 3. align everything with ShortStack
+## 4. align leftovers with Tophat2
+## 5. merge bam, assign length groups
+## 6. quantitate + bigWig total bam
+## 7. size-fractionate bam and quantitate by size
+
+
+## after genome+junctions merge completes, generate track files
+## and run quantitator
+&execute("$bam2track -b $allbam -g $geno -n APM --BW --stranded", 1, $LOG, 3);
+&execute("$SmallRnaQuantitate3 -b $allbam -o $allpref -g $geno -a $anno", 1, $LOG);
+#&execute("$bam2track -b $unqbam -g $geno -n APM --BW --stranded", 1, $LOG, 3);
+#&execute("$SmallRnaQuantitate3 -b $unqbam$ -o $unqpref -g $geno -a $anno", 1, $LOG);
+
+
+## Split bam by read length and quantitate, bigWig each read-length bam
+my $ungrpallbam = "$splitdir/ungrouped.all.bam";
+my $ungrpunqbam = "$splitdir/ungrouped.unq.bam";
+&execute("samtools split -u $ungrpallbam -f \"$splitdir/%!bp.bam\" $allbam", 1, $LOG, 3);
+#&execute("samtools split -u $ungrpunqbam -f \"$splitdir/%!bp.unique.bam\" $unqbam", 1, $LOG, 3);
+
+foreach my $len (sort {$a <=> $b} keys %trimlens) {
+	next if $len < $lenmin || $len > $lenmax;
+	&execute("$bam2track -b $splitdir/${len}bp.bam -g $geno -n APM --BW --stranded", 1, $LOG, 3);
+	&execute("$SmallRnaQuantitate3 -b $splitdir/${len}bp.bam -o $splitdir/${len}bp -g $geno -a $anno", 1, $LOG);
+#	&execute("$bam2track -b $splitdir/${len}bp.unique.bam -g $geno -n APM --BW --stranded", 1, $LOG, 3);
+#	&execute("$SmallRnaQuantitate3 -b $splitdir/${len}bp.unique.bam -o $splitdir/${len}bp.unique -g $geno -a $anno", 1, $LOG);
+}
+
+######### FIXME: ADD FQR FOR ALIGNED READS ONLY
+
+&logreport("\nsmallRNA-initial complete: ".`date`, 1, $LOG);
+close $LOG;
+exit;
+
+
+
+
+
+sub evaluate_trimming {
+    
+    if ($notrim) {
+		
+		## TRIMMING WAS SKIPPED -- get "post-trim" read lengths some other way
+		if (-e $trimfqr) {
+			## Trimmed fastqReads file exists
+			chomp(my @trimh = split /\n/, `tail -n +2 $trimfqr | cut -f1,2`);
+			foreach (@trimh) {
+				my ($len, $N) = split;
+				next if $len eq 'Total';
+				$len =~ s/bp$//;
+				$trimlens{$len} = $N;
+			}
+			&logreport("Trim-length histogram restored from $trimfqr.\n", 1, $LOG);
+		} else {
+			## Calculate read lengths from input fastq
+			my $LEN;
+			if ($inputfq2 =~ /\.gz$/) {
+				open $LEN, '-|', "zcat $inputfq2 | sed -n 2~4p";
+			} else {
+				open $LEN, '-|', "sed -n 2~4p $inputfq2";
+			}
+			while (<$LEN>) {
+				$trimlens{ length($_)-1 }++;  # -1 due to newline
+			}
+			&logreport("$. trimmed sequences surveyed from $inputfq2.\n", 1, $LOG);
+			close $LEN;
+		}
+		
+		$stats{TRIMMED} = $stats{TOTAL} += $trimlens{$_} foreach keys %trimlens;
+		$pstats{TRIMMED} = $pstats{TOTAL} = '100.00';
+		$stats{TRIMLOST} = $pstats{TRIMLOST} = 'NA';
+		
+    } else {
+		
+		## TRIMMING WAS COMPLETED -- get post-trim read lengths from output files
+		chomp(my $trimstats = `grep "^Input" $trimerr`);
+		($stats{TOTAL}, $stats{TRIMMED}, $stats{TRIMLOST}) = ($trimstats =~ /Input Reads: (\d+) Surviving: (\d+) .* Dropped: (\d+)/);
+		if (!$stats{TOTAL}) {
+			## No read totals??
+			if (defined $stats{TOTAL}) {
+				## 0 reads in input??
+				&logreport("$0: Trimmomatic reports that the input fastq was empty!\n", 1, $LOG);
+			} else {
+				&logreport("$0: Failed to interpret Trimmomatic output: cannot find read statistics!\n", 1, $LOG);
+			}
+			die;
+		}
+		$pstats{$_} = sprintf("%0.2f", 100*$stats{$_}/$stats{TOTAL}) foreach qw/ TOTAL TRIMMED TRIMLOST /;
+		
+		chomp(my @trimh = split /\n/, `cat $trimhist`);
+		foreach (@trimh) {
+			my ($len, $N) = split;
+			$trimlens{$len} = $N;
+		}
+		
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

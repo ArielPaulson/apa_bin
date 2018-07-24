@@ -1,0 +1,27 @@
+#!/usr/bin/env Rscript
+
+source("/home/apa/apa_tools.R")
+ca <- commandArgs(trailing=TRUE)
+out <- ca[1]
+func <- ca[2]
+header <- as.logical(ca[3])
+files <- ca[4:length(ca)]
+
+message(paste(c(paste0("Combining by '",func,"' ",ifelse(header,"headered","headerless")," files:"),paste0(" ",files)),collapse="\n"))
+
+dat <- lapply(files, function(x) zerofy(as.matrix(read.delim(x,header=header,row.names=1))) )
+save.image("test.RData")
+if (func=="sum" | func=="mean") {
+    ## easy methods
+    red <- dat[[1]]
+    for (i in 2:length(dat)) red <- red + dat[[i]]
+    if (func=="mean") red <- red / length(dat)
+} else {
+    ## hard methods
+    red <- array(0, dim(dat[[1]]))
+    dat2 <- array(0, c(dim(dat[[1]]),length(dat)))
+    for (i in 1:length(dat)) dat2[,,i] <- dat[[i]]
+    for (i in 1:ncol(red)) red[,i] <- apply(dat2[,i,], 1, func)
+}
+dimnames(red) <- dimnames(dat[[1]])
+write.table2(red, out, row.head="")

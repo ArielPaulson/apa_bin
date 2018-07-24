@@ -1,0 +1,7 @@
+#!/usr/bin/env perl
+use strict;
+
+my %data;
+$data{$_} = 1 while (<>);
+print sort keys %data;  # retains newlines
+exit;

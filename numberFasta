@@ -1,0 +1,39 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use strict;
+
+my ($fasta, $prefix, $offset, $withlen);
+GetOptions("f=s" => \$fasta, "p=s" => \$prefix, "o=i" => \$offset, "withlen" => \$withlen);
+
+open IN, $fasta or die "Cannot read '$fasta': $!\n";
+open OUT, "> $prefix.fa" or die "Cannot write '$prefix.fa': $!\n";
+open KEY, "> $prefix.key" or die "Cannot write '$prefix.key': $!\n";
+$withlen ? (print KEY "New\tOld\tLength\n") : (print KEY "New\tOld\n");
+my ($header, $seq);
+if ($withlen) {
+    while (<IN>) {
+	$_ =~ s/[\n\r]+$//;
+	if ($_ =~ /^>(.*)/) {
+	    print KEY "$offset\t$header\t",length($seq),"\n" if $seq;
+	    print OUT '>',++$offset,"\n";
+	    ($header, $seq) = ($1, '');
+	} else {
+	    print OUT "$_\n";
+	    $seq .= $_;
+	}
+    }
+} else {
+    while (<IN>) {
+	$_ =~ s/[\n\r]+$//;
+	if ($_ =~ /^>(.*)/) {
+	    print OUT '>',++$offset,"\n";
+	    print KEY "$offset\t$1\n";
+	} else {
+	    print OUT "$_\n";
+	}
+    }
+}
+close IN;
+close OUT;
+close KEY;
+exit;

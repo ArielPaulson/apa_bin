@@ -1,0 +1,102 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use File::Spec;
+use Pod::Usage;
+use strict;
+use Scalar::Util qw(looks_like_number);
+
+
+## geno+anno                : return transcriptome bp
+## geno+anno+rlen           : return reads per 1x
+## geno+anno+rlen+samp      : return reads per 1x per sample
+## geno+anno+rlen+nrds      : return average x
+## geno+anno+rlen+nrds+samp : return average x per sample
+## geno+anno+rlen+nrds+tgtx : return N samples possible
+## geno+anno+rlen+tgtx      : return required N reads
+## geno+anno+rlen+tgtx+samp : return required N reads per sample
+## geno+anno+nrds+tgtx      : return required read length
+## geno+anno+nrds+tgtx+samp : return required read length per sample
+
+
+my $geno;  # genome name in /n/data1/genomes/indexes, e.g. 'mm10'
+my $anno;  # transcriptome (annotation) name within genome location, e.g. 'Ens_80'
+my $rlen;  # read length
+my $nrds;  # N reads
+my $tgtx;  # target X
+my $samp;  # N samples
+
+GetOptions("g=s"=>\$geno, "a=s"=>\$anno, "r=i"=>\$rlen, "n=s"=>\$nrds, "x=f"=>\$tgtx, "s=i"=>\$samp);
+
+my $gbp = "/n/data1/genomes/indexes/$geno/$anno/$geno.$anno.GenomeBpTypes.txt";
+die "$0: Failed to locate GenomeBpTypes file '$gbp'!\n" unless -e $gbp;
+die "$0: -n must be numeric!\n" if $nrds && !looks_like_number($nrds);
+
+my $RLEN = $rlen ? 1 : 0;
+my $NRDS = $nrds ? 1 : 0;
+my $TGTX = $tgtx ? 1 : 0;
+my $ARGS = $RLEN + $NRDS + $TGTX;
+die "$0: When using -r|-n|-x: valid combos -r, -r/-n, -r/-x, -r/-n/-x!\n" if $ARGS == 1 && !$RLEN;
+die "$0: Cannot specify all arguments!  Nothing to compute.  Try dropping -s.\n" if $ARGS == 3 && $samp;
+print "$0: WARNING: -s by itself won't do anything!  Ignoring.\n" if $samp && !$ARGS;
+
+chomp(my $txbp = `bash -c 'paste -s -d+ <(head -2 $gbp | tail -1 | cut -f5-8 | sed \"s/\\t/\\n/g\") | bc'`);  # PC-UTR + PC-CDS + NC-EXON + RIBO
+
+my @output;
+push @output, ["PC+NC+RIBO BP", $txbp];
+
+my $rdec;
+if ($rlen) {
+    my $per = $txbp/$rlen;
+    $per *= $samp if $samp;
+    push @output, ["READS PER X", &round($per)];
+    if ($nrds) {
+	$rdec = 1;  # we will print numbers which have something right of the decimal point
+	my $est = ($nrds*$rlen)/$txbp;
+	$est /= $samp if $samp;
+	push @output, ["AVERAGE X", &round($est,1)];
+	if ($tgtx) {
+	    my $smp = $est/$tgtx;
+	    push @output, ["SAMPLES POSSIBLE", &round($smp,1)];
+	}
+    } elsif ($tgtx) {
+	my $rds = ($tgtx*$txbp)/$rlen;
+	$rds *= $samp if $samp;
+	push @output, ["NEEDED READS", &ceiling($rds)];
+    }
+} elsif ($ARGS) {
+    my $len = ($tgtx*$txbp)/$nrds;
+    $len *= $samp if $samp;
+    push @output, ["MIN READ LEN", &ceiling($len)];
+}
+
+my $maxw = my $ldec = 0;
+foreach (@output) {
+    $maxw = length($$_[0]) if length($$_[0]) > $maxw;  # max length of label
+}
+foreach (@output) {
+    $ldec = length(&round($$_[1])) if length(&round($$_[1])) > $ldec;  # max N digits left of decimal point
+}
+$ldec+=2 if $rdec;
+foreach (@output) {
+    my ($label, $value) = @$_;
+    $value .= "  " if $rdec && $value == int($value);
+    printf("%-${maxw}s : %${ldec}s\n", $label, $value);
+}
+exit;
+
+
+sub round {
+    my ($N, $d) = @_;
+    $d = 0 unless defined $d;
+    return sprintf("%0.${d}f", $N);
+}
+
+sub ceiling {
+    my $N = shift;
+    if ($N - int($N) > 0) {
+	$N = int($N) + 1;
+    } else {
+	$N = int($N);
+    }
+    return $N;
+}

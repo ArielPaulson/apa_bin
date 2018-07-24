@@ -1,0 +1,102 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+## Converts reference names in a VCF, given a conversion table.  Also converts names in the header.
+## Designed to convert NCBI/Ensembl -> UCSC names for dbSNP builds.
+## Also designed to work with names / chrom_data files from /n/data1/genomes/indexes builds.
+
+
+my $invcf;   # input VCF
+my $outvcf;  # output VCF
+my $geno;    # genome name, e.g. 'mm10'
+my $from;    # provider name in /n/data1/genomes/indexes/$geno/$geno.chrom_data.txt matching the chromosome names of the input VCF, e.g. 'Ensembl'
+my $to;      # provider name from the above which will be in the output, e.g. 'UCSC'
+my $drop;    # drop rows with non-convertible references? (else will die, if any encountered)
+
+GetOptions("i=s"=>\$invcf, "o=s"=>\$outvcf, "g=s"=>\$geno, "f=s"=>\$from, "t=s"=>\$to, "drop"=>\$drop);
+
+die "$0: Input VCF '$invcf' does not exist!\n" unless -e $invcf;
+my $chrdat = "/n/data1/genomes/indexes/$geno/$geno.chrom_data.txt";
+die "$0: Genome name '$geno' has no associated chrom_data.txt file!\n" unless -e $chrdat;
+($outvcf = $invcf) =~ s/.vcf/.$geno.vcf/ unless $outvcf;
+
+my ($from_name, $from_len, $to_name);
+
+my (%conv, %clen);
+open my $CD, '<', $chrdat;
+while (<$CD>) {
+    s/[\n\r]+$//;
+    my @data = split /\t/, $_;
+    if ($. == 1) {
+        foreach my $i (0..$#data) {
+            $from_name = $i if $data[$i] eq "$from.Name";
+            $to_name = $i if $data[$i] eq "$to.Name";
+            $from_len = $i if $data[$i] eq "$from.Length";
+        }
+        die "$0: from-name '$from' not matched in colnames of $chrdat!\n" unless defined $from_name;
+        die "$0: to-name '$to' not matched in colnames of $chrdat!\n" unless defined $to_name;
+        ## If chrom_data.txt is properly formatted, then if $from.Name is findable, so is $from.Length.
+    } else {
+        $conv{ $data[$from_name] } = $data[$to_name];
+        $clen{ $data[$from_name] } = $data[$to_name];
+    }
+}
+close $CD;
+
+my $lost = my $hlost = 0;
+my $IN = &open2('R', $invcf, 'input VCF');
+my $OUT = &open2('W', $outvcf, 'output VCF', 1);  # extra '1' will use bgzip (not zip) if $outvcf =~ /\.gz$/
+while (<$IN>) {
+    if (/^##contig=<ID=([^,]+)/) {
+        ##contig=<ID=chr1,length=58871917>
+        if ($conv{$1}) {   # if value is empty, line is skipped
+            my ($chr, $len, $new) = ($1, $clen{$1}, $conv{$1});
+            if (/length=(\d+)/) {
+                die "$0: reference '$chr' given length is $1, but chrom_data says $len!  You have the wrong genome.\n" if $1 != $len;
+            }
+            $_ =~ s/ID=$chr/ID=$new/;
+            print $OUT $_;
+        } elsif ($drop) {
+            $hlost++;
+        } else {
+            die "$0: 'from' reference name '$1' missing from chrom_data file!\n";
+        }
+    } elsif (/^#/) {
+        ## other header lines
+        print $OUT $_;
+    } else {
+        my ($chr, $etc) = split /\t/, $_, 2;
+        if ($conv{$chr}) {   # if value is empty, line is skipped
+            print $OUT "$conv{$chr}\t$etc";
+        } else {
+            if ($drop) {
+                $lost++;
+            } else {
+                die "$0: 'from' reference name '$chr' missing from chrom_data file!\n";
+            }
+        }
+    }
+}
+close $IN;
+close $OUT;
+if ($outvcf =~ /\.gz$/) {
+    system "chmod 755 $outvcf";
+    if (-e "$invcf.tbi") {
+        system "tabix -f $outvcf";
+        system "chmod 755 $outvcf.tbi";
+    }
+}
+
+if ($hlost) {
+    print "$lost unconvertible rows from $hlost unconvertible references\n";
+} elsif ($drop) {
+    print "$lost unconvertible rows\n";
+}
+print "$0 complete\n";
+exit;
+
+

@@ -1,0 +1,446 @@
+#!/usr/bin/env perl
+use warnings;
+use strict;
+use Cwd;
+use File::Basename;
+use Getopt::Long;
+use Pod::Usage;
+use FindBin;
+
+#$Id$
+
+# Copyright © 2005, Stowers Institute for Medical Research.  All
+# rights reserved.
+
+# c.f. attached LICENSE
+
+
+=pod
+
+=head1 SYNOPSIS
+
+TrackSlicer [region] [tracks]
+
+This script extracts specified coordinates of .wig files.
+
+=head1 OPTIONS
+
+[region] may be either [chr start end] or [list file]
+
+[tracks] may be [filename(s)], [glob], [directory] or [list file]
+
+See EXAMPLES in the manpage for examples.
+
+Other options:
+
+=over
+
+=item B<--help>
+
+Display command line usage with options.
+
+=item B<--man>
+
+Display complete manual page and exit.
+
+=item B<--verbose>
+
+Provides a trace of processing on STDERR.
+
+=item B<--version> 
+
+Display the scripts version number and exit.
+
+=back
+
+=head1 DESCRIPTION
+
+TrackSlicer is designed to take sets of .wig files and export specific regions into a tab-delimited output file,
+where rows correspond to probes/bp in the region and columns to sources (.wig files).  The regions and the track 
+files can each be specified in several ways:
+
+=over
+
+=item [region] may be given as three arguments (chr start end) or as a file containing multiple such regions.
+
+=item If multiple regions are given as a list file, it must have 3 tab-delimited columns, no header:
+
+=item Chr	Start	End
+
+=item ...
+
+=item S< >                                                                                       
+
+=item [tracks] may be entered as a single file, a string of files, a glob, or simply a directory.
+
+=item If only a directory is specified, all .wig files in that directory will be processed.
+
+=item If multiple tracks are given as a list file, each entry must include the necessary path:
+
+=item local.wig
+
+=item subdirectory/other.wig
+
+=item /n/projects/user/remote.wig
+
+=item ...
+
+=back
+
+Handling for .bed files (and maybe other formats) is planned.
+
+=head1 EXAMPLES
+
+
+=over
+
+=item TrackSlicer regions.txt trackfiles.txt
+
+=item TrackSlicer MT 100 5000 track.wig
+
+=item TrackSlicer 21 1 100000 track1.wig track2.wig track3.wig
+
+=item TrackSlicer chr5 200000 500000 home/user/files/
+
+=item TrackSlicer regions.txt home/user/files/test_*.wig
+
+=back
+
+=head1 VERSION
+
+$Revision:  1.00$
+
+=head1 AUTHOR
+
+Ariel Paulson (apa@stowers-institute.org)
+
+=head1 DEPENDENCIES
+
+=over
+
+=item perl
+
+=item Getopt::Long
+
+=item Pod::Usage
+
+=item FindBin
+
+=back
+
+=head1 AVAILABILITY
+
+Email the author for sources.
+
+=head1 TO DO
+
+=over
+
+=item Add .bed format handling
+
+=cut
+
+#use vars qw($VERSION $VC_DATE);
+
+#BEGIN {
+our $VERSION =  qw$Revision: 0.01 $[-1];
+our $VC_DATE =  qw$Date: $[-2];
+#}
+
+#use UNIVERSAL::require;
+
+my $man = 0;
+my $help = 0;
+my $verbose;
+my $version;
+
+#use File::Spec; ... other modules
+
+GetOptions('help|?'        => \$help,
+	   'man!'           => \$man,
+	   'verbose!'       => \$verbose,
+           'version!'       => \$version,
+) or pod2usage(2);
+
+pod2usage(1) if $help;
+pod2usage(-exitstatus => 0, -verbose => 2) if $man;
+if ($version) {print "$FindBin::Script: $VERSION\n"; exit(0)};
+
+###########################################################  ACTUAL CODE
+###########################################################  ACTUAL CODE
+###########################################################  ACTUAL CODE
+
+
+## NOTE: this script has sockets for BED files, but no handling has been written for them yet
+
+my $wdir = cwd();
+my (@coords, @files, @chroms, @names, $name, $locs, $tracks, %regions, %matches, %allnames, %maxpos, %filenames);
+
+@ARGV || die "No arguments given!\nNeed:\n  { (chr start end) OR (coords list file) }\n  AND\n  { (track file path) OR (directory) OR (files list file) }\n";
+
+## Parse @ARGV
+if ($ARGV[0] =~ /^\w+$/ && $ARGV[1] =~ /^\d+$/ && $ARGV[2] =~ /^\d+$/) {	# chr start end
+	$ARGV[0] = "chr$ARGV[0]" if ($ARGV[0] !~ /^chr/);
+	push @coords, join "\t", @ARGV[0..2];
+	if (scalar @ARGV == 4) { 	# single second argument
+		if (-e $ARGV[3]) {	# file
+			if ($ARGV[3] =~ /\.(wig|bed)$/) {	# track file
+				@files = ($ARGV[3]);
+				my ($name, $dir, $ext) = fileparse($ARGV[3]);
+				$filenames{$ARGV[3]} = $name;
+			} else {				# file-of-files, hopefully
+				open LIST, $ARGV[3];
+				while (<LIST>) {
+					(my $file = $_) =~ s/[\n\r]//g;
+					push @files, $file;
+					my ($name, $dir, $ext) = fileparse($file);
+					$filenames{$file} = $name;
+				}
+				close LIST;
+			}
+			my ($name, $dir, $ext) = fileparse($ARGV[3]);
+			$tracks = $name;
+		} elsif (-d $ARGV[3]) {	# directory
+			foreach my $file (<*.wig>, <*.bed>) {
+				push @files, $file;
+				my ($name, $dir, $ext) = fileparse($file);
+				$filenames{$file} = $name;
+			}
+			($tracks = $ARGV[3]) =~ s/\//_/g;
+		} else {		# wrong argument format
+			die "Incorrect format for second argument: Must be a file, file list, or a directory!";
+		}
+	} else {			# multiple "second" arguments (file list, hopefully)
+		@files = @ARGV[3..$#ARGV];
+		$tracks = 'multiple_files';
+	}
+	$locs = join '_', @ARGV[0..2];
+} elsif (-e $ARGV[0]) {			# coords file
+	$locs = $ARGV[0];
+	if (scalar @ARGV == 2) { 	# single second argument
+		if (-e $ARGV[1]) {	# file
+			if ($ARGV[1] =~ /\.(wig|bed)$/) {	# track file
+				my ($name, $dir, $ext) = fileparse($ARGV[1]);
+				$filenames{$ARGV[1]} = $name;
+				$tracks = $name;
+				@files = ($ARGV[1]);
+			} else {				# file-of-files, hopefully
+				open LIST, $ARGV[1];
+				while (<LIST>) {
+					(my $file = $_) =~ s/[\n\r]//g;
+					push @files, $file;
+					my ($name, $dir, $ext) = fileparse($file);
+					$filenames{$file} = $name;
+				}
+				close LIST;
+				print "File: 2\n";
+				my ($name, $dir, $ext) = fileparse($ARGV[1]);
+				$tracks = $name;
+			}
+		} elsif (-d $ARGV[1]) {	# directory
+			foreach my $file (<*.wig>, <*.bed>) {
+				push @files, $file;
+				my ($name, $dir, $ext) = fileparse($file);
+				$filenames{$file} = $name;
+			}
+			($tracks = $ARGV[1]) =~ s/\//_/g;
+				print "File: 3\n";
+		} else {		# wrong argument format
+			die "Incorrect format for second argument: Must be a file, file list, or a directory!";
+		}
+	} else {			# multiple "second" arguments (file list, hopefully)
+		@files = @ARGV[1..$#ARGV];
+		$tracks = 'multiple_files';
+				print "File: 4\n";
+	}
+} else {				# wrong argument format
+	die "Incorrect format for first argument: Must be a file or a three-argument set: chr start end!";
+}
+
+$tracks =~ s|^.*/([^\/]+)$|$1| if $tracks =~ /\//;
+$locs =~ s|^.*/([^\/]+)$|$1| if $locs =~ /\//;
+my $outname = $locs."_$tracks";
+#print "outname: $outname\n";
+
+unless (@coords) {	## Get coords, if from list
+	open LIST, $ARGV[0];
+	@coords = <LIST>;
+	close LIST;
+}
+
+my (%alpha, %numeric, %tempregions);
+foreach (@coords) {	## Load coords into hash
+	$_ =~ s/[\n\r]//g;
+	my ($chr, $start, $end) = split /\t/, $_;
+	$chr =~ s/^chr//;
+	($chr =~ /\D/) ? ($alpha{$chr} = 1) : ($numeric{$chr} = 1);
+	$chr = "chr$chr";
+	push @{ $tempregions{$chr} }, "$start.$end";
+}
+foreach my $chr (keys %tempregions) {
+	my @allpos;
+	my @temp = sort {$a <=> $b} @{ $tempregions{$chr} };	# sort arrays by start position
+	foreach (@temp) {
+		my ($start, $end) = split /\./, $_;
+		push @{ $regions{$chr} }, [$start, $end];	# reload as subarrays, not TSV strings
+		push @allpos, $start;
+		push @allpos, $end;
+	}
+	$maxpos{$chr} = (sort {$b <=> $a} @allpos)[0];		# highest searchable value for a given chr (know when to quit = faster)
+}
+@chroms = map { "chr$_" } ( (sort {$a <=> $b} keys %numeric), (sort keys %alpha) );
+
+## Parse files
+chomp(my $start_time = `date`);
+foreach my $file (@files) {
+#	print "$file\n";
+	$file =~ s/[\n\r]//g;
+	my ($count, $fcount, $type, $chr, $start, $bstart, $end, $val, $step, $span, $fail, $prev_chr, %complete);
+	my $name = $1 if ($file =~ /\/?([^\/]+)$/);
+	if ($file =~ /\.wig$/) {
+		$allnames{$name} = 1;	# file made it this far
+	} elsif ($file =~ /\.bed$/) {
+
+
+		#############################  CHANGE THIS WHEN ADDING .BED FILE SUPPORT  ############################
+		print "Sorry: no .bed handlers at the moment!  Skipping.\n";
+		$allnames{$name} = 0;	# not useable file
+		next;
+
+
+	} else {
+		print "File $name not in .bed or .wig format!  Skipping.\n";
+		$allnames{$name} = 0;	# not useable file
+		next;
+	}
+	
+	chomp(my $now = `date`);
+	print "Scanning $name for ";
+	(scalar @coords == 1) ? (print "$coords[0]: $now\n") : (print scalar @coords," regions: $now\n");
+	open IN, $file;
+	while (<IN>) {
+		next if ($_ =~ /^\#/ || $_ =~ /^track/);	# skip comments, header
+		$count++;
+#		print "$count\n" if ($count % 1000000 == 0);
+		(my $line = $_) =~ s/[\n\r]//g;
+
+		## Determine subformat
+		if ($count == 1) {
+			my @test = split /\t/, $line;
+			if ($_ =~ /^variableStep/) {
+				$type = 'V';
+			} elsif ($_ =~ /^fixedStep/) {
+				$type = 'F';
+			} elsif (scalar @test == 4) {
+				$type = 'W';
+			} else {
+				print "Unknown .wig format for $name!  Skipping\n";
+				$fail = 1;
+			}
+		}
+
+		## Get coordinates / value
+		if ($type eq 'V') {
+			if ($line =~ /^variableStep/) {
+				if ($line =~ /chrom=(\S+)/) {
+					$chr = $1;
+					($line =~ /span=(\d+)/) ? ($span = $1) : ($span = undef);
+					print "Starting $chr...\n";
+				} else {
+					print "Invalid variableStep declaration line:\n \"$line\"\nCannot determine chromosome of stepsize! Skipping $name\n";
+					$fail = 1;
+				}
+				next;
+			} else {
+				next if (! $regions{$chr} || $complete{$chr});	# nothing to do
+				($start, $val) = split /\t/, $line;
+				($span) ? ($end = $start + $span - 1) : ($end = $start + 1);
+#				print "$chr, $start, $end, $val, $span\n";
+			}
+		} elsif ($type eq 'F') {
+			if ($line =~ /^fixedStep/) {
+				if ($line =~ /chrom=(\S+)\s+start=(\d+)\s+step=(\d+)/) {
+					($chr, $bstart, $step, $fcount) = ($1, $2, $3, 0);	# reset $fcount at each def line
+					($line =~ /span=(\d+)/) ? ($span = $1) : ($span = undef);
+#					print "Starting $chr...\n";
+				} else {
+					print "Invalid fixedStep declaration line:\n \"$line\"\nCannot determine chromosome of stepsize! Skipping $name\n";
+					$fail = 1;
+				}
+				next;
+			} else {
+				next if (! $regions{$chr} || $complete{$chr});	# nothing to do
+				$val = $line;
+				$start = $bstart + ($fcount - 1) * $step;
+				($span) ? ($end = $start + $span - 1) : ($end = $start + 1);
+			}
+		} elsif ($type eq 'W') {
+			my ($chr, $start, $end, $val) = split /\t/, $line;
+#			print "Starting $chr...\n" if ($chr ne $prev_chr);
+			$prev_chr = $chr;
+			next if (! $regions{$chr} || $complete{$chr});	# nothing to do			
+		}
+
+		if ($fail) {
+#			print "Skipping $name\n";
+			$allnames{$name} = 0;	# file has unusable format
+			last;			# exit file
+		}
+
+		## Compare current position to target regions
+		foreach my $i (0..$#{ $regions{$chr} }) {
+			my ($rstart, $rend) = @{ $regions{$chr}->[$i] };
+#			print "$chr:$i | $rstart-$rend | $start-$end\n";
+			if ($rend < $start) {		# target is upstream of pending region -- not far enough
+				if ($start > $maxpos{$chr}) {
+					$complete{$chr} = 1;	# cleared the last region for this chromosome
+					print "$chr complete! $maxpos{$chr}\n";
+					last;	# last $i, that is
+				}
+			} elsif ($rstart > $end) {	# target is downstream of pending region -- too far
+			} else {			# target overlaps pending region by at least one bp
+
+
+				#############################  CHANGE THIS WHEN ADDING VARIABLE ROW COORDS  ############################
+				$matches{$chr}{"$rstart-$rend"}{"$start.$end"}{$name} = $val;
+				print "Matched: $rstart-$rend -> $start-$end : $val\n";
+
+			}
+		}
+	}
+	close IN;
+}
+	
+foreach	(sort keys %allnames) {			# make a list of parseable files only
+	push @names, $_ if $allnames{$_};	# those with 0 are skipped
+}
+
+## Arrange output
+print "Write directory: $wdir\nFilename: TrackSlicer_Results_$outname.txt\n";
+open OUT, "> TrackSlicer_Results_$outname.txt" or die "Cannot open TrackSlicer_Results_$outname.txt: $!";
+print OUT "\t$_" foreach @names;
+print OUT "\n";
+foreach my $chr (@chroms) {
+	foreach (@{ $regions{$chr} }) {
+		my $target = join '-', @$_;
+		print OUT "$chr:$target ---------\n";	# "chr:rstart-rend"
+		if ($matches{$chr}{$target}) {
+			foreach my $site (sort {$a <=> $b} keys %{ $matches{$chr}{$target} }) {
+				(my $newsite = $site) =~ s/\./-/;	# stored using '.' to get numeric sort to pass -w; now convert to '-' for display
+				print OUT "$chr:$newsite";	# "chr:start-end"
+				foreach (@names) {
+					my $value = $matches{$chr}{$target}{$site}{$_} || "0";
+					print OUT "\t$value";
+				}
+				print OUT "\n";
+			}
+		}
+		print OUT "\n";
+	}
+}
+close OUT;
+chomp(my $end_time = `date`);
+print "Started at: $start_time\nEnded at $end_time\n";
+exit;
+
+

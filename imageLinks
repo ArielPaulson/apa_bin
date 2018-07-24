@@ -1,0 +1,10 @@
+#!/bin/bash
+
+ls -1 $1 | awk '{ print "\n*:*\n{% image_link "$1" class = medium %}" }'
+
+echo -e "\n*:*\n{% image_grid 2 class = medium %}\n{% endimage_grid %}\n"
+
+ls -1 $1
+
+echo ""
+

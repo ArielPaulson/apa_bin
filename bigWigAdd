@@ -1,0 +1,20 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use strict;
+
+## USAGE: addBigWig -o out.bw [-g geno | -c chrom.sizes] in1.bw in2.bw ... inN.bw
+
+my ($outbw, $geno, $chrsz);
+GetOptions("o=s"=>\$outbw, "g=s"=>\$geno, "c=s"=>\$chrsz);
+my @inbws = @ARGV;
+
+$chrsz = "/n/data1/genomes/indexes/$geno/$geno.chrom.sizes" if $geno;
+die "$0: chrom.sizes file '$chrsz' does not exist!\n" unless -e $chrsz;
+
+my $cmd = "bigWigMerge -threshold=-9999999999 @inbws stdout | wigToBigWig -clip stdin $chrsz $outbw";  # low thresh to accomodate negative-strand BWs
+print STDERR "$cmd\n";
+system $cmd;
+print STDERR "$0 complete!\n";
+exit;
+
+

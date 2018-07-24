@@ -1,0 +1,62 @@
+#!/usr/bin/env perl
+use strict;
+
+die "Already run!\n";
+
+my $test = 1;
+my ($dir, $func, $declare, @sym, @lines);
+my %already;
+
+foreach my $R (glob "bulk/*.R") {
+    next if $R eq 'bulk/seqLogo.pub.R';
+    ($dir = $R) =~ s/\.R$//;
+    $dir =~ s/^bulk/code/;
+    system "mkdir $dir" unless -d $dir;
+    $func = undef;
+    @sym = @lines = ();
+    print "\n$R\n";
+    open IN, $R;
+    while (<IN>) {
+        if (/^apa.names.\S+ <- c\((.*?)\)/) {
+            $declare = $.;
+            &write_function if $func;
+            ($func = $1) =~ s/["\s]//g;
+            $func =~ s/^apa.names.[^,]+,//;
+            if ($func =~ /,/) {
+                ($func, @sym) = (split /,/, $func);
+                print " FUNC: $func\n SYM: @sym\n";
+            }
+            foreach my $name ($func, @sym) {
+                print "$name already seen: $already{$name} ($R)!\n" if $already{$name};
+                $already{$name} = $R;
+            }
+        } else {
+            push @lines, $_;
+            if (/^(\S+) <- function/) {
+                if ($declare != $.-1) {
+                    print "    NOT DECLARED: $1\n";
+                }
+                $declare = 0;
+            }
+        }
+    }
+    close IN;
+    &write_function if $func;
+}
+
+
+sub write_function {
+    print "$func: ",scalar(@lines)," lines (@sym)\n";
+    unless ($test) {
+        open OUT, "> $dir/$func.R";
+        print OUT "\n";
+        print OUT @lines;
+        if (@sym) {
+            print OUT "$_ <- $func\n" foreach @sym;
+            print OUT "\n\n";
+        }
+        close OUT;
+    }
+    $func = undef;
+    @sym = @lines = ();
+}

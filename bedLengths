@@ -1,0 +1,46 @@
+#!/usr/bin/perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+# appends lengths to a bed file (as final column)
+
+my $bed;
+my $sort;
+my @data;
+my $stdio;
+my $bed12;
+
+GetOptions("b=s" => \$bed, "sort" => \$sort, "bed12"=>\$bed12, "" => \$stdio);
+
+my $IN;
+if ($stdio) {
+    $IN = *STDIN;
+} else {
+    open $IN, '<', $bed or die "$0: Failed to open bed file '$bed' for reading: $!\n";
+}
+if ($bed12) {
+    while (<$IN>) {
+        $_ =~ s/[\n\r]+$//;
+        my $blocksizes = (split /\t/, $_)[10];
+        my $len;
+        $len += $_ foreach split /,/, $blocksizes;
+        push @data, [$len, "$_\t$len\n"];
+    }
+} else {
+    while (<$IN>) {
+        $_ =~ s/[\n\r]+$//;
+        my ($start, $end) = (split /\t/, $_)[1,2];
+        my $len = $end-$start;
+        push @data, [$len, "$_\t$len\n"];
+    }
+}
+close $IN;
+
+if ($sort) {
+    print $$_[1] foreach sort { $$b[0] <=> $$a[0] } @data;
+} else {
+    print $$_[1] foreach @data;
+}
+exit;
+

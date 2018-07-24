@@ -1,0 +1,22 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use strict;
+
+my ($cols, @cols, %data);
+my $delim = "\t";
+GetOptions("d=s"=>\$delim, "c=s"=>\$cols);
+if ($cols =~ /(\d+)-(\d+)/) {
+    @cols = ($1..$2);
+} else {
+    @cols = split /,/, $cols;
+}
+die "$0: no columns specified to test for uniqueness!\n" unless @cols;
+my $n = $cols[-1] + 1;
+$_-- foreach @cols;  # now 0-based
+
+while (<>) {
+    my $key = join($delim, (split /$delim/, $_, $n)[@cols]);
+    print $_ unless $data{$key};
+    $data{$key} = 1;
+}
+exit;

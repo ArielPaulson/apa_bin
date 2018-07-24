@@ -1,0 +1,139 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+### A souped-up Cuffcompare wrapper that goes back into the input GTFs and decides the best single gene to assign to each merged locus.
+
+my $cuffcompare = '/n/local/stage/cufflinks/cufflinks_2.2.1/cuffcompare';
+my $compareModels = '/home/apa/local/bin/compareModels';
+my $colTally = '/home/apa/local/bin/colTally';
+
+my (@inputs, $output, $prefix, $cores, $ref_fa, $symbols);
+
+GetOptions("o=s"=>\$output, "c=i"=>\$cores, "r=s"=>\$ref_fa, "s=s"=>\$symbols);
+@inputs = @ARGV;   # SHOULD BE GIVEN IN ORDER OF ANNOTATION IMPORTANCE
+
+my $tmp = "$output";
+system "rm -rf $tmp";
+mkdir $tmp;
+
+my (%convert, %compare, %weights, %percents, %final);
+
+if ($symbols) {
+    open my $SYM, '<', $symbols or die "$0: Cannot read id->symbol conversion file '$symbols': $!\n";
+    while (<$SYM>) {
+	$_ =~ s/[\n\r]+$//;
+	my ($id, $symbol) = split /\t/, $_;
+	$convert{I}{$id} = $symbol;
+    }
+    close $SYM;
+}
+foreach my $i (0..$#inputs) {
+    open my $GTF, '<', $inputs[$i] or die "$0: Cannot read input GTF file '$inputs[$i]': $!\n";
+    while (<$GTF>) {
+	$_ =~ s/[\n\r]+$//;
+	my @data = split /\t/, $_;
+	my ($gene, $trans) = ($data[8] =~ /gene_id "([^"]+)"; transcript_id "([^"]+)";/);
+	$convert{T}{$trans} = $gene;
+	$weights{$gene} = $i;
+    }
+    close $GTF;
+}
+
+system "$cuffcompare -p $cores -o gtfMerge.$$ @inputs";
+system "mv gtfMerge.$$.* $tmp/";
+system "mv gtfMerge.$$ $tmp/log";
+system "cat @inputs > $tmp/inputs.gtf";
+chdir $tmp;
+system "rename gtfMerge.$$. '' *";
+
+chomp(my $ilines = `cat inputs.gtf | wc -l`);
+chomp(my $igenes = `cat inputs.gtf | grep -oP "gene_id \\S+" | sort -u | wc -l`);
+chomp(my $itrans = `cat inputs.gtf | grep -oP "transcript_id \\S+" | sort -u | wc -l`);
+chomp(my $clines = `cat combined.gtf | wc -l`);
+chomp(my $cgenes = `cat combined.gtf | grep -oP "gene_id \\S+" | sort -u | wc -l`);
+chomp(my $ctrans = `cat combined.gtf | grep -oP "transcript_id \\S+" | sort -u | wc -l`);
+my $linesw = (sort {$b <=> $a} map { length($_) } ($ilines, $clines))[0];
+my $transw = (sort {$b <=> $a} map { length($_) } ($itrans, $ctrans))[0];
+my $genesw = (sort {$b <=> $a} map { length($_) } ($igenes, $cgenes))[0];
+printf("inputs.gtf:   %-${linesw}s total lines, %-${transw}s transcripts, %-${genesw}s genes\n", $ilines, $itrans, $igenes);
+printf("combined.gtf: %-${linesw}s total lines, %-${transw}s transcripts, %-${genesw}s genes\n", $clines, $ctrans, $cgenes);
+
+system "$compareModels -a combined.gtf -b inputs.gtf -o compare.txt";
+system "$colTally -f compare.txt -c 1 > compare_models_per_novel.txt";
+system "$colTally -f compare.txt -c 1 --retally > compare_models_per_novel2.txt";
+
+open my $COMP, '<', 'compare.txt' or die "$0: Failed to open comparison file 'compare.txt': $!\n";
+while (<$COMP>) {
+    $_ =~ s/[\n\r]+$//;
+    my @data = split /\t/, $_;
+    my ($merge, $annot, $bpo, $p1, $p2) = @data[0,1,3,5,6];
+    my $score = sprintf("%0.2f", ($p1+$p2)/2);  # mean of both exonic overlap percents
+    $compare{$merge}{$annot} = [$score, $bpo, $p1, $p2];
+}
+close $COMP;
+
+open my $LOCI, '<', 'loci' or die "$0: Failed to read comparison file 'loci': $!\n";
+open my $LOCI2, '>', 'loci_plus' or die "$0: Failed to write comparison file 'loci_plus': $!\n";
+print $LOCI2 join("\t", qw/ Merge Chrom Start End Score Strand Gene Symbol /, @inputs),"\n";
+while (<$LOCI>) {
+    $_ =~ s/[\n\r]+$//;
+    my ($merge, $coord, $dash, @sources) = split /\t/, $_;
+    my ($chr, $strand, $start, $end) = ($coord =~ /^([^\[]+)\[([+-])\](\d+)-(\d+)$/);
+    my %ranked;
+    foreach my $entry (@sources) {
+	next if $entry eq '-';
+	foreach my $trans (split /,/, $entry) {
+	    my $gene = $convert{T}{$trans};
+	    print "WARNING: Transcript '$trans' has no gene!\n" unless $gene;
+	    my ($score, $bpo, $p1, $p2) = @{ $compare{$merge}{$gene} };
+	    $ranked{$score}{ $weights{$gene} }{$gene} = 1;
+	}
+    }
+    my $topscore = (sort {$b <=> $a} keys %ranked)[0];
+    my $topweight = (sort {$a <=> $b} keys %{ $ranked{$topscore} })[0];
+    my $winner = (keys %{ $ranked{$topscore}{$topweight} })[0];  # if > 1 best gene, just take first
+    $final{$merge} = $winner;
+    my @sources2;
+    foreach my $i (0..$#sources) {
+	my $ientry = $sources[$i];
+	if ($ientry eq '-') {
+	    push @sources2, $ientry;
+	} else {
+	    my %igenes;
+	    foreach my $itrans (split ',', $ientry) {
+		$igenes{ $convert{T}{$itrans} }{$itrans} = 1;
+	    }
+	    my @ientry2;
+	    foreach my $igene (sort keys %igenes) {
+		my $itrans = join(",", sort keys %{ $igenes{$igene} });
+		my ($pct1, $pct2) = @{ $compare{$merge}{$igene} }[2,3];  # $igene had better be represented here!!
+		$percents{1}{$pct1}++;
+		$percents{2}{$pct2}++;
+		if (!$pct1 || !$pct2) {
+		    print "WARNING: $merge annotation '$igene' ($itrans) was not found in compare.txt!!!\n";
+		} else {
+		    push @ientry2,  $pct2 < 100 ? "$igene($pct1/$pct2)" : "$igene($pct1)";
+		}
+	    }
+	    push @sources2, join(",",@ientry2);
+	}
+    }
+    print $LOCI2 join("\t", $merge, $chr, $start, $end, $topscore, $strand, $winner, $convert{I}{$winner}, @sources2),"\n";
+}
+close $LOCI;
+close $LOCI2;
+
+open my $CGTF, '<', 'combined.gtf' or die "$0: Cannot read combined GTF file 'combined.gtf': $!\n";
+open my $CGTF2, '>', 'combined_named.gtf' or die "$0: Cannot write named combined GTF file 'combined_named.gtf': $!\n";
+while (<$CGTF>) {
+    my @data = split /\t/, $_;
+    $data[8] =~ s/(gene_id ")([^"]+)/$1$final{$2}/;
+    print $CGTF2 join("\t", @data);
+}
+close $CGTF;
+close $CGTF2;
+
+print "$0 Complete!\n";
+exit;

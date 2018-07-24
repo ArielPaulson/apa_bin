@@ -1,0 +1,80 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my ($infasta, $outfasta, @fields, $keyfile, $addlen, $first, $custom);
+my ($fieldstring, $indelim, $outdelim) = (1, '\s+', '|');
+
+GetOptions(
+    "i=s" => \$infasta,      # input fasta
+    "o=s" => \$outfasta,     # output fasta
+    "f=s" => \$fieldstring,  # csv string of field numbers (1-based) to extract into output header (default 1)
+    "id=s" => \$indelim,     # header field delimiter in fasta (default = whitespace of any length)
+    "od=s" => \$outdelim,    # field delimiter to use in transformed header (default = pipe)
+    "key" => \$keyfile,      # old->new header file
+    "addlen" => \$addlen,    # add sequence length as last header field in output?
+    "custom=s" => \$custom   # ignore -f, -d, -o and execute custom code block passed in here (i.e. --custom='inline_perl_code')
+    );
+
+my @fields = split /,/, $fieldstring;
+$_-- foreach @fields;  # convert to array indices *********************
+#print "'$indelim' => '$outdelim'\n";
+
+if ($custom) {
+    $custom =~ s/^'//;
+    $custom =~ s/'$//;
+    print STDERR "Received custom block: {\n$custom\n}\n";
+}
+
+my (@key, $block, $header, $newheader, $OUT);
+open my $IN, '<', $infasta or die "$0: Failed to open input fasta '$infasta': $!\n";
+if ($outfasta) {
+    open $OUT, '>', $outfasta or die "$0: Failed to write output fasta '$outfasta': $!\n";
+} else {
+    open $OUT, '>-';
+}
+while (<$IN>) {
+    next if $_ =~ /^#/;
+    if ($_ =~ /^>(.*)/) {
+	push @key, &finalize($block, $header, $newheader) if $block;	# so, won't print on first header
+	$block = '';
+	$header = $1;
+	$newheader = &transform($1);
+    } else {
+	$block .= $_;
+    }
+}
+push @key, &finalize($block, $header, $newheader);
+close $IN;
+close $OUT;
+if ($keyfile) {
+    $keyfile = "$outfasta.key.txt";
+    open my $KEY, '>', $keyfile or die "$0: Failed to write to key file '$keyfile': $!\n";
+    print $KEY @key;
+    close $KEY;
+}
+exit;
+
+
+sub finalize {
+    my ($BLOCK, $HEADER, $NEWHEADER) = @_;
+    if ($addlen) {
+	(my $BLOCK2 = $BLOCK) =~ s/[\n\r]//g;
+	$NEWHEADER .= $outdelim.length($BLOCK2);
+    }
+    print $OUT ">$NEWHEADER\n$BLOCK";
+    return "$NEWHEADER\t$HEADER\n";
+}
+
+
+sub transform {
+    my $OLD = shift;
+    my $NEW;
+    if ($custom) {
+	eval $custom;
+    } else {
+	$NEW = join $outdelim, (split /$indelim/, $OLD)[@fields];
+    }
+    return $NEW;
+}

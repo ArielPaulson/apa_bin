@@ -1,0 +1,49 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## divides a SAM file into groups by read (specified in $groups)
+## reports alignments-per-read histogram per group
+
+my ($sam, $groups, $output) = @ARGV;
+
+my (%hdat, %allgroups, %histo);
+
+print "Reading Groups...\n";
+open my $GR, '<', $groups or die "$0: cannot read groups file '$groups': $!\n";
+while (<$GR>) {
+    $_ =~ s/[\n\r]+$//;
+    my ($header, $group) = split /\t/, $_;
+    $hdat{$header}{G} = $group;
+    $allgroups{$group} = 1;
+}
+close $GR;
+
+print "Reading SAM...\n";
+open my $SAM, '<', $sam or die "$0: cannot read sam file '$sam': $!\n";
+while (<$SAM>) {
+    $_ =~ s/[\n\r]+$//;
+    my @data = split /\t/, $_;
+    my ($header, $flags, $chr, $start, $mapq) = @data[0..4];
+    $hdat{$header}{A}++;
+}
+close $SAM;
+
+print "Tallying...\n";
+foreach my $header (keys %hdat) {
+    $histo{ $hdat{$header}{G} }{ $hdat{$header}{A} }++;
+}
+
+print "Writing...\n";
+open my $OUT, '>', $output or die "$0: cannot write output file '$output': $!\n";
+print $OUT "Group\tAligns\tN\@Aligns\n";
+foreach my $group (sort keys %allgroups) {
+    foreach my $n (sort {$a <=> $b} keys %{ $histo{$group} }) {
+	print $OUT "$group\t$n\t$histo{$group}{$n}\n";
+    }
+}
+close $OUT;
+
+print "$0 Complete!\n";
+exit;

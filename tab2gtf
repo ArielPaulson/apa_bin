@@ -1,0 +1,25 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use strict;
+
+my $tab = $ARGV[0];
+my @fieldnames;
+
+my $IN = &open2('R', $tab, 'Input gtf-tab file');
+while (<$IN>) {
+    chomp;
+    my @data = split /\t/, $_;
+    if ($.==1) {
+	@fieldnames = @data[8..$#data];
+    } else {
+	my $line = join("\t", @data[0..7], '');
+	foreach my $i (0..$#fieldnames) {
+	    my $j = $i+8;
+	    $line .= "$fieldnames[$i] \"$data[$j]\"; ";
+	}
+	print "$line\n";
+    }
+}
+close $IN;
+exit;
+

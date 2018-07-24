@@ -1,0 +1,26 @@
+#!/bin/bash
+
+## Modified from https://www.biostars.org/p/16556/
+
+B=0
+N2=0
+M2=0
+S2=0
+
+echo -e "Bam\tPairs\tMeanSize\tSdSize";
+for bam in $@
+do
+    line=$(samtools view $bam | awk -v BAM=$bam 'BEGIN { OFS="\t" } { if ($9 > 0) { N+=1; S+=$9; S2+=$9*$9 } } END { M=S/N; print BAM,N,M,sqrt ((S2-M*M*N)/(N-1)) }')
+    echo $line | sed "s/ /\t/g"
+    N=$(echo $line | cut -f2 -d' ')
+    M=$(echo $line | cut -f3 -d' ')
+    S=$(echo $line | cut -f4 -d' ')
+    B=$(echo "$B+1" | bc)  # N bams
+    N2=$(echo "$N2+$N" | bc)  # total pairs
+    M2=$(echo "$M2+$M" | bc)  # total mean
+    S2=$(echo "$S2+$S" | bc)  # total sd
+done
+
+M3=$(echo "scale=2; $M2/$B" | bc)
+S3=$(echo "scale=2; $S2/$B" | bc)
+echo -e "TOTAL\t$N2\t$M3\t$S3"

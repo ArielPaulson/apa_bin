@@ -1,0 +1,126 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use strict;
+
+## Uses a bed file to extract regions from a bedGraph file.
+## May input either the bedGraph or just a BAM file; will autodetect format and convert BAM->BG.
+## Redirect output to some file.
+## Output is either:
+##  1. Default: bedgraph with an extra prepended column, that being the line # of the bed file for the extracted region.
+##  2. Matrix: rows = N bed entries (in order) and cols = positions per entry (values = depths @ positions); this requires all bed entries have same width.
+## Use '--matrix' to toggle matrix output.  Fails if bed entries do not all have same width.
+
+my ($bed, $bam, $genome, $outfile, $matrix, $dups);
+GetOptions("i=s" => \$bed, "b=s" => \$bam, "g=s" => \$genome, "o=s" => \$outfile, "matrix" => \$matrix, "dups" => \$dups);
+my $rmdup = $dups ? 0 : 1;
+my $tmp1 = "bgRegions.$$.tmp.bam";
+my $tmp2 = "bgRegions.$$.tmp.bg";
+
+my (%regions, %lengths, $i);
+open IN, $bed or die "Could not open bed file '$bed': $!\n";
+while (<IN>) {
+    next if ($_ =~ /^#/ || $_ =~ /^track/);
+    $_ =~ s/[\n\r]+$//;
+    $regions{++$i} = [split /\t/, $_];
+    my $len = $regions{$i}->[2]-$regions{$i}->[1];
+    push @{ $regions{$i} }, $len;
+    $lengths{$len}++;
+}
+close IN;
+my $Nregions = $i;  # region count
+
+my $cols;
+if (scalar (keys %lengths) > 1) {
+    die "Not all BED entries had same length: cannot use '--matrix'!\n";
+} else {
+    $cols = (keys %lengths)[0];
+}
+
+(my $rdbam = $bam) =~ s/bam$/rmdup.bam/i;
+my $target = $bam;
+if ($rmdup) {
+    unless (-s $rdbam) {
+	my $cmd = "samtools rmdup $bam $rdbam";
+	print "$cmd\n"; system $cmd;
+    }
+    unless (-s "$rdbam.bai") {
+	my $cmd = "samtools index $rdbam";
+	print "$cmd\n"; system $cmd;
+    }
+    $target = $rdbam;
+}
+
+my (%raw, %data);
+
+if (0) {   # method 1 -- SLOW
+    foreach my $i (1..$Nregions) {
+	my $coord = $regions{$i}->[0].':'.$regions{$i}->[1].'-'.$regions{$i}->[2];
+	my $cmd = "samtools view -h $target $coord | samtools view -bS - > $tmp1";
+	print "$cmd\n"; system $cmd;
+	my $cmd = "samtools index $tmp1";
+	print "$cmd\n"; system $cmd;
+	my $cmd = "genomeCoverageBed -dz -ibam $tmp1 -g $genome > $tmp2";
+	print "$cmd\n"; system $cmd;
+	open IN, $tmp2;
+	while (<IN>) {
+	    chomp;
+	    my ($chr, $pos, $depth) = split /\t/, $_;
+	    next if $pos < $regions{$i}->[1];
+	    next if $pos > $regions{$i}->[2];
+	    my $relative = $pos - $regions{$i}->[1];
+	    $data{$i}{$relative} = [$pos, $depth];
+	}
+	close IN;
+	system "rm -f bgRegions.$$.tmp.*";
+	sleep 1;  # for killing
+    }
+}
+
+if (0) {   # method 2 -- SLOW
+    my $cmd = "intersectBed -wa -u -abam $target -b $bed | samtools view -h - | samtools view -bS - > $tmp1.1";
+    print "$cmd\n"; system $cmd;
+    my $cmd = "samtools view -H $target > $tmp1.2";
+    print "$cmd\n"; system $cmd;
+    my $cmd = "samtools reheader $tmp1.2 $tmp1.1 > $tmp1";
+    print "$cmd\n"; system $cmd;
+    my $cmd = "samtools index $tmp1";
+    print "$cmd\n"; system $cmd;
+    my $cmd = "genomeCoverageBed -dz -ibam $tmp1 -g $genome > $tmp2";
+    print "$cmd\n"; system $cmd;
+}
+
+if (1) {   # method 3
+    my $cmd = "samtools depth -b $bed $target > $tmp2";
+    print "$cmd\n"; system $cmd;
+}
+
+open IN, $tmp2;
+while (<IN>) {
+    chomp;
+    my ($chr, $pos, $depth) = split /\t/, $_;
+    $raw{$chr}{$pos} = $depth;
+}
+close IN;
+system "rm -f bgRegions.$$.tmp.*";
+
+foreach my $i (1..$Nregions) {
+    my ($chr, $start, $end) = @{ $regions{$i} }[0..2];
+    foreach my $j ($start+1..$end) {   # METHOD 3 RETURNS 1-BASED COORDS
+	$data{$i}{$j-$start} = [$j, $raw{$chr}{$j}];
+    }
+}
+
+open OUT, "> $outfile";
+if ($matrix) {
+    foreach my $i (1..$Nregions) {
+	print OUT join("\t", map { $data{$i}{$_}->[1] || 0 } (1..$cols)), "\n";
+    }
+} else {
+    foreach my $i (1..$Nregions) {
+	print OUT "$i\t$regions{$i}->[0]\t$data{$i}{$_}\n" foreach (1..$regions{$i}->[-1]);
+    }
+}
+close OUT;
+
+sleep 1;  # for killability
+exit;

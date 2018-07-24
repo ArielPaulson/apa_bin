@@ -1,0 +1,6 @@
+#!/bin/bash
+
+for org in sce dme gga dre mmu hsa
+do
+    /home/apa/local/bin/NewKEGG $org > NewKEGG.$org.log 2>&1
+done

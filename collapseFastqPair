@@ -1,0 +1,34 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## Takes paired fastqs as input, and outputs one fastq with "/1", "/2" suffixed to headers.
+## If headers contain two fields separated by a space, only the first field will be retained.
+## Automatically gzips if $outfq ends with '.gz'.
+
+my ($fastq1, $fastq2, $outfq) = @ARGV;
+die "$0: Fastq2 '$fastq2' does not exist!\n" unless -e $fastq2;  # only test this one; the other two are tested immedately below
+
+my $OUT = &open2('W', $outfq, 'output fastq');
+my $r;
+foreach my $i (1,2) {
+	my $IN = &open2('R', $ARGV[$i-1], "input fastq $i");
+	while (<$IN>) {
+		$r++;
+		if ($r==1) {
+			chomp;
+			my ($header) = (split /\s+/, $_)[0];
+			print $OUT "$header/$i\n";
+		} else {
+			print $OUT $_;
+		}
+		$r = 0 if $r == 4;
+	}
+	close $IN;
+}
+close $OUT;
+
+print "$0 complete!\n";
+exit;

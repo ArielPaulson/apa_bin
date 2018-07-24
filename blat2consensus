@@ -1,0 +1,218 @@
+#!/usr/bin/env perl
+require '/home/apa/local/bin/apa_routines.pm';
+use Getopt::Long;
+use strict;
+
+## Takes a fastq file, a psl with alignments from the fastq sequences, the reference fasta, and a bed file of target regions (within the alignment area)
+## Returns one file per bed region, in samtools pileup format
+## reference fasta should have one sequence per bed file entry; header = bed id or "chr.start.end" so that sequences can be matched to bed entries
+
+my ($fastq, $psl, $bed, $ref, $outdir, $unique, $writefasta, $onlyfasta);
+GetOptions("f=s" => \$fastq, "p=s" => \$psl, "b=s" => \$bed, "r=s" => \$ref, "o=s" => \$outdir, "unique" => \$unique, "fasta" => \$writefasta, "onlyfasta" => \$onlyfasta);
+$writefasta = 1 if $onlyfasta;
+my ($pslname) = ($psl =~ /([^\/]+$)/);
+die "Output dir '$outdir' already exists!\n" if -d $outdir;
+system "mkdir -p $outdir";
+die "Failed to create output dir '$outdir'!\n" unless -d $outdir;
+my $indFaDir = "$outdir/Individual_Fastas";  # if needed
+
+my (@chrs, %aligns, %regions);
+if (-e $bed) {
+    print "Reading bed...\n";
+    open IN, $bed or die "Cannot read bed file '$bed': $!\n";
+    while (<IN>) {
+	$_ =~ s/[\n\r]+$//;
+	my @data = split /\t/, $_;
+	push @chrs, $data[0] unless $regions{$data[0]};
+	$regions{$data[0]}{$data[3]} = [@data[1..2], $data[4], ''];
+	$aligns{$data[3]} = [];  # initialize
+    }
+    close IN;
+} else {
+    my ($chr, $start, $end, $etc) = ($bed =~ /(.*):(\d+)-(\d+)(.*)/);    # can also enter chr7:1000000-1000200 e.g., like samtools view BUT: unlinkable to ref fasta, so you won't get the reference sequence
+    my ($strand) = ($etc =~ /^:([+-])/);  # if exists
+    die "Bed file '$bed' not a valid file or coordinate string!\n" unless ($chr && $start && $end);
+    my $id = "$chr.$start.$end";
+    $regions{$chr}{$id} = [$start, $end, $strand, ''];
+    push @chrs, $chr;
+}
+
+print "Reading reference fasta...\n";
+open IN, $ref or die "Cannot read reference fasta '$ref': $!\n";
+my (%refseq, $chr);
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    if ($_ =~ /^>(.*)/) {
+	$chr = $1;
+    } else {
+	$refseq{$chr} .= $_ if $regions{$chr};   # ignore sequence in ref which is not part of target regions
+    }
+}
+close IN;
+
+print "Reading fastq...\n";
+open IN, $fastq or die "Cannot read fastq file '$fastq': $!\n";
+my ($i, $header, %fq);
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    $i++;
+    if ($i == 1) {
+	$_ =~ s/^@//;
+	$header = (split /\s+/, $_)[0];  # how blat sees it
+    } elsif ($i == 2) {
+	$fq{$header}->[0] = $_;  # seq
+    } elsif ($i == 4) {
+	$fq{$header}->[1] = $_;  # qual
+	$i = 0;
+    }
+}
+close IN;
+
+print "Reading psl...\n";
+open IN, $psl or die "Cannot read psl file '$psl': $!\n";
+my (%hits);
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    my @data = split /\t/, $_;
+    my ($ident, $mismatch, $reps, $Ns, $qgaps, $qgapbp, $sgaps, $sgapbp, $strand, $query, $querylen, $qpos1, $qpos2, $chr, $chrlen, $cpos1, $cpos2, $blocks, $blocksizes, $qstarts, $tstarts) = @data;
+    $hits{$query}++;
+    next unless $regions{$chr};
+    my ($cstart, $cend) = sort {$a <=> $b} ($cpos1, $cpos2);
+    foreach my $id (keys %{ $regions{$chr} }) {
+	my ($rstart, $rend, $rstrand) = @{ $regions{$chr}{$id} }[0..2];
+#	print "$chr\t$id:$rstart-$rend:$rstrand\t$query:$cstart-$cend\n";
+	if ($rend >= $cstart && $rstart <= $cend) {
+	    push @{ $aligns{$id} }, \@data;
+#	    print "Matched $chr: $rstart-$rend | $cstart-$cend\n";
+	}
+    }
+}
+close IN;
+
+if ($writefasta) {
+    open FA, "> $outdir/$pslname.cons.fa";
+    system "mkdir -p $indFaDir/query";
+    system "mkdir -p $indFaDir/target";
+}
+my %known = map {($_=>1)}  qw/ A C G T N - /;
+my @kfreqbase = qw/ A C G T N - X /;  # 'X' being anything not in %known
+my %maps;
+foreach my $chr (keys %regions) {
+    foreach my $id (keys %{ $regions{$chr} }) {
+#	my (@output, %tofasta);
+	my ($rstart, $rend, $rstrand, $rseq) = @{ $regions{$chr}{$id} };
+#	print "$id, $chr, $rstart, $rend\n";
+	my $rwidth = $rend-$rstart+1;
+	my @reference = split //, substr($refseq{$chr}, $rstart, $rwidth);
+	my $rseq = ${ &blockify(join '', @reference) };
+	if (@{ $aligns{$id} }) {
+	    my $pass;
+	    unless ($onlyfasta) {
+		open OUT, "> $outdir/$pslname.$id.cons";
+		print OUT "ChrPos\tRef\tCon\tConPct\tReads\tA\tC\tG\tT\tN\tGaps\tMisc\tMedQual\tContribBases\tContribQuals\n";
+	    }
+	    foreach my $align (@{ $aligns{$id} }) {
+		my ($ident, $mismatch, $reps, $Ns, $qgaps, $qgapbp, $sgaps, $sgapbp, $strand, $query1, $querylen, $qstart, $qend, $chr, $chrlen, $cstart, $cend, $blocks, $blocksizes, $qblockstarts, $cblockstarts) = @$align;
+		next if $unique && $hits{$query1} > 1;
+		(my $query = $query1) =~ s/\|\d+$//;
+		$pass = 1;  # at least 1 unique alignment
+#		print " $query\n";
+		my ($seq, $qual) = @{ $fq{$query} };
+		if ($strand eq '-') {
+		    $seq = ${ &revcomp($seq) };
+		    $qual = reverse $qual;
+		}
+		$blocksizes =~ s/,$//;
+		$qblockstarts =~ s/,$//;
+		$cblockstarts =~ s/,$//;
+		my @blocksizes = split /,/, $blocksizes;
+		my @cblockstarts = split /,/, $cblockstarts;
+		my @qblockstarts = split /,/, $qblockstarts;
+		foreach my $j (0..$#qblockstarts) {
+		    my @subseq = split //, substr($seq, $qblockstarts[$j], $blocksizes[$j]);
+		    my @subqual = split //, substr($qual, $qblockstarts[$j], $blocksizes[$j]);
+		    my @mapcoords = ($cblockstarts[$j]..$cblockstarts[$j]+$blocksizes[$j]);
+#		    printf " $query %3i | %3i %3i %3i\n", $j, (scalar @subseq), (scalar @subqual), (scalar @mapcoords);
+		    foreach (0..$#mapcoords) {
+			push @{ $maps{$id}{SEQ}{ $mapcoords[$_] } }, $subseq[$_] || '-';
+			push @{ $maps{$id}{QUAL}{ $mapcoords[$_] } }, $subqual[$_];
+		    }
+		}
+	    }
+	    my $refk = -1;
+	    my @fasta;
+	    if ($pass) {
+#		print "$pass passing alignments\n";
+#		foreach my $k ($rstart..$rstart+100) {   # test mode
+		foreach my $k ($rstart..$rend) {
+		    my ($ktotN, $kconN, $kpct, $kmedq, $kseq, $kqual, $kcon) = (0, 0, 0, 0, '', '', 'N');
+		    my $kref = $reference[++$refk] || 'N';
+		    my %kfreq = map {($_=>0)} @kfreqbase;
+		    if (defined $maps{$id}{SEQ}{$k}) {
+			$ktotN = scalar @{ $maps{$id}{SEQ}{$k} };
+			foreach (@{ $maps{$id}{SEQ}{$k} }) {
+			    $known{"\U$_"} ? $kfreq{"\U$_"}++ : $kfreq{X}++;
+			}
+			my $krepN = $ktotN-$kfreq{N}-$kfreq{'-'};
+			if ($krepN >= 2) {
+			    $kcon = (sort {$kfreq{$b} <=> $kfreq{$a}} keys %kfreq)[0];
+			    $kconN = $kfreq{$kcon};
+			    $kcon = 'n' if $kcon eq 'N';   # if consensus is literally 'N', then lowercase it.
+			    $kcon = $kconN/$krepN > 0.5 ? $kcon : 'N';
+			}
+			foreach (@{ $maps{$id}{SEQ}{$k} }) {
+			    $_ = '.' if $_ eq $kcon;
+			}
+			$kcon = "\L$kcon" if $krepN < 10;   # also lowercase it if known coverage < 10
+			$kpct = sprintf("%0.2f", $kconN/$ktotN);
+			$kseq = join '', @{ $maps{$id}{SEQ}{$k} };
+			$kqual = join '', @{ $maps{$id}{QUAL}{$k} };
+			$kmedq = median([map {ord($_)-33} @{ $maps{$id}{QUAL}{$k} }], 1) if $kfreq{'-'} < $krepN;
+		    }
+		    my $kfreqstr = join "\t", map { $kfreq{$_} } @kfreqbase;
+		    print OUT "$k\t$kref\t$kcon\t$kpct\t$ktotN\t$kfreqstr\t$kmedq\t$kseq\t$kqual\n" unless $onlyfasta;
+		    push @fasta, $kcon;
+		}
+		if ($writefasta) {
+		    my $rseq = ${ &blockify(join '', @reference) };
+		    my $seq = ${ &blockify(join '', @fasta) };
+		    print FA ">$id.TARGET\n$rseq\n>$id.QUERY\n$seq\n";
+		    &write_ifasta($id, ">$id.QUERY\n$seq\n");
+		    &write_ifasta("$id.TARGET", ">$id.TARGET\n$rseq\n");
+		}
+	    } else {
+		foreach my $k ($rstart..$rend) {
+		    my ($ktotN, $kconN, $kpct, $kmedq, $kseq, $kqual, $kcon) = (0, 0, 0, 0, '', '', 'N');
+		    my $kref = $reference[++$refk] || 'N';
+		    my $kfreqstr = join "\t", map {0} @kfreqbase;
+		    print OUT "$k\t$kref\t$kcon\t$kpct\t$ktotN\t$kfreqstr\t$kmedq\t$kseq\t$kqual\n" unless $onlyfasta;
+		    push @fasta, $kcon;
+		}
+		(my $seq = $rseq) =~ tr/ACGTacgt/NNNNNNNN/;  # no passing alignments -- return same length seq as reference, but all Ns
+		print FA ">$id.TARGET\n$rseq\n>$id.QUERY\n$seq\n" if $writefasta;
+		&write_ifasta($id, ">$id.QUERY\n$seq\n");
+		&write_ifasta("$id.TARGET", ">$id.TARGET\n$rseq\n");
+	    }
+	    close OUT unless $onlyfasta;
+	} else {
+	    (my $seq = $rseq) =~ tr/ACGTacgt/NNNNNNNN/;  # no passing alignments -- return same length seq as reference, but all Ns
+	    print FA ">$id.TARGET\n$rseq\n>$id.QUERY\n$seq\n" if $writefasta;
+	    &write_ifasta($id, ">$id.QUERY\n$seq\n");
+	    &write_ifasta("$id.TARGET", ">$id.TARGET\n$rseq\n");
+	}
+    }
+}
+close FA if $writefasta;
+print "blat2consensus complete!\n";
+kill $$;
+
+
+
+sub write_ifasta {
+    
+    my ($name, $block) = @_;
+    my $subdir = $name =~ /TARGET/ ? 'target' : 'query';
+    open IFA, "> $indFaDir/$subdir/$name.fa";
+    print IFA $block;
+    close IFA;
+}

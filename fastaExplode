@@ -1,0 +1,40 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use strict;
+
+my ($file, $outdir, $extension, $nobreaks, @headersToExtract);
+GetOptions("f=s"=>\$file, "o=s"=>\$outdir, "x=s"=>\$extension, "no-breaks"=>\$nobreaks);
+my @headersToExtract = @ARGV;
+my %headersToExtract = map {($_=>1)} @headersToExtract;
+
+die "$0: No input fasta specified!\n" unless $file;
+$outdir = '.' unless $outdir;
+system "mkdir -p $outdir" unless -d $outdir;
+$extension = 'fa' unless $extension;
+
+my ($header, @headers, %seq);
+open IN, $file or die "Failed to open file '$file': $!\n";
+while (<IN>) {
+    if ($_ =~ /^>(.*)/) {
+        &write_seq($header, \$seq) if $seq;
+        $seq = $_;  # HEADER LINE WITH NEWLINE
+        $header = $1;
+        $header =~ s/\s/_/g;  # all whitespace becomes _
+        $header =~ s/\W/./g;  # all symbols become .
+    } else {
+        s/[\n\r]+$// if $nobreaks;
+        $seq .= $_ if $_;
+    }
+}
+close IN;
+&write_seq($header, \$seq);
+exit;
+
+
+sub write_seq {
+    my ($HEAD, $SEQREF) = @_;
+    next if @ARGV && !exists $headersToExtract{$HEAD};
+    open OUT, "> $outdir/$HEAD.$extension";
+    print OUT ${$SEQREF};
+    close OUT;    
+}

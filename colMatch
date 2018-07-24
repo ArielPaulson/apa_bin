@@ -1,0 +1,55 @@
+#!/usr/bin/env perl
+use strict;
+
+## this script matches multiple fixed strings from a specific column
+## grep cannot handle multiple fixed strings when constrained to a specific column
+## awk cannot handle multiple fixed strings, period
+## also avoids problems if any string(s) contains regex-reactive characters
+
+my ($listfile, $filtfile, $column, $retain, $nheader) = @ARGV;
+$column--;
+
+my (%filt, %stats);
+
+open IN1, $listfile;
+while (<IN1>) {
+    s/[\n\r]+$//;
+    $filt{$_} = 1;
+    $stats{FT}++;
+}
+close IN1;
+$stats{FU} = scalar keys %filt;
+
+open IN2, $filtfile;
+while (<IN2>) {
+    s/[\n\r]+$//;
+    if ($. <= $nheader) {
+	print "$_\n";
+    } else {
+	my @data = split /\t/, $_;
+	my $value = $data[$column];
+	$stats{IT}++;
+	$stats{IU}{$value}++;
+	if ($filt{$value}) {
+	    print "$_\n" if $retain;   # keep items in filter
+	    $stats{MT}++;
+	    $stats{MU}{$value}++;
+	} else {
+	    print "$_\n" if !$retain;  # discard items in filter
+	    $stats{MT}++;
+	    $stats{MU}{$value}++;
+	}
+    }
+}
+close IN2;
+
+$stats{IU} = scalar keys %{ $stats{IU} };
+$stats{MU} = scalar keys %{ $stats{MU} };
+
+print STDERR "Filtered $filtfile with $listfile\n";
+print STDERR "$stats{IT} input lines / $stats{IU} unique\n";
+print STDERR "$stats{FT} filter lines / $stats{FU} unique\n";
+print STDERR "$stats{MT} matched lines / $stats{MU} unique\n";
+print STDERR "$0 complete!\n";
+exit;
+

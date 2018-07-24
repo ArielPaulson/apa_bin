@@ -1,0 +1,14 @@
+#!/usr/bin/perl
+use Cwd;
+
+touch_dir(cwd());
+exit;
+
+sub touch_dir {
+	my $dir = shift;
+	foreach my $file (glob "$dir/*") {
+		system "touch $file";
+		touch_dir($file) if -d $file;
+	}
+}
+ 

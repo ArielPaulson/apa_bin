@@ -1,0 +1,24 @@
+#!/bin/bash
+set -e
+
+usr=$(whoami)
+echo -e "HOST\tCPUS\tRAM.GB\tSWAP.GB\tTMP.GB\tSCRATCH.GB"
+
+if [ -z $1 ]; then
+    thishost=$(hostname)
+    thishost=${thishost%.sgc.loc}
+    str=$(/home/apa/local/bin/hostStats_subunit)
+    echo -e "$thishost\t$str"
+else
+    for host in "$@"
+    do  
+	if ping -c 1 $host > /dev/null 2>&1
+	then
+	    str=$(ssh -q -x $usr@$host '/home/apa/local/bin/hostStats_subunit' 2> /dev/null)
+	    echo -e "$host\t$str"
+	else 
+	    echo -e "$host\tNA\tNA\tNA\tNA\tNA"
+	fi
+    done
+fi
+

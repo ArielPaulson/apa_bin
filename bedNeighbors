@@ -1,0 +1,154 @@
+#!/usr/bin/perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+die;   # UNDER CONSTRUCTION
+
+# Annotates one or more target bed files with gene/exon hits, or nearest neighbors (in either direction).
+# Takes 1+ bed files of targets, and several types of feature bed files (genes mandatory, exons/uxons optional).
+# FEATURE BED FILES MUST HAVE STRAND, EVEN IF STRANDWISE MATCHING IS OFF (which it is by default).
+# Target beds do not require strands, unless strandwise matching is on.
+# Returns hit genes (and uxons if available), otherwise neighbors in both directions.
+# Neighbors are assigned to 5' and 3' based on target strand.  If no target strand info, (+) strand is assumed.
+# Allows bedtools-style strandedness control.
+#
+# Future: add uxon/iintron numbering (so reports if hit uxon 1 vs N, or iintron 1, as TSS-proximal features may be more significant).
+
+
+# globals
+
+my @peaks;   # peak file list
+my $strand;  # bedtools strand-handling flag -- strand-insensitive by default
+
+# temp files
+
+my $gntmp = "bedNeighbors.$$.gn.tmp";
+my $uptmp = "bedNeighbors.$$.up.tmp";
+my $dntmp = "bedNeighbors.$$.dn.tmp";
+my $uxtmp = "bedNeighbors.$$.ux.tmp";
+
+# GetOptions
+
+my $genebed;    # genes bed file -- MUST HAVE STRAND
+my $exonbed;    # optional exons bed file -- MUST HAVE STRAND -- will get converted to uxon bed on the fly
+my $uxonbed;    # optional uxons file -- MUST HAVE STRAND
+my $senseonly;  # restrict matching to same strand of target
+my $antionly;   # restrict matching to opposite strand of target
+
+GetOptions("g=s" => \$genebed, "e=s" => \$exonbed, "u=s" => \$uxonbed, "s=s" => \$senseonly, "S=s" => \$antionly);
+
+# variables QC
+
+die "Gene bed '$genebed' not found!\n" unless -e $genebed;
+die "Exon bed '$exonbed' not found!\n" if ($exonbed && !-e $exonbed);
+die "Uxon bed '$uxonbed' not found!\n" if ($uxonbed && !-e $uxonbed);
+die "Cannot specify both -e and -u!\n" if $exonbed && $uxonbed;
+die "Cannot specify both -s and -S!\n" if $senseonly && $antionly;
+
+$strand = $senseonly ? '-s' : $antionly ? '-S' : '';
+
+foreach my $file (@ARGV) {
+    die "Peaks file '$file' not found!\n" unless -e $file;
+    push @peaks, $file;
+}
+
+# feature file testing
+
+foreach my $file ($genebed, $exonbed, $uxonbed) {
+    next unless -e $file;
+    open IN, $file or die "Cannot read feature file '$file': $!\n";
+    while (<IN>) {
+	next if ($_ =~ /^track/ || $_ =~ /^#/);
+	my $N = scalar (split /\t/, $_);
+	die "Feature file '$file' has less than six columns!\n" if $N < 6;
+	last;
+    }
+    close IN;
+}
+
+# convert exon bed to uxon bed, if necessary
+
+if ($exonbed) {
+    $uxonbed = "bedNeighbors.$$.ux1.tmp";
+    system "/home/apa/local/bin/exons2uxons $exonbed > $uxonbed";
+}
+
+# intersection and summarization
+
+foreach my $file (@peaks) {
+
+    print "$file\n";
+    my %pdat;
+    
+    system "intersectBed $strand -split -wao -a $file -b $genebed > $gntmp";  # gene matches
+    system "intersectBed $strand -split -wao -a $file -b $uxonbed > $uxtmp" if $uxonbed;  # uxon matches
+    system "closestBed $strand -D a -io -id -a $file -b $genebed > $uptmp";  # non-overlapping, transcriptionally-upstream neighbor genes
+    system "closestBed $strand -D a -io -iu -a $file -b $genebed > $dntmp";  # non-overlapping, transcriptionally-downstream neighbor genes
+    
+    open IN, $gntmp or die "Failed to open gene match file: $!\n"; 
+    while (<IN>) {
+	chomp;
+	my @data = split /\t/, $_;
+	my $over = pop @data;
+	my @peak = join "\t", @data[0..-7];
+	my @feat = @data[-6..-1];
+	$pdat{H}{$feat[3]}{G} = $over;
+    }
+    close IN;
+    
+    open IN, $uptmp or die "Failed to open upstream match file: $!\n"; 
+    while (<IN>) {
+	chomp;
+	my @data = split /\t/, $_;
+	my $dist = pop @data;
+	my @peak = join "\t", @data[0..-7];
+	my @feat = @data[-6..-1];
+	next if exists $pdat{H};  # already hit a gene; don't need neighbors
+	if ($feat[0] eq 'none' && $feat[1] == -1) {
+	    ($feat[3], $dist) = $peak[5] eq '-' ? ("$data[0].end", $data[2]) : ("$data[0].start", $data[1]);
+	}
+	$pdat{N}{5}{$feat[3]} = -1 * $dist;  # $dist was negative
+    }
+    close IN;
+    
+    open IN, $dntmp or die "Failed to open downstream match file: $!\n"; 
+    while (<IN>) {
+	chomp;
+	my @data = split /\t/, $_;
+	my $dist = pop @data;
+	my @peak = join "\t", @data[0..-7];
+	my @feat = @data[-6..-1];
+	next if exists $pdat{H};  # already hit a gene; don't need neighbors
+	if ($feat[0] eq 'none' && $feat[1] == -1) {
+	    ($feat[3], $dist) = $peak[5] eq '-' ? ("$data[0].start", $data[1]) : ("$data[0].end", $data[2]);
+	}
+	$pdat{N}{3}{$feat[3]} = $dist;
+    }
+    close IN;
+    
+    if ($uxonbed) {
+	open IN, $uxtmp or die "Failed to open uxon match file: $!\n"; 
+	while (<IN>) {
+	    chomp;
+	    my @data = split /\t/, $_;
+	    my $over = pop @data;
+	    my @peak = join "\t", @data[0..-7];
+	    my @feat = @data[-6..-1];
+	    my $gene = (split /:/, $feat[3])[0];
+	    $pdat{H}{$gene}{U}{$feat[3]} = $over;
+	}
+	close IN;
+    }
+    
+    my @output = ("Chr\tStart\tEnd\t");
+    
+    
+    
+    
+    
+    
+    
+    system "rm -f bedNeighbors.$$.*.tmp";
+}
+exit;

@@ -1,0 +1,39 @@
+#!/usr/bin/perl
+use strict;
+
+## verbose, timestamped 'cp -R' wrapper.
+## does NOT copy the target directory, ONLY its contents
+##  e.g. if copying /path1/data to /path2/data, must specify like this,
+##  NOT as /path1/data to /path2 : the 'data' subdir will not be created.
+
+my ($from, $to) = @ARGV;
+$from =~ s/\/$//;  # drop trailing slash, if exists
+$to =~ s/\/$//;
+die "Read directory '$from' does not exist!\n" unless -d $from;
+die "Write directory '$to' does not exist!\n" unless -d $to;
+
+chdir $from;
+my (@dirs, @files);
+foreach (glob "*") {
+    if (-d $_) {
+	push @dirs, $_;
+    } else {
+	push @files, $_;
+    }
+}
+
+if (@files) {
+    chomp(my $now = `date`);
+    print "Copying ", scalar @files, " files: $now\n";
+    system "cp $_ $to/$_" foreach @files;
+}
+
+foreach my $dir (@dirs) {
+    chomp(my $now = `date`);
+    print "Copying $dir: $now\n";
+    system "cp -R $dir $to/";
+}
+
+chomp(my $now = `date`);
+print "Finished: $now\n";
+exit;

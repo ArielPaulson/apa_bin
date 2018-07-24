@@ -1,0 +1,176 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## Takes 2 HiC fastqs, one for each end, aligns each independently with bowtie2.
+## Filters both bams to contain only pair-aligned reads (no orphans), and creates a unified bam.
+## Then, splits each the unified bam into "noise" (short-range alignment) and "signal" (long-range alignment) bams.
+## Finally, runs RChipQC.R on the signal bam, and makes bigWigs for signal and noise.
+
+
+## LATER WILL HAVE FULL ALIGNMENT CODE.
+## FOR NOW, RE-PROCESSING EXISTING BAMS
+
+
+## output bams: (single, multi) x (signal, noise); if any end multi, then pair is considered multi
+
+my $tmp = "hicAlign.$$.tmp";
+my $hicAlignR = "/home/apa/local/bin/scriptutils/hicAlign.R";
+my $RChipQCR = "/home/apa/local/bin/RChipQC.R";
+my $bam2track = "/home/apa/local/bin/bam2track";
+
+my ($outdir, $prefix, $geno, $cores, $ram, %bams);
+
+($outdir, $prefix, $geno, $cores, $ram, $bams{1}{IN}, $bams{2}{IN}) = @ARGV;
+
+die "$0: no output prefix!\n" unless $prefix;
+$outdir = "$outdir/$prefix";
+die "$0: genome '$geno' has no local build!\n" unless -d "/n/data1/genomes/indexes/$geno";
+$cores = 1 unless $cores;
+$ram = '1G' unless $ram;
+
+foreach my $i (1,2) {
+    die "$0: end-$i bam '$bams{$i}{IN}' does not exist!\n" unless -e $bams{$i}{IN};
+    $bams{$i}{BAI} = "$bams{$i}{IN}.bai";
+    ($bams{$i}{IDX} = $bams{$i}{IN}) =~ s/.bam$/.idxstats.txt/;
+    ($bams{$i}{ORPH} = $bams{$i}{IN}) =~ s/.bam$/.orphans.bam/;
+    ($bams{$i}{PAIRM} = $bams{$i}{IN}) =~ s/.bam$/.paired.multi.bam/;
+    ($bams{$i}{PAIRU} = $bams{$i}{IN}) =~ s/.bam$/.paired.nomulti.bam/;
+}
+$bams{3}{ORPH} = "$outdir/$prefix.orphans.bam";
+$bams{3}{PAIRM} = "$outdir/$prefix.paired.multi.bam";
+$bams{3}{PAIRU} = "$outdir/$prefix.paired.nomulti.bam";
+(my $hicstats = $bams{3}{PAIRU}) =~ s/bam$/hicAlign.stats.txt/;
+my $sigbam = "$outdir/$prefix.paired.nomulti.signal.bam";
+my $noibam = "$outdir/$prefix.paired.nomulti.noise.bam";
+
+die "$0: improbably, temp dir '$tmp' already exists!\n" if -d $tmp;
+mkdir $tmp;
+die "$0: output location '$outdir' already exists!\n" if -d $outdir;
+system "rm -rf $outdir";
+system "mkdir -p $outdir" unless -d $outdir;  ### FIXME
+
+foreach my $i (1,2) {
+    my %reads = ();
+    my $j = $i==1 ? 2 : 1;
+    
+    print "Reading end-$j read IDs...\n";
+    open my $RD, "samtools view -F 4 $bams{$j}{IN} |";  ### MUST FILTER -F 4
+    while (<$RD>) {
+        my ($header, $else) = split /\t/, $_, 2;
+        $reads{$header} = $else =~ /\tXS:i:/;  # 0|1 for multiread-ness
+    }
+    close $RD;
+    
+    print "Filtering end $i orphans...\n";
+    open my $PAIRU, "| samtools view -h -bS - > $bams{$i}{PAIRU}";
+    open my $PAIRM, "| samtools view -h -bS - > $bams{$i}{PAIRM}";
+    open my $ORPH,  "| samtools view -h -bS - > $bams{$i}{ORPH}";
+    open my $HEAD,  "samtools view -H $bams{$i}{IN} |";
+    while (<$HEAD>) {
+        print $PAIRU $_;
+        print $PAIRM $_;
+        print $ORPH $_;
+    }
+    close $HEAD;
+    open my $SAM, "samtools view -F 4 $bams{$i}{IN} |";  ### MUST FILTER -F 4
+    while (<$SAM>) {
+        my $multi = $_ =~ /\tXS:i:/;
+        my ($read, $flags, $etc) = split /\t/, $_, 3;
+        $flags++;  # PE bit
+        $flags += $i==1 ? 64 : 128;  # end bit
+        if (exists $reads{$read}) {
+            if ($multi || $reads{$read}) {
+                print $PAIRM "$read\t$flags\t$etc";
+            } else {
+                print $PAIRU "$read\t$flags\t$etc";
+            }
+        } else {
+            print $ORPH "$read\t$flags\t$etc";
+        }
+    }
+    close $_ foreach ($SAM, $PAIRU, $PAIRM, $ORPH);
+}
+
+foreach my $set (qw/ ORPH PAIRM PAIRU /) {
+    print "Creating $bams{3}{$set}...\n";
+    &execute("samtools merge $bams{3}{$set} $bams{1}{$set} $bams{2}{$set}", 1);
+    &execute("samtools index $bams{3}{$set}", 1);
+    (my $IDX = $bams{3}{$set}) =~ s/bam$/idxstats.txt/;
+    &execute("samtools idxstats $bams{3}{$set} > $IDX", 1);
+}
+
+my $siglim = 1000;
+
+print "Splitting signal from noise (threshold=$siglim)...\n";
+open my $SIG,  '|-', "samtools view -h -bS > $sigbam";
+open my $NOI,  '|-', "samtools view -h -bS > $noibam";
+open my $HEAD, '-|', "samtools view -H $bams{3}{PAIRU}";
+while (<$HEAD>) {
+    print $SIG $_;
+    print $NOI $_;
+}
+close $HEAD;
+open my $SAM,  '-|', "samtools sort -n $bams{3}{PAIRU} | samtools view";
+my @prev;
+while (<$SAM>) {
+    my @data = split /\t/, $_, 11;   ## $read, $flags, $chr, $start, $mapq, $cigar, $mchr, $mstart, $flen, $seq, $etc\n
+    if ($data[0] eq $prev[0]) {
+        ## both mate alignments are now loaded
+        if ($data[2] eq $data[2]) {
+            ## cis; could be "signal" or "noise" depending on MP distance
+            ## @prev alignment should be 5' to @data alignment
+            my $flen = ($data[3]+length($data[9])-1) - $prev[3];  # fragment length (outer MP distance)
+            $prev[1] += 2;  # proper-pair-align bit
+            $data[1] += 2;
+            @prev[6,7,8] = ('=', $data[3],  $flen);   # $mchr, $mstart, $flen
+            @data[6,7,8] = ('=', $prev[3], -$flen);
+            if ($flen >= $siglim) {
+                print $SIG join("\t", @prev);
+                print $SIG join("\t", @data);
+            } else {
+                print $NOI join("\t", @prev);
+                print $NOI join("\t", @data);
+            }
+        } else {
+            ## trans; automatically "signal"
+            @prev[6,7] = ($data[2], $data[3]);   # $mchr, $mstart
+            @data[6,7] = ($prev[2], $prev[3]);
+            print $SIG join("\t", @prev);
+            print $SIG join("\t", @data);
+        }
+    }
+    @prev = @data;
+}
+close $_ foreach ($SAM, $SIG, $NOI);
+
+## Sort signal / noise bams, index, idxstats
+foreach my $bam ($sigbam, $noibam) {
+    &execute("samtools sort -@ $cores -m $ram -o $tmp/TMP.bam $bam", 1);
+    &execute("mv -f $tmp/TMP.bam $bam", 1);
+    &execute("samtools index $bam", 1);
+    (my $idx = $bam) =~ s/bam$/idxstats.txt/;
+    &execute("samtools idxstats $bam > $idx", 1);
+}
+
+## Make bigWigs
+my @M;
+foreach (1,2) {
+    &execute("samtools index $bams{$_}{IN}", 1) unless -e $bams{$_}{BAI};
+    &execute("samtools idxstats $bams{$_}{IN} > $bams{$_}{IDX}", 1) unless -e $bams{$_}{IDX};
+}
+chomp($M[0] = `bash -c 'paste -s -d+ <(grep -v '*' $bams{1}{IDX} | cut -f3) | bc'`);  ### ASSUMING ONLY ONE ALIGNMENT PER READ!!!!
+chomp($M[1] = `bash -c 'paste -s -d+ <(grep -v '*' $bams{2}{IDX} | cut -f3) | bc'`);  ### "
+my $Mval = $M[0]+$M[1];    # ORIGINAL N ALIGNED READS
+
+foreach my $bam ($bams{3}{ORPH}, $bams{3}{PAIRM}, $sigbam, $noibam) {
+    &execute("$bam2track -b $bam -g $geno -n APM -Mval $Mval --BW", 1);
+}
+#&execute("$RChipQCR $bams{3}{PAIRU} 10 TRUE FALSE 1000 TRUE $geno", 1);
+print STDERR "$RChipQCR $bams{3}{PAIRU} 10 TRUE FALSE 1000 TRUE $geno\n";
+
+system "rm -rf $tmp";
+system "kill $$";   ### DO NOT USE 'exit'!!!  hashes much too large
+

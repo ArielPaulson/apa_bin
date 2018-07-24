@@ -1,0 +1,89 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## Inputs
+my $bed;     # bed file
+my $ref;     # reference fasta
+my $flank5;  # 5' flank distance to include
+my $flank3;  # 3' flank distance to include
+my $chrsize; # chr sizes file; only required if using $flank3 and/or $flank5
+my $meme;    # write output in minimal MEME format?  (instead of plain text matrix)
+
+## Globals
+my %sequences;  # sequences from bed regions
+my %PSSM;       # generated PSSM
+my $width;      # BED entry width
+my $tmp = "bed2pssm.$$.tmp";
+system "mkdir $tmp";
+die "$0: Failed to create temp dir '$tmp'!\n";
+
+GetOptions("b=s" => \$bed, "r=s" => \$ref, "f5=i" => \$flank5, "f3=i" => \$flank3, "meme" => \$meme);
+
+die "$0: Failed to locate reference fasta '$ref'!\n" unless -e $ref;
+
+if ($flank5 || $flank3) {
+    unless (-e $chrsize) {
+	print "$0: Specified -f5/-f3 but not -c.  Calculating...\n";
+	system "/home/apa/local/bin/fastaLengths -f $ref > $tmp/ref.lengths";
+	$chrsize = "$tmp/ref.lengths";
+    }
+}
+
+if ($flank5 && $flank3) {
+    system "slopBed -i $bed -g $chrsize -l $flank5 -r $flank3 > $tmp/flanked.bed";
+} elsif ($flank5) {
+    system "slopBed -i $bed -g $chrsize -l $flank5 > $tmp/flanked.bed";
+} elsif ($flank3) {
+    system "slopBed -i $bed -g $chrsize -r $flank3 > $tmp/flanked.bed";
+} else {
+    system "cp $bed $tmp/flanked.bed";
+}
+
+my %lengths;
+system "/home/apa/local/bin/bedLengths -b $tmp/flanked.bed > $tmp/flanked.bed.lengths";
+open my $IN1, '<', "$tmp/flanked.bed.lengths" or die "$0: Cannot open '$tmp/flanked.bed.lengths' for reading: $!\n";
+while (<$IN1>) {
+    $_ =~ s/[\n\r]+$//;
+    my $len = (split /\t/, $_)[-1];
+    $lengths{$len}++;
+}
+close $IN1;
+
+die "$0: BED entries do not all have same length: cannot create PSSM!\n" if scalar (keys %lengths) != 1;
+$width = (keys %lengths)[0];
+
+system "/home/apa/local/bin/bed2fasta -i $tmp -r $ref -p $tmp/sequence";
+
+my @fail = split /\n/, `grep 0$ $tmp/sequence.extraction_success`;
+print "$0: Bed extraction failed: $_\n" foreach @fail;
+
+my $header;
+open my $IN2, '<', "$tmp/sequence.fa" or die "$0: Failed to open extracted fasta '$tmp/sequence.fa' for reading: $!\n";
+while (<$IN2>) {
+    $_ =~ s/[\n\r]+$//;
+    if ($_ =~ /^>(.*)/) {
+	$header = $1;
+    } else {
+	$sequences{$header} .= $_;
+    }
+}
+close $IN2;
+
+foreach my $header (keys %sequences) {
+    my @bases = split //, $sequences{$header};
+    $PSSM{$_}{ $bases[$_] }++ foreach (0..$#bases);
+}
+
+if ($meme) {
+    print "$0: option --meme not yet ready!\n";
+} else {
+    print ">$bed\n";
+    print join("\t",('', map{"\t".$_} (1..$width))),"\n";
+    foreach my $base (qw/ A C G T /) {
+	print join("\t",($base, map { "\t$PSSM{$_}{$base}" } (0..$width-1))),"\n";
+    }
+}
+exit;
+

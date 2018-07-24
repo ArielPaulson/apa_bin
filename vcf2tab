@@ -1,0 +1,446 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Excel::Writer::XLSX;
+use Data::Dumper;
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+## Tabularizes a VCF, in particular the INFO fields, genotype columns, and snpEff effects.
+## Each unique INFO key in the VCF gets its own column; each row may or may not have values for all keys.
+## Multi-alt variants may be split into one row per alt, all other fields being equal (--alleles).
+## snpEff effects strings can be tabularized such that:
+##   each unique effect type gets its own column (--col-effects),
+##   each unique transcript/effect combo gets its own row (--row-effects), all other fields being equal.
+##     i.e., if variant X has 5 snpEff predictions, then variant X will get 5 output rows, all identical, except for the value in the "snpEff" column.
+## Can write as txt (default) or xlsx (--xlsx).  Header is discarded.
+
+
+## FIXME: colEff handling for RPKMs, ortho data??
+
+
+## Inputs
+my $invcf;    # input VCF
+my $outfile;  # output file
+my $xlsx;     # write XLSX output?
+my $rowEff;   # split effects fields and output one line per effect?
+my $colEff;   # output effects fields into separate columns per type?
+my $alleles;  # split multi-allele records into one record per allele?
+my ($help, $man, $version);
+
+GetOptions(
+    "i=s" => \$invcf,
+    "o=s" => \$outfile,
+    "xlsx" => \$xlsx,
+    "row-effects" => \$rowEff,
+    "col-effects" => \$colEff,
+    "alleles" => \$alleles,
+    "help" => \$help,
+    "man" => \$man,
+    "version" => \$version
+    );
+
+
+## Globals
+my @header;      # VCF header
+my %allheader;   # all header fields
+my @lines;       # non-header line numbers (first,last)
+my %matrix;      # main output table
+my %effects;     # separate output table for effects fields, which can be many->one
+my %rpkms;       # tracking for RPKM data, if any
+my %rpkm_samps;  # tracking for RPKM sample names, if any
+my $anyortho;    # does any snpOrthology data exist
+my $INFO;        # INFO column number
+my $FORMAT;      # FORMAT column number
+my @GENO;        # genotype column number(s)
+my @geno_names;  # name(s) of genotype column(s)
+my @geno_fmt;    # format fields for genotype data
+my @OTHER;       # tracking for nonstandard field numbers
+my $have_geno;   # genotype fields exist
+my $have_other;  # @OTHER fields exist
+my $have_eff;    # snpEff effects exist
+my %effTypes;    # observed effect types
+my $EFFANN;      # effect type field format (old 'EFF' or new 'ANN')
+my %EFFANN;      # tally of above instances
+my $split_eff = $rowEff || $colEff ? 1 : 0;  # splitting effects, one way or the other
+my %HETHOM = ('HET',1, 'HOM',1);  # strings to match
+my %VARTYPE = map {($_=>1)} qw/ SNP MNP INS DEL /;  # strings to match
+my %MISC = map {($_=>1)} qw/ DS RV VLD /;  # strings to match
+my %typeswap;    # tracks old->new variant type settings
+
+
+## Argument testing
+unless ($outfile) {
+    ($outfile = $invcf) =~ s/\.vcf(\.gz)?$//;
+    if ($xlsx) {
+        $outfile .= '.xlsx';
+    } else {
+        $outfile .= '.txt';
+        $outfile .= '.gz' if $invcf =~ /\.gz$/;
+    }
+}
+
+
+
+
+## Main
+
+my $IN = &open2('R', $invcf, 'input vcf');
+my $nr = 0;
+while (my $line = <$IN>) {
+    next if $line =~ /^##/;
+    $line =~ s/[\n\r]+$//;
+    if ($line =~ /^#CHROM/) {
+        $line =~ s/^#//;
+        $lines[0] = $.;
+        @header = split /\t/, $line;  # CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	<SAMPLES>
+        foreach my $i (0..$#header) {
+            if ($header[$i] eq 'INFO') {
+                $INFO = $i;
+            } elsif ($header[$i] eq 'FORMAT') {
+                $FORMAT = $i;
+                last;   # ASSUMES ALL TRAILING COLUMNS ARE GENOTYPE DATA
+                
+#            } elsif ($GENO{$i}) {     # already accounted for 
+#                $have_geno = 1;
+#            } elsif ($i > $FORMAT) {  # other (nonstandard) fields?  (BETWEEN FORMAT AND GENO COLS)
+#                push @OTHER, $i;
+#                $have_other = 1;
+#               push @{ $allheader{OTHER} }, $header[$i];
+            }
+        }
+        @{ $allheader{CORE} } = @header[0..6];
+        if ($#header > $FORMAT) {
+            $have_geno = 1;
+            @GENO = ($FORMAT+1..$#header);  # expected positions of genotype columns
+            @geno_names = @header[@GENO];
+        }
+    } else {
+        $nr++;
+        my @data = split /\t/, $line;
+        ## CORE
+        my ($POS, $REF, $ALT) = @data[2..4];
+        my @alts = $alleles ? (split /,/, $ALT) : ($ALT);
+        my @ids = split /,/, $data[2];
+        @ids = (map {$ids[0]} @alts) if $#alts > $#ids;  # basically, multiple unidentified SNPs with just one ID = '.'; convert to array of '.'s for each
+        foreach my $allele (1..scalar(@alts)) {
+            my $alt = $alts[$allele-1];
+            $matrix{$.}{$allele}{CORE}{$header[$_]} = $data[$_] foreach (0,1,3,5,6);  # NOT 2 OR 4
+            $matrix{$.}{$allele}{CORE}{$header[2]} = $ids[$allele];  # VARIANT ID
+            $matrix{$.}{$allele}{CORE}{$header[4]} = $alt;      # ALT CALL
+            ## OTHER
+            if ($have_other) {
+                $matrix{$.}{$allele}{OTHER}{$header[$_]} = $data[$_] foreach @OTHER;
+            }
+            ## INFO
+            foreach my $item (split /;/, $data[$INFO]) {
+                my @keyval = split /=/, $item;
+                if ($keyval[0] eq 'EFF') {           # Old snpEff effects
+                    die "$0: $invcf uses old snpEff fields (\"EFF\"-type), which cannot be separated by allele!  Please reanalyze to get \"ANN\"-type snpEff fields.\n" if $alleles;
+                    ## EFF
+                    $EFFANN = 'EFF';
+                    if ($split_eff) {
+                        foreach my $entry (split /,/, $keyval[1]) {
+                            my ($efftype, $effstring) = ($entry =~ /^([^()]+)\(([^()]+)\)/);
+                            $effTypes{$efftype}++;
+                            if ($rowEff) {
+                                push @{ $effects{$.}{1}{$efftype} }, [$efftype, (split /\|/, $effstring)];  ## using 1 because these cannot be split
+                            } elsif ($colEff) {
+                                push @{ $effects{$.}{1}{$efftype} }, "$efftype($effstring)";                ## using 1 because these cannot be split
+                            }
+                        }
+                    } else {
+                        $matrix{$.}{1}{$EFFANN} = $keyval[1];  # if not splitting, store under %matrix      ## using 1 because these cannot be split
+                    }
+                    $have_eff = 1;
+                    $EFFANN{$EFFANN}++;
+                } elsif ($keyval[0] eq 'ANN') {      # New snpEff effects
+                    ## ANN
+                    $EFFANN = 'ANN';
+                    if ($split_eff || $alleles) {
+                        my @alleletmp;
+                        foreach my $entry (split /,/, $keyval[1]) {
+                            my ($effalt, $efftype, $effstring) = ($entry =~ /^([^\|]+)\|([^\|]+)\|(.*)/);
+                            #print "EFFALT: $effalt\nEFFTYPE: $efftype\nEFFSTRING: $effstring\n";
+                            $effTypes{$efftype}++;
+                            if ($rowEff) {
+                                if ($alleles) {
+                                    push @{ $effects{$.}{$allele}{$efftype} }, [$efftype, (split /\|/, $effstring)] if $effalt eq $alt;
+                                } else {
+                                    push @{ $effects{$.}{1}{$efftype} }, [$efftype, (split /\|/, $effstring)];  ## using 1 because not splitting
+                                }
+                            } elsif ($colEff) {
+                                if ($alleles) {
+                                    push @{ $effects{$.}{$allele}{$efftype} }, "$effalt|$efftype|$effstring" if $effalt eq $alt;
+                                } else {
+                                    push @{ $effects{$.}{1}{$efftype} }, "$effalt|$efftype|$effstring";  ## using 1 because not splitting
+                                }
+                            } elsif ($alleles) {
+                                push @alleletmp, $entry if $effalt eq $alt;
+                            }
+                        }
+                        unless ($split_eff) {
+                            $matrix{$.}{$allele}{$EFFANN} = join(',',@alleletmp);  # recombine effects (for this allele only) into string
+                        }
+                    } else {
+                        $matrix{$.}{1}{$EFFANN} = $keyval[1];  ## using 1 because not splitting
+                    }
+                    $have_eff = 1;
+                    $EFFANN{$EFFANN}++;
+                } elsif ($keyval[0] eq 'RPKM') {     # RPKMs
+                    foreach my $entry (split /,/, $keyval[1]) {
+                        my ($GT, $id, @values) = split /\|/, $entry;
+                        foreach my $pair (@values) {
+                            my ($sample, $rpkm) = ($pair =~ /^(.*):([\d.]+)$/);
+                            $rpkms{$GT}{$id}{$sample} = $rpkm;
+                            $rpkm_samps{$sample} = 1;
+                            ##########   EVENTUALLY MAP G->T RELATIONS FOR 'EFF' OUTPUT   ##########
+                        }
+                    }
+                } elsif ($keyval[0] eq 'SnpOrtho') {     # snpOrthology field
+                    foreach my $entry (split /,/, $keyval[1]) {
+                        my ($Galt, $Talt, $trans, $obs, $cons, $dscore) = split /\|/, $entry;
+                        if ($Galt eq $alt) {   # may be multi-alt position
+                            $matrix{$.}{$allele}{SNPORTHO}{$trans} = [$obs, $cons, $dscore];
+                            $anyortho = 1;
+                        }
+                    }
+                } elsif ($keyval[0] eq 'TYPE') {
+                    if (exists $matrix{$.}{$allele}{INFO}{TYPE}) {
+                        if ($matrix{$.}{$allele}{INFO}{TYPE} ne $keyval[1]) {
+                            #print "$0: WARNING line $. already has a value for INFO key 'TYPE'!  KEEP: '$keyval[1]'  DROP: '$matrix{$.}{$allele}{INFO}{TYPE}'\n";
+                            $typeswap{1}{ "$matrix{$.}{$allele}{INFO}{TYPE} -> $keyval[1]" }++;
+                        } else {
+                            $typeswap{0}{ "$matrix{$.}{$allele}{INFO}{TYPE} -> $keyval[1]" }++;
+                        }
+                    }
+                    $matrix{$.}{$allele}{INFO}{TYPE} = $keyval[1];
+                    $allheader{INFO}{TYPE} = 1;
+                } elsif (defined $keyval[1]) {       # other key=value pair
+                    if (exists $matrix{$.}{$allele}{INFO}{$keyval[0]} && $matrix{$.}{$allele}{INFO}{$keyval[0]} ne $keyval[1]) {
+                        print "$0: WARNING line $. already has a value for INFO key '$keyval[0]'!  KEEP: '$keyval[1]'  DROP: '$matrix{$.}{$allele}{INFO}{$keyval[0]}'\n";
+                    }
+                    $matrix{$.}{$allele}{INFO}{$keyval[0]} = $keyval[1];
+                    $allheader{INFO}{$keyval[0]} = 1;
+                } elsif ($keyval[0] eq 'STR') {      # ignore...?
+                } elsif ($HETHOM{$keyval[0]}) {      # zygosity
+                    $matrix{$.}{$allele}{INFO}{ZYGOSITY} = $keyval[0];
+                    $allheader{INFO}{ZYGOSITY} = 1;
+                } elsif ($VARTYPE{$keyval[0]}) {     # variant type
+                    ## is this still necessary, given the $keyval[0] eq 'TYPE' block above?
+                    $matrix{$.}{$allele}{INFO}{TYPE} = $keyval[0];
+                    $allheader{INFO}{TYPE} = 1;
+                } elsif ($MISC{$keyval[0]}) {        # other tags
+                    $matrix{$.}{$allele}{OTHER}{$keyval[0]} = 1;
+                    $allheader{MISC}{$keyval[0]} = 1;
+                } else {
+                    print "$0: Unknown INFO field '$keyval[0]' on line $.!\n";
+                    ## Then automaticall assume 'other'
+                    $matrix{$.}{$allele}{OTHER}{$keyval[0]} = 1;
+                    $allheader{MISC}{$keyval[0]} = 1;
+                }
+            }
+            ## GENO
+            if ($nr == 1) {
+                ## Set GENO column names
+                @geno_fmt = split /:/, $data[$FORMAT];
+                foreach my $g (@geno_names) {
+                    push @{ $allheader{GENO} }, "$g.$_" foreach @geno_fmt;
+                }
+                #print "@{ $allheader{GENO} }\n";
+            }
+            if ($have_geno) {
+                foreach my $n (0..$#GENO) {
+                    my @geno_dat = split /:/, $data[$GENO[$n]];
+                    foreach my $f (0..$#geno_fmt) {
+                        $matrix{$.}{$allele}{GENO}{"$geno_names[$n].$geno_fmt[$f]"} = $geno_dat[$f]||'.';
+                    }
+                }
+            }
+        }
+    }
+}
+$lines[1] = $.;
+close $IN;
+die "$0: $invcf: Mixed old and new snpEff effects detected: will not proceed!\n" if scalar(keys %EFFANN)>1;
+my @rpkm_samples = sort keys %rpkm_samps;
+
+if ($allheader{MISC}) {
+    push @{ $allheader{OTHER} }, sort keys %{ $allheader{MISC} };
+    delete $allheader{MISC};
+    $have_other = 1;
+}
+
+my ($Ninfo, $Ngeno, $Nother, @effHeader, @effTypeList, %effColNum);
+my ($OUT, $workbook, $sheet, $header_format, $text_format, $row);
+
+$Ninfo = scalar(keys %{ $allheader{INFO} })-1;
+$Ngeno = $#{ $allheader{GENO} } if $have_geno;
+$Nother = $#{ $allheader{OTHER} } if $have_other;
+
+
+## Construct header
+my %outheader;
+# header line 1
+push @{ $outheader{1} }, ('', 'CORE', (map {''} (1..6)), '', 'INFO', (map {''} (1..$Ninfo)));
+if ($have_other) {
+    push @{ $outheader{1} }, 'OTHER';
+    push @{ $outheader{1} }, map {''} (1..$Nother) if $Nother > 0;
+}
+foreach (@GENO) {
+    my @gtmp = map {''} @geno_fmt;
+    $gtmp[0] = 'GENO';
+    push @{ $outheader{1} }, @gtmp;
+}
+push @{ $outheader{1} }, 'EFFECTS' if $have_eff;
+# header line 2
+push @{ $outheader{2} }, 'SNP_NO';
+push @{ $outheader{2} }, @{ $allheader{CORE} } if exists $allheader{CORE};
+push @{ $outheader{2} }, 'ALLELE';
+push @{ $outheader{2} }, sort keys %{ $allheader{INFO} } if exists $allheader{INFO};
+push @{ $outheader{2} }, @{ $allheader{OTHER} } if $have_other;
+push @{ $outheader{2} }, @{ $allheader{GENO} } if exists $allheader{GENO};
+my %efftranch;
+if ($rowEff) {
+    if ($EFFANN eq 'EFF') {
+        my @tranch1 = ('Effect','Effect_Impact','Functional_Class','Codon_Change/Distance','Amino_Acid_Change','Amino_Acid_Length','Gene_Name');
+        ##########   EVENTUALLY BE ABLE TO ADD GENE ID, RPKM TO @TRANCH1   ##########
+        my @tranch2 = ('Transcript_BioType','Gene_Coding','Transcript_ID');
+        my @tranch3 = ('Exon/Intron_Rank','Genotype_Number','Warnings/Errors');
+        %efftranch = (1,[0..6], 2,[7..9], 3,[10..12]);
+        if (exists $rpkms{T}) {
+            push @tranch2, map { "Transcript_RPKM_$_" } @rpkm_samples;
+        }
+        ## No SnpOrthology fields; not compatible with older 'EFF'-style annotations
+        push @{ $outheader{2} }, (@tranch1,@tranch2,@tranch3);   # OLD SNPEFF
+    } elsif ($EFFANN eq 'ANN') {
+        my @tranch1 = qw/ Consequence Impact Gene_Name Gene_ID /;
+        my @tranch2 = qw/ Feature_Type Feature_ID /;
+        my @tranch3 = qw/ Feature_Biotype Rank HGVS.c HGVS.p cDNA_Pos CDS_Pos AA_Pos Distance Errors /;
+        %efftranch = (1,[0..3], 2,[4,5], 3,[6..14]);
+        if (exists $rpkms{G}) {
+            push @tranch1, map { "Gene_RPKM_$_" } @rpkm_samples;
+        }
+        if (exists $rpkms{T}) {
+            push @tranch2, map { "Feature_RPKM_$_" } @rpkm_samples;
+        }
+        push @tranch3, ('SnpOrtho.Obs','SnpOrtho.Cons','SnpOrtho.Score') if $anyortho;
+        push @{ $outheader{2} }, (@tranch1,@tranch2,@tranch3);   # NEW STANDARD 'ANN' FIELD  # leaving off first field 'Alt'
+    }
+} elsif ($colEff) {
+    ## NO SPECIAL RPKM HANDLING
+    @effTypeList = sort keys %effTypes;
+    %effColNum = map {($effTypeList[$_]=>$_)} (0..$#effTypeList);
+    push @{ $outheader{2} }, @effTypeList;
+} else {
+    ## NO SPECIAL RPKM HANDLING
+    push @{ $outheader{2} }, $EFFANN;
+}
+
+
+
+## Write outputs
+if ($xlsx) {
+    $workbook = Excel::Writer::XLSX->new($outfile) or die "Cannot write output Excel file '$outfile': $!\n";
+    $sheet = $workbook->add_worksheet('Sheet1');
+    $header_format = $workbook->add_format(bold=>1);
+    $text_format = $workbook->add_format(num_format=>'@');
+} else {
+    $OUT = &open2('W', $outfile, 'output table');
+}
+
+&writeline($outheader{1}, $row++, $header_format);
+&writeline($outheader{2}, $row++, $header_format);
+
+foreach my $line ($lines[0]+1..$lines[1]) {
+    foreach my $allele (sort {$a <=> $b} keys %{ $matrix{$line} }) {  # NUMERIC
+        my @outline = ($line-$lines[0]);  # start with SNP_NO
+        push @outline, $matrix{$line}{$allele}{CORE}{$_} foreach @{ $allheader{CORE} };
+        push @outline, $allele;
+        push @outline, $matrix{$line}{$allele}{INFO}{$_} foreach sort keys %{ $allheader{INFO} };
+        push @outline, $matrix{$line}{$allele}{OTHER}{$_} foreach @{ $allheader{OTHER} };
+        push @outline, $matrix{$line}{$allele}{GENO}{$_} foreach @{ $allheader{GENO} };
+        if ($have_eff) {
+            if ($split_eff) {
+                if ($rowEff) {
+                    if ($EFFANN eq 'EFF') {
+                        foreach my $efftype (keys %{ $effects{$line}{$allele} }) {
+                            foreach my $entry (@{ $effects{$line}{$allele}{$efftype} }) {
+                                my @outfields = @{$entry}[ @{$efftranch{1}}, @{$efftranch{2}} ];
+                                if (exists $rpkms{T}) {
+                                    my $tid = $entry->[ $efftranch{2}->[-1] ];
+                                    push @outfields, map { $rpkms{T}{$tid}{$_}||'NA' } @rpkm_samples;
+                                }
+                                push @outfields, @{$entry}[ @{$efftranch{3}} ];
+                                &writeline([@outline, @outfields], $row++, $text_format);
+                            }
+                        }
+                    } elsif ($EFFANN eq 'ANN') {
+                        foreach my $efftype (keys %{ $effects{$line}{$allele} }) {
+                            foreach my $entry (@{ $effects{$line}{$allele}{$efftype} }) {
+                                my @outfields = @{$entry}[ @{$efftranch{1}} ];
+                                my $gid = $entry->[ $efftranch{1}->[-1] ];
+                                my $tid = $entry->[ $efftranch{2}->[-1] ];
+                                (my $tid2 = $tid) =~ s/\.\d+$//;
+                                if (exists $rpkms{G}) {  # gene RPKMs = last part of tranch 1
+                                    push @outfields, map { $rpkms{G}{$gid}{$_}||'NA' } @rpkm_samples;
+                                }
+                                push @outfields, @{$entry}[ @{$efftranch{2}} ];
+                                if (exists $rpkms{T}) {  # transcript RPKMs = last part of tranch 2
+                                    push @outfields, map { $rpkms{T}{$tid}{$_}||'NA' } @rpkm_samples;
+                                }
+                                push @outfields, @{$entry}[ @{$efftranch{3}} ];
+                                if (exists $matrix{$line}{$allele}{SNPORTHO}{$tid}) {  # snpOrthology data = last part of tranch 3
+                                    push @outfields, @{ $matrix{$line}{$allele}{SNPORTHO}{$tid} };
+                                }
+                                if (exists $matrix{$line}{$allele}{SNPORTHO}{$tid2}) {  # transcript may have had ".version" that needed cropping
+                                    push @outfields, @{ $matrix{$line}{$allele}{SNPORTHO}{$tid2} };
+                                }
+                                &writeline([@outline, @outfields], $row++, $text_format);
+                            }
+                        }
+                    }
+#                    foreach my $efftype (keys %{ $effects{$line}{$allele} }) {
+#                        &writeline([@outline, @$_], $row++, $text_format) foreach @{ $effects{$line}{$allele}{$efftype} };
+#                    }
+                } elsif ($colEff) {
+                    my @bycol = map {''} @effTypeList;
+                    foreach my $efftype (keys %{ $effects{$line}{$allele} }) {
+                        $bycol[$effColNum{$efftype}] = join ',', @{ $effects{$line}{$allele}{$efftype} };
+                    }
+                    &writeline([@outline, @bycol], $row++, $text_format);
+                }
+            } else {
+                &writeline([@outline, $matrix{$line}{$allele}{$EFFANN}], $row++, $text_format);
+            }
+        } else {
+            &writeline(\@outline, $row++, $text_format);
+        }
+    }
+}
+
+if ($xlsx) {
+    $workbook->close();
+} else {
+    close $OUT;
+}
+#print "\ninput lines: ",($lines[1]-$lines[0]),"\noutput lines: $out\n";
+if (%typeswap) {
+    print "typeswap:\n";
+    print "$_\t$typeswap{0}{$_}\n" foreach sort keys %{ $typeswap{0} };
+    print "$_\t$typeswap{1}{$_}\n" foreach sort keys %{ $typeswap{1} };
+}
+print "$0 $invcf complete!\n";
+#system "kill $$";
+
+
+
+sub writeline {
+    my ($AREF, $ROW, $FMT) = @_;
+    if ($xlsx) {
+        $sheet->write( $ROW, $_, $$AREF[$_], $FMT ) foreach (0..$#$AREF);
+    } else {
+        print $OUT join("\t", @$AREF), "\n";
+    }
+}

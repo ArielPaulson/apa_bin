@@ -1,0 +1,52 @@
+#!/usr/bin/perl
+use Getopt::Long;
+use strict;
+
+my ($v, $w, $d, $q, $o);  # vcf, wt-vcf for ignored SNPs, min depth, min qual, output file
+GetOptions("v=s" => \$v, "w=s" => \$w, "d=i" => \$d, "q=i" => \$q, "o=s" => \$o);
+die "Must specify -o <output_file>!\n" unless $o;
+
+my (%vcf, %wtvcf, $header);
+
+if ($w) {
+    open IN, $w or die "Cannot open wt vcf file '$w': $!\n";
+    while (<IN>) {
+	$_ =~ s/[\n\r]+$//;
+	next if $. == 1;
+	my ($chr, $pos, $id, $ref, $alt, $qual, $filt, $info, $fmt, $else) = split /\t/, 10;
+	next if $alt eq 'X';  # useless
+	$alt =~ s/,X$//;      # remove trailing 'X' entry, if others exist
+	$wtvcf{$chr}{$pos}{$alt} = 1;
+    }
+    close IN;
+}
+
+my (%dtally, %stage);
+open OUT, "> $o" or die "Cannot write to file '$o': $!\n";
+open IN, $v or die "Cannot open vcf file '$v': $!\n";
+while (<IN>) {
+    if ($. == 1) {
+	print OUT $_;
+	next;
+    }
+    my ($chr, $pos, $id, $ref, $alt, $qual, $filt, $info, $fmt, $else) = split /\t/, $_, 10;
+    my ($dep) = ($info =~ /DP=(\d+)/);
+    $dtally{$dep}++;
+    $stage{1}++;
+    next if $d && $dep < $d;
+    $stage{2}++;
+    next if $q && $qual < $q;
+    $stage{3}++;
+    next if $alt eq 'X';  # useless
+    $stage{4}++;
+    $alt =~ s/,X$//;      # remove trailing 'X' entry, if others exist
+    next if $wtvcf{$chr}{$pos}{$alt};  # ignore if seen in wt 
+    $stage{5}++;
+    print OUT join("\t",($chr, $pos, $id, $ref, $alt, $qual, $filt, $info, $fmt, $else));  # $else has \n
+}    
+close IN;
+close OUT;
+
+#print "$_\t$dtally{$_}\n" foreach sort {$a <=> $b} keys %dtally;
+#print "$stage{1} | $stage{2} | $stage{3} | $stage{4} | $stage{5}\n";
+exit;

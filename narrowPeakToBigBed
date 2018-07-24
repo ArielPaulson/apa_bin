@@ -1,0 +1,116 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+## Dependencies
+my $bin = '/home/apa/local/bin';
+my $sortBedCoord = "$bin/sortBedCoord";
+my $bedToBigBed = "$bin/scriptutils/bedToBigBed";
+
+
+## Inputs
+my $input;   # input narrowPeak file
+my $output;  # output bigBed file
+my $pcolor;  # color peaks intervals by p-value
+my $genome;   # bowtie-built genome ID, i.e. mm9, dm3
+my $chrsize;  # specify chrom.sizes, .fai, or equivalent file, if custom genome
+
+
+## Get and Test Arguments
+GetOptions("i=s"=>\$input, "o=s"=>\$output, "g=s" => \$genome, "c=s" => \$chrsize, "pcolor"=>\$pcolor);
+
+die "$0: no input specified!\n" unless $input;
+unless ($output) {
+    $output = $input;
+    $output =~ s/\.narrowPeak$//;
+    $output .= '.bb';
+}
+
+if ($genome && $chrsize) {
+    print STDERR "$0: '-g' and '-c' are redundant!  Ignoring '-g'...\n";
+} elsif ($genome && !$chrsize) {
+    $chrsize = "/n/data1/genomes/indexes/$genome/$genome.fa.fai";
+    die "$0: Cannot locate chrom sizes file '$chrsize'!  Bad genome label?\n" unless -e $chrsize;
+} elsif ($chrsize && !-e $chrsize) {
+    die "$0: Cannot find chrom sizes file '$chrsize'!\n";
+} elsif (!$genome && !$chrsize) {
+    die "$0: Must specify one of '-g' or '-c'!\n";
+}
+
+
+## Globals
+my %pcols = (
+    0=>"255,0,0",     # red 
+    1=>"255,140,0",   # darkorange
+    2=>"255,255,0",   # yellow
+    3=>"127,255,0",   # chartreuse
+    4=>"0,205,0",     # green3
+    5=>"0,255,255",   # cyan
+    6=>"30,144,255",  # dodgerblue
+    7=>"0,0,255",     # blue
+    8=>"125,38,205",  # purple3
+    9=>"0,0,0"        # black
+    );
+
+
+## Filehandles
+my ($IN, $TMP);
+if ($input =~ /\.gz$/) {
+    open $IN, '-|', "gunzip -c $input" or die "$0: Cannot read input file '$input': $!\n";
+} else {
+    open $IN, '<', $input or die "$0: Cannot read input file '$input': $!\n";
+}
+my $tmp = "narrowPeakToBigBed.$$.tmp";
+open $TMP, '>', $tmp or die "$0: Cannot write temp file '$tmp': $!\n";
+
+
+## Main
+while (<$IN>) {
+    my ($chr, $start, $end, $name, $score, $strand, $fc, $pm, $qm, $summit) = split;  # $summit retains newline
+    print $TMP "$chr\t$start\t$end\t$name\t1\t$strand";
+    if ($pcolor) {
+	my $p = 10**(-1*$pm);
+	my $color;
+	if ($p >= 0.9) {
+	    $color = $pcols{9};
+	} elsif ($p >= 0.8) {
+	    $color = $pcols{8};
+	} elsif ($p >= 0.7) {
+	    $color = $pcols{7};
+	} elsif ($p >= 0.6) {
+	    $color = $pcols{6};
+	} elsif ($p >= 0.5) {
+	    $color = $pcols{5};
+	} elsif ($p >= 0.4) {
+	    $color = $pcols{4};
+	} elsif ($p >= 0.3) {
+	    $color = $pcols{3};
+	} elsif ($p >= 0.2) {
+	    $color = $pcols{2};
+	} elsif ($p >= 0.1) {
+	    $color = $pcols{1};
+	} elsif ($p >= 0.0) {
+	    $color = $pcols{0};
+	} else {
+	    print "$0: Unexpected p-value '$p' from magnitude '$pm', $input line $.\n";
+	}
+	print $TMP "\t$start\t$end\t$color\n";
+    } else {
+	print $TMP "\n";
+    }
+}
+close $IN;
+close $TMP;
+system "$sortBedCoord -i $tmp --overwrite";
+my $N = $pcolor ? 9 : 6;
+my $cmd = "$bedToBigBed -tab -type=bed$N $tmp $chrsize $output";
+print STDERR "$cmd\n";
+system $cmd;
+system "rm -f $tmp";
+exit;
+
+#print R color key?
+#viewPalette(c(2,"darkorange",7,"chartreuse",3,5,"dodgerblue",4,"purple3",1), labels=paste0(">=",seq(0,0.9,0.1)))
+

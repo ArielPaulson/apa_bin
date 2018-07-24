@@ -1,0 +1,436 @@
+#!/usr/bin/env perl
+require '/home/apa/local/bin/apa_routines.pm';   # revcomp, blockify, UTRweld, translate
+use Getopt::Long;
+use strict;
+
+### Get inputs
+
+
+my $input;        # input file, default BED
+my $output;       # optional output filename
+my $exons;        # is this an exons bed file?  (ID=Transcript:Num; will concatenate exon sets into transcripts)
+my $format;       # if not bed; see %kformats hash below
+my $one;          # input is BED-style but coords are 1-based
+my $introndelim;  # mainly for troubleshooting, when using $exons: use this character to mark intron locations in transcripts
+my $prefix;       # use this prefix for output files (fasta and extraction_success), default = $input
+my $width = 50;   # default output fasta line width = 50bp
+my $reference = '.';  # default reference dir = working dir
+my $tmode;        # inframe|best|orf|bestorf (no default).  Translation mode.  For the moment, incompatible with use of 'introndelim'.  
+my $silent;       # do not print warnings
+
+my %kformats = map {($_=>1)} qw/ bed gtf gff psl npsl psle /;  # known formats to work with
+my $knames = join ', ', map {"'$_'"} sort keys %kformats;
+
+# Notes on formats psl, npsl, and psle
+# psl  = proper psl format
+# npsl = psl-style UCSC alignment table: col 1 = alignment number, cols 2-22 are PSL definition (e.g. 'all_mrna.txt', 'all_est.txt')
+# psle = pseudo-psl UCSC alignment table: columns must be as (1) above, EXCEPT: col 19 = 0 | col 20 = tBlockStarts | col 21 = tBlockEnds (e.g. 'refFlat.txt', AFTER YOU REORGANIZE IT)
+#        Note: files like 'refFlat.txt' don't provide most of the PSL data columns, but most aren't necessary anyway.  Just arrange in PSL order (noting changes to cols 19-21) and fill in missing columns with zeroes.
+
+
+GetOptions("r=s" => \$reference, "i=s" => \$input, "o=s" => \$output, "p=s" => \$prefix, "f=s" => \$format, "w=i" => \$width, "t=s" => \$tmode, "exons" => \$exons, "one" => \$one, "intron-delim=s" => \$introndelim, "silent" => \$silent);
+
+
+#print "INTRON DELIMITER: '$introndelim'\n";
+#sleep 1;
+
+my ($frames, $orfs, $idelim);
+if ($tmode) {
+    if ($tmode eq 'inframe') {
+	($frames, $orfs) = ('1', '0');
+    } elsif ($tmode eq 'best') {
+	($frames, $orfs) = ('best', '0');
+    } elsif ($tmode eq 'orf') {
+	($frames, $orfs) = ('1', '1');
+    } elsif ($tmode eq 'bestorf') {
+	($frames, $orfs) = ('best', '1');
+    }
+}
+
+if ($format) {
+    $format = "\L$format";
+    die "$0: Unknown format '$format': must be one of: $knames\n" unless $kformats{$format};
+} else {
+    if ($input =~ /\.bed$/i) {
+	$format = 'bed';
+    } elsif ($input =~ /\.psl$/i) {
+	$format = 'psl';
+    } elsif ($input =~ /\.gtf$/i) {
+	$format = 'gtf';
+    } elsif ($input =~ /\.gff\d?$/i) {
+	$format = 'gff';
+    } else {
+	die "$0: Must specify feature format format '$format': must be one of: $knames\n" unless $kformats{$format};
+    }
+}
+$prefix = $input unless $prefix;
+
+my (@chrord, %ordered, %genestrand, %bychr, %nseq, $top, @fastas, %sequences, $blocks);
+my %strconv = ('+','+', '-','-', '++','+', '--','+', '+-','-', '-+','-');  # converts blatx strands
+
+
+
+## Read genome features
+
+
+
+open my $IN1, '<', $input or die "$0: Cannot open input file '$input' for reading: $!\n";
+print "Parsing '$input'...\n";
+if ($format eq 'bed') {
+    &parse_bed;
+} elsif ($format eq 'psl' || $format eq 'npsl' || $format eq 'psle') {
+    &parse_psl;
+} elsif ($format eq 'gtf' || $format eq 'gff') {
+    &parse_gxf;
+}
+close $IN1;
+
+my ($maxE, $maxG);
+foreach my $chr (keys %{ $nseq{G} }) {
+    $maxG = length($nseq{G}{$chr}) if length($nseq{G}{$chr}) > $maxG;
+    if ($blocks) {
+	$maxE = length($nseq{E}{$chr}) if length($nseq{E}{$chr}) > $maxE;
+    }
+}
+
+
+
+## Test for genomic sequence
+
+
+
+my ($maxchr, $maxchr2);
+if (-d $reference) {  # directory of chr-level fastas
+    
+    @fastas = glob "$reference/*.fa";  # expecting UCSC-style "chr1.fa", e.g.
+    @fastas = glob "$reference/*.fasta" unless @fastas;  # some other fasta set??
+    die "$0: No fastas found in directory '$reference'!\n" unless @fastas;
+    my ($chr, $ext);
+    foreach (@fastas) {
+	($chr, $ext) = ($_ =~ /([^\/]+)\.(fa[sta]{0,3})$/);
+	$maxchr2 = length($chr) if length($chr) > $maxchr2;
+    }
+    $maxchr2 += length($ext)+4; # extra 4 for periods
+    
+} elsif (-e $reference) {  # toplevel fasta: least-efficient way to do this, as must load all sequences at once
+    
+    $top = 1;
+    my $chr;
+    open my $IN2, '<', $reference or die "$0: Cannot open reference fasta '$reference' for reading: $!\n";
+    print "Reading '$reference'...\n";
+    while (<$IN2>) {
+	$_ =~ s/[\n\r]+$//;
+	if ($_ =~ /^>(.*)/) {
+	    $chr = $1;
+	    $maxchr = length($chr) if length($chr) > $maxchr;
+	} elsif ($_ =~ /^#/) {
+	} elsif ($bychr{$chr}) {   # avoid unecessary sequence
+	    $sequences{$chr} .= $_;
+	}
+    }
+    close $IN2;
+    
+} else {
+    
+    die "$0: Cannot locate reference source path '$reference'!\n";
+    
+}
+
+
+
+## Extract/write sequences
+
+
+my $extract = $output ? "$output.extraction_success" : "$prefix.extraction_success";
+$output = "$prefix.fa" unless $output;
+open my $OUT, '>', $output or die "$0: Cannot open '$output' for writing: $!\n";
+open my $IDS, '>', $extract or die "$0: Cannot open '$extract' for writing: $!\n";
+print $IDS "ID\tChr\tStart\tEnd\tSuccess\n";
+foreach my $chr (@chrord) {
+    
+    my $chrseq;
+    my ($fa1, $fa2) = ("$reference/$chr.fa", "$reference/$chr.fasta");
+    
+    if ($top) {
+	$chrseq = $sequences{$chr};
+	printf "Retrieving %${maxchr}s...", $chr;
+    } else {
+	my $FA;
+	if (-e $fa1) {
+	    open $FA, '<', $fa1 or die "$0: Cannot open reference fasta '$fa1' for reading: $!\n";
+	    printf "Reading $reference/%-${maxchr2}s", "$chr.fa...";
+	} elsif (-e $fa2) {
+	    open $FA, '<', $fa2 or die "$0: Cannot open reference fasta '$fa2' for reading: $!\n";
+	    printf "Reading $reference/%-${maxchr2}s", "$chr.fasta...";
+	} else {
+	    print "$0: No obvious fasta files for chr '$chr' found!  Skipping ", (scalar keys %{ $bychr{$chr} }), " bed entries...\n";
+	    next;
+	}
+	while (<$FA>) {
+	    $_ =~ s/[\n\r]//g;
+	    $chrseq .= $_ unless ($_ =~ /^>/ || $_ =~ /^#/);	# skip headers & comments
+	}
+	close $FA;
+    }
+    $| = 1;
+    printf " | %9i bases read", length($chrseq);
+    $| = 1;
+    
+    if ($blocks) {
+	
+	my $successes;
+	printf " | Extracting %${maxE}i blocks in %${maxG}i models...", $nseq{E}{$chr}, $nseq{G}{$chr};
+	$| = 1;
+	foreach my $trans (@{ $ordered{$chr} }) {  # keep in input order, within chromosome
+	    my @exonseq;
+	    foreach my $exon (sort {$a <=> $b} keys %{ $bychr{$chr}{$trans} }) {  
+		my $seq = ${ &extract(@{ $bychr{$chr}{$trans}{$exon} }[2,3], \$chrseq) };
+		if ($seq) {
+		    $bychr{$chr}{$trans}{$exon}->[4] = 1;  # success
+		    $successes++;
+		    push @exonseq, $seq;
+		} else {
+		    push @exonseq, '';
+		}
+		print $IDS (join "\t", @{ $bychr{$chr}{$trans}{$exon} }), "\n";
+	    }
+	    my $transseq = join $introndelim, @exonseq;
+	    $transseq = ${ &revcomp(\$transseq) } if $genestrand{$trans} eq '-';
+	    if ($frames) {
+		my $frames2 = 1;
+		if ($frames eq 'best') {
+		    $frames2 = $genestrand{$trans} eq '.' ? 'bestof6' : 'bestof3';
+		}
+		my %tdata = %{ translate({ 'sequence',$transseq, 'mode',$frames2, 'orfs',$orfs, 'introndelim',$introndelim }) };
+		foreach my $frame (qw/ +0 +1 +2 -0 -1 -2 /) { 
+		    next unless $tdata{$frame};
+		    if ($orfs) {
+			foreach my $orf (keys %{ $tdata{$frame}{ORFS} }) {
+			    my $transaa = ${ &blockify(\$tdata{$frame}{ORFS}{$orf}{ORF_SEQUENCE_AA}) };
+			    print $OUT ">${trans}_${frame}_ORF$orf\n$transaa\n";
+			}
+		    } else {
+			my $transaa = ${ &blockify(\$tdata{$frame}{SEQUENCE_AA}) };
+			print $OUT ">${trans}_$frame\n$transaa\n";
+		    }
+		}
+	    } else {
+		$transseq = ${ &blockify(\$transseq) };
+		print $OUT ">$trans\n$transseq\n";
+	    }
+	}
+	printf " | %${maxE}i blocks succeeded (%0.2f)\n", $successes, 100*$successes/$nseq{E}{$chr};
+	
+    } else {
+	
+	my $successes;
+	printf " | Extracting %${maxG}i regions...", $nseq{G}{$chr};
+	$| = 1;
+	foreach my $id (@{ $ordered{$chr} }) {  # keep in input order, within chromosome
+	    my $seq = ${ &extract(@{ $bychr{$chr}{$id} }[2,3], \$chrseq) };
+	    if ($seq) {
+		$bychr{$chr}{$id}->[4] = 1;  # success
+		$successes++;
+		$seq = ${ &revcomp(\$seq) } if $genestrand{$id} eq '-';
+		if ($frames) {
+		    my $frames2 = 1;
+		    if ($frames eq 'best') {
+			$frames2 = $genestrand{$id} eq '.' ? 'bestof6' : 'bestof3';
+		    }
+		    my %tdata = %{ translate({ 'sequence',$seq, 'mode',$frames2, 'orfs',$orfs, 'introndelim',$introndelim }) };
+		    foreach my $frame (qw/ +0 +1 +2 -0 -1 -2 /) { 
+			next unless $tdata{$frame};
+			if ($orfs) {
+			    foreach my $orf (keys %{ $tdata{$frame}{ORFS} }) {
+				my $aa = ${ &blockify(\$tdata{$frame}{ORFS}{$orf}{ORF_SEQUENCE_AA}) };
+				print $OUT ">${id}_${frame}_ORF$orf\n$aa\n";
+			    }
+			} else {
+			    my $aa = ${ &blockify(\$tdata{$frame}{SEQUENCE_AA}) };
+			    print $OUT ">${id}_$frame\n$aa\n";
+			}
+		    }
+		} else {
+		    $seq = ${ &blockify(\$seq) };
+		    print $OUT ">$id\n$seq\n";
+		}
+		print $IDS (join "\t", @{ $bychr{$chr}{$id} }), "\n";
+	    }
+	}
+	printf " | %${maxG}i regions succeeded (%0.2f)\n", $successes, 100*$successes/$nseq{G}{$chr};
+	
+    }
+}
+close $OUT;
+close $IDS;
+
+print "bed2fasta $input complete!\n";
+exit;
+
+
+
+sub extract {
+    
+    my ($START, $END, $SEQREF) = @_;
+    
+    my $SEQ;
+    if ($START <= $END) {
+	$SEQ = substr($$SEQREF, $START-1, $END-$START+1);
+    } elsif ($START > $END) {	# wraps around breakpoint of circular reference, e.g. MT or plasmid
+	my $SEQA = substr($$SEQREF, $END-1, length($$SEQREF)-$END+1);
+	my $SEQB = substr($$SEQREF, 0, $START);
+	$SEQ = $SEQA.$SEQB;
+    }
+    return \$SEQ;
+    
+}
+
+
+sub parse_bed {
+
+    my %already;
+    while (<$IN1>) {
+	$_ =~ s/[\n\r\"]+$//;
+	next if ($_ =~ /^track/ || $_ =~ /^#/);
+	next unless $_;		# no blank lines
+	my ($chr, $start, $end, @else) = split "\t", $_;   # only first three guaranteed
+	push @chrord, $chr unless $bychr{$chr};
+	$start++ unless $one;
+	my $id = $else[0] || $.;
+	my $strand = $else[2] || '+';
+	print "WARNING: entry '$_' has ambiguous strand: setting to '+'\n" if ($else[2] && $else[2] ne '+' && $else[2] ne '-') && !$silent;
+	if ($exons) {
+	    $blocks = 1;
+	    my ($trans, $exon) = split /:/, $id;   # EXPECTS THIS FORMAT OF EXON ID
+	    unless ($already{$trans}) {
+		push @{ $ordered{$chr} }, $trans;
+		$nseq{G}{$chr}++;
+	    }
+	    $already{$trans} = 1;
+	    $bychr{$chr}{$trans}{"$start\t$end"} = [$chr, $id, $start, $end, 0];  # terminal '0' refers to extraction success: changes later
+	    $genestrand{$trans} = $strand;
+	    $nseq{E}{$chr}++;
+	} else {
+	    $genestrand{$id} = $strand;
+	    push @{ $ordered{$chr} }, $id;  # ordered
+	    $nseq{G}{$chr}++;
+	    if ($else[7]) {   # exon blocks
+		$blocks = 1;
+		my ($blocksizes, $chrstarts) = @else[7,8];
+		$blocksizes =~ s/,$//;
+		$chrstarts =~ s/,$//;
+		my @blocksizes = split /,/, $blocksizes;
+		my @chrstarts = split /,/, $chrstarts;
+		my $nexons = 0;
+		foreach my $i (0..$#blocksizes) {
+		    $nexons++;
+		    my ($start, $end) = $one ? ($chrstarts[$i], $chrstarts[$i]+$blocksizes[$i]-1) : ($chrstarts[$i]+1, $chrstarts[$i]+$blocksizes[$i]);
+		    $bychr{$chr}{$id}{"$start\t$end"} = ["$id:$nexons", $chr, $start, $end, 0];
+		    $nseq{E}{$chr}++;
+		}
+	    } else {
+		$bychr{$chr}{$id} = [$chr, $id, $start, $end, 0];
+	    }
+	}
+    }
+}
+
+
+sub parse_psl {
+    
+    $blocks = 1;  # automatic
+    my (%already, $begin, $i);
+    while (<$IN1>) {
+	if ($. == 1) {
+	    if ($_ =~ /^psLayout/) {  # full psl header
+		$begin = 6;
+	    } elsif ( $_ =~ /^matches/ || $_ =~ /^bin/) {  # filtered psl or headerized npsl
+		$begin = 2;
+	    }
+	}
+	next if $. < $begin;
+	$_ =~ s/[\n\r]+$//;
+	$i++;  # headerless $.
+	my @data = split /\t/, $_;
+	shift @data if $format eq 'npsl';  # drop first "entry #" field
+	my ($match, $misses, $repmatch, $Ns, $qgaps, $qgapbp, $sgaps, $sgapbp, $strand, $id, $length, $qpos1, $qpos2, $chr, $chrlen, $spos1, $spos2, $blocks, $blocksizes, $qstarts, $chrstarts) = @data;
+	push @chrord, $chr unless $bychr{$chr};
+	my $id2 = $already{$id} ? "$id:$i" : $id;  # multiple blat hits for same object?  enumerate them
+	$already{$id}++;
+	$strand = $strconv{$strand};     # in case of blatx results
+	push @{ $ordered{$chr} }, $id2;
+	$nseq{G}{$chr}++;
+	$genestrand{$id2} = $strand;
+	$blocksizes =~ s/,$//;
+	$qstarts =~ s/,$//;
+	$chrstarts =~ s/,$//;
+	my @chrstarts = split /,/, $chrstarts;
+	my $nexons;
+	
+	
+	### must alter (-) strand block start/ends
+	
+	
+	if ($format eq 'psle') {
+	    my @chrends = @chrstarts;  # not actually chrstarts, if $format eq 'psle'
+	    my @chrstarts = split /,/, $qstarts;   # not actually qstarts either
+	    foreach my $i (0..$#chrstarts) {
+		$nexons++;
+		my ($start, $end) = ($chrstarts[$i]+1, $chrends[$i]);
+		$bychr{$chr}{$id2}{"$start\t$end"} = ["$id2:$nexons", $chr, $start, $end, 0];
+		$nseq{E}{$chr}++;
+	    }
+	} else {
+	    my @blocksizes = split /,/, $blocksizes;
+	    foreach my $i (0..$#chrstarts) {
+		$nexons++;
+		my ($start, $end) = ($chrstarts[$i]+1, $chrstarts[$i]+$blocksizes[$i]);
+		$bychr{$chr}{$id2}{"$start\t$end"} = ["$id2:$nexons", $chr, $start, $end, 0];
+		$nseq{E}{$chr}++;
+	    }
+	}
+    }
+}
+
+
+sub parse_gxf {
+
+    $blocks = 1;   # automatic
+    my (%nexons, %already);
+    while (<$IN1>) {
+	$_ =~ s/[\n\r]+$//;
+	next if ($_ =~ /^track/ || $_ =~ /^#/);
+	next unless $_;		# no blank lines
+	my ($chr, $source, $type, $start, $end, $score, $strand, $phase, $annot) = split "\t", $_;
+	next unless $type eq 'exon';
+	my ($gene, $trans, $exon, $id);
+	
+	###### MUST TEST FOR EXON/CDS/UTR ARRANGEMENT
+	
+	push @chrord, $chr unless $bychr{$chr};
+	if ($format eq 'gtf') {
+#	    ($gene) = ($annot =~ /gene_id \"(.*?)\"/);
+	    ($trans) = ($annot =~ /transcript_id \"(.*?)\"/);
+	} elsif ($format eq 'gff') {
+	    ($trans) = ($annot =~ /Parent=(.*?);/);
+	    $trans =~ s/^["']//;
+	    $trans =~ s/["']$//;
+	} else {
+	    die "No format specified!\n";
+	}
+	unless ($already{$trans}) {
+	    push @{ $ordered{$chr} }, $trans;
+	    $nseq{G}{$chr}++;
+	}
+	$already{$trans} = 1;
+	$nexons{$trans}++;
+	$genestrand{$trans} = $strand;
+	if ($strand ne '+' && $strand ne '-') {
+	    print "WARNING: entry '$_' has ambiguous strand: setting to '+'\n" unless !$silent;
+	    $strand = '+';
+	}
+	$bychr{$chr}{$trans}{"$start\t$end"} = ["$id:$nexons{$trans}", $chr, $start, $end, 0];
+	$nseq{E}{$chr}++;
+    }
+}
+

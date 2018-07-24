@@ -1,0 +1,35 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my $invcf = $ARGV[0];
+my $gz = $invcf =~ /\.gz$/ ? 1 : 0;
+
+my $IN;
+if ($gz) {
+    open $IN, '-|', "gunzip -c $invcf";
+} else {
+    open $IN, '<', $invcf;
+}
+
+while (<$IN>) {
+    next if /^#/;
+    s/[\n\r]+$//;
+    my ($chr, $pos, $id, $ref1, $alt1, $qual, $else) = split /\t/, $_, 7;
+    my $start = $pos-1;  # 0-based
+    foreach my $alt (split /,/, $alt1) {
+	foreach my $ref (split /,/, $ref1) {
+#	    my $name = $id;
+	    my $name = $id eq '.' ? "$ref>$alt" : "$id:$ref>$alt";
+	    if (length($ref)>length($alt)) {
+		## Deletion
+		print "$chr\t$start\t",($start+length($ref)-length($alt)),"\t$name\t$qual\t+\n";
+	    } else {
+		## SNP, MNP or Insertion
+		print "$chr\t$start\t",($start+1+length($alt)-length($ref)),"\t$name\t$qual\t+\n";
+	    }
+	}
+    }
+}
+

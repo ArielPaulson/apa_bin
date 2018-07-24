@@ -1,0 +1,49 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use strict;
+
+
+## Converts a VCF with multi-allele alt rows to a VCF with one row per alt.
+##
+## Example input (1 row):
+## chr1  893475  rs9234401  A  G,C  .  .  <ETC>
+##
+## Corresponding output (2 rows):
+## chr1  893475  rs9234401  A  G  .  .  <ETC>
+## chr1  893475  rs9234401  A  C  .  .  <ETC>
+##
+## If multi-ref positions exist, these will be split likewise.
+## If for some bizarre reason any multi-ref/multi-alt positions exist, one row per ref/alt combination (where ref!=alt) will be generated.
+
+
+my ($invcf, $outvcf) = @ARGV;
+unless ($outvcf) {
+    ($outvcf = $invcf) =~ s/(.vcf(.gz)?$)/.mono$1/;
+    $outvcf .= '.gz' if $invcf =~ /\.gz$/;
+}
+
+my $IN = &open2('R', $invcf, 'input VCF');
+my $OUT = &open2('W', $outvcf, 'output VCF', 1);  # if output compressed, extra '1' uses bgzip not gzip
+while (<$IN>) {
+    if (/^#/) {
+        print $OUT $_;
+    } else {
+        my ($chr, $pos, $id, $ref, $alt, $etc) = split /\t/, $_, 6;
+        my @refs = split /,/, $ref;
+        my @alts = split /,/, $alt;
+        if ($#refs||$#alts) {
+            foreach my $ref1 (@refs) {
+                foreach my $alt1 (@alts) {
+                    print $OUT join("\t", $chr, $pos, $id, $ref1, $alt1, $etc) if $ref1 ne $alt1;
+                }
+            }
+        } else {
+            print $OUT $_;
+        }
+    }
+}
+close $IN;
+close $OUT;
+exit;
+
+

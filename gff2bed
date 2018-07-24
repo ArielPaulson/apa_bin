@@ -1,0 +1,31 @@
+#!/usr/bin/perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my $input;
+my $output;
+my $strandfix;
+
+GetOptions("i=s" => \$input, "o=s" => \$output, "fix" => \$strandfix);
+
+my $ext;
+my %ok_ext = map {($_=>1)} qw/ gff gff2 gff3 /; 
+($ext) = ($input =~ /\.(\w{3,4})/);
+$ext = "\L$ext";
+die "Unknown input extension '$ext': must be one of: ", join(', ', sort keys %ok_ext), " !\n" unless $ok_ext{$ext};
+
+open IN, $input or die "$0: Cannot open GFF file '$input' for reading: $!\n";
+open OUT, "> $output" or die "$0: Cannot open output '$output' for writing: $!\n";
+while (<IN>) {
+    next if $_ =~ /^#/ || $_ =~ /^track/;
+    $_ =~ s/[\n\r]+$//;
+    my ($chr, $src, $type, $start, $end, $score, $strand, $frame, $annot) = split /\t/, $_;
+    $start--;  # 0-based
+    $strand = '+' if $strand eq '.' && $strandfix;
+    my ($name) = ($annot =~ /Name=([^;]+)/);
+    print OUT "$chr\t$start\t$end\t$name\t$score\t$strand\n";
+}
+close OUT;
+close IN;
+exit;

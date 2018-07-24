@@ -1,0 +1,68 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+# input:
+#  pfa, k/bins, opt: pref, struct bed, dom/mot beds, --arff.
+#  "k=0" or "bin=1" produces single mean & percent values for entire peptide(s)
+# output content (global, and featwise if feat beds):
+#  kmer hist
+#  dom/mot counts, if provided
+#  promerties (means/pcts & MAs): 
+#   SC wt, SC len, hydrophob, arom, charge, pH, chem props, 
+#   propensities (hel, sheet, turn, bonds, binds, etc), 
+#   C/N PSSM (k=20?), 
+# output structure (one .dat file per fasta per k/bins):
+#  record layout like PDB: c1=stat, c2=type, c3=scope, c4=key, c5=peptide, c6=value(s)
+#  1: call params (header, starts with "#")
+#  2: featwise properties 
+#     Re: features
+#      "GLOBAL" is the only guaranteed feature
+#      other major feat types: AHELIX, BSHEET, BTURN, CCOIL, LOOP, UNORD
+#      other types allowed?
+#      VCF-style key definitions in header?
+#      features also get prevalence stats like N, % peptide, mean AAs, etc.
+#     Re: properties
+#      categoricals get percents, numericals get means.  Both can have mov avgs.
+#      kmer tables if k>=1
+# 
+# examples:
+# KMER A GLOBAL PDQK prot1 7
+# KMER A GLOBAL GLNE prot1 5
+# KMER A AHELIX PDQK prot1 1
+# KMER A BSHEET DDDD prot1 10
+# AHEL P GLOBAL MEAN prot1 1.567
+# AHEL P GLOBAL MAVG prot1 0.252,0.446,0.798,1.015,1.663,...
+# AHEL P AHELIX MEAN prot1 2.625
+# AHEL P AHELIX MAVG prot1    ??? one for each ahelix instance?  Binned MA histo for all? 
+# PHOB P GLOBAL MEAN prot1 1.07
+# PHOB C GLOBAL PCT  prot1 0.18
+
+# HIM TALK FVW
+
+## other things:
+## min overlap of mot/dom with feature?  50% of either?
+## discretize/histogram MA values?
+
+## needs supplementary AA property table.  Per AA:
+## categoricals: NUBAR, phos-able, sulfuric, amide, etc.
+## numericals: propensities, mass, charge, length, pH, hphob, isoE, pKa, binding, bonding, etc.
+
+#http://www.ncbi.nlm.nih.gov/pubmed/14651256
+#http://www.nature.com/nature/journal/v367/n6464/abs/367660a0.html
+#http://www.ncbi.nlm.nih.gov/books/NBK22364/
+
+#http://tango.crg.es/about.jsp
+
+#https://en.wikipedia.org/wiki/Protein_subcellular_localization_prediction
+#http://www.psort.org/ & http://psort.hgc.jp/
+#http://proteomics.ysu.edu/tools/subcell.html
+#http://www.cbs.dtu.dk/services/TargetP/
+#http://cello.life.nctu.edu.tw/
+#http://www.hsls.pitt.edu/obrc/index.php?page=localization_targeting
+#http://expasy.org/resources/search/keywords:subcellular%20location
+#http://www.ncbi.nlm.nih.gov/CBBresearch/Lu/subcellular/
+
+
+

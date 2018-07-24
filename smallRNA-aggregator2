@@ -1,0 +1,181 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Data::Dumper;
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+## Takes a directory of 'smallRNA-pipeline2' output folders and aggregates results:
+## * Makes alignment-stats, trim-stats, trim-histo, fastq-uniqueness, and fraction-size tables
+## * Makes sense, antisense counts tables
+## * Makes idxstats and RnaSeqMetrics tables
+## * Uploads tracks to an indicated location
+## * Makes bigWig headers for uploaded tracks
+## * FUTURE: Makes aggregated track hub
+
+
+my ($outdir, $geno, $anno, $hubname, $tracksdir);
+
+GetOptions("o=s"=>\$outdir, "g=s"=>\$geno, "a=s"=>\$anno, "h=s"=>\$hubname, "d=s"=>\$tracksdir);
+
+die "$0: Working directory '$outdir' does not exist!\n" unless -d $outdir;
+
+chomp($outdir = `readlink -f $outdir`);
+my $aggdir = "$outdir/aggregated";
+system "mkdir $aggdir";
+my $prefix = "$aggdir/aggregated";
+
+my $log = "$prefix.log";
+my $LOG = &open2('W', $log, 'Output log');
+
+my (%files, %fracs);
+my $bin = '/home/apa/local/bin';
+
+my @samples;
+
+foreach my $rundir (glob "$outdir/*") {
+    next unless -e "$rundir/smallRNA-pipeline2.log";  # not a real run directory?
+    (my $sample = $rundir) =~ s/.*\///;
+	push @samples, $sample;
+    my ($fqr1, $fqr2) = ("$rundir/trimmed.fqReads.txt", "$rundir/trimmed.fqReads2.txt");
+    &execute("yes | cp $fqr1 $fqr2", 1, $LOG);
+    &execute("perl -i -pe 's!^(\\S+.fastq.gz)!$sample/\$1!' $fqr2", 1, $LOG);
+    push @{ $files{FQR}{1} }, $fqr2;
+    push @{ $files{HST}{1} }, "$rundir/trimmed.histogram.txt";
+    push @{ $files{ERR}{1} }, "$rundir/trimmed.stderr.txt";
+    push @{ $files{BW}{$sample} }, (glob "$rundir/tracks/*.bw"); ############################ THIS WILL CAUSE PROBLEMS ONCE UNIQUES ARE IN PLACE.  BE PRECISE WITH GLOBS.
+    foreach my $fracdir (glob "$rundir/analysis_*") {
+		(my $frac = $fracdir) =~ s/.*analysis_//;
+		$fracs{$frac} = 1;
+		push @{ $files{SRQ}{$frac} }, "$fracdir/$frac.smallRNA-quantitate2.txt" if -e "$fracdir/$frac.smallRNA-quantitate2.txt";
+		foreach my $aln (qw/ sRNA TE genome /) {
+			my $FAprefix = "$fracdir/${aln}_alignment/$frac.$aln";
+			push @{ $files{SUM}{$frac}{$aln} }, "$FAprefix.Log.txt" if -e "$FAprefix.Log.txt";    ### IF SHORTSTACK
+            push @{ $files{IDX}{$frac}{$aln} }, "$FAprefix.idxstats.txt" if -e "$FAprefix.idxstats.txt";  ## PRIMARY NOT FULL
+		}
+    }
+}
+
+#die Dumper(\%{ $files{BW} }),"\n";
+
+#foreach my $set (sort keys %files) {
+#    my $M = scalar %{ $files{$set} };
+#    my $N = 0;
+#    $N += scalar(@{ $files{$set}{$_} }) foreach keys %{ $files{$set} };
+#    print "$set\t$M\t$N\n";
+#}
+
+my $f1 = $files{SRQ}{ (keys %fracs)[0] }->[0];  # any one of these should do; all runs SHOULD have quantitated the exact same feature set...
+## Group ID Length Count.U Count.S Count.A RPKM.U RPKM.S RPKM.A
+chomp(my @SRQ_header = split /\t/, `head -1 $f1`);
+
+foreach my $frac (sort keys %fracs) {
+    my $fracprefix = "$prefix.$frac";
+    foreach my $i (4..9) {  # counts, RPKMs
+		my $label = $SRQ_header[$i-1];
+		my $fracprefixL = "$fracprefix.$label";
+		&execute("$bin/mergeMatrix -k 2 -v $i -h 1 -kn ID --nosort -o $fracprefixL.SRQmerge1.txt @{ $files{SRQ}{$frac} }", 1, $LOG);
+		&execute("paste <(cut -f1-3 $f1) <(cut -f2- $fracprefixL.SRQmerge1.txt) > $fracprefixL.SRQmerge2.txt", 1, $LOG, 0, 1);
+		&execute("grep -v ^BPTYPE $fracprefixL.SRQmerge2.txt | grep -vP \"^GENE\\t__\" > $fracprefixL.txt", 1, $LOG, 0, 1);
+		unless ($label =~ /RPKM/) {
+			## These values exist only for Counts, not RPKMs
+			&execute("grep -P \"^(Group|BPTYPE)\\t\" $fracprefixL.SRQmerge2.txt | $bin/transpose - | tail -n +2 | sed \"s/^ID\\t/Sample\\t/\" | awk 'BEGIN { OFS=\"\\t\" } { x=\$1; \$1=\"\"; print x,\"$frac\\t$label\",\$0 }' | sed \"s/\\t\\t/\\t/\" > $fracprefixL.BpTypes1.txt", 1, $LOG);
+			&execute("(head -1 $fracprefixL.SRQmerge2.txt && grep -P \"^GENE\\t__\" $fracprefixL.SRQmerge2.txt) | cut -f2- | $bin/transpose - | grep -v ^Length | sed \"s/^ID\\t/Sample\\t/\" | awk 'BEGIN { OFS=\"\\t\" } { x=\$1; \$1=\"\"; print x,\"$frac\\t$label\",\$0 }' > $fracprefixL.htseq_lost1.txt", 1, $LOG);
+			&execute("perl -i -pe 's!\\t\\t!\\t!' $fracprefixL.BpTypes1.txt", 1, $LOG);
+			&execute("perl -i -pe 's!\\t\\t!\\t!' $fracprefixL.htseq_lost1.txt", 1, $LOG);
+		}
+    }
+	
+	foreach my $aln (qw/ TE genomic /) {
+		my $msg = "FRAC $frac ALN $aln FILES ";
+		$msg .= exists $files{SUM}{$frac}{$aln} ? scalar(@{ $files{SUM}{$frac}{$aln} }) : 0;
+		print STDERR "$msg\n";
+		&execute("$bin/mergeAlignSummary -o $fracprefix.$aln.align_summary1.txt -a shortstack @{ $files{SUM}{$frac}{$aln} }", 1, $LOG);
+		&execute("cat $fracprefix.$aln.align_summary1.txt | perl -pe 's/\t/\t$frac\t$aln\t/' > $fracprefix.$aln.align_summary2.txt", 1, $LOG);
+	}
+	my $aln = 'genomic';  # the below are genomic only
+	&execute("$bin/mergeIdxStats -o $fracprefix.$aln.idxstats1.txt @{ $files{IDX}{$frac}{$aln} }", 1, $LOG);
+	&execute("$bin/transpose -i $fracprefix.$aln.idxstats1.txt | awk 'BEGIN { OFS=\"\\t\" } { x=\$1; \$1=\"\"; print x,\"$frac\",\$0 }' | sed \"s/\\t\\t/\\t/\" > $fracprefix.$aln.idxstats2.txt", 1, $LOG);
+	
+}
+
+## OLD CODE
+&execute("$bin/cat2 $aggdir/*.align_summary2.txt > $prefix.align_summary.txt", 1, $LOG);
+&execute("perl -i -pe 's!^File\\t\\S+\\t\\S+!Sample\\tFraction\\tReference!' $prefix.align_summary.txt", 1, $LOG);
+&execute("perl -i -pe 's!Multi\\tNA\\tUnmapped!Multi\\tOver20\\tUnmapped!' $prefix.align_summary.txt", 1, $LOG);
+&execute("perl -i -pe 's!Multi/Mapped\\tNA\\tUnmapped/Total!Multi/Mapped\\tOver20/Multi\\tUnmapped/Total!' $prefix.align_summary.txt", 1, $LOG);
+
+&execute("$bin/cat2 --header=2 $aggdir/*.idxstats2.txt > $prefix.idxstats.txt", 1, $LOG);
+&execute("perl -i -pe 's!^Sequence\\t\\S+!Sample\\tFraction!' $prefix.idxstats.txt", 1, $LOG);
+&execute("perl -i -pe 's!^Length\\t\\S+!Length\\tGenomic!' $prefix.idxstats.txt", 1, $LOG);
+&execute("perl -i -pe 's!\\t\\t!\\t!' $prefix.idxstats.txt", 1, $LOG);
+
+&execute("$bin/cat2 --header=2 $aggdir/*.BpTypes1.txt > $prefix.BpTypes.txt", 1, $LOG);
+&execute("perl -i -pe 's!^Sample\\t\\S+\\t\\S+!Sample\\tFraction\\tCount!' $prefix.BpTypes.txt", 1, $LOG);
+&execute("perl -i -pe 's!^Length\\t\\S+\\t\\S+!Length\\tGenomic\\tBp!' $prefix.BpTypes.txt", 1, $LOG);
+
+&execute("$bin/cat2 $aggdir/*.htseq_lost1.txt > $prefix.htseq_lost.txt", 1, $LOG);
+&execute("perl -i -pe 's!^Sample\\t\\S+\\t\\S+!Sample\\tFraction\\tCount!' $prefix.htseq_lost.txt", 1, $LOG);
+
+&execute("$bin/mergeMatrix -k 1 -v 2 -h 0 -kn GENE -o $prefix.trimHisto1.txt @{ $files{HST}{1} }", 1, $LOG);
+&execute("(head -1 $prefix.trimHisto1.txt && tail -n +2 $prefix.trimHisto1.txt | sort -k1,1n) > $prefix.trimHisto.txt", 1, $LOG);
+&execute("perl -i -pe 's!/trimmed.histogram.txt!!g' $prefix.trimHisto.txt", 1, $LOG);
+&execute("perl -i -pe 's!^GENE!TrimLen!g' $prefix.trimHisto.txt", 1, $LOG);
+
+open OUT, "> $prefix.trimStats.txt";
+print OUT "Sample\tTotal\tTrimmed\tDropped\n";
+foreach my $err (@{ $files{ERR}{1} }) {
+    chomp(my $trimstats = `grep "^Input" $err`);
+    my ($tot, $trm, $drop) = ($trimstats =~ /Input Reads: (\d+) Surviving: (\d+) .* Dropped: (\d+)/);
+    $err =~ s/\/trimmed.stderr.txt//;
+    print OUT join("\t", $err, $tot, $trm, $drop),"\n";
+}
+close OUT;
+
+foreach my $file (glob "$aggdir/*.txt") {
+    &execute("perl -i -pe 's!$outdir/!!g' $file", 1, $LOG);
+    &execute("perl -i -pe 's!/analysis_\\S+!!g' $file", 1, $LOG);
+}
+
+&execute("$bin/cat2 @{ $files{FQR}{1} } | sed 's/.fastq.gz//' | perl -pe 's!/!\\t!' > $prefix.fqReads.txt", 1, $LOG);  # cat only the modified files  *** RUN _AFTER_ PERL -I -PE MODS ***
+&execute("perl -i -pe 's!^FILE\\tREADS!Sample\\tFraction\\tReads!' $prefix.fqReads.txt", 1, $LOG);
+
+&execute("rm -f $aggdir/*.SRQmerge[12].txt", 1, $LOG);
+&execute("rm -f $aggdir/*.BpTypes1.txt", 1, $LOG);
+&execute("rm -f $aggdir/*.htseq_lost1.txt", 1, $LOG);
+&execute("rm -f $aggdir/*.align_summary[12].txt", 1, $LOG);
+&execute("rm -f $aggdir/*.idxstats[12].txt", 1, $LOG);
+&execute("rm -f $aggdir/*.trimHisto1.txt", 1, $LOG);
+&execute("rm -f $aggdir/*.fqReads2.txt", 1, $LOG);
+
+&execute("yes | cp /n/data1/genomes/indexes/$geno/$anno/$geno.$anno.genedata.txt $aggdir/$geno.$anno.gene_data.txt", 1, $LOG);
+&execute("yes | cp /n/data1/genomes/indexes/$geno/$anno/$geno.$anno.GenomeBpTypes.txt $aggdir/$geno.$anno.GenomeBpTypes.txt", 1, $LOG);
+
+my $SO = &open2('W', "$aggdir/sample.order", 'Sample order list');
+print $SO "$_\n" foreach @samples;
+close $SO;
+
+my $FO = &open2('W', "$aggdir/fraction.order", 'Fraction order list');
+print $FO "too-short\n";
+print $FO "$_\n" foreach sort keys %fracs;
+print $FO "too-long\n";
+close $FO;
+
+## TRACKS STUFF BELOW
+#foreach my $file (@BW) {
+#    my ($this_prefix) = ($file =~ /([^\/]+)\.bw$/);
+#    print "track type=bigWig name=$this_prefix description=\"$this_prefix\" visibility=full bigDataUrl=http://tracks.stowers.org/microarray/repo/$this_prefix$file\n";
+#    system("bash","-c","cp $file $this_prefix$file") if $copy;
+#}
+
+## Expect (http://www.nist.gov/el/msid/expect.cfm) example:
+#sub copyover {
+#    $scp=Expect->spawn("/usr/bin/scp ${srcpath}/$file $who:${destpath}/$file");
+#    $scp->expect(30,"ssword: ") || die "Never got password prompt from $dest:$!\n";
+#    print $scp 'password' . "\n";
+#    $scp->expect(30,"-re",'$\s') || die "Never got prompt from parent system:$!\n";
+#    $scp->soft_close();
+#    return;
+#}
+

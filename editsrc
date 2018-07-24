@@ -1,0 +1,51 @@
+#!/bin/bash
+
+## Finds, and opens in Emacs, the source script for some apa_tools.R function
+## If unable to find, looks for aliases and other functions with similar names
+
+func=$1
+emacsnw=$2  # optional
+
+if [ -z $func ]; then echo "No function name given!"; exit 1; fi
+code=/home/apa/local/bin/apa_tools/code
+script=$(ls $code/*/$func.R 2>/dev/null | head -1)
+
+if [ ! -z $script ]; then
+    if [ -z $emacsnw ]; then
+        emacs $script &
+    else 
+        emacs -nw $script
+    fi
+else
+    ## function name not found; maybe it is an alias...
+    aliases=($(grep -P "^$func <- " $code/*/*.R | cut -f1 -d: | sort -u))
+    if [ ${#aliases[@]} -eq 1 ]; then
+        ## found it
+        aliased=${aliases[0]}
+        aliasedn=${aliased##*/}
+        echo -e "\nFound '$func' as alias of '$aliasedn'\n"
+        sleep 1
+        if [ -z $emacsnw ]; then
+            emacs $aliased &
+        else 
+            emacs -nw $aliased
+        fi
+    elif [ ${#aliases[@]} -gt 1 ]; then
+        ## found multiple aliases??  Not good.
+        echo -e "\nFIXME: '$func' is an alias of multiple other functions!!!"
+        for a in ${aliases[@]}; do an=${a##*/}; echo " $an"; done
+        echo ""
+    else
+        ## no aliases found
+        echo -e "\nCould not find any $func.R, or aliases to $func!"
+        maybes=($(ls $code/*/*$func*.R 2>/dev/null))
+        if [ ${#maybes[@]} -gt 0 ]; then
+            echo -e "\nSimilarly-named functions:"
+            for r in ${maybes[@]}; do rn=${r##*/}; echo " $rn"; done
+            echo ""
+        else
+            echo -e "\nNo similarly-named functions found either.\n"
+        fi
+    fi
+fi
+

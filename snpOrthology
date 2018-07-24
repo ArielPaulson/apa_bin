@@ -1,0 +1,429 @@
+#!/usr/bin/env Rscript
+
+source("/home/apa/apa_tools.R")
+biomart.complete <- FALSE
+biomart.complete.X <- FALSE
+biomart.complete.O <- FALSE
+PDB.complete <- FALSE
+clobber <- FALSE
+#vcfFractionate <- "/home/apa/local/bin/vcfFractionate"
+snpOrthology_functions <- "/home/apa/local/bin/scriptutils/snpOrthology_functions.R"
+snpOrthology_subunit <- "/home/apa/local/bin/scriptutils/snpOrthology_subunit.R"
+snpOrthology_finalize <- "/home/apa/local/bin/scriptutils/snpOrthology_finalize.R"
+source(snpOrthology_functions)
+
+
+## Run: ./snpOrthology <outdir> <params_file> <...vcfs...>
+
+
+
+##### ADD:
+## show truncation % from start-loss or stop-gain mutations.
+## add no-results messages like no annotated orthologs, no high-ident transcripts, no reporting positions, other error, etc
+
+
+
+## NEW OPERATIONS:
+## INPUT:  Provide one or more VCFs, and a params file which contains: source org, list of ortholog orgs, N cores for parallelization, output dir, min-ident value, etc.
+## OUTPUT: Extracts transcripts and their missense variants from VCF(s), gets required metadata from Ensembl, saves pre-analysis RData objects, writes scripts to run on a cluster.
+## AFTER:  You run the array job on a cluster.  Should then run /home/apa/local/bin/scriptutils/rerun_dead to ensure all finished.
+##
+## WHAT IT DOES (per transcript):
+## 1. Finds all orthologs from Ensembl; if multiple, then takes most-similar one based on pairwise peptide alignment.
+## 2. Aligns the transcript peptide with its single best orthologs per specified organism(s).
+## 3. Evaluates SNP conservation and returns annotated multi-alignment images and stats for the indicated residue(s).
+## 4. If PDB data is provided, then:
+##    a. Aligns transcript peptide to PDB chains
+##    b. Evaluates the proximity of side-chain atoms to the indicated residues, before and after applying the mutation.
+##    c. Looks for disruption of known side-chain-bonding events, like disulfide bridges, salt bridges, aromatic stacks, etc.
+##    d. DEVEL: Looks for disruption of larger features like a-helices, hydrophobic surfaces, etc.
+##
+## NOTE: PDB NO LONGER WORKS -- MUST BE REWRITTEN TO MATCH NEW WORKFLOW
+
+
+## Params files have 2 tab-delim columns: col 1 = key, col 2 = value, rows may be in any order.
+## Rows below describe the keys and their values, and the number of times each key may appear:
+## KEY       TIMES  VALUE
+## SOURCE	   1      Source org (where sequence is from), as "Genus species".
+## ORTHOLOG	 N      Organism(s) to take orthologous sequences from (do NOT include SOURCE), as "Genus species".
+## MINIDENT  1      Float on [0,1].  Minimum end-to-end identity percent for an ortholog (vs source transcript) to use ortholog in multiple alignment + downstream analysis
+## PDB		   1      Optional: a tab-delim file containing PDB mappings + one header row.  Col 1 = gene ID, col 2 = full path/url to PDB file, col 3 = Genus species (must be in ortholog list), and optional col 4 = chain letter.
+## Values in column 1 may be preceded by some spaces for justification purposes.
+
+
+
+
+
+ca <- commandArgs(trailing=TRUE)
+
+## outdir="~/cbio.heb.100/code/snpOrthology_out"; paramfile="heb_1.params"; vcf.files="test1.vcf.gz"
+
+## read outdir, params file, vcf locations
+outdir <- fixpath(ca[1], clobber="ignore", mkdir=FALSE)  # init 'outdir' value, just to get RData properly pathed
+paramfile <- ca[2]
+vcf.files <- ca[3:length(ca)]
+vcf.exist <- file.exists(vcf.files)
+if (any(!vcf.exist)) stop("These VCF files do not exist:\n",paste(vcf.files[!vcf.exist],collapse="\n "))
+V <- length(vcf.files)
+
+## set up output RData
+params.label <- sub("^.*/","",sub(".txt$","",paramfile))
+outprefix <- paste0(outdir,params.label,".snpOrthology.")  # outfiles = <outdir>/<file_base_name>.snpOrthology.*   ## initial value; gets pathed (or reloaded) later
+RData <- paste0(outprefix,"RData")
+message(RData)
+
+if (!clobber & file.exists(RData)) {
+    
+    message("Restarting from save...")
+    load(RData)
+    
+} else {
+    
+    ## output locations
+    message("\nSetting up run...")
+    outdir <- fixpath(outdir, clobber="no")  # final 'outdir', which includes clobber handling, but only if run the first time
+    outprefix <- paste0(outdir,params.label,".snpOrthology.")  # outfiles = <outdir>/<file_base_name>.snpOrthology.*    ## final 'outprefix'
+    fracdir <- paste0(outdir,"vcfFractionate/")
+    fracpref <- paste0(fracdir,"input")
+    datadir <- paste0(outdir,"data/")
+    resultsdir <- paste0(outdir,"results/")
+    tmpdir <- paste0(resultsdir,"tmp/")
+    system(paste("mkdir -p",datadir))
+    system(paste("mkdir",resultsdir))
+    if (dir.exists(outdir)) {
+        message(paste0("Writing to '",outdir,"'"))
+    } else {
+        stop(paste0("Failed to create output location '",outdir,"'!\n"))
+    }
+    
+    ## get params, test geno/anno
+    params <- as.matrix(read.delim(paramfile, as.is=TRUE, header=FALSE))
+    params[is.na(params)] <- ""  # prevent logical tests from getting NAs
+    params[,1] <- sub("^ +","",params[,1])  # strip leading whitespace, if any
+    geno <- params[params[,1]=="GENO",2]
+    anno <- params[params[,1]=="ANNO",2]
+    idx <- paste0("/n/data1/genomes/indexes/",geno,"/",anno,"/")
+    if (!dir.exists(idx)) stop("Expected genome/annotation index location '",idx,"' does not exist!\n")
+    
+    ## load gtf, gene & transcript metadata
+    message("Loading transcriptome metadata...")
+    gtf <- read.delim(paste0(idx,geno,".",anno,".cuff.gtf"), as.is=TRUE, header=FALSE, comment="#")
+    meta <- getMetaData(geno, anno, transcript=TRUE, peptide=TRUE, exon=TRUE)
+    ens.ver <- ifelse(meta$build[meta$build[,1]=="Annotation Provider",2]=="Ensembl", as.numeric(meta$build[meta$build[,1]=="Annotation Version",2]), NA)
+    if (is.na(ens.ver)) stop("snpOrthology currently only works with Ensembl organisms!\n")
+    
+    ### corrected multiple alignments, if any
+    #multialn.ortho <- ifelse(any(params[,1]=="MULTIALN"), params[params[,1]=="MULTIALN",2], NA)
+    #multialn.pdb  <- ifelse(any(params[,1]=="MULTIPDB"), params[params[,1]=="MULTIPDB",2], NA)
+    
+    ## minimum end-to-end identity% between query and ortholog for ortholog to be used (else, ortholog ignored) -- default 0.7 (70%)
+    min.ortho.idt <- ifelse(any(params[,1]=="MINIDENT"), as.numeric(params[params[,1]=="MINIDENT",2]), 0.7)
+    
+    ## reorder org vector: source org must be #1 // make variants of sci names
+    orgs <- c(params[params[,1]=="SOURCE",2], params[params[,1]=="ORTHOLOG",2])
+    names(orgs) <- gsub(" ","_",orgs)
+    orgs.gs <- lapply(orgs, function(x) unlist(strsplit(x," ")) )
+    orgs.ens <- tolower(sapply(orgs.gs, function(x) paste0(substr(x[1],0,1),x[2])) )
+    O <- length(orgs)
+    
+    ### Fractionate VCF; take only first 1 or 2 fractions (high priority exonic, low priority exonic)
+    #system(paste(vcfFractionate,vcf.file,fracpref))
+    #vcf <- list()
+    #vcf[[1]] <- read.vcf(paste0(fracpref,".1.high-priority-exonic.vcf.gz"))
+    #vcf[[2]] <- read.vcf(paste0(fracpref,".2.low-priority-exonic.vcf.gz"))
+    #if (length(vcf)>1) {
+    #    vcf <- do.call(rbind,vcf)
+    #} else {
+    #    vcf <- vcf[[1]]
+    #}
+    
+    ## extract variant data from VCF
+    ## chr1 18852102 WU00597985 T C 440 . 19 . AC=3;AF=0.750;AN=4;BaseQRankSum=1.501;DP=23;Dels=0.00;FS=0.000;HaplotypeScore=0.0000;MLEAC=3;MLEAF=0.750;MQ=60.00;MQ0=0;MQRankSum=0.689;QD=19.14;ReadPosRankSum=0.446;SOR=0.793;SNP;VARTYPE=SNP;ANN=C|intron_variant|MODIFIER|smc2|ENSDARG00000017744|transcript|ENSDART00000109416.3|protein_coding|8/23|c.1020+428T>C||||||
+    message("Processing VCFs...")
+    vcfs <- vector("list", length=V)
+    for (v in 1:V) {
+        message(" ",vcf.files[v],": ",Sys.time())
+        vdat <- apply(read.vcf(vcf.files[v]), 1, function(x) {
+            ## x cols: "CHROM","POS","ID","REF","ALT","QUAL","FILTER","INFO"
+            if (grepl(";ANN=",x[[8]]) & grepl("missense_variant",x[[8]])) {
+                s <- lapply(unlist(strsplit(sub(";.*","",sub(".*ANN=","",x[[8]])),",")), function(y) {
+                    z <- unlist(strsplit(y,"\\|"))
+                    ## A | missense_variant | MODERATE | CABZ01072487.1 | ENSDARG00000098214 | transcript | ENSDART00000166972.1 | protein_coding | 4/5 | c.664G>T | p.Val222Leu | 763/1428 | 664/1179 | 222/392 |
+                    ## vars <- data.frame(Chr,Pos,RefNT.G,AltNT.G,Trans,TransBp,Phase,CdsBp,TransAa,MAPos,RefNT.T,AltNT.T,RefAA,AltAA)
+                    if (grepl("missense_variant",z[[2]])) {  # could also be stuff like 'missense_variant&splice_region_variant'
+                        c.2 <- unlist(strsplit(sub(".*[0-9]+","",z[[10]]),">"))
+                        p.2 <- unlist(strsplit(sub("[0-9]+","|",sub("^p.","",z[[11]])),"\\|"))
+                        c( x[[1]], x[[2]], x[[4]], z[[1]], z[[7]], sub("/.*","",z[[12]]), NA, sub("/.*","",z[[13]]), sub("/.*","",z[[14]]), NA, c.2, p.2 )
+                    }
+                })
+                s <- s[listLengths(s)>0]
+                if (length(s)>0) do.call(rbind, s)
+            }
+        })
+        message("Transcripts with N variants:")
+        print(table(listLengths(vdat,nrow)))
+        vdat <- as.data.frame(do.call(rbind, vdat[listLengths(vdat)>0]))
+        for (i in c(2,6:10)) mode(vdat[[i]]) <- "numeric"
+        vdat <- vdat[,c(1:ncol(vdat),10,10,10)]
+        for (i in 15:17) vdat[,i] <- NA
+        colnames(vdat) <- c("Chr","Pos","RefNT.G","AltNT.G","Trans","TransBp","Phase","CdsBp","TransAa","MAPos","RefNT.T","AltNT.T","RefAA","AltAA","OrthoX","OrthoN","OrthoR")
+        ## remove transcript version numbers, if needed
+        ##IM("TRANSCRIPTS:",sort(unique(vdat[,5])))
+        vdat[,5] <- sub("\\.[0-9]+$","",vdat[,5])    ############# FIXME DO BETTER THAN THIS
+        ttest <- vdat[,5] %in% meta$trans.data[,1]
+        message("nrow vdat: ",nrow(vdat))
+        if (all(ttest)) {
+            message("All transcripts identified!")
+        } else {
+            tlost <- which(!ttest)
+            tfix <- sub("\\.[0-9]+$","",vdat[tlost,5])
+            ttest2 <- tfix %in% meta$trans.data[,1]
+            if (all(ttest2)) {
+                vdat[tlost,5] <- tfix
+            } else {
+                tlost2 <- sort(unique(vdat[!ttest2,5]))
+                message(paste0(length(tlost2)," vcf transcripts were not found in the specified annotations!  First few: ",paste(tlost2[1:min(c(5,length(tlost2)))],collapse=", "),"\n"))
+                vdat <- vdat[ttest2,]
+            }
+        }
+        vcfs[[v]] <- vdat
+    }
+    
+    ## initialize variant-data dataframe
+    ## A | missense_variant | MODERATE | CABZ01072487.1 | ENSDARG00000098214 | transcript | ENSDART00000166972.1 | protein_coding | 4/5 | c.664G>T | p.Val222Leu | 763/1428 | 664/1179 | 222/392 |
+    ##vars <- data.frame(Chr,Pos,RefNT.G,AltNT.G,Trans,TransBp,Phase,TransAa,MAPos,RefNT.T,AltNT.T,RefAA,AltAA)
+    ##vars <- mat.split(vars[,c(1:4,10:13,5:9)], vars$Trans)
+    vcfs <- unique(do.call(rbind, vcfs))
+    vcfs$RefAA <- TLAs[match(toupper(vcfs$RefAA),TLAs[,1]),2]  # 'Thr' -> 'T', e.g.
+    vcfs$AltAA <- TLAs[match(toupper(vcfs$AltAA),TLAs[,1]),2]  # "
+    vcfs$OrthoX <- O
+    message("VCFS: ",nrow(vcfs)," ROWS")
+    vars <- mat.split(vcfs, vcfs$Trans)
+    trans <- names(vars)
+    names(trans) <- trans
+    message("VCFS: ",length(trans)," TRANSCRIPTS")
+    ## Not done yet!  Will reorder 'vars' to match 'genes', created below.
+    
+    save.image(RData)
+    
+}
+
+
+
+if (!biomart.complete) {
+
+    ## get marts and available attributes for each org
+    message("\nSetting up marts: ",Sys.time())
+    suppressMessages(require(biomaRt))
+    if (!exists("marts")) {
+        marts <- lapply(orgs.ens, findMart, ens.ver, NULL, FALSE)
+        la <- lapply(marts, listAttributes)
+        t(sapply(la,dim))
+        save.image(RData)
+    }
+    
+    ## get variant-transcript NT and AA sequences, and associated Ensembl Gene IDs
+    message("\nGetting transcript sequence: ",Sys.time())
+    genes <- getBM(attributes=qw(ensembl_transcript_id,ensembl_gene_id), filters="ensembl_transcript_id", values=trans, mart=marts[[1]])
+    found <- match(trans,genes[,1])
+    trans.lost <- trans[which(is.na(found))]
+    trans <- trans[which(!is.na(found))]
+    genes <- genes[match(trans,genes[,1]),]
+    G <- nrow(genes)
+    if (length(trans.lost)>0) message("The following ",length(trans.lost)," transcripts are not found at Biomart!\n ",paste(trans.lost,collapse="\n "), "\nRemoving from dataset...")
+    vars <- vars[match(genes[,1],names(vars))]
+    
+    orient <- function(x, g) {
+        if (meta$gene.data$Strand[meta$gene.data[,1]==g]=="-") x <- translate(x, qw(A,C,G,T), qw(T,G,C,A))
+        x
+    } 
+    for (i in 1:G) {
+        vars[[i]]$RefNT.T <- orient(vars[[i]]$RefNT.G, genes[i,2])
+        vars[[i]]$AltNT.T <- orient(vars[[i]]$AltNT.G, genes[i,2])
+    }
+    
+    tseq <- lapply(list(
+        nt=getSequence(id=trans, type="ensembl_transcript_id", seqType="cdna", mart=marts[[1]]),
+        aa=getSequence(id=trans, type="ensembl_transcript_id", seqType="peptide", mart=marts[[1]])
+    ), function(x){ y=split(x[,1],x[,2]); y[match(trans,names(y))] })
+    tseq$aa <- lapply(tseq$aa, function(x) gsub("U","C",x))  # convert Selenocysteine U to Cysteine C: U will break pairwiseAlignment()
+    tseq2 <- tseq
+    for (i in 1:2) tseq2[[i]] <- lapply(tseq[[i]], function(x) if (length(x)>0) { unlist(strsplit(x,"")) } )
+    
+    biomart.complete <- TRUE
+    save.image(RData)
+    
+}
+
+
+
+if (!biomart.complete.X) {
+    
+    message("\nProcessing exons: ",Sys.time())
+    suppressMessages(require(biomaRt))
+    x <- getBM(attributes=qw(ensembl_transcript_id,ensembl_exon_id,exon_chrom_start,exon_chrom_end,cds_start,cds_end,cds_length), filters="ensembl_transcript_id", values=genes[,1], mart=marts[[1]])
+    x <- cbind(x[,1:4],exon_length=x[,4]-x[,3]+1,x[,5:6],cds_length=x[,6]-x[,5]+1)
+    exons.tmp <- x[order(x[,3]),]  # sort by start pos
+    all.exons <- mat.split(exons.tmp, exons.tmp[,1])
+    all.exons <- all.exons[match(genes[,1],names(all.exons))]
+    
+    biomart.complete.X <- TRUE
+    rm(exons.tmp)
+    save.image(RData)
+    
+}
+
+
+
+if (!biomart.complete.O) {
+    
+    suppressMessages(require(biomaRt))
+    ortho.tmp <- new.list(names(orgs))
+    
+    for (j in 1:O) {
+        message("\nProcessing ",names(orgs)[j]," gene data: ",Sys.time())
+        symb <- grep("_symbol$",la[[j]][,1],value=TRUE)
+        symb <- ifelse (names(orgs)[j]=="Homo_sapiens","hgnc_symbol",setdiff(symb,"hgnc_symbol")[1])
+        if (is.na(symb)) symb <- "wikigene_name"
+        if (!symb %in% la[[j]][,1]) symb <- "external_gene_name"
+        ## Acquire (ortho|para|homo)log genes, if any
+        g.ortho <- getBM(attributes=grep("log_",grep(orgs.ens[j],la[[1]][,1],value=T),value=T), filters="ensembl_transcript_id", values=genes[,1], mart=marts[[1]])  # "log_" targeting "(ortho|para|homo)log_" attributes
+        g.ortho <- g.ortho[g.ortho[,1]!="",]
+        message(paste0(sum(!is.na(g.ortho[[1]]))," ",orgs.ens[j],"_gene_ensembl"))
+        ## skip non-source orgs with no orthologs
+        if (j>1 & all(is.na(g.ortho[[1]]))) next
+        ## strip sci name from these col names, else future rbinds will have issues
+        colnames(g.ortho) <- sub(paste0(orgs.ens[j],"_"),"",colnames(g.ortho))
+        ## if source org, use gene for query transcript (to eliminate dealing with inparalogs), otherwise use resulting ortholog
+        ## NOT: currently not at-risk for inparalog problems; tseq controls target sequences and inparalogs are just there for reference
+        gids <- g.ortho[,1]
+        if (j==1) gids <- c(gids, genes[,2])
+        ## get gene data for ortholog(s)
+        g.data <- getBM(attributes=c("ensembl_gene_id",symb,qw(chromosome_name,strand,start_position,end_position,gene_biotype,description)), filters="ensembl_gene_id", values=gids, mart=marts[[j]])   # once also included: source, status
+        ## standardize this col name, else future rbinds will have issues
+        colnames(g.data)[2] <- "symbol"
+        ## find all peptides for orthologs
+        ## unfortunately, orthologs are genewise not transcriptwise, do download all gene peptides and then 
+        peps <- getBM(qw(ensembl_peptide_id,ensembl_transcript_id,ensembl_gene_id), "ensembl_gene_id", gids, marts[[j]])
+        ## if source org gene has > 1 peptide, select the one corresponding to the query transcript
+        #if (j==1) peps <- peps[match(genes[,1],peps[,2]),]
+        ## remove transcripts with no peptide (=noncoding)
+        peps <- peps[truthify(peps[,1]!=""),]
+        ## get sequence for each 'peps' peptide
+        p.seq <- getSequence(id=peps[,1], type="ensembl_peptide_id", seqType="peptide", mart=marts[[j]])
+        ## convert Selenocysteine U to Cysteine C: U will break pairwiseAlignment()
+        p.seq[,1] <- gsub("U","C",p.seq[,1])
+        ## add sequences to 'peps'
+        peps <- cbind(peps, aln_score=0, idt_pct=0, acceptable=FALSE, p.seq[match(peps[,1],p.seq[,2]),1,drop=FALSE])
+        
+        ortho.tmp[[j]] <- list(ortho=g.ortho, data=g.data, peps=peps)
+        
+        rm(symb,gids,p.seq,g.ortho,g.data,peps)
+    }
+    
+    save.image(RData)   # early checkpoint
+    
+    message("\nMatching orthologs: ",Sys.time())
+    all.ortho <- new.list(genes[,1], elem=new.list(names(orgs)))
+    for (i in 1:G) {
+        pids <- ortho.tmp[[1]][[3]][ortho.tmp[[1]][[3]][,3]==genes[i,2],1]
+        for (j in 1:O) {
+            all.ortho[[i]][[j]] <- list()
+            all.ortho[[i]][[j]]$ortho <- ortho.tmp[[j]]$ortho[ortho.tmp[[j]]$ortho[,3] %in% pids,]  # NEED NOT INCLUDE SELF
+            ogids <- all.ortho[[i]][[j]]$ortho[,1]
+            if (j==1) ogids <- c(ogids, genes[i,2])
+            all.ortho[[i]][[j]]$data  <- ortho.tmp[[j]]$data[ortho.tmp[[j]]$data[,1] %in% ogids,]   # MUST INCLUDE SELF
+            all.ortho[[i]][[j]]$peps  <- ortho.tmp[[j]]$peps[ortho.tmp[[j]]$peps[,3] %in% ogids,]   # MUST INCLUDE SELF
+        }
+        report.index(i,100,G)
+    }
+    
+    biomart.complete.O <- TRUE
+    rm(ortho.tmp)
+    save.image(RData)
+    
+}
+
+
+
+if (!PDB.complete) {
+
+    ## get PDB data, if any
+    do.PDB <- ifelse(any(params[,1]=="PDB"), TRUE, FALSE)
+    if (do.PDB) {
+        pdbs <- nameless(as.data.frame(t(sapply(params[params[,1]=="PDB",2], function(x) c(unlist(strsplit(x,":")),0,0,0,0) ))))
+        pdbs <- cbind(sub(".pdb$","",sub("^.*/","",pdbs[,1])), pdbs)
+        colnames(pdbs) <- qw(ID,File,Chain,Organism,Transcript,QStart,QEnd,SStart,SEnd)  # Q positions are relative to PDB chain; S positions are relative to reference.  Reference will depend on chain organism.
+        pdb.dat <- new.list(pdbs[,1])  # 4-digit PDB IDs only
+        trans.pdb <- split(pdbs, pdbs$Transcript)
+        trans.pdb <- named.list(trans.pdb[match(genes[,1],names(trans.pdb))], genes[,1])
+        trans.pdb.dat <- new.list(genes[,1])
+        
+        for (i in 1:G) {
+            if (length(trans.pdb[[i]])==0) next
+            for (j in 1:nrow(trans.pdb[[i]])) {
+                trans.pdb.dat[[i]] <- new.list(trans.pdb[[i]]$ID)
+                if (grepl("^(ht|f)tp",trans.pdb[[i]]$File[j])) {
+                    x <- tempfile()
+                    download.file(trans.pdb[[i]]$File[j], x)  # , method, quiet = FALSE, mode = "w", cacheOK = TRUE, extra = getOption("download.file.extra"))
+                } else {
+                    x <- trans.pdb[[i]]$File[j]
+                }
+                trans.pdb.dat[[i]][[j]] <- rownameless(t(sapply(sub("\r$","",scan(x,what="",sep="\n")), function(y) c( RECORD=gsub(" ","",substr(y,1,6)), DATA=sub(" +$","",substr(y,7,80)) ) )))  # in case of Mac/Win newlines)
+            }
+        }
+    } else {
+        pdbs <- pdb.dat <- trans.pdb <- trans.pdb.dat <- c()
+    }
+    
+    PDB.complete <- TRUE
+    save.image(RData)  # early checkpoint 1
+    
+}
+
+#source(snpOrthology_functions); x <- get.biomart(i)
+
+message("\nWriting per-transcript RDatas: ",Sys.time())
+qsub <- no.ortho <- rep("",G)
+for (i in 1:G) {
+    this.trans <- genes[i,1]
+    this.ortho <- all.ortho[[i]]
+    ocol <- sum(listLengths(lapply(this.ortho[2:O],"[[",1),nrow))
+    if (ocol==0) {
+        no.ortho[i] <- this.trans
+    } else {
+        this.vars <- vars[[i]]
+        this.exons <- all.exons[[i]]
+        this.tseq <- lapply(tseq,"[[",i)
+        this.tseq2 <- lapply(tseq2,"[[",i)
+        this.trans.pdb <- trans.pdb[[i]]
+        this.trans.pdb.dat <- trans.pdb.dat[[i]]
+        this.rdata <- paste0(datadir,this.trans,".RData")
+        this.result.rdata <- paste0(resultsdir,this.trans,".RData")
+        this.tmp.dir <- paste0(tmpdir,this.trans,"/")
+        this.tmp.prefix <- paste0(this.tmp.dir,"tmp.")
+        qsub[i] <- paste(snpOrthology_subunit,this.rdata)
+        save(this.trans, do.PDB, O, min.ortho.idt, this.ortho, this.vars, this.exons, this.tseq, this.tseq2, this.trans.pdb, this.trans.pdb.dat, genes, orgs, datadir, resultsdir, this.tmp.dir, this.tmp.prefix, this.result.rdata, file=this.rdata)
+    }
+    report.index(i,1000,G)
+}
+no.ortho <- no.ortho[no.ortho!=""]
+qsub <- qsub[qsub!=""]
+
+save(outdir, resultsdir, outprefix, orgs, orgs.ens, genes, G, no.ortho, pdbs, do.PDB, file=paste0(outprefix,"finalize.RData"))
+
+write.vector(qsub, paste0(outprefix,"qsub.array"))
+qsub.cmd <- paste0("qsub -t 1-",length(qsub),":1 -tc 32 -q all.q -b y -cwd -o qsub.o -e qsub.e '$(sed -n ${SGE_TASK_ID}p ",outprefix,"qsub.array)'")
+write.vector(c("",qsub.cmd,"",paste0(snpOrthology_finalize," ",outprefix,"finalize.RData")), paste0(outprefix,"exe.sh"),"\n")
+
+## Final shell file (exe.sh):
+## Qsub all transcripts
+## Run 'snpOrthology_finalize' and exit
+## Then delete 'RData', since it is rather large and no longer necessary
+
+rm(list=grep("^this\\.",ls(),value=TRUE))
+save.image(RData)
+message("snpOrthology complete!\n")
+quit()
+
+

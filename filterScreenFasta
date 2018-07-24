@@ -1,0 +1,321 @@
+#!/usr/bin/env perl
+require '/home/apa/local/bin/apa_routines.pm';  # &blockify
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+
+## Takes a fasta, the cross_match .screen output for the fasta, and some parameters, and selects passing reads.
+## For these reads, writes one or more of the following fastas:
+## 1. A fasta of the original unscreened sequences.
+## 2. A fasta of the screened sequences.
+## 3. A fasta of the sequence fragments left over after removing the screened positions.
+
+
+
+## Inputs
+my $input;    # input .screen fasta from cross_match
+my $prefix;   # prefix for output fasta files; else gets $input
+my $origfa;   # original fasta file (that cross_match was run on); required if $minintX==0
+my $minintX;  # smallest internal screening event (in bp) to take seriously (default 1, see below)
+my $minbp;    # smallest unscreened fragment (in bp) to write to output (default 1, see below)
+my $linelen;  # output fasta line length (default 50)
+my $onlyscr;  # output only reads which had screening events
+my $onlynon;  # output only reads which had no screening events
+
+GetOptions("i=s"=>\$input, "p=s"=>\$prefix, "r=s"=>\$origfa, "x=i"=>\$minintX, "b=i"=>\$minbp, "l=i"=>\$linelen, "only-screened"=>\$onlyscr, "no-screened"=>\$onlynon);
+
+$minintX = 1 unless defined $minintX;
+$minbp = 1 unless defined $minbp;
+$linelen = 50 unless $linelen;
+$prefix = $input unless $prefix;
+
+
+
+## Explanation of .screen fasta contents, and what $minintX and $minbp do
+## cross_match will take an input fasta, and a fasta of maskable sequences, and mask sequences like so:
+
+## 5' MASK
+## INPUT:  >SEB9BZKS1:271:C47FYACXX:7:1101:11802:3759
+##         ACTCCCTACCAAGACTAAAATGCTGATCCTTGGAATTCTCGGGTGCCAAG
+## OUTPUT: >SEB9BZKS1:271:C47FYACXX:7:1101:11802:3759
+##         XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXGGAATTCTCGGGTGCCAAGG
+
+## 3' MASK
+## INPUT:  >SEB9BZKS1:271:C47FYACXX:7:1203:8969:43709
+##         AGTTCTACAGTCCGACGATCTCTGACATTGAAGACTCTGCTGCCCGAGAT
+## OUTPUT: >SEB9BZKS1:271:C47FYACXX:7:1203:8969:43709
+##         AGTTCTACAGTCCGACGATCXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+
+## INTERNAL MASK
+## INPUT:  >SEB9BZKS1:271:C47FYACXX:7:1212:12657:95043
+##         CCGACGATCTTCGGGAATTGTCGGACAAGTTTAACGCTGGAATTCTCGGG
+## OUTPUT: >SEB9BZKS1:271:C47FYACXX:7:1212:12657:95043
+##         CCGACGATXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXGGAATTCTCGGGT
+
+## COMPLETE MASK
+## INPUT:  >SEB9BZKS1:271:C47FYACXX:7:1102:7679:74358
+##         GACAGCGAACCAGGACGGGTGACGCATAGGTTTATCCCATACGTCACTCTT
+## OUTPUT: >SEB9BZKS1:271:C47FYACXX:7:1102:7679:74358
+##         XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+
+## this script will return non-X fragments from a .screen fasta.
+## 
+## '$minbp' indicates the largest fragment, in bp, to write out:
+##   Default is 1, which writes any fragment, even 1bp, out.
+##   Setting $minbp = 0 will not write any fragments to file (only untouched reads); any screening causes entire read to be discarded.
+## 
+## '$minintX' indicates the largest internal masking event to take seriously:
+##   Often the masking sequences are hundreds of bp; should a masking event of only, say, 10bp be considered 'real'?
+##   A masking event of only 10bp at the 5' or 3' end is probably unfinished; 
+##     it is unclear how much further the masking could have continued, if the sequence were longer.
+##   A masking event of only 10bp in the middle of the read, leaving flank sequence intact, is another matter.
+##   It is only this latter event that $minintX considered.  Masks extending to 5' or 3' ends are not ignored.
+##   Setting a meaningful $minintX requires some knowledge of the masking sequences and their expected behavior.
+##   Default is 1, which takes all events seriously, even if only 1bp, and splits the read accordingly.
+##   Setting $minintX = 0 causes ALL internal screening events to be ignored (i.e. replaces X with original sequence); requires $origfa.
+
+
+
+## Globals & Filehandles
+my %origseq;  # original read sequences
+my %stats;    # output statistics
+my $header;   # read header
+my $seq;      # read sequence
+my $SCR;      # input fasta FH
+my $ORIG;     # original fasta FH
+my $OUTO;     # output fasta FH (passing reads, full original sequence) -- inactive if $onlynon
+my $OUTS;     # output fasta FH (passing reads, full screened sequence)
+my $OUTF;     # output fasta FH (passing reads, unscreened fragments) -- inactive if $onlynon
+my $replace = $origfa && $minintX != 1 ? 1 : 0;  # able to perform internal-screen replacements?
+
+
+
+## Initialize IO
+
+if ($input =~ /.gz$/) {
+    open $SCR, '-|', "gunzip -c $input" or die "$0: Cannot read input fasta '$input': $!\n";
+} else {
+    open $SCR, '<', $input or die "$0: Cannot read input fasta '$input': $!\n";
+}
+if ($origfa =~ /.gz$/) {
+    open $ORIG, '-|', "gunzip -c $origfa" or die "$0: Cannot read original fasta '$origfa': $!\n";
+} elsif ($origfa) {
+    open $ORIG, '<', $origfa or die "$0: Cannot read original fasta '$origfa': $!\n";
+}
+unless ($onlynon) {
+    open $OUTO, '>', "$prefix.original.fasta" or die "$0: Cannot write original-read output fasta '$prefix.original.fasta': $!\n";
+    open $OUTF, '>', "$prefix.fragment.fasta" or die "$0: Cannot write read-fragment output fasta '$prefix.fragment.fasta': $!\n";
+}
+open $OUTS, '>', "$prefix.screened.fasta" or die "$0: Cannot write screened-read output fasta '$prefix.screened.fasta': $!\n";
+
+
+
+## Main
+
+if ($origfa) {
+    print "Reading original fasta: ".`date`;
+    while (<$ORIG>) {
+	s/[\n\r]+$//;
+	if (/^>(.*)/) {
+	    $header = $1;
+	} else {
+	    $origseq{$header} .= $_;
+	}
+    }
+    close $ORIG;
+    $header = undef;
+}
+
+print "Processing screened fasta: ".`date`;
+my $h;
+while (<$SCR>) {
+    s/[\n\r]+$//;
+    if (/^>(.*)/) {
+	&process($header, $seq) if $header;
+	$header = $1;
+	$seq = '';
+	$h++;
+	print " $h: ".`date` if $h % 1000000 == 0;
+    } else {
+	$seq .= $_;
+    }
+}
+&process($header, $seq);
+
+
+
+## Report and Exit
+
+close $SCR;
+close $OUTS;
+unless ($onlynon) {
+    close $OUTO;
+    close $OUTF;
+}
+$stats{TOTALS}{IN_READS} = $h;
+my $digw = length($stats{TOTALS}{OUT_FRAGS});
+$digw = length($h) if length($h) > $digw;
+my $format = "%-9s  %${digw}i\n";
+
+print "\nUNSCREENED:\n";
+printf($format, $_, $stats{UNSCREENED}{$_}||0) foreach qw/ LONG SHORT /;
+print "\nSCREENED:\n";
+printf($format, $_, $stats{SCREENED}{$_}||0) foreach sort keys %{ $stats{SCREENED} };
+print "\nSCREENINGS:\n";
+printf($format, "$_ BP", $stats{SCREENINGS}{$_}||0) foreach qw/ MAX_5 MIN_5 MAX_3 MIN_3 MAX_I MIN_I /;
+if ($replace) {
+    print "\nREPLACEMENTS:\n";
+    printf($format, $_, $stats{REPLACEMENTS}{$_}||0) foreach qw/ READS EVENTS SUCCESS FAIL IGNORE /;
+}
+print "\nTOTALS\n";
+printf($format, $_, $stats{TOTALS}{$_}||0) foreach qw/ IN_READS OUT_READS OUT_FRAGS /;
+print "\nfilterScreenFasta $input complete: ".`date`;
+
+system "kill $$";  # vastly faster than 'exit' when giant hashes are in play
+
+
+
+
+sub process {
+    
+    my ($HEADER, $SEQ) = @_;
+    my $SEQ2 = $SEQ;
+    my $already;
+    
+    ## first detect/replace too-small internal screening events
+    
+    if ($SEQ =~ /[^X]X+[^X]/) {
+	$stats{REPLACEMENTS}{READS}++;
+	while ($SEQ =~ /(?<=[^X])X+(?=[^X])/g) {
+	    my $len = length($&);
+	    my $offset = pos($SEQ)-$len;
+	    $stats{REPLACEMENTS}{EVENTS}++;
+	    $stats{SCREENINGS}{MIN_I} = $len unless $stats{SCREENINGS}{MIN_I} && $len > $stats{SCREENINGS}{MIN_I};
+	    $stats{SCREENINGS}{MAX_I} = $len if $len > $stats{SCREENINGS}{MAX_I};
+	    if ($replace) {
+		if (!$minintX || $len < $minintX) {
+		    ## internal screening event too small; replace with original sequence
+		    if (exists $origseq{$HEADER}) {
+#		    print "   REPL $HEADER $offset $len($minintX) $& : ",substr($SEQ2, $offset, $len)," => ",substr($origseq{$HEADER}, $offset, $len),"\n";
+			$stats{REPLACEMENTS}{SUCCESS}++;
+			substr($SEQ2, $offset, $len) = substr($origseq{$HEADER}, $offset, $len);
+		    } else {
+			$stats{REPLACEMENTS}{FAIL}++;
+			print STDERR "Sequence $HEADER not found in original fasta!\n";
+		    }
+		} else {
+#		    print " NOREPL $HEADER $offset $len($minintX) $& : ",substr($SEQ2, $offset, $len),"\n";
+		    $stats{REPLACEMENTS}{IGNORE}++;
+		}
+	    }
+	}
+    }
+    
+    ## now process read, which contains only believable screening events
+    
+    if ($SEQ2 =~ /X/) {
+	## screening occurred
+	
+	if ($SEQ2 =~ /[^X]/) {
+	    ## something left over from screening
+	    
+	    ## strip flanking Xs and record which ones occurred
+	    my $SEQ3 = $SEQ2;
+	    my $XP;
+	    if ($SEQ3 =~ /^(X+)/ && $SEQ3 =~ /(X+)$/) {
+		$XP = 53;
+		$stats{SCREENINGS}{MIN_5} = length($1) unless $stats{SCREENINGS}{MIN_5} && length($1) > $stats{SCREENINGS}{MIN_5};
+		$stats{SCREENINGS}{MAX_5} = length($1) if length($1) > $stats{SCREENINGS}{MAX_5};
+		$stats{SCREENINGS}{MIN_3} = length($2) unless $stats{SCREENINGS}{MIN_3} && length($2) > $stats{SCREENINGS}{MIN_3};
+		$stats{SCREENINGS}{MAX_3} = length($2) if length($2) > $stats{SCREENINGS}{MAX_3};
+	    } elsif ($SEQ3 =~ /^(X+)/) {
+		$XP = 5;
+		$stats{SCREENINGS}{MIN_5} = length($1) unless $stats{SCREENINGS}{MIN_5} && length($1) > $stats{SCREENINGS}{MIN_5};
+		$stats{SCREENINGS}{MAX_5} = length($1) if length($1) > $stats{SCREENINGS}{MAX_5};
+	    } elsif ($SEQ3 =~ /(X+)$/) {
+		$XP = 3;
+		$stats{SCREENINGS}{MIN_3} = length($1) unless $stats{SCREENINGS}{MIN_3} && length($1) > $stats{SCREENINGS}{MIN_3};
+		$stats{SCREENINGS}{MAX_3} = length($1) if length($1) > $stats{SCREENINGS}{MAX_3};
+	    }
+	    $SEQ3 =~ s/^X+//;
+	    $SEQ3 =~ s/X+$//;
+	    
+	    if ($SEQ3 =~ /[^X]X+[^X]/) {
+		## internal screening occurred (believable)
+		
+		## split on internal screening events and record how many occurred
+		my @frags = split /X+/, $SEQ3;
+#		print " FRAGS $HEADER $#frags $SEQ3\n";
+		if ($#frags == 1) {
+		    ## single internal event
+		    $XP .= 'I';
+		} else {
+		    ## multiple internal events
+		    $XP .= 'M';
+		}
+		
+		## print fragments, if any long enough
+		foreach my $f (0..$#frags) {
+		    if (length($frags[$f])<$minbp) {
+			## fragment ignorably short
+			$stats{SCREENED}{"SHORT_$XP"}++;
+		    } else {
+			## fragment long enough to print
+			$stats{SCREENED}{"LONG_$XP"}++;
+			if ($minbp && !$onlynon) {
+			    print $OUTO ">$HEADER\n",${ &blockify($origseq{$HEADER},$linelen) },"\n";
+			    print $OUTS ">$HEADER\n",${ &blockify($SEQ2,$linelen) },"\n";
+			    print $OUTF ">$HEADER.",($f+1),"\n",${ &blockify($frags[$f],$linelen) },"\n";
+			    $stats{TOTALS}{OUT_FRAGS}++;
+			    $stats{TOTALS}{OUT_READS}++ unless $already;
+			    $already = 1;
+			}
+		    }
+		}
+		
+	    } else {
+		## screening was 5'/3' only
+		
+		if (length($SEQ3)<$minbp) {
+		    ## fragment ignorably short
+		    $stats{SCREENED}{"SHORT_$XP"}++;
+		} else {
+		    ## fragment long enough to print
+		    $stats{SCREENED}{"LONG_$XP"}++;
+		    if ($minbp && !$onlynon) {
+			print $OUTO ">$HEADER\n",${ &blockify($origseq{$HEADER},$linelen) },"\n";
+			print $OUTS ">$HEADER\n",${ &blockify($SEQ2,$linelen) },"\n";
+			print $OUTF ">$HEADER.1\n",${ &blockify($SEQ3,$linelen) },"\n";
+			$stats{TOTALS}{OUT_FRAGS}++;
+			$stats{TOTALS}{OUT_READS}++ unless $already;
+			$already = 1;
+		    }
+		}
+		
+	    }
+	    
+	} else {
+	    ## read 100% screened out
+	    $stats{SCREENED}{FULLY}++;
+	}
+	
+    } else {
+	## no screening occurred
+	## USE $SEQ2: $SEQ3 NOT DEFINED HERE
+	if (length($SEQ2)<$minbp) {
+	    $stats{UNSCREENED}{SHORT}++;
+	} else {
+	    $stats{UNSCREENED}{LONG}++;
+	    if ($minbp && !$onlyscr) {
+		print $OUTO ">$HEADER\n",${ &blockify($origseq{$HEADER},$linelen) },"\n" unless $onlynon;
+		print $OUTS ">$HEADER\n",${ &blockify($SEQ2,$linelen) },"\n";
+		$stats{TOTALS}{OUT_FRAGS}++;
+		$stats{TOTALS}{OUT_READS}++ unless $already;
+		$already = 1;
+	    }
+	}
+    }
+    
+}

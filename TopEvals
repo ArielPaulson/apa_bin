@@ -1,0 +1,45 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+
+my ($file, $withlen, $printsubj, $outfile);   # $file is a blast m8 output
+GetOptions("f=s"=>\$file, "l"=>\$withlen, "s"=>\$printsubj, "o=s"=>\$outfile);
+
+open IN, $file or die "Cannot read '$file': $!\n";
+while (<IN>) {
+    my ($query, $subj, $idt, $mlen, $mms, $gaps, $qpos1, $qpos2, $spos1, $spos2, $eval, $score) = split /\t/, $_;
+    next if $query eq $subj;  # no self, in case self-blast
+    my $qmlen = abs($qpos1-$qpos2)+1;
+    my $identbp = sprintf("%0.0f", $idt*$mlen/100);
+    if ($withlen) {
+	my ($qlen) = ($query =~ /\|(\d+)$/);
+	my $qidtpct = sprintf("%0.2f", 100*$identbp/$qlen);
+	my $qlenpct = sprintf("%0.2f", 100*$qmlen/$qlen);
+	$scores{$query}{$eval}{"$qidtpct\t$idt\t$qlenpct\t$mlen"}{$subj} = 1;
+    } else {
+	$scores{$query}{$eval}{"$idt\t$mlen"}{$subj} = 1;
+    }
+}
+close IN;
+
+open OUT, "> $outfile";
+if ($withlen) {
+    print OUT "Query\tE-Val\tQryIdt%\tAlnIdt%\tQryAln%\tAlnLen";
+    $printsubj ? print OUT "\tSubjects\n" : print OUT "\n";
+} else {
+    print OUT "Query\tE-Val\tAlnIdt%\tAlnLen";
+    $printsubj ? print OUT "\tSubjects\n" : print OUT "\n";
+}
+foreach my $query (keys %scores) {
+    my $topeval = (sort {$a <=> $b} keys %{ $scores{$query} })[0];
+    foreach my $stats (keys %{ $scores{$query}{$topeval} }) {
+	print OUT "$query\t$topeval\t$stats";
+	if ($printsubj) {
+	    my $subjs = join ',', (keys %{ $scores{$query}{$topeval}{$stats} });
+	    print OUT "\t$subjs\n";
+	} else {
+	    print OUT "\n";
+	}
+    } 
+}
+close OUT;
+exit;

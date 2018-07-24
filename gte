@@ -1,0 +1,23 @@
+#!/bin/bash
+
+if [ -z $1 ]; then
+    ## Reading from pipe (hopefully something was piped in...)
+    tmp="/tmp/gte.$$"
+    touch $tmp;
+    while read x; do echo "$x" >> $tmp; done
+    gtf=$tmp
+else
+    ## File specified
+    gtf=$1
+fi
+
+G=$(grep -oP "gene_id \S+" $gtf | sort -u | wc -l)
+T=$(grep -oP "transcript_id \S+" $gtf | sort -u | wc -l)
+E=$(grep -P "\texon\t" $gtf | cut -f1,4,5,7 | sort -u | wc -l)
+L=$(cat $gtf | wc -l)
+
+if [ -z $1 ]; then rm -f $tmp; fi
+
+echo -e "File\tLines\tExons\tTranscripts\tGenes"
+echo -e "$gtf\t$L\t$E\t$T\t$G"
+

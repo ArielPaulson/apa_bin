@@ -1,0 +1,41 @@
+#!/usr/bin/perl
+
+# this script does descends recursively into /n/analysis and looks for leaf directories with no .sequence.txt or .fq files.
+
+my (@emptyleaves, %isterminal, $totalnodes, $totalleaves);
+
+goto_dir('/n/analysis');
+
+open OUT, "> empty_leaves.txt";
+print OUT map { "$_\n" } @emptyleaves;
+close OUT;
+print "$totalnodes nodes | $totalleaves leaves | ", (scalar @emptyleaves), " empty\n";
+
+exit;
+
+
+sub goto_dir {
+    $totalnodes++;
+    my $dir = shift;
+#    $isterminal{$dir} = 1;  # initial assumption
+    if ($dir =~ /XX$/) {  # only query flowcell directories
+	$totalleaves++;
+	my @seq = (
+	    glob("$dir/*sequence.txt"),          # canonical
+	    glob("$dir/*sequence.txt.gz"),       # canonical
+	    glob("$dir/s_*_sequence_*.txt"),     # multiplexed
+	    glob("$dir/s_*_sequence_*.txt.gz"),  # multiplexed
+	    glob("$dir/*.fastq"),                # alternate extension
+	    glob("$dir/*.fastq.gz"),             # alternate extension
+	    glob("$dir/*.fq"),                   # alternate extension
+	    glob("$dir/*.fq.gz") );              # alternate extension
+	push @emptyleaves, $dir unless @seq;
+    } else {
+	foreach my $file (glob "$dir/*") {
+	    if (-d $file) {
+#	        $isterminal{$file} = 0;
+		goto_dir($file);
+	    }
+	}
+    }
+}

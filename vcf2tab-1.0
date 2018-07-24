@@ -1,0 +1,297 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Excel::Writer::XLSX;
+use Data::Dumper;
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+# Deps:
+
+## Inputs
+my $invcf;    # input VCF
+my $outfile;  # output file
+my $xlsx;     # write XLSX output?
+my $rowEff;   # split effects fields and output one line per effect?
+my $colEff;   # output effects fields into separate columns per type?
+my ($help, $man, $version);
+
+GetOptions(
+    "i=s" => \$invcf,
+    "o=s" => \$outfile,
+    "xlsx" => \$xlsx,
+    "row-effects" => \$rowEff,
+    "col-effects" => \$colEff,
+    "help" => \$help,
+    "man" => \$man,
+    "version" => \$version
+    );
+
+## Globals
+my @header;      # VCF header
+my %allheader;   # all header fields
+my @lines;       # non-header line numbers (first,last)
+my %matrix;      # main output table
+my %effects;     # separate output table for effects fields, which can be many->one
+my $INFO;        # INFO column number
+my $FORMAT;      # FORMAT column number
+my @GENO;        # genotype column number(s)
+my @geno_names;  # name(s) of genotype column(s)
+my @geno_fmt;    # format fields for genotype data
+my @OTHER;       # tracking for nonstandard field numbers
+my $have_geno;   # genotype fields exist
+my $have_other;  # @OTHER fields exist
+my $have_eff;    # snpEff effects exist
+my %effTypes;    # observed effect types
+my $EFFANN;      # effect type field format (old 'EFF' or new 'ANN')
+my %EFFANN;      # tally of above instances
+my $split_eff = $rowEff || $colEff ? 1 : 0;  # splitting effects, one way or the other
+my %HETHOM = ('HET',1, 'HOM',1);  # strings to match
+my %VARTYPE = map {($_=>1)} qw/ SNP MNP INS DEL /;  # strings to match
+my %MISC = map {($_=>1)} qw/ RV VLD /;  # strings to match
+
+
+## Argument testing
+unless ($outfile) {
+    ($outfile = $invcf) =~ s/\.vcf(\.gz)?$//;
+    if ($xlsx) {
+        $outfile .= '.xlsx';
+    } else {
+        $outfile .= '.txt';
+        $outfile .= '.gz' if $invcf =~ /\.gz$/;
+    }
+}
+
+
+
+
+## Main
+
+my $IN = &open2('R', $invcf, 'input vcf');
+my $nr = 0;
+while (my $line = <$IN>) {
+    next if $line =~ /^##/;
+    $line =~ s/[\n\r]+$//;
+    if ($line =~ /^#CHROM/) {
+        $line =~ s/^#//;
+        $lines[0] = $.;
+        @header = split /\t/, $line;  # CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	<SAMPLES>
+        foreach my $i (0..$#header) {
+            if ($header[$i] eq 'INFO') {
+                $INFO = $i;
+            } elsif ($header[$i] eq 'FORMAT') {
+                $FORMAT = $i;
+                last;   # ASSUMES ALL TRAILING COLUMNS ARE GENOTYPE DATA
+                
+#            } elsif ($GENO{$i}) {     # already accounted for 
+#                $have_geno = 1;
+#            } elsif ($i > $FORMAT) {  # other (nonstandard) fields?  (BETWEEN FORMAT AND GENO COLS)
+#                push @OTHER, $i;
+#                $have_other = 1;
+#               push @{ $allheader{OTHER} }, $header[$i];
+            }
+        }
+        @{ $allheader{CORE} } = @header[0..6];
+        if ($#header > $FORMAT) {
+            $have_geno = 1;
+            @GENO = ($FORMAT+1..$#header);  # expected positions of genotype columns
+            @geno_names = @header[@GENO];
+        }
+    } else {
+        $nr++;
+        my @data = split /\t/, $line;
+        ## CORE
+        $matrix{$.}{CORE}{$header[$_]} = $data[$_] foreach (0..6);
+        ## OTHER
+        if ($have_other) {
+            $matrix{$.}{OTHER}{$header[$_]} = $data[$_] foreach @OTHER;
+        }
+        ## INFO
+        foreach my $item (split /;/, $data[$INFO]) {
+            my @keyval = split /=/, $item;
+            if ($keyval[0] eq 'EFF') {           # Old snpEff effects
+                ## EFF
+                $EFFANN = 'EFF';
+                if ($split_eff) {
+                    foreach my $entry (split /,/, $keyval[1]) {
+                        my ($efftype, $effstring) = ($entry =~ /^([^()]+)\(([^()]+)\)/);
+                        $effTypes{$efftype}++;
+                        if ($rowEff) {
+                            push @{ $effects{$.}{$efftype} }, [$efftype, (split /\|/, $effstring)];
+                        } elsif ($colEff) {
+                            push @{ $effects{$.}{$efftype} }, "$efftype($effstring)";
+                        }
+                    }
+                } else {
+                    $matrix{$.}{$EFFANN} = $keyval[1];  # if not splitting, store under %matrix
+                }
+                $have_eff = 1;
+                $EFFANN{$EFFANN}++;
+            } elsif ($keyval[0] eq 'ANN') {      # New snpEff effects
+                ## ANN
+                $EFFANN = 'ANN';
+                if ($split_eff) {
+                    foreach my $entry (split /,/, $keyval[1]) {
+                        my ($alt, $efftype, $effstring) = ($entry =~ /^([^\|]+)\|([^\|]+)\|(.*)/);
+                        #print "ALT: $alt\nEFFTYPE: $efftype\nEFFSTRING: $effstring\n";
+                        $effTypes{$efftype}++;
+                        if ($rowEff) {
+                            push @{ $effects{$.}{$efftype} }, [$efftype, (split /\|/, $effstring)];
+                        } elsif ($colEff) {
+                            push @{ $effects{$.}{$efftype} }, "$alt|$efftype|$effstring";
+                        }
+                    }
+                } else {
+                    $matrix{$.}{$EFFANN} = $keyval[1];
+                }
+                $have_eff = 1;
+                $EFFANN{$EFFANN}++;
+            } elsif (defined $keyval[1]) {       # other key=value pair
+                print "$0: WARNING line $. already has a value for INFO key '$keyval[0]'!  $matrix{$.}{INFO}{$keyval[0]} vs $keyval[1]\n" if exists $matrix{$.}{INFO}{$keyval[0]};
+                $matrix{$.}{INFO}{$keyval[0]} = $keyval[1];
+                $allheader{INFO}{$keyval[0]} = 1;
+            } elsif ($keyval[0] eq 'STR') {      # ignore...?
+            } elsif ($HETHOM{$keyval[0]}) {      # zygosity
+                $matrix{$.}{INFO}{ZYGOSITY} = $keyval[0];
+                $allheader{INFO}{ZYGOSITY} = 1;
+            } elsif ($VARTYPE{$keyval[0]}) {     # variant type
+                $matrix{$.}{INFO}{TYPE} = $keyval[0];
+                $allheader{INFO}{TYPE} = 1;
+            } elsif ($MISC{$keyval[0]}) {        # other tags
+                $matrix{$.}{OTHER}{$keyval[0]} = 1;
+                $allheader{MISC}{$keyval[0]} = 1;
+            } else {
+                print "$0: Unknown INFO field '$keyval[0]' on line $.!\n";
+            }
+        }
+        ## GENO
+        if ($nr == 1) {
+            @geno_fmt = split /:/, $data[$FORMAT];
+            foreach my $g (@geno_names) {
+                push @{ $allheader{GENO} }, "$g.$_" foreach @geno_fmt;
+            }
+            print "@{ $allheader{GENO} }\n";
+        }
+        if ($have_geno) {
+            foreach my $n (0..$#GENO) {
+                my @geno_dat = split /:/, $data[$GENO[$n]];
+                foreach my $f (0..$#geno_fmt) {
+                    $matrix{$.}{GENO}{"$geno_names[$n].$geno_fmt[$f]"} = $geno_dat[$f]||'.';
+                }
+            }
+        }
+    }
+}
+$lines[1] = $.;
+close $IN;
+die "$0: $invcf: Mixed old and new snpEff effects detected: will not proceed!\n" if scalar(keys %EFFANN)>1;
+
+if ($allheader{MISC}) {
+    push @{ $allheader{OTHER} }, sort keys %{ $allheader{MISC} };
+    delete $allheader{MISC};
+    $have_other = 1;
+}
+
+my ($Ninfo, $Ngeno, $Nother, @effHeader, @effTypeList, %effColNum);
+my ($OUT, $workbook, $sheet, $header_format, $text_format, $row);
+
+$Ninfo = scalar(keys %{ $allheader{INFO} })-1;
+$Ngeno = $#{ $allheader{GENO} } if $have_geno;
+$Nother = $#{ $allheader{OTHER} } if $have_other;
+
+
+## Construct header
+my %outheader;
+# header line 1
+push @{ $outheader{1} }, ('', 'CORE', (map {''} (1..6)), 'INFO', (map {''} (1..$Ninfo)));
+if ($have_other) {
+    push @{ $outheader{1} }, 'OTHER';
+    push @{ $outheader{1} }, map {''} (1..$Nother) if $Nother > 0;
+}
+foreach (@GENO) {
+    my @gtmp = map {''} @geno_fmt;
+    $gtmp[0] = 'GENO';
+    push @{ $outheader{1} }, @gtmp;
+}
+push @{ $outheader{1} }, 'EFFECTS' if $have_eff;
+# header line 2
+push @{ $outheader{2} }, 'SNP_NO';
+push @{ $outheader{2} }, @{ $allheader{CORE} } if exists $allheader{CORE};
+push @{ $outheader{2} }, sort keys %{ $allheader{INFO} } if exists $allheader{INFO};
+push @{ $outheader{2} }, @{ $allheader{OTHER} } if $have_other;
+push @{ $outheader{2} }, @{ $allheader{GENO} } if exists $allheader{GENO};
+if ($rowEff) {
+    if ($EFFANN eq 'EFF') {
+        push @{ $outheader{2} }, ('Effect','Effect_Impact','Functional_Class','Codon_Change/Distance','Amino_Acid_Change','Amino_Acid_Length','Gene_Name','Transcript_BioType','Gene_Coding','Transcript_ID','Exon/Intron_Rank','Genotype_Number','Warnings/Errors');   # OLD SNPEFF
+    } elsif ($EFFANN eq 'ANN') {
+        push @{ $outheader{2} }, qw/ Consequence Impact Gene_Name Gene_ID Feature_Type Feature_ID Trans_Biotype Rank HGVS.c HGVS.p cDNA_Pos CDS_Pos AA_Pos Distance Errors /;  # NEW STANDARD 'ANN' FIELD  # leaving off first field 'Alt'
+    }
+} elsif ($colEff) {
+    @effTypeList = sort keys %effTypes;
+    %effColNum = map {($effTypeList[$_]=>$_)} (0..$#effTypeList);
+    push @{ $outheader{2} }, @effTypeList;
+} else {
+    push @{ $outheader{2} }, $EFFANN;
+}
+
+
+
+## Write outputs
+if ($xlsx) {
+    $workbook = Excel::Writer::XLSX->new($outfile) or die "Cannot write output Excel file '$outfile': $!\n";
+    $sheet = $workbook->add_worksheet('Sheet1');
+    $header_format = $workbook->add_format(bold=>1);
+    $text_format = $workbook->add_format(num_format=>'@');
+} else {
+    $OUT = &open2('W', $outfile, 'output table');
+}
+
+&writeline($outheader{1}, $row++, $header_format);
+&writeline($outheader{2}, $row++, $header_format);
+
+foreach my $line ($lines[0]+1..$lines[1]) {
+    my @outline = ($line-$lines[0]);
+    push @outline, $matrix{$line}{CORE}{$_} foreach @{ $allheader{CORE} };
+    push @outline, $matrix{$line}{INFO}{$_} foreach sort keys %{ $allheader{INFO} };
+    push @outline, $matrix{$line}{OTHER}{$_} foreach @{ $allheader{OTHER} };
+    push @outline, $matrix{$line}{GENO}{$_} foreach @{ $allheader{GENO} };
+    if ($have_eff) {
+        if ($split_eff) {
+            if ($rowEff) {
+                foreach my $efftype (keys %{ $effects{$line} }) {
+                    &writeline([@outline, @$_], $row++, $text_format) foreach @{ $effects{$line}{$efftype} };
+                }
+            } elsif ($colEff) {
+                my @bycol = map {''} @effTypeList;
+                foreach my $efftype (keys %{ $effects{$line} }) {
+                    $bycol[$effColNum{$efftype}] = join ',', @{ $effects{$line}{$efftype} };
+                }
+                &writeline([@outline, @bycol], $row++, $text_format);
+            }
+        } else {
+            &writeline([@outline, $matrix{$line}{$EFFANN}], $row++, $text_format);
+        }
+    } else {
+        &writeline(\@outline, $row++, $text_format);
+    }
+}
+
+if ($xlsx) {
+    $workbook->close();
+} else {
+    close $OUT;
+}
+#print "input lines: ",($lines[1]-$lines[0]),"\noutput lines: $out\n";
+print "$0 $invcf complete!\n";
+#system "kill $$";
+
+
+
+sub writeline {
+    my ($AREF, $ROW, $FMT) = @_;
+    if ($xlsx) {
+        $sheet->write( $ROW, $_, $$AREF[$_], $FMT ) foreach (0..$#$AREF);
+    } else {
+        print $OUT join("\t", @$AREF), "\n";
+    }
+}

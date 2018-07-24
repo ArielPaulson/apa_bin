@@ -1,0 +1,16 @@
+#!/usr/bin/env perl
+use strict;
+
+my $outfile = shift @ARGV;
+my $tmp = "combineBeds.$$.tmp";
+
+system "cat @ARGV > $tmp";
+system "/home/apa/local/bin/sortBedCoord -i $tmp --overwrite";
+chomp(my $wc1 = `cat $tmp | wc -l`);
+system "mergeBed -i $tmp > $outfile";
+system "/home/apa/local/bin/nameBed $outfile";
+system "mv $outfile.named $outfile";
+chomp(my $wc2 = `cat $outfile | wc -l`);
+system "rm -f $tmp";
+print "combineBeds $outfile: $wc1 merged into $wc2\n";
+exit;

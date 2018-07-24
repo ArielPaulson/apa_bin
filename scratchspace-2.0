@@ -1,0 +1,127 @@
+#!/usr/bin/env perl
+use strict;
+
+#print "Down for repairs at the moment\n"; die;
+
+my $target = $ARGV[0] eq '--tmp' ? '/tmp' : '/scratch';
+
+my @ordrank = qw/ T G M K B U ? /;  # occasionally the math gets screwed up if large amounts of I/O are going on.  'U' is for unknown-usage users, '?' flags a negative-used-space result.
+my %ordscale = ('U',1, '?',1, 'B',1, 'K',1024**1, 'M',1024**2, 'G',1024**3, 'T',1024**4);
+my $otherusers = '<unknown>';
+my $reserved = '<reserved>';
+chdir $target or die "Cannot cd to $target: $!\n";
+#print "\n";
+my ($maxN, $sumN, %ranked, %raw, %printable, $maxuser);
+
+## Global space stats
+
+chomp(my @df1 = `df .`);
+my @df = (split /\s+/, $df1[-1]);
+shift @df unless $df[0]>0;  # drop first field if char or blank
+$df[$_] *= 1024 foreach (0..2);    # df reports in kb not b
+
+my ($total, $used, $free, $usepct) = @df;
+my @printdf = @df;
+foreach my $i (0..2) {
+    $printdf[$i] = join '', @{ &ordify($printdf[$i]) };
+    $maxN = length($printdf[$i]) if length($printdf[$i]) > $maxN;  # includes 'ord' chars
+}
+$printdf[3] = sprintf("%3.0f%", 100*$used/$total);   # recalculate -- df not very accurate
+
+## User space stats
+
+foreach my $entry (glob "*") {
+    my @data = (split /\s+/, `ls -lad $entry`);
+    my $user = $data[2];
+    my ($n, $u, @du);
+    if ($entry eq 'lost+found' || $entry =~ /^(gconfd|orbit|Rtmp)-/) {
+	## generally small and permissions-locked -- could count them up, but just ignoring for now
+	next;
+    }
+    if (-d $entry) {
+	my @msg;
+	chomp(@msg = `ls $entry 2>&1`);
+	if ($msg[0] =~ /^ls: cannot open directory/) {
+	    $n = 0;
+	    $u = 1;
+	} else {
+	    chomp(@du = `du -s $entry`);
+	    $n = (split /\s+/, $du[-1])[0] * 1024;  # du reports in kb not b
+	    $u = $#du>1 ? $#du : 0;  # 'du' output > 1 line indicates there were unaccessible directories
+	}
+    } else {
+	$n = $data[4];
+    }
+    $sumN += $n;
+    $raw{$user}{N} += $n;
+    $raw{$user}{U} += $u;
+}
+
+foreach my $user (keys %raw) {
+    next unless $raw{$user}{N} || $raw{$user}{U};  # ignore users with 0 bytes and no hidden data
+    my ($N, $ord);
+    if ($raw{$user}{N}) {
+	($N, $ord) = @{ &ordify($raw{$user}{N}) };
+	$printable{$user} = $N * $ordscale{$ord};
+	$maxuser = length($user) if length($user) > $maxuser;
+    } else {
+	$printable{$user} = $N = $raw{$user}{N};
+	$ord = 'U';
+    }
+    $ranked{$ord}{$N}{$user} = 1;
+    $maxN = length($N) if length($N) > $maxN;
+}
+$maxN++;  # to account for $ord character when printf-ing
+
+## estimate reserved space
+
+$raw{$reserved}{N} = $total - $free - $used;
+if ($raw{$reserved}{N}) {
+    my ($N, $ord) = @{ &ordify($raw{$reserved}{N}) };
+    $ranked{$ord}{$N}{$reserved} = 1;
+    $printable{$reserved} = $N * $ordscale{$ord};
+    $maxN = length($N) if length($N) > $maxN;
+    $maxuser = length($reserved) if length($reserved) > $maxuser;
+}
+
+## remainder of space not attributable to users
+
+my ($oN, $oord) = @{ &ordify($used-$sumN) };
+if ($oN) {
+    $ranked{$oord}{$oN}{$otherusers} = 1;
+    $maxuser = length($otherusers) if length($otherusers) > $maxuser;
+    $maxN = length($oN) if length($oN) > $maxN;
+}
+
+## print report
+
+my $maxtotal = (sort {$b <=> $a} (length('Total'), length($printdf[0])))[0];
+my $maxfree = (sort {$b <=> $a} (length('Free'), length($printdf[2])))[0];
+printf "\n%-${maxuser}s  %${maxN}s  %4s  %${maxtotal}s  %${maxfree}s\n", ('', qw/ Used Use% Total Free /);
+printf "%-${maxuser}s  %${maxN}s  %4s  %${maxtotal}s  %${maxfree}s\n", ('Total', @printdf[1,3,0,2]);
+
+foreach my $ord (@ordrank) {
+    foreach my $N (sort {$b <=> $a} keys %{ $ranked{$ord} }) {
+	my $used = "$N$ord";
+	$used = '???' if $used eq '0U';
+	my $upct = sprintf("%3.0f%", 100*$raw{$_}{N}/$total);
+	$upct = '  ?%' if $used eq '???';
+	printf "%-${maxuser}s  %${maxN}s  %s\n", $_, $used, $upct foreach (sort keys %{ $ranked{$ord}{$N} });
+    }
+}
+print "\n";
+exit;
+
+
+sub ordify {
+    my $n = shift;
+    foreach my $ord (@ordrank) {
+	my $scaled = $n / $ordscale{$ord};
+	if ($scaled >= 1) {
+	    my $printscaled = $ord eq 'T' ? sprintf("%0.1f",$scaled) : sprintf("%0.0f",$scaled);
+	    return [$printscaled, $ord];
+	} elsif ($scaled < 0) {
+	    return [sprintf("%0.0f",$scaled), '?'];
+	}
+    }
+}

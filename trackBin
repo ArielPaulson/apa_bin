@@ -1,0 +1,40 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my ($inbam, $chrsizes, $binbp, $outtxt);
+
+GetOptions("i=s"=>\$inbam, "c=s"=>\$chrsizes, "b=i"=>\$binbp, "o=s"=>\$outtxt);
+
+my %cs;
+open CS, $chrsizes;
+while (<CS>) {
+    chomp;
+    my ($chr, $len) = split;
+    $cs{$chr} = $len;
+}
+close CS;
+
+my (@depths, $sum, $i, $j, $prev_chr);
+open IN, "genomeCoverageBed -d -split -ibam $inbam -g $chrsizes |";
+open OUT, "> $outtxt";
+while (<IN>) {
+    chomp;
+    my ($chr, $pos, $depth) = split;
+    $sum += $depth;
+    $i++;
+    if ($chr ne $prev_chr) {
+	$sum = $i = 0;  # any final bin < $binbp on every chr will get discarded
+    }
+    if ($i % $binbp == 0) {
+	print OUT "$chr\t$i\t$sum\n";
+	$sum = 0;
+    }
+    $prev_chr = $chr;
+}
+close OUT;
+close IN;
+
+print "trackBin $inbam complete!\n";
+exit;

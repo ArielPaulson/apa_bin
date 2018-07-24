@@ -1,0 +1,6 @@
+#!/usr/bin/perl
+
+/bin/ps -o pid,args -e > psArgs.$$
+
+grep $pid psArgs.$$
+

@@ -1,0 +1,323 @@
+#!/usr/bin/env perl
+require '/home/apa/local/bin/apa_routines.pm';  # &translate
+use Getopt::Long;
+use Data::Dumper;
+use File::Spec;
+use Pod::Usage;
+use strict;
+
+
+## THINGS TO ADD:
+## -f can be a codon usage table instead of a CDS fasta, speeding things up
+## (eventually) specify geno/anno only
+## lineplot of old/new codon optimality across transcript
+## better graph titles/xylabs
+## dhist of new codon optimalities, gains per trans
+
+
+## Dependencies
+my $gtfToGenePred = 'gtfToGenePred';
+my $genePredToBed = 'genePredToBed';
+my $fastaFromBed = 'fastaFromBed';
+
+
+## Inputs
+my $input;   # input fasta of sequence(s) to codon-optimize
+my $cdsfa;   # fasta of protein-coding-transcript CDS sequences, preferably only one transcript per gene to reduce bias
+my $outdir;  # output directory
+my $clobber; # output directory, if clobbering allowed
+my $GC_opt;  # optimize for codon GC content first, then codon frequency?
+my $write_cdso;  # write full background optimality dataset?
+
+
+
+## Get, test args
+GetOptions("i=s"=>\$input, "f=s"=>\$cdsfa, "o=s"=>\$outdir, "oc=s"=>\$clobber, "GC=s"=>\$GC_opt, "cdso"=>\$write_cdso);
+
+&validate('file', $cdsfa, 'CDS fasta', 1); 
+
+die "$0: if specified, '--GC' value must be 'min' or 'max'!\n" if $GC_opt && $GC_opt ne 'min' && $GC_opt ne 'max';
+
+
+## Directories & files
+my $tmp = "/tmp/codonOptimize.$$";
+&create_writedir($tmp, '', 'Temp location');
+
+$outdir = &create_writedir($outdir, $clobber, 'Output location', 'codonOptimize_out');
+my $out_fa = "$outdir/optimized.fasta";
+my $out_usage = "$outdir/usage_table.txt";
+my $out_inopt = "$outdir/optimization_table.txt";
+my $out_inopt2 = "$outdir/optimization_summary.txt";
+my $out_cdsopt = "$outdir/background_optimality.txt.gz";
+my $out_cdsopt2 = "$outdir/background_optimality_summary.txt";
+my $out_R = "$outdir/optimality.R";
+my $out_Rpng = "$outdir/optimality.R.png";
+my $out_Rdata = "$outdir/optimality.RData";
+
+
+## Globals
+my %cdsseq;    # background sequences
+my %cdscod;    # codon arrays for CDS sequences
+my %inpseq;    # input sequences to optimize
+my %inpcod;    # codon arrays for input sequences
+my @inpnames;  # input sequence names (in input order)
+my %usage;     # codon usage data
+my %optimal;   # optimized codon set
+my %optseq;    # optimized input sequences
+my %report;    # reporting objects
+
+my %codon2aa = (
+    'TTT' => 'F',	'TTC' => 'F',	'TTA' => 'L',	'TTG' => 'L',
+    'TCT' => 'S',	'TCC' => 'S',	'TCA' => 'S',	'TCG' => 'S',
+    'TAT' => 'Y',	'TAC' => 'Y',	'TAA' => '*',	'TAG' => '*',
+    'TGT' => 'C',	'TGC' => 'C',	'TGA' => '*',	'TGG' => 'W',
+    'CTT' => 'L',	'CTC' => 'L',	'CTA' => 'L',	'CTG' => 'L',
+    'CCT' => 'P',	'CCC' => 'P',	'CCA' => 'P',	'CCG' => 'P',
+    'CAT' => 'H',	'CAC' => 'H',	'CAA' => 'Q',	'CAG' => 'Q',
+    'CGT' => 'R',	'CGC' => 'R',	'CGA' => 'R',	'CGG' => 'R',
+    'ATT' => 'I',	'ATC' => 'I',	'ATA' => 'I',	'ATG' => 'M',
+    'ACT' => 'T',	'ACC' => 'T',	'ACA' => 'T',	'ACG' => 'T',
+    'AAT' => 'N',	'AAC' => 'N',	'AAA' => 'K',	'AAG' => 'K',
+    'AGT' => 'S',	'AGC' => 'S',	'AGA' => 'R',	'AGG' => 'R',
+    'GTT' => 'V',	'GTC' => 'V',	'GTA' => 'V',	'GTG' => 'V',
+    'GCT' => 'A',	'GCC' => 'A',	'GCA' => 'A',	'GCG' => 'A',
+    'GAT' => 'D',	'GAC' => 'D',	'GAA' => 'E',	'GAG' => 'E',
+    'GGT' => 'G',	'GGC' => 'G',	'GGA' => 'G',	'GGG' => 'G' 
+    );
+my %aa2codon = map {($_=>[])} values %codon2aa;
+my %codonGC;
+foreach my $codon (keys %codon2aa) {
+    push @{ $aa2codon{ $codon2aa{$codon} } }, $codon;
+    foreach my $base (split //, $codon) {
+        $codonGC{$codon}++ if $base eq 'C' || $base eq 'G';
+    }
+}
+my @aaord = qw/ A C D E F G H I K L M N P Q R S T V W Y * /;
+
+
+
+
+## Get input sequences
+my $INP = &open2('R', $input, 'Input sequences');
+my ($href, $aref) = readFasta($INP);
+%inpseq = %$href;
+@inpnames = @$aref;
+
+
+## Convert background GTF to transcript fasta; read in
+
+my $CDS = &open2('R', $cdsfa, 'CDS sequences');
+%cdsseq = %{ (&readFasta($CDS))[0] };
+
+
+## Translate background sequences
+my $C = scalar(keys %cdsseq);
+print STDERR "Translating $C background CDS sequences...\n";
+foreach my $trans (keys %cdsseq) {
+    my %trdata = %{ &translate({'sequence'=>$cdsseq{$trans}, 'mode'=>1, 'ascodons'=>1}) };
+    foreach (@{ $trdata{'+0'}{CODON_TABLE} }) {
+        my ($codon, $aa) = split /\t/, $_;
+        next if $aa eq 'X';   # Ns in sequence
+        push @{ $cdscod{$trans} }, $codon;
+        $usage{CDS}{COD}{$codon}++;
+        $usage{CDS}{AA}{$aa}{$codon}++;
+        $usage{CDS}{NAA}{$aa}++;
+        $usage{CDS}{TOT}++;
+    }
+}
+
+## Decide optimal codon set
+foreach my $aa (@aaord) {
+    $optimal{$aa} = ['', 0];
+    foreach my $codon (@{ $aa2codon{$aa} }) {
+        my $n = $usage{CDS}{AA}{$aa}{$codon};
+        my $gc = $codonGC{$codon};
+        #print STDERR "CODON: $codon | AA: $aa | N: $n | GC: $gc\n";
+        if ($GC_opt) {
+            
+            
+            ##### WORKING HERE #####
+            
+            
+            $report{USAGE}{$aa}{$codon} = [$n, sprintf("%0.1f", 100*$n/($usage{CDS}{NAA}{$aa}||1))];
+            $optimal{$aa} = [$codon, $n] if $n > $optimal{$aa}->[1];
+        } else {
+            $report{USAGE}{$aa}{$codon} = [$n, sprintf("%0.1f", 100*$n/($usage{CDS}{NAA}{$aa}||1))];
+            $optimal{$aa} = [$codon, $n] if $n > $optimal{$aa}->[1];
+        }
+    }
+}
+
+
+## Get optimality distribution of background sequences
+print STDERR "Calculating optimality of background sequences...\n";
+$report{CDSOPT} = "Transcript\tPos\tAA\tCodon\tFreq\n";
+$report{CDSOPT2} = "Transcript\tCodons\tMinimum\tMedian\tMean\tMaximum\n";
+foreach my $trans (keys %cdsseq) {
+    my ($i, $fsum, $fmax, @vals);
+    my $fmin = 200;  # impossibly high freq
+    foreach my $codon (@{ $cdscod{$trans} }) {
+        my $aa = $codon2aa{$codon};
+        my $freq = $report{USAGE}{$aa}{$codon}->[1];
+        $i++;
+        $report{CDSOPT} .= "$trans\t$i\t$aa\t$codon\t$freq\n";
+        push @vals, $freq;
+        $fsum += $freq;
+        $fmin = $freq if $freq < $fmin;
+        $fmax = $freq if $freq > $fmax;
+    }
+    my $fmean = sprintf("%0.1f", &mean(\@vals, 1));
+    my $fmed = &median(\@vals, 1);
+    my $ncodon = scalar @{ $cdscod{$trans} };
+    $report{CDSOPT2} .= "$trans\t$ncodon\t$fmin\t$fmed\t$fmean\t$fmax\n";
+}
+
+
+## Translate input sequences; optimize codons
+print STDERR "Optimizing input sequences...\n";
+$report{OPTMAT} = "Transcript\tCodon\tAA\tOldCodon\tOptCodon\tOldFreq\tOptFreq\tGain\n";
+$report{OPTMAT2} = "Transcript\tCodons\tAffected\tAffected%\tOldMinimum\tOldMedian\tOldMean\tOldMaximum\tOptMinimum\tOptMedian\tOptMean\tOptMaximum\n";
+foreach my $trans (@inpnames) {
+    my (@old_temp, @opt_temp);
+    my ($i, $fsum1, $fsum2, $fmax1, $fmax2, $gained, $altcodon, @vals1, @vals2);
+    my $fmin1 = my $fmin2 = 9E9;  # impossibly high freq
+    $report{OPTFA} .= ">$trans\n";
+    my %trdata = %{ &translate({'sequence'=>$inpseq{$trans}, 'mode'=>1, 'ascodons'=>1}) };
+    foreach (@{ $trdata{'+0'}{CODON_TABLE} }) {
+        $i++;
+        my ($codon, $aa) = split /\t/, $_;
+        my $optcodon = $optimal{$aa}->[0];
+        $altcodon++ if $codon ne $optcodon;
+        $optseq{$trans} .= $optcodon;
+        my $codon_f = $report{USAGE}{$aa}{$codon}->[1];
+        my $optcodon_f = $report{USAGE}{$aa}{$optcodon}->[1];
+        my $gain = sprintf("%0.1f", $optcodon_f-$codon_f);
+        $report{OPTMAT} .= "$trans\t$i\t$aa\t$codon\t$optcodon\t$codon_f\t$optcodon_f\t$gain\n";
+        $report{OPTFA} .= $optcodon;
+        push @vals1, $codon_f;
+        $fsum1 += $codon_f;
+        $fmin1 = $codon_f if $codon_f < $fmin1;
+        $fmax1 = $codon_f if $codon_f > $fmax1;
+        push @vals2, $optcodon_f;
+        $fsum2 += $optcodon_f;
+        $fmin2 = $optcodon_f if $optcodon_f < $fmin2;
+        $fmax2 = $optcodon_f if $optcodon_f > $fmax2;
+    }
+    $report{OPTFA} .= "\n";
+    my $fmean1 = sprintf("%0.1f", &mean(\@vals1, 1));
+    my $fmed1 = &median(\@vals1, 1);
+    my $fmean2 = sprintf("%0.1f", &mean(\@vals2, 1));
+    my $fmed2 = &median(\@vals2, 1);
+    my $ncodon = scalar @{ $trdata{'+0'}{CODON_TABLE} };
+    my $altcodonp = sprintf("%0.1f", 100*$altcodon/($ncodon||1));
+    $report{OPTMAT2} .= "$trans\t$ncodon\t$altcodon\t$altcodonp\t$fmin1\t$fmed1\t$fmean1\t$fmax1\t$fmin2\t$fmed2\t$fmean2\t$fmax2\n";
+}
+
+
+## Write outputs
+print STDERR "Writing...\n";
+my $OPTFA = &open2('W', $out_fa, 'Optimized fasta');
+print $OPTFA $report{OPTFA};
+close $OPTFA;
+system "perl -i -pe 's/(\\w{50})/\$1\\n/g' $out_fa";
+
+my $USAGE = &open2('W', $out_usage, 'Codon usage table');
+print $USAGE "AA\tCodon\tN\tFreq\n";
+foreach my $aa (@aaord) {
+    foreach my $codon (sort @{ $aa2codon{$aa} }) {
+        my ($n, $f) = (0, 0.00);
+        ($n, $f) = @{ $report{USAGE}{$aa}{$codon} } if $report{USAGE}{$aa} && $report{USAGE}{$aa}{$codon};
+        print $USAGE "$aa\t$codon\t$n\t$f\n";
+    }
+}
+close $USAGE;
+
+my $OPTMAT = &open2('W', $out_inopt, 'Codon optimization table');
+print $OPTMAT $report{OPTMAT};
+close $OPTMAT;
+
+my $OPTMAT2 = &open2('W', $out_inopt2, 'Codon optimization summary');
+print $OPTMAT2 $report{OPTMAT2};
+close $OPTMAT2;
+
+if ($write_cdso) {
+    my $CDSOPT = &open2('W', $out_cdsopt, 'Background optimality table');
+    print $CDSOPT $report{CDSOPT};
+    close $CDSOPT;
+}
+
+my $CDSOPT2 = &open2('W', $out_cdsopt2, 'Background optimality summary');
+print $CDSOPT2 $report{CDSOPT2};
+close $CDSOPT2;
+
+my $SCRIPT = &open2('W', $out_R, 'Optimality R script');
+my $R = <<EOF;
+\#!/usr/bin/env Rscript
+library(methods)
+source("/home/apa/apa_tools.R")
+
+if (file.exists("$out_cdsopt")) {
+     ## code is here if you want to use it -- not part of basic analysis though.
+#    cds <- read.delim(gzfile("$out_cdsopt"), as.is=TRUE)
+#    cds <- mat.split(cds, cds[,1])   # Takes forever!
+}
+
+inp <- read.delim(gzfile("$out_inopt"), as.is=TRUE)
+inp <- mat.split(inp, inp[,1])
+N <- length(inp)
+
+cds.stat <- as.matrix(read.delim("$out_cdsopt2", row.names=1))
+
+inp.stat <- as.matrix(read.delim("$out_inopt2", row.names=1))
+affected <- inp.stat[,"Affected"]
+opt.stat <- inp.stat[,grep("^Opt",colnames(inp.stat)),drop=FALSE]
+inp.stat <- inp.stat[,grep("^Old",colnames(inp.stat)),drop=FALSE]
+colnames(opt.stat) <- sub("^Opt","",colnames(opt.stat))
+colnames(inp.stat) <- sub("^Old","",colnames(inp.stat))
+
+use.stats <- c("Mean","Median","Minimum","Maximum")
+xlabs <- lapply(named.vector(use.stats,use.stats), function(x) paste(x,"Codon Optimality") )
+C <- length(use.stats)
+
+opt.gain <- opt.stat
+opt.gain <- opt.stat-inp.stat
+
+inp.col <- ternary(N<=7, 1:N+1, rainbow(N))
+
+save.image("$out_Rdata")
+
+png("$out_Rpng", 1000, C*500)
+par(mfrow=c(C,2), mar=c(3,4,4,1), las=1, cex=1.2)
+for (s in use.stats) {
+    x <- cds.stat[,s]
+    h <- hist(x, col=8, breaks=50, xlab=xlabs[[s]], ylab="Transcripts", main=paste("Codon Optimality % per Trans:",s))
+    if (N==1) {
+        y.pch <- mean(range(h\$counts))
+    } else {
+        y.pch <- seq(min(h\$counts), min(h\$counts), length=N+2)
+        y.pch <- y.pch[2:(N+1)]
+    }
+    for (i in 1:2) {  # make bold points
+        points(inp.stat[,s], y.pch, col=inp.col, pch=1, cex=1.2)
+        points(opt.stat[,s], y.pch, col=inp.col, pch=3)
+    }
+    legend(ifelse(s=="Maximum","topleft","topright"), pch=c(1,3), legend=c("Original","Optimized"))
+    barplot(opt.gain[,s], col=inp.col, names=rownames(opt.gain), ylim=c(0,max(c(1,opt.gain[,s]))), main="% Gain from Optimization")
+}
+dev.off()
+
+EOF
+print $SCRIPT $R;
+close $SCRIPT;
+
+
+## Run analysis script
+print STDERR "Running R session...\n";
+system "chmod a+x $out_R";
+system "$out_R";
+
+
+## Exit
+system "rm -rf $tmp";
+print STDERR "codonOptimize $outdir complete!\n";
+exit;

@@ -1,0 +1,162 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+no strict 'refs';
+
+my $infile;      # input alignments file
+my $format;      # if not inferrable from extension; see %okFormats below
+my $outprefix;   # prefix for output file(s)
+my $passonly;    # output pass-filter reads only
+my $orphans;     # PE runs only: split output into whole-pair fastqs versus single-end-orphan fastqs
+my $unmapped;    # output only unaligned reads (e.g. from bowtie SAM output)
+my $stdio;       # input data is piped in
+my $ends = 1;    # number of ends aligned
+my %okFormats = ('EXPORT',1, 'SAM',1, 'BAM',1);  # known input formats
+
+GetOptions("i=s"=>\$infile, "f=s"=>\$format, "o=s"=>\$outprefix, "e=i"=>\$ends, "pass"=>\$passonly, "orphans"=>\$orphans, "unmapped"=>\$unmapped, ""=>\$stdio);
+
+my ($IN, %FULL, %ORPH);  # filehandles
+
+if ($stdio) {
+    
+    if ($format =~ /^txt$/i) {
+	$format = 'EXPORT' if $infile =~ /export.txt$/i;
+    }
+    $format = "\U$format";
+    die "$0: Unsupported format '$format'!  Must be 'EXPORT', 'SAM', or 'BAM'!\n" unless $okFormats{$format};
+    
+    $ends = 1 if $format eq 'EXPORT';
+    die "$0: Ends value must be 1 or 2 if specified!\n" unless ($ends == 1 || $ends == 2);
+    
+    die "No output prefix specified!\n" unless $outprefix;
+    
+    if ($format eq 'BAM') {
+	print "Converting BAM...\n";
+    } elsif ($format eq 'SAM') {
+	print "Converting SAM...\n";
+    } elsif ($format eq 'EXPORT') {
+	print "Converting export...\n";
+    } else {
+	die "$0: Unknown format '$format'!\n";
+    }
+    $IN = *STDIN;
+    
+} else {
+
+    ($format) = ($infile =~ /\.([^.]+)$/) unless $format;
+    if ($format =~ /^txt$/i) {
+	$format = 'EXPORT' if $infile =~ /export.txt$/i;
+    }
+    $format = "\U$format";
+    die "$0: Unsupported format '$format'!  Must be 'EXPORT', 'SAM', or 'BAM'!\n" unless $okFormats{$format};
+    
+    $ends = 1 if $format eq 'EXPORT';
+    die "$0: Ends value must be 1 or 2 if specified!\n" unless ($ends == 1 || $ends == 2);
+    
+    ($outprefix = $infile) =~ s/\.$format$//i unless $outprefix;  # trim extension, if possible
+    
+    if ($format eq 'BAM') {
+	print "Converting BAM...\n";
+	open $IN, '-|', "samtools view $infile";
+    } elsif ($format eq 'SAM') {
+	print "Converting SAM...\n";
+	open $IN, '<', $infile;
+    } elsif ($format eq 'EXPORT') {
+	print "Converting export...\n";
+	open $IN, '<', $infile;
+    } else {
+	die "$0: Unknown format '$format'!\n";
+    }
+    
+}
+
+if ($ends == 1) {
+    open $FULL{1}, '>', "$outprefix.fastq";
+    $orphans = undef;  # meaningless unless PE
+} elsif ($ends == 2) {
+    open $FULL{1}, '>', "${outprefix}_1.fastq";
+    open $FULL{2}, '>', "${outprefix}_2.fastq";
+    open $ORPH{1}, '>', "${outprefix}_1.orphans.fastq";
+    open $ORPH{2}, '>', "${outprefix}_2.orphans.fastq";
+}
+
+my (%preOrphan, %endHeaders, $N4);
+
+if ($format eq 'SAM' || $format eq 'BAM') {
+    
+    my $FH = $FULL{1};
+    while (<$IN>) {
+	chomp;
+	my ($header, $flag, $seq, $qual) = (split /\t/, $_)[0,1,9,10];
+	if ($unmapped) {
+	    $N4++ if ($flag & 4);
+	    next unless ($flag & 4);
+	}
+	my $end = 1;         # default
+	if ($flag & 1) {     # paired-end
+	    if ($flag & 64) {
+		# end 1; $end already == 1
+	    } elsif ($flag & 128) {
+		$end = 2;
+	    } else {
+		print "$0: Improper end flags on line $.!\n";
+	    }
+	}
+	next if $endHeaders{"$header:$end"};  # if multireads: only print once for each read/end 
+	$endHeaders{"$header:$end"} = 1;
+	next if $passonly && ($flag & 512);  # not "passing"
+	if ($ends == 2) {
+	    $preOrphan{$header}{$end} = "$seq\n+\n$qual";
+	} else {
+	    print $FH "\@$header\n$seq\n+\n$qual\n";  # single-end can print in-line, since not writing 2 files in same read order
+	}
+    }
+    print "Unmapped: $N4\n" if $unmapped;
+    
+} elsif ($format eq 'EXPORT') {
+
+    # NOT READY FOR PE
+
+    my $FH = $FULL{1};
+    while (<IN>) {
+	chomp;
+	my @data = (split /\t/, $_)[0-9,21];
+	my $header = join ':', @data[0..6];
+	my $end = $data[7];
+	next if $endHeaders{"$header:$end"};  # if multireads: only print once for each read/end 
+	$endHeaders{"$header:$end"} = 1;
+	my ($seq, $qual, $chr, $filt) = @data[8..10,21];
+	next if ($unmapped && $chr ne 'NM');
+	next if ($passonly && $filt eq 'N');
+	if ($ends == 2) {
+	    $preOrphan{$header}{$end} = "$seq\n+\n$qual";
+	} else {
+	    print $FH "\@$header\n$seq\n+\n$qual\n";  # single-end can print in-line, since not writing 2 files in same read order
+	}
+    }
+}
+close $IN;
+
+if ($ends == 2) {   # $ends == 1 is done by now
+    
+    open $FULL{1}, '>', "${outprefix}_1.fastq";
+    open $FULL{2}, '>', "${outprefix}_2.fastq";
+    open $ORPH{1}, '>', "${outprefix}_1.orphans.fastq";
+    open $ORPH{2}, '>', "${outprefix}_2.orphans.fastq";
+    
+    foreach my $header (keys %preOrphan) {
+	if (scalar(keys %{ $preOrphan{$header} }) == 2) {  # both ends aligned
+	    foreach my $end (1..$ends) {
+		print {$FULL{$end}} "\@$header\n$preOrphan{$header}{$end}\n";
+	    }
+	} else {  # orphan read
+	    my $end = (keys %{ $preOrphan{$header} })[0];
+	    print {$ORPH{$end}} "\@$header\n$preOrphan{$header}{$end}\n";
+	}
+    }
+}
+
+print "$0 Complete!\n";
+system "kill $$ 2>/dev/null";  # faster than 'exit', esp. with giant hashes
+

@@ -1,0 +1,45 @@
+#!/usr/bin/env perl
+use strict;
+
+
+## Input: an output table from 'basecall'
+## Output: an ACGTNxACGTN matrix of ref base (rows) -> called base (cols) counts.
+
+
+my $basecalls = $ARGV[0];
+my $out = "$basecalls.mutation_table.txt";
+my $cat = $basecalls =~ /\.gz$/ ? 'zcat' : 'cat';
+
+my @bases = qw/ A C G T N /;
+my %bases = map {($_=>1)} @bases;
+my %table = map {($_=>[0,0,0,0,0])} @bases;
+
+open IN, '-|', "$cat $basecalls | cut -f3,5-9";
+while (<IN>) {
+    next if $.==1;
+    print "$.\n" if $. % 1E6 == 0;
+    chomp;
+    my ($ref, @bases) = split;  # @bases holds ACGTN in that order
+    $table{$ref}->[$_] += $bases[$_] foreach (0..4);
+}
+close IN;
+
+foreach my $ref (sort keys %table) {
+    unless ($bases{$ref}) {
+        ## non-N degenerate reference base
+        ## transfer counts to N row, then delete
+        $table{N}->[$_] += $table{$ref}->[$_] foreach (0..4);
+        delete $table{$ref};
+    }
+}
+
+open OUT, "> $out";
+print OUT join("\t", '', @bases), "\n";
+foreach (@bases) {
+    print OUT join("\t", $_, @{ $table{$_} }), "\n";
+}
+close OUT;
+
+print "Wrote $out.\n";
+exit;
+

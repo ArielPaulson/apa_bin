@@ -1,0 +1,26 @@
+#!/usr/bin/perl
+
+my ($killnamed, $killelse);
+if ($ARGV[0] eq '--kill') {
+    ($killnamed, $killelse) = (0, 1);
+} elsif ($ARGV[0] eq '--killall') {
+    ($killnamed, $killelse) = (1, 1);
+}
+
+chomp(my $me = `whoami`);
+
+foreach (glob "*") {
+    my $uid = (stat $_)[4];
+    my $user = (getpwuid $uid)[0]; 
+    if ($user eq $me) {
+	if ($killelse) {
+	    next if ($_ eq $me && !$killnamed);  # spare my named directory, unless otherwise specified
+	    print "Removing: $_\n";
+	    system "rm -Rf $_";
+	} else {
+	    print "$_\n";
+	}
+    }
+}
+exit;
+

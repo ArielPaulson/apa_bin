@@ -1,0 +1,45 @@
+#!/bin/bash
+
+models=$1
+outfile=$2
+chrsize=$3
+strand=$4
+
+TEMP=getIntergenes.temp
+mkdir $TEMP
+
+A=2
+W=1
+C=-1
+
+echo "Sorting $models"
+models2=$TEMP/sorted.bed
+#sort -g -s -k2,3 $models | sort -s -k1,1 > $models2
+/home/apa/local/bin/sortBedCoord -i $models -o $models2
+
+echo "Generating/annotating intergenes"
+
+if (($strand -eq== $A)); then
+    mergeBed -i $models2 >  $TEMP/flat_A.bed
+    complementBed -i $TEMP/flat_A.bed -g $chrsize > $TEMP/intergenes_A.bed
+    perl -e 'open IN, "$ARGV[0]/intergenes_A.bed"; open OUT, "> $ARGV[0]/intergenes_A.1.bed"; while (<IN>) { chomp(my @data = split /\t/, $_); $data[1]-- if $data[1]; $data[2]++; print OUT (join "\t", @data),"\n"; };' $TEMP
+    intersectBed -wao -a $TEMP/intergenes_A.1.bed -b $models2 > $outfile
+elif (($strand == $W)); then
+    mergeBed -s -i $models2 > $TEMP/flat_strand.bed
+    grep -E -e $'\t'\\+[\\t\\r\\n]\|\\+$ $models2 > $TEMP/models_W.bed             # grep out lines that have "<TAB>+<TAB>" or "<TAB>+<EOL>"
+    grep -E -e $'\t'\\+[\\t\\r\\n]\|\\+$ $TEMP/flat_strand.bed > $TEMP/flat_W.bed  # grep out lines that have "<TAB>+<TAB>" or "<TAB>+<EOL>"
+    complementBed -i $TEMP/flat_W.bed -g $chrsize > $TEMP/intergenes_W.bed
+    perl -e 'open IN, "$ARGV[0]/intergenes_W.bed"; open OUT, "> $ARGV[0]/intergenes_W.1.bed"; while (<IN>) { chomp(my @data = split /\t/, $_); $data[1]-- if $data[1]; $data[2]++; print OUT (join "\t", (@data,$.,1,"+")),"\n"; };' $TEMP
+    intersectBed -wao -s -a $TEMP/intergenes_W.1.bed -b $TEMP/models_W.bed | cut -f1-3,7-13 > $outfile
+elif (($strand == $C)); then
+    mergeBed -s -i $models2 > $TEMP/flat_strand.bed
+    grep -E -e $'\t'\\-[\\t\\r\\n]\|\\-$ $models2 > $TEMP/models_C.bed             # grep out lines that have "<TAB>-<TAB>" or "<TAB>-<EOL>"
+    grep -E -e $'\t'\\-[\\t\\r\\n]\|\\-$ $TEMP/flat_strand.bed > $TEMP/flat_C.bed  # grep out lines that have "<TAB>-<TAB>" or "<TAB>-<EOL>"
+    complementBed -i $TEMP/flat_C.bed -g $chrsize > $TEMP/intergenes_C.bed
+    perl -e 'open IN, "$ARGV[0]/intergenes_C.bed"; open OUT, "> $ARGV[0]/intergenes_C.1.bed"; while (<IN>) { chomp(my @data = split /\t/, $_); $data[1]-- if $data[1]; $data[2]++; print OUT (join "\t", (@data,$.,1,"-")),"\n"; };' $TEMP
+    intersectBed -wao -s -a $TEMP/intergenes_C.1.bed -b $TEMP/models_C.bed | cut -f1-3,7-13 > $outfile
+fi
+
+#rm -Rf $TEMP
+echo "Wrote $outfile"
+

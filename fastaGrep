@@ -1,0 +1,42 @@
+#!/usr/bin/env perl
+use strict; 
+
+
+## case-insensitive greps a pattern from both strands in a fasta file
+## returns BED output to STDOUT
+## pattern should be properly escaped etc for use in standard Perl m// operator.
+
+
+my ($fasta, $regex) = @ARGV;
+
+my $cat = $fasta =~ /\.gz$/ ? 'zcat' : 'cat';
+
+open IN, "$cat $fasta | /home/apa/local/bin/fasta2tab |";
+while (<IN>) {
+    my ($header, $seq) = split /\t/, $_, 2;
+    #print STDERR "$header\n";
+    $seq = "\U$seq";
+    my %hits;
+    ## + match
+    while ($seq =~ /$regex/g) {
+        my $end = pos($seq);
+        my $len = length($&);
+        my $start = $end-$len;  # 0-based
+        push @{ $hits{$start}{$end} }, "$&\t$len\t+\n";
+    }
+    ## - match
+    (my $rseq = reverse $seq) =~ tr/ACGTURYSWKMHDVB/TGCAAYRSWMKDHBV/;   # full degenerate revcomp
+    while ($rseq =~ /$regex/g) {
+        my $start = pos($rseq);
+        my $len = length($&);
+        my $end = $start+$len;  # 0-based
+        push @{ $hits{$start}{$end} }, "$&\t$len\t-\n";
+    }
+    foreach my $start (sort {$a <=> $b} keys %hits) {
+        foreach my $end (sort {$a <=> $b} keys %{ $hits{$start} }) {
+            print "$header\t$start\t$end\t$_" foreach @{ $hits{$start}{$end} };
+        }
+    }
+}
+close IN;
+exit;

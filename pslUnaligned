@@ -1,0 +1,159 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Getopt::Long;
+use strict;
+
+## Extracts unaligned flanks of partly-blatted reads and writes to fasta
+
+
+die;  ### WORK IN PRORGESS: for (-) strand alignments, must make 5'/3' match for query and subject, revcomp one of the sequences
+
+
+### Inputs
+my $psl;
+my $query_fa;
+my $target_fa;
+my $out;
+my $minbp;
+my $targetcentric;
+
+
+
+### Get, test arguments
+GetOptions("p=s"=>\$psl, "q=s"=>\$query_fa, "t=s"=>\$target_fa, "o=s"=>\$out, "m=i"=>\$minbp, "target-centric"=>\$targetcentric);
+$out = "$psl.unalignedFlanks.fa" unless $out;
+$minbp = 1 unless $minbp;
+
+
+### Globals
+my %headers;
+my %seq;
+my %aln;
+my $header;
+my $QT;
+
+
+### Main
+
+## Read query fasta
+my $QFA = &open2('R', $query_fa, 'Query fasta');
+$QT = $targetcentric ? 'T' : 'Q';
+while (<$QFA>) {
+    s/[\n\r]+$//;
+    if (/^>(\S+)/) {
+	$header = $1;
+	push @{ $headers{$QT} }, $header;
+    } else {
+	$seq{$QT}{$header} .= $_;
+    }
+}
+close $QFA;
+
+## Read target fasta
+my $TFA = &open2('R', $target_fa, 'Target fasta');
+$QT = $targetcentric ? 'Q' : 'T';
+while (<$TFA>) {
+    s/[\n\r]+$//;
+    if (/^>(\S+)/) {
+	$header = $1;
+	push @{ $headers{$QT} }, $header;
+    } else {
+	$seq{$QT}{$header} .= $_;
+    }
+}
+close $TFA;
+
+## Prep alignment maps
+foreach my $query (@{ $headers{Q} }) {
+    foreach my $target (@{ $headers{T} }) {
+	foreach my $strand ('+', '-') {
+	    $aln{$query}{$target}{$strand}{$_} = [9E9, -1, 0] foreach qw/ Q T /;   # initial start, end = impossibly large, small; last elem is length
+	}
+    }
+}
+
+## Read PSL
+my $IN = &open2('R', $psl, 'Input PSL');
+while (<$IN>) {
+    s/[\n\r]+$//;
+    next if $. < 6;
+    my @data = split;
+    my ($ident, $mismatch, $reps, $Ns, $qgaps, $qgapbp, $tgaps, $tgapbp, $strand, $target, $tlen, $tstart, $tend, $query, $qlen, $qstart, $qend, $blocks, $blocksizes, $tstarts, $qstarts) = @data[0..20];
+    if ($targetcentric) {
+	my ($xgaps, $xgapbp, $xname, $xlen, $xstart, $xend, $xstarts) = ($tgaps, $tgapbp, $target, $tlen, $tstart, $tend, $tstarts);
+	($tgaps, $tgapbp, $target, $tlen, $tstart, $tend, $tstarts) = ($qgaps, $qgapbp, $query, $qlen, $qstart, $qend, $qstarts);
+	($qgaps, $qgapbp, $query, $qlen, $qstart, $qend, $qstarts) = ($xgaps, $xgapbp, $xname, $xlen, $xstart, $xend, $xstarts);
+    }
+    die "Query '$query' not found in query fasta!\n" unless exists $seq{Q}{$query};
+    die "Target '$target' not found in target fasta!\n" unless exists $seq{T}{$target};
+    ## Determine maximum aligned area on query, and associated regions on target
+    if ($qstart < $aln{$query}{$target}{$strand}{Q}->[0]) {
+	$aln{$query}{$target}{$strand}{Q}->[0] = $qstart;
+	$aln{$query}{$target}{$strand}{T}->[0] = $tstart;
+    }
+    if ($qend > $aln{$query}{$target}{$strand}{Q}->[1]) {
+	$aln{$query}{$target}{$strand}{Q}->[1] = $qend;
+	$aln{$query}{$target}{$strand}{T}->[1] = $tend;
+    }
+    $aln{$query}{$target}{$strand}{Q}->[2] = $qlen;
+    $aln{$query}{$target}{$strand}{T}->[2] = $tlen;
+}
+close $IN;
+
+## Process PSL & write output
+my $OUT = &open2('W', $out, 'Output fasta');
+my @report;
+foreach my $query (@{ $headers{Q} }) {
+    foreach my $target (@{ $headers{T} }) {
+	foreach my $strand ('+','-') {
+	    next if $aln{$query}{$target}{$strand}{Q}->[0] == 9E9;   # empty pairing
+	    my ($qminstart, $qmaxend, $qlen) = @{ $aln{$query}{$target}{$strand}{Q} };
+	    my ($tminstart, $tmaxend, $tlen) = @{ $aln{$query}{$target}{$strand}{T} };
+	    ## Unaligned query flanks
+	    my $qwidth5 = $qminstart - 0;
+	    my $qwidth3 = $qlen - $qmaxend;
+	    ## Unaligned target flanks
+	    my $twidth5 = $strand == "+" ? $tminstart - 0 : $tlen - $tmaxend;
+	    my $twidth3 = $strand == "+" ? $tlen - $tmaxend : $tminstart - 0;
+	    ## Get smallest flanks
+	    my $width5 = $qwidth5 < $twidth5 ? $qwidth5 : $twidth5;
+	    my $width3 = $qwidth3 < $twidth3 ? $qwidth3 : $twidth3;
+	    ## Get query substr positions
+	    my $qinitial = $qminstart - $width5;
+	    my $qfinal = $qmaxend + $width3;
+	    ## Get target substr positions
+	    my $tinitial = $strand == "+" ? $tminstart - $width5 : $tmaxend + $width3;
+	    my $tfinal = $strand == "+" ? $tmaxend + $width3 : $tminstart - $width5;
+	    ## observed widths
+	    my $qobsw5 = $qminstart - $qinitial;
+	    my $qobsw3 = $qfinal - $qmaxend;
+	    my $tobsw5 = $tminstart - $tinitial;
+	    my $tobsw3 = $tfinal - $tmaxend;
+	    push @report, [$query, $target, $strand, "$width5, $qwidth5, $twidth5", "$width3, $qwidth3, $twidth3", "$qlen: $qinitial, $qminstart, $qmaxend, $qfinal", "$tlen: $tinitial, $tminstart, $tmaxend, $tfinal", "$qobsw5, $qobsw3", "$tobsw5, $tobsw3"];
+	    ## Write unaligned sequences, in query-target pairs, if long enough to report
+	    if ($width5 >= $minbp) {
+		print $OUT ">$query:$target:$strand:Query5:",$qinitial+1,"-$qminstart\n",${&blockify(substr($seq{Q}{$query},$qinitial,$qminstart))},"\n";
+		print $OUT ">$query:$target:$strand:Target5:",$tinitial+1,"-$tminstart\n",${&blockify(substr($seq{T}{$target},$tinitial,$tminstart))},"\n";
+	    }
+	    if ($width3 >= $minbp) {
+		print $OUT ">$query:$target:$strand:Query3:",$qmaxend+1,"-$qfinal\n",${&blockify(substr($seq{Q}{$query},$qmaxend,$qfinal))},"\n";
+		print $OUT ">$query:$target:$strand:Target3:",$tmaxend+1,"-$tfinal\n",${&blockify(substr($seq{T}{$target},$tmaxend,$tfinal))},"\n";
+	    }
+	}
+    }
+}
+close $OUT;
+
+my @maxw = map {0} @{$report[0]};
+my $reportN = scalar @{$report[0]};
+foreach my $line (@report) {
+    foreach my $i (0..$reportN-1) {
+	$maxw[$i] = length($$line[$i]) if length($$line[$i]) > $maxw[$i];
+    }
+}
+my $format = join(' | ', map {'%'.$maxw[$_].'s'} (0..$reportN-1)) . "\n";
+printf($format, @$_) foreach @report;
+
+
+print "pslUnalignedFlanks $psl complete!\n";
+exit;

@@ -1,0 +1,304 @@
+#!/usr/bin/env perl
+require "$ENV{SIMR_APA_BIN}/apa_routines.pm";
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+#### FIXME: ADD SAMPLE NAMES TO $fq1, $fq2, $bam
+
+
+my $fasta2tab = "/home/apa/local/bin/fasta2tab";
+my $tab2fasta = "/home/apa/local/bin/tab2fasta";
+my $fastqUnaligned = "/home/apa/local/bin/fastqUnaligned";
+
+my ($geno, $anno, $cores, $outdir, $fq1, $fq2, $selection, $bam, $PE, $labels, $add);
+GetOptions("g=s"=>\$geno, "a=s"=>\$anno, "c=i"=>\$cores, "o=s"=>\$outdir, "s=s"=>\$selection, "l=s"=>\$labels, "fq1=s"=>\$fq1, "fq2=s"=>\$fq2, "bam=s"=>\$bam, "pe=s"=>\$PE, "add"=>\$add);
+
+die "$0: at least -fq1 or -bam must be given!\n" unless $fq1 || $bam;
+die "$0: cannot specify both -fq1 and -bam!\n" if $fq1 && $bam;
+die "$0: must specify -pe yes|no if using -bam!\n" if $bam && !$PE;
+die "$0: -pe value must be 'yes' or 'no'!\n" if $PE && $PE !~ /^(yes|no)$/i;
+$PE = 'yes' if $fq2;
+$PE = $PE eq 'yes';  # convert to 1|0
+$cores = 1 unless $cores;
+$outdir = 'alignToMaxIsoform' unless $outdir;
+
+my ($bylen, $byexpr);
+unless ($add) {
+    die "$0: -g and -a are mandatory!\n" unless $geno && $anno;
+}
+    my %okselect = map {($_=>1)} qw/ length expression /;
+    die "$0: must specify -s as either 'length' or 'expression'!\n" unless $okselect{$selection};
+    $bylen  = $selection eq 'length';
+    $byexpr = $selection eq 'expression';
+
+my @fq1 = split /,/, $fq1;
+my @fq2 = split /,/, $fq2;
+my @bam = split /,/, $bam;
+my @labels = split /,/, $labels;
+die "$0: \@fq1, \@fq2 lengths differ!\n" if @fq2 && $#fq1!=$#fq2;
+die "$0: \@fq1, \@labels lengths differ!\n" if @fq1 && @labels && $#fq1!=$#labels;
+die "$0: \@fq2, \@labels lengths differ!\n" if @fq2 && @labels && $#fq2!=$#labels;
+die "$0: \@bam, \@labels lengths differ!\n" if @bam && @labels && $#bam!=$#labels;
+foreach my $f1 (@fq1) {
+    die "$0: fastq 1 '$f1' does not exist!\n" unless -e $f1;
+}
+foreach my $f2 (@fq2) {
+    die "$0: fastq 2 '$f2' does not exist!\n" unless -e $f2;
+}
+foreach my $b (@bam) {
+    die "$0: bam '$b' does not exist!\n" unless -e $b;
+}
+
+my $genoidx  = "/n/data1/genomes/indexes/$geno";
+my $genoidxp = "/n/data1/genomes/indexes/$geno/bowtie2/$geno";
+my $annoidx  = "/n/data1/genomes/indexes/$geno/annotation/$anno";
+my $map      = "/n/data1/genomes/indexes/$geno/annotation/$anno/beds/$geno.$anno.transcript_maps_merged.cDNA_coords.bed";
+my $gtf      = "/n/data1/genomes/indexes/$geno/annotation/$anno/gtfs/$geno.$anno.cuff.gtf";
+my $gtfidx   = "/n/data1/genomes/indexes/$geno/annotation/$anno/gtfs/$geno.$anno.cuff.gtf.index";
+my $gtfidxp  = "/n/data1/genomes/indexes/$geno/annotation/$anno/gtfs/$geno.$anno.cuff.gtf.index/$geno.$anno.cuff";
+die "$0: geno/anno combination '$geno/$anno' is not a sitewide index!\n" unless -d $annoidx;
+
+my $inidir   = "$outdir/initial_out";
+my $findir   = "$outdir/final_out";
+my $btidir   = "$outdir/bowtie2_index";
+my $maxpref  = $byexpr ? "$btidir/highest_expr_isoforms" : "$btidir/longest_isoforms";
+system "mkdir -p $_" foreach ($findir, $btidir);  ## NOT $inidir, yet
+
+my $N = @fq1 ? $#fq1 : $#bam;
+my $merge = @bam ? 1 : 0;  # if bam input, then merging runs
+my (%samp, @fq1A, @fq2A, @bamA, @unal_pref);
+
+foreach my $i (0..$N) {
+    $labels[$i] = "sample_$i" unless $labels[$i];
+    my $label = $labels[$i];
+    if ($bam) {
+        ## Alignment exists, get INIDIR from that
+        ($samp{$i}{INIDIR} = $bam[$i]) =~ s!/[^/]+.bam$!!;
+    } else {
+        ## Start from scratch
+        $samp{$i}{INIDIR} = "$inidir/$label";
+        $bam[$i] = "$samp{$i}{INIDIR}/accepted_hits.bam";
+    }
+    push @unal_pref, "$samp{$i}{INIDIR}/unaligned";
+    if ($PE) {
+        $fq1A[$i] = "$unal_pref[$i]_1.fastq.gz";
+        $fq2A[$i] = "$unal_pref[$i]_2.fastq.gz";
+    } else {
+        $fq1A[$i] = "$unal_pref[$i].fastq.gz";    # and $fq2A[$i] is still undef
+    }
+    $samp{$i}{FINDIR} = "$findir/$label";
+}
+
+if ($merge) {
+    ## aligned-read fastqs should already have been made
+    foreach my $i (0..$#bam) {
+        die "$0: required fastq '$fq1A[$i]' does not exist!\n" unless -e $fq1A[$i];
+        die "$0: required fastq '$fq2A[$i]' does not exist!\n" if $PE && ! -e $fq2A[$i];
+    }
+} else {
+    system "mkdir -p $inidir" unless $add;  # if not merging, then this will be required
+}
+
+my (%QC, %biotype, %maxt);
+unless ($add) {
+    open my $GD, '<', "$annoidx/$geno.$anno.transdata.txt";
+    while (<$GD>) {
+        chomp;
+        ## TransID, Name, GeneID, Chr, Start, End, Strand, Tot_Len, cDNA_Len, CDS_Len, cDNA_GC, CDS_GC, N_Exons, Max_Intron, Biotype, SimpleBiotype, GeneBiotype, GeneSimpleBiotype, StatusGenomic_CDS_Start, Genomic_CDS_End, Trans_CDS_Start, Trans_CDS_End, snpEff_Codon_Table
+        my ($trans, $gene, $tlen, $tbio, $tsbio, $gbio, $gsbio) = (split /\t/, $_)[0,2,8,14..17];
+        $biotype{G}{$gene} = [$gbio, $gsbio];
+        $biotype{T}{$trans} = [$tbio, $tsbio];
+        $QC{$gene}{$trans}{XL} = $tlen;
+        next unless $gsbio eq $tsbio;  # trans biotype must match gene biotype, no NMD junk etc.
+        $QC{$gene}{$trans}{SB} = 1;  # biotype match
+        $maxt{$gene} = [$tlen, $trans] if $tlen > $maxt{$gene}->[0];  # initial maxt: length
+    }
+    close $GD;
+
+    foreach my $gene (keys %maxt) {
+        $QC{$gene}{ $maxt{$gene}->[1] }{ML} = 1;  # record max-length-ness
+    }
+}
+
+## If $byexpr, then not a simple length selection
+## Must align, quantitate, and compare isoform expression levels
+## %maxt gets rebooted
+
+unless ($merge) {
+    
+    ## Start from scratch
+    foreach my $i (0..$#fq1) {
+        
+        unless (-e "$bam[$i].bai") {
+            &execute("tophat -p $cores -o $samp{$i}{INIDIR} --no-novel-juncs --no-coverage-search --transcriptome-only --transcriptome-index $gtfidxp $genoidxp $fq1[$i] $fq2[$i]", 1);
+            #&execute("tophat -p $cores -o $samp{$i}{INIDIR} --no-novel-juncs --no-coverage-search --transcriptome-index $gtfidxp $genoidxp $fq1[$i] $fq2[$i]", 1);
+            &execute("samtools index $bam[$i]", 1);
+        }
+        &execute("samtools idxstats $bam[$i] > $bam[$i].idxstats.txt", 1) unless -e "$bam[$i].idxstats.txt";
+        my $unbam = "$samp{$i}{INIDIR}/unmapped.bam";
+        
+        if (-e $unbam) {
+            if ($PE) {
+                &execute("$fastqUnaligned -fq1 $fq1[$i] -fq2 $fq2[$i] -p $unal_pref[$i] -o aligned --aligned $bam[$i]", 1);
+                &execute("rename unaligned_aligned aligned $unal_pref[$i]*.fastq.gz", 1);
+            } else {
+                &execute("samtools bam2fq $bam[$i] | gzip > $fq1A[$i]", 1);
+                &execute("samtools bam2fq $unbam | gzip > $unal_pref[$i].fastq.gz", 1);
+            }
+            &execute("rm -f $unbam", 1);
+        }
+    }
+}
+
+
+if ($byexpr) {
+    
+    my ($i, %FPM);
+    ## @bam was either populated via command line, or by the @fq1 loop above.
+    ## get exon counts whether $merge or not
+    unless ($add) {
+        foreach my $i (0..$#bam) {
+            
+            print "Reading $bam[$i] expression data...\n";
+            chomp(my $M = `bash -c 'paste -s -d+ <(cut -f3 $bam[$i].idxstats.txt) | bc'`);  # need total aligned reads for FPM
+            my $cbfile = "$samp{$i}{INIDIR}/gtf.coverageBed.txt.gz";
+            &execute("coverageBed -counts -F 0.5 -a $gtf -b $bam[$i] | gzip > $cbfile", 1) unless -e $cbfile;
+            
+            ## Parse coverageBed output to find top FPM transcripts
+            ## NOT TOP FPKM -- we want highest N reads, period.
+            ## This biases towards longer isoforms, which is good
+            ## Super-high-expressed short isoforms are bad
+            open my $CB, '-|', "zcat $cbfile";
+            while (<$CB>) {
+                chomp;
+                ## GTF with extra column for read overlap (by 50%+ of read length) counts
+                my ($annot, $reads) = (split /\t/, $_)[8,9];
+                my ($gene, $trans) = ($annot =~ /gene_id "([^"]+)"; transcript_id "([^"]+)";/);
+                $QC{$gene}{$trans}{XP}{$labels[$i]} = $reads;
+                ## CUMULATIVE FPM FOR ALL RUNS // don't need 1E6 scaling factor here
+                ## avoid biotype mismatches; e.g. PC gene but NC trans
+                $FPM{$gene}{$trans} += $reads/$M if $QC{$gene}{$trans}{SB};
+            }
+            close $CB;
+            
+        }
+        
+        ## After all FPMs summed, choose max transcript per gene
+        %maxt = ();
+        foreach my $gene (keys %FPM) {
+            my $maxtrans = (sort { $FPM{$gene}{$b}<=>$FPM{$gene}{$a} } keys %{ $FPM{$gene} })[0];
+            next unless $FPM{$gene}{$maxtrans};   # only include max trans if it was expressed at all!
+            $maxt{$gene} = [$FPM{$gene}{$maxtrans}, $maxtrans];
+            $QC{$gene}{$maxtrans}{MX} = 1;
+            #print "MAXT: $gene, $maxtrans, $FPM{$gene}{$maxtrans}\n";
+        }
+        my $ngenes = scalar keys %FPM;
+        my $nmaxt = scalar keys %maxt;
+        my $nzeroes = $ngenes - $nmaxt;
+        print "$ngenes genes | $nmaxt highest-expressed transcripts found | $nzeroes genes have no expressed isoforms.\n";
+        
+        ## Write QC dataset
+        my %t2g;
+        open my $QOUT, "> $btidir/transcript.QC.txt";
+        print $QOUT join("\t", qw/ Gene GeneBiotype GeneSimpleBiotype Transcript TransBiotype TransSimpleBiotype SameBiotype Exon_Len Longest MaxExpr /, map { "Counts.$_" } @labels), "\n";
+        foreach my $gene (sort keys %QC) {
+            my ($gbio, $gsbio) = @{ $biotype{G}{$gene} };
+            foreach my $trans (sort keys %{ $QC{$gene} }) {
+                $t2g{$trans} = $gene;
+                my ($tbio, $tsbio) = @{ $biotype{T}{$trans} };
+                my ($samebio, $exlen, $longest, $maxexpr) = map { $QC{$gene}{$trans}{$_} } qw/ SB XL ML MX /;
+                my @counts = map { $QC{$gene}{$trans}{XP}{$_} } @labels;
+                print $QOUT join("\t", $gene, $gbio, $gsbio, $trans, $tbio, $tsbio, $samebio, $exlen, $longest, $maxexpr, @counts), "\n";
+            }
+        }
+        close $QOUT;
+        
+        ## Write map.bed with transcript changed to gene|transcript
+        open my $MIN, '<', $map;
+        open my $MOUT, '>', "$btidir/transcript.maps.bed";
+        while (<$MIN>) {
+            chomp;
+            my ($trans, $start, $end, $name, $score, $strand) = split /\t/, $_;
+            my $name2 = $name =~ /:CDS/ ? 'CDS' : $name =~ /:UTR/ ? "UTR$score" : $name;
+            print $MOUT join("\t", "$t2g{$trans}|$trans", $start, $end, $name2, 1, "+\n");
+        }
+        close $MIN;
+        close $MOUT;
+        
+    }  ### end unless $add
+    
+} else {
+    
+    ## If longest, not highest-expr, then no pre-alignment stages
+    
+    unless ($merge) {
+        @fq1A = @fq1;
+        @fq2A = @fq2;
+    }
+    
+}
+
+
+unless ($add) {
+    
+    ## At this point, %maxt holds the max transcript set, selection method no longer matters
+    ## Write max-trans fasta
+    ## Build bowtie2 index
+    my %allmaxtrans = map { ( $maxt{$_}->[1] => $_ ) } sort keys %maxt;
+
+    open my $FAI, '-|', "cat $gtfidxp.fa | $fasta2tab";
+    open my $FAO, '|-', "$tab2fasta > $maxpref.fa";
+    while (<$FAI>) {
+        my ($num, $trans, $chrstr, @etc) = split;
+        my $seq = $etc[-1];
+        ($seq = reverse $seq) =~ tr/ACGTacgt/TGCAtgca/ if $chrstr =~ /-$/;
+        if (exists $allmaxtrans{$trans}) {
+            my $gene = $allmaxtrans{$trans};
+            print $FAO "$gene|$trans\t$seq\n";  # for some reason, $seq has no newline??  effect of plain 'split'?
+        }
+    }
+    close $_ foreach ($FAI, $FAO);
+    system "samtools faidx $maxpref.fa";
+    
+    open my $GTFI, '<', $gtf;
+    open my $GTFO, '|-', "gzip > $maxpref.gtf.gz";
+    while (<$GTFI>) {
+        my ($trans) = (/transcript_id "([^"]+)"/);
+        print $GTFO $_ if exists $allmaxtrans{$trans};
+    }
+    close $_ foreach ($GTFI, $GTFO);
+    
+    &execute("bowtie2-build $maxpref.fa $maxpref > $maxpref.bowtie2-build.log", 1);
+    
+}
+
+
+## Run alignment against max-transcript index
+foreach my $i (0..$#fq1A) {
+    
+    &execute("tophat -g 1 -p $cores -o $samp{$i}{FINDIR} $maxpref $fq1A[$i] $fq2A[$i]", 1);  #### -g 1 no multi-aligns!!!
+    my $ibam = "$samp{$i}{FINDIR}/accepted_hits.bam";
+    &execute("samtools index $ibam", 1);
+    &execute("samtools idxstats $ibam > $ibam.idxstats.txt", 1);   # transcript alignment counts
+    chomp(my $M = `bash -c 'paste -s -d+ <(cut -f3 $ibam.idxstats.txt) | bc'`);
+    &execute("echo -e \"GENE|TRANSCRIPT\\tLENGTH\\tALIGNS\\tRPKM\" > $ibam.RPKMs.txt", 1);
+    my $t = '"\\t"';
+    &execute("head -n -1 $ibam.idxstats.txt | awk -v M=$M '{ print \$1$t\$2$t\$3$t(1E9*\$3)/(\$2*M) }' >> $ibam.RPKMs.txt", 1);
+    &execute("echo -e \"*\\t0\\t0\\t0\" >> $ibam.RPKMs.txt", 1);
+    
+    if ($PE) {
+        ## unmapped bam->fq for PE not ready yet; leave as bam
+    } else {
+        &execute("samtools bam2fq $samp{$i}{FINDIR}/unmapped.bam | gzip > $samp{$i}{FINDIR}/unaligned.fastq.gz", 1);
+        &execute("rm -f $samp{$i}{FINDIR}/unmapped.bam", 1);
+    }
+    
+}
+
+
+## Done!
+print "$0 complete!\n";
+exit;
+

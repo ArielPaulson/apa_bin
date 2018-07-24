@@ -1,0 +1,40 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my ($input, $output);  # BED or GTF files
+my ($fail, $drop);     # fail causes procedure to fail if any unconvertible lines  //  drop causes unconvertibles to be dropped, instead of failing
+
+GetOptions("i=s" => \$input, "o=s" => \$output, "drop" => \$drop, "fail" => \$fail);
+
+my %opp = ('+'=>'-', '-'=>'+');
+my $bed = '\S+\s+' x 5;
+my $gxf = '\S+\s+' x 6;
+my $failed;
+
+open IN, $input or die "$0: Cannot open input '$input' for reading: $!\n"; 
+open OUT, "> $output" or die "$0: Cannot open output '$output' for writing: $!\n";
+while (<IN>) {
+    if ($_ =~ /^track/ || $_ =~ /^#/) {   # headers
+	print OUT $_;
+    } elsif ($_ =~ s/^($bed)([+-])/$1$opp{$2}/) {   # BED file
+	print OUT $_;
+    } elsif ($_ =~ s/^($gxf)([+-])/$1$opp{$2}/) {   # GFF/GTF file
+	print OUT $_;
+    } else {
+	chomp;
+	print "Failed to parse line $., '$_': not BED-like or GTF-like.";
+	$drop ? (print "  Dropping.\n") : (print "\n");
+	$failed++;
+    }
+}
+close OUT;
+close IN;
+
+if ($failed) {
+    print "$0: $input: $fail lines failed to convert\n";
+    system "rm -f $output" if $fail;
+}
+exit;
+

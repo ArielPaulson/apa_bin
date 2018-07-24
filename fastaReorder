@@ -1,0 +1,36 @@
+#!/usr/bin/env perl
+require '/home/apa/local/bin/apa_routines.pm';
+use strict;
+
+my ($infasta, $order, $outfasta) = @ARGV;  # ALL ARE FILES
+
+my $ORD = &open2('R', $order, 'Ordering file');
+chomp(my @order = (<$ORD>));
+my %order = map {($_=>1)} @order;
+close $ORD;
+
+print STDERR "Reading input fasta...\n";
+my $IFA = &open2('R', $infasta, 'Input fasta');
+my @x = &readFasta($IFA, 1);
+close $IFA;
+my %sequence = %{ $x[0] };
+
+my ($OK, $NOK, $ABS) = (0, 0, 0);
+foreach my $header (keys %sequence) {
+    $ABS++ unless exists $order{$header};
+}
+
+print STDERR "Writing output fasta...\n";
+my $OFA = &open2('W', $outfasta, 'Output fasta');
+foreach my $header (@order) {
+    if (exists $sequence{$header}) {
+        $OK++;
+        print $OFA ">$header\n$sequence{$header}";  # sequence pre-blocked with terminal newlines
+    } else {
+        $NOK++;
+    }
+}
+close $OFA;
+
+print STDERR "$OK ordering headers matched | $NOK not matched | $ABS headers in fasta were not in the ordering\n";
+exit;

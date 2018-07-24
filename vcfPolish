@@ -1,0 +1,57 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## Ensures VCF is headerized, uniqued, sorted, compressed, and indexed
+## Args: input VCF, output VCF, optional header source file, optional genome label
+## If no header source file, headerization is skipped (assumes already has header!)
+## If no header source file, but genome is given, then just give header file as ''
+## If genome is given, then the file /n/data1/genomes/indexes/$GENO/$GENO.chrom.sizes must exist.
+
+my $unique = '/home/apa/local/bin/unique';
+my $vcfSort = '/home/apa/local/bin/vcfSort';
+my $vcfHeaderOrder = '/home/apa/local/bin/vcfHeaderOrder';
+
+my $invcf;    # input vcf
+my $outvcf;   # output vcf (which may also be the input)
+my $headvcf;  # optional header-source VCF
+my $geno;     # optional genome label
+my $verbose;
+
+GetOptions("i=s"=>\$invcf, "o=s"=>\$outvcf, "h=s"=>\$headvcf, "g=s"=>\$geno, "verbose"=>\$verbose);
+
+die "$0: input VCF '$invcf' does not exist!\n" unless -e $invcf;
+die "$0: output VCF '$outvcf' not specified!\n" unless $outvcf;
+die "$0: VCF header source '$headvcf' does not exist!\n" if $headvcf && !-e $headvcf;
+my $chrsz = "/n/data1/genomes/indexes/$geno/$geno.chrom.sizes";
+die "$0: Required chrom.sizes file '$chrsz' does not exist!\n" if $geno && !-e $chrsz;
+
+$headvcf = $invcf unless $headvcf;
+my ($hcomp, $herr, $hrcmd, $hwcmd) = @{ &is_compressed($headvcf, 1) };
+die "$0: file '$headvcf' had compression errors:\n$herr\n" if $herr && !$hrcmd;
+my ($icomp, $ierr, $ircmd, $iwcmd) = @{ &is_compressed($invcf, 1) };
+die "$0: file '$invcf' had compression errors:\n$ierr\n" if $ierr && !$ircmd;
+my $tmp = "$invcf.tmp";
+&execute("$hrcmd $headvcf | grep \"^#\" > $tmp",$verbose);    # initialize with header
+&execute("$vcfHeaderOrder $tmp $tmp $geno",$verbose);         # orders and overwrites
+&execute("$ircmd $invcf | grep -v \"^#\" >> $tmp",$verbose);  # drops existing header rows
+
+## $tmp is uncompressed at this time
+## $OUTVCF MAY BE $INVCF; will overwrite below
+if ($outvcf =~ /\.b?gz$/i) {
+    ## Write VCF compressed
+    &execute("cat $tmp | $unique | $vcfSort - | bgzip -f > $outvcf",$verbose);
+    &execute("tabix -p vcf -f $outvcf",$verbose);  # can tabix if bgzipped
+    &execute("chmod 755 $outvcf $outvcf.tbi",$verbose);
+} else {
+    ## Write VCF uncompressed
+    &execute("cat $tmp | $unique | $vcfSort - > $outvcf",$verbose);
+    &execute("chmod 755 $outvcf",$verbose);
+}
+
+system "rm -f $tmp";
+print "$0 $invcf complete!\n";
+exit;
+

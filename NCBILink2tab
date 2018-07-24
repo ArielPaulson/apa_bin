@@ -1,0 +1,106 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use strict;
+no strict 'refs';  # because Perl sucks
+
+## Enter as many files as you want.  Each file must be either:
+##  1. XML from an eutils' elinks.fcgi query, keys are query IDs (see below);
+##  2. Tabular; keys are in column 1.
+## All column-1 and query IDs must be the same (or from a common set).
+## The output will be keyed on this common set (col 1), and all other columns will be the associated IDs found in the input files.
+
+## Header and first record from an elinks.fcgi query.  XML files must have this format:
+#<?xml version="1.0"?>
+#<!DOCTYPE eLinkResult PUBLIC "-//NLM//DTD eLinkResult, 23 November 2010//EN" "http://www.ncbi.nlm.nih.gov/entrez/query/DTD/eLink_101123.dtd">
+#<eLinkResult>
+#	<LinkSet>
+#		<DbFrom>nuccore</DbFrom>
+#		<IdList>
+#			<Id>2443265</Id>
+#		</IdList>
+#		<LinkSetDb>
+#			<DbTo>gene</DbTo>
+#			<LinkName>nuccore_gene</LinkName>
+#			<Link>
+#				<Id>668880</Id>
+#			</Link>
+#		</LinkSetDb>
+#	</LinkSet>
+
+my (%linksets, %alldbs, $fromname);
+    
+foreach my $file (@ARGV) {
+    
+    my ($xml, $start, $capture, $idcapture, $source, $dbname, $fromid);
+    
+    open TEST, $file;
+    while (<TEST>) {
+	$xml = 1 if $_ =~ /^<\?xml/;
+	last if $. == 1;
+    }
+    close TEST;
+    
+    open IN, $file or warn "Cannot read input file '$file': $!\n";
+    if ($xml) {
+	while (<IN>) {
+	    $start = 1 if $_ =~ /^<eLinkResult>/;
+	    next unless $start;
+	    $_ =~ s/[\n\r]+$//;
+	    if ($_ =~ /^\s*<LinkSet>/) {
+		$capture = 1;
+	    } elsif (/^\s*<\/LinkSet>/) {
+		$capture = 0;
+	    } elsif (/^\s*<DbFrom>(.*)<\/DbFrom>/) {
+		$fromname = $1;
+		$source = 'FROM';
+	    } elsif (/^\s*<IdList>/) {
+		$idcapture = 1;
+	    } elsif (/^\s*<\/IdList>/) {
+		$idcapture = 0;
+	    } elsif (/^\s*<LinkSetDb>/) {
+		# ignore for now
+	    } elsif (/^\s*<\/LinkSetDb>/) {
+		# ignore for now
+	    } elsif (/^\s*<DbTo>(.*)<\/DbTo>/) {
+		$dbname = $1;
+		$source = 'TO';
+		$alldbs{$dbname} = 1;
+	    } elsif (/^\s*<LinkName>.*<\/LinkName>/) {
+		# ignore for now
+	    } elsif (/^\s*<Link>/) {
+		$idcapture = 1;
+	    } elsif (/^\s*<\/Link>/) {
+		$idcapture = 0;
+	    } elsif (/^\s*<Id>(.*)<\/Id>/) {
+		if ($source eq 'FROM') {
+		    $fromid = $1;
+		} else {
+		    $linksets{$fromid}{$dbname}{$1} = 1;
+		}
+	    }
+	}
+    } else {
+	my @dbnames;
+	while (<IN>) {
+	    $_ =~ s/[\n\r]+$//;
+	    my @data = split /\t/, $_;
+	    if ($. == 1) {
+		@dbnames = @data;
+		$alldbs{$_} = 1 foreach @dbnames[1..$#data];
+		next;
+	    }
+	    $linksets{$data[0]}{$dbnames[$_]}{$data[$_]} = 1 foreach (1..$#data);
+	}
+    }
+    close IN;
+}
+
+print join "\t", ($fromname, sort keys %alldbs), "\n";
+foreach my $id (sort {$a <=> $b} keys %linksets) {
+    print $id;
+    foreach my $linkdb (sort keys %alldbs) {
+	print "\t$_" foreach sort keys %{ $linksets{$id}{$linkdb} };
+    }
+    print "\n";
+}
+exit;

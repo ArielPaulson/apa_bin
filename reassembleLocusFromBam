@@ -1,0 +1,230 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## Extracts BAM reads overlapping some gene, assembles them with Trinity, and aligns the contigs with blat.
+## Returns the final alignment PSL and derived bigBed file, and contig fasta.
+
+## TO DO: Exhaustive Trinity mode, which will run Trinity N times and take all nonredundant contigs with unique best alignments.
+##        This will ensure no losses due to random tiebreaking during assembly, which actually happened in the test case (ENSMUSG00000067567, mm10, Ens_80),
+##          and resulted in the loss of a spliced alignment by reducing a fully-alignable 765bp contig to a partially-alignable 756bp contig.
+
+## ALSO TO DO:
+## Locus all-sample bam IGV session
+
+
+my $geneid;        # Ensembl gene ID for locus to reassemble
+my $outdir;        # Output dir
+my $clobber;       # Output dir, if overwriting
+my $geno;          # Name of indexed genome
+my $anno;          # Name of indexed transcriptome
+my $flank;         # Value is "integer,integer" (or just "integer") indicating 5', 3' flank bp, if any.  Will extend locus by these flanks when searching for reads.
+my $tracksdir;     # For the bigBed header file: what is the subdir path under http://tracks.stowers.org/r/ where the .bb file will be stored?
+my @bams;          # list of bams to pull reads from
+my $keep;          # keep intermediate datasets?
+my $cores = 1;     # cores for Trinity
+my $mem = '1G';    # RAM for Trinity
+my $minlen = 100;  # smallest Trinity contig to retain
+my $spliced = 'all';  # final retained contigs, based on presence of spliced alignments: keep all contigs ('all'), only spliced ('only'), or no spliced ('none') ?
+
+GetOptions("i=s"=>\$geneid, "o=s"=>\$outdir, "oc=s"=>\$clobber, "g=s"=>\$geno, "a=s"=>\$anno, "s=s"=>\$spliced, "c=i"=>\$cores, "m=s"=>\$mem, "f=s"=>\$flank, "l=i"=>\$minlen, "d=s"=>\$tracksdir, "keep"=>\$keep);
+@bams = @ARGV;
+die "$0: no BAMs specified!\n" unless @bams;
+die "$0: no gene ID given!\n" unless $geneid;
+my %okspliced = map {($_=>1)} qw/ all only none /;
+die "$0: unsupported -s value '$spliced'!\n" unless $okspliced{$spliced};
+
+my $bowtie2 = 'bowtie2';
+my $bin = '/home/apa/local/bin';
+my $gdir = "/n/data1/genomes/indexes/$geno";
+my $pdir = "/n/projects/apa/stuff/bowtie_building/preps/$geno";
+my $genofa = "$gdir/$geno.fa";
+my $gdata = "$gdir/$anno/$geno.$anno.genedata.txt";
+my $chrsz = "$gdir/$geno.chrom.sizes";
+chomp(my $cdnafa = `ls $pdir/$anno/*.cdna.all.fa.gz 2>/dev/null | head -1`);
+
+die "$0: geno/anno combination '$geno/$anno' not found in /n/data1/genomes/indexes!\n" unless -e $gdata;
+chomp(my $havegene = `grep "^$geneid" $gdata | wc -l`);
+die "$0: gene ID '$geneid' does not exist in transcriptome $geno/$anno!\n" unless $havegene;
+
+my @noexist;
+foreach my $bam (@bams) {
+    push @noexist, $bam unless -e $bam;
+}
+die "$0: the following bam files do not exist: @noexist\n" if @noexist;
+
+my @flank = (0,0);  # 5' flank bp, 3' flank bp
+if ($flank) {
+    @flank = $flank =~ /,/ ? (split /,/, $flank) : ($flank,$flank);
+}
+
+if ($clobber) {
+    system "rm -rf $clobber" if -d $clobber;
+    $outdir = $clobber;
+} elsif ($outdir) {
+    ## do nothing
+} else {
+    $outdir = "reassembleLocusFromBam.$geneid";
+}
+die "$0: output dir '$outdir' already exists!  Use -oc to overwrite.\n" if -d $outdir;
+system "mkdir -p $outdir";
+die "$0: failed to create output dir '$outdir'!\n" unless -d $outdir;
+
+my $log = "$outdir/log.txt";
+my $sampdir = "$outdir/samples";
+my $trindir = "$outdir/trinity";
+my $blatdir = "$trindir/blat";
+my $bt2dir = "$trindir/bowtie2";
+my $idxdir = "$bt2dir/idx";
+my $initpref = "$outdir/locus";
+my $finalpref = "$outdir/final";
+
+my $LOG = &open2('W', $log, 'log file');
+&execute("mkdir $sampdir", 1, $LOG);
+&execute("mkdir -p $blatdir", 1, $LOG);
+&execute("mkdir -p $idxdir", 1, $LOG);
+
+&execute("grep -i \"^$geneid\" $gdata | awk '{ print \$3\"\\t\"\$4\"\\t\"\$5\"\\t\"\$1\":\"\$2\"\\t1\\t+\" }' > $initpref.bed", 1, $LOG);
+&execute("fastaFromBed -fi $genofa -bed $initpref.bed -fo $initpref.fa", 1, $LOG);
+&execute("perl -i -pe 's/(\\w{50})/\$1\\n/g' $initpref.fa", 1, $LOG);
+if (-e $cdnafa) {
+    &execute("zcat $cdnafa | $bin/fasta2tab | grep $geneid | $bin/tab2fasta > $initpref.cdnas.fa", 1, $LOG);
+    &execute("$bin/fastaLengths -f $initpref.cdnas.fa", 1, $LOG);
+}
+&execute("$bin/fastaLengths -f $initpref.fa", 1, $LOG);
+
+chomp(my @bed = split /\t/, `cat $initpref.bed`);
+my $chr = $bed[0];
+my $start = $bed[1]-$flank[0];
+my $end = $bed[2]+$flank[1];
+chomp(my $chrlen = `grep -P "^$chr\\t" $chrsz | cut -f2`);
+
+my $sam = "$outdir/locus.sam";
+my $bam = "$outdir/locus.bam";
+my $xsam = "$sampdir/x.sam";
+&execute("samtools view -H $bams[0] | grep -v \"^RG\" > $sam", 1, $LOG);  # init sam w/ header
+&execute("echo -e \"\@RG\tID:$_\tPU:1\tLB:1\tSM:$_\tPL:illumina\" >> $sam", 1, $LOG) foreach (0..$#bams);  # add read-group header lines
+
+open OUT, '>', "$outdir/sample_sheet.txt";
+print OUT "Sample_Num\tBam_Path\n";
+foreach my $i (0..$#bams) {
+    chomp(my $bampath = `readlink -f $bams[$i]`);
+    my $ibam = "$sampdir/$i.bam";
+    my $ifq = "$sampdir/$i.fq.gz";
+    print OUT "$i\t$bampath\n";
+    &execute("samtools view -h $bams[$i] $chr:".($start+1)."-$end > $xsam", 1, $LOG);
+    &execute("cat $xsam | grep -v \"^\@\" | perl -pe 's/\\tRG:Z:\\S+//' | awk -F\"\\t\" '{ print \$0\"\\tRG:Z:$i\" }' >> $sam", 1, $LOG);
+    &execute("cat $xsam | samtools view -bS - > $ibam", 1, $LOG);
+    &execute("samtools bam2fq $ibam | gzip > $ifq", 1, $LOG);
+}
+close OUT;
+&execute("rm -f $xsam", 1, $LOG);
+&execute("cat $sam | samtools view -bS - > $bam", 1, $LOG);
+
+my $allfq = "$outdir/locus.fastq";
+my $trinfa = "$trindir/trinity.fa";  # NOT original "Trinity.fasta" -- this is the processed version
+&execute("zcat $sampdir/*.fq.gz > $allfq", 1, $LOG);
+&execute("Trinity --seqType fq --max_memory $mem --single $allfq --CPU $cores --min_contig_length $minlen --output $trindir", 1, $LOG);
+&execute("cat $trindir/Trinity.fasta | $bin/fasta2tab | perl -pe 's/ [^\t]+//' | awk '{ print \$0\"\\t\"length(\$2) }' | sort -k3,3nr | cut -f1-2 | $bin/tab2fasta > $trinfa", 1, $LOG);
+&execute("$bin/fastaLengths -f $trinfa > $trinfa.lengths", 1, $LOG);
+&execute("cat $trinfa.lengths", 1, $LOG);
+
+my $trinidx = "$idxdir/trinity";
+my $bt2_sam = "$bt2dir/trinity.aligned.sam";
+my $bt2_bam = "$bt2dir/trinity.aligned.bam";
+my $bt2_aln = "$bt2dir/trinity.aligned.fq.gz";
+my $bt2_una = "$bt2dir/trinity.unaligned.fq.gz";
+my $bt2_alnsum = "$bt2dir/trinity.align_summary.txt";
+&execute("$bowtie2-build $trinfa $trinidx", 1, $LOG);
+&execute("$bowtie2 -p $cores --al-gz $bt2_aln --un-gz $bt2_una -x $trinidx -U $allfq -S $bt2_sam 2> $bt2_alnsum", 1, $LOG);
+&execute("samtools view -h -F 4 $bt2_sam | samtools sort -@ $cores -m $mem - -o $bt2_bam", 1, $LOG);
+&execute("samtools idnex $bt2_bam", 1, $LOG);
+&execute("rm -f $bt2_sam", 1, $LOG);
+#zcat Hoxa1_assembly/trinity/bowtie2/trinity.unaligned.fq.gz ù sed -n 2¨4p ù sort -u ù uniq -c ù awk 'é print $2"çt"$1 è' > x.rds
+&execute("cat $bt2_alnsum", 1, $LOG);
+&execute("gzip $allfq", 1, $LOG);
+
+my $blatpref = "$blatdir/trinity";
+my $lost = "$blatpref.psl.lost";
+&execute("blat $initpref.fa $trinfa $blatpref.psl", 1, $LOG);
+&execute("$bin/filterAligns -f $blatpref.psl -t blat -q $trinfa --best --lost", 1, $LOG);
+&execute("mv -f $lost $lost.fa", 1, $LOG) if -s $lost;  # will exist, but may be 0 bytes
+
+my $best = "$blatpref.psl.best";
+my $best2 = "${best}2";
+open IN, '<', $best;
+open OUT, '>', $best2;
+while (<IN>) {
+    if ($. < 6) {
+        print OUT $_;
+        next;
+    }
+    chomp;
+    my @data = split /\t/, $_;
+    $data[20] =~ s/,$//;
+    my @starts = split /,/, $data[20];
+    $data[13] = $chr;
+    $data[14] = $chrlen;
+    $data[15] += $start;
+    $data[16] += $start;
+    $data[20] = join(",", map {$_+$start} @starts);
+    print OUT join("\t", @data),",\n";
+}
+close IN;
+close OUT;
+
+my $asplpref = "$blatpref.best.all";
+my $osplpref = "$blatpref.best.spliced";
+my $usplpref = "$blatpref.best.unspliced";
+
+&execute("ln -sf \$(readlink -f $best2) $asplpref.psl", 1, $LOG);
+&execute("head -5 $best2 > $osplpref.psl", 1, $LOG);
+&execute("head -5 $best2 > $usplpref.psl", 1, $LOG);
+&execute("tail -n +6 $best2 | awk '{ if (\$18!=1) print \$0 }' >> $osplpref.psl", 1, $LOG);
+&execute("tail -n +6 $best2 | awk '{ if (\$18==1) print \$0 }' >> $usplpref.psl", 1, $LOG);
+&execute("tail -n +6 $osplpref.psl | cut -f10 | sort -u > $osplpref.ids.txt", 1, $LOG);
+&execute("tail -n +6 $usplpref.psl | cut -f10 | sort -u > $usplpref.ids.txt", 1, $LOG);
+
+&execute("$bin/psl2bb -i $asplpref.psl -o $asplpref.bb -g $geno", 1, $LOG);
+&execute("$bin/psl2bb -i $osplpref.psl -o $osplpref.bb -g $geno", 1, $LOG);
+&execute("$bin/psl2bb -i $usplpref.psl -o $usplpref.bb -g $geno", 1, $LOG);
+if ($tracksdir) {
+    &execute("$bin/bigWigHeaders -d $tracksdir $asplpref.bb > $asplpref.bb.header.txt", 1, $LOG) if -e "$asplpref.bb";
+    &execute("$bin/bigWigHeaders -d $tracksdir $osplpref.bb > $osplpref.bb.header.txt", 1, $LOG) if -e "$osplpref.bb";
+    &execute("$bin/bigWigHeaders -d $tracksdir $usplpref.bb > $usplpref.bb.header.txt", 1, $LOG) if -e "$usplpref.bb";
+}
+
+&execute("ln -sf \$(readlink -f $trinfa) $asplpref.fa", 1, $LOG);
+&execute("$bin/fastaFilter -i $trinfa -o $osplpref.fa -s $osplpref.ids.txt --include", 1, $LOG);
+&execute("$bin/fastaFilter -i $trinfa -o $usplpref.fa -s $usplpref.ids.txt --include", 1, $LOG);
+
+my ($use, $slabel);
+if ($spliced eq 'all') {
+    $use = $asplpref;
+    $slabel = '';
+} elsif ($spliced eq 'only') {
+    $use = $osplpref;
+    $slabel = ' spliced';
+} elsif ($spliced eq 'none') {
+    $use = $usplpref;
+    $slabel = ' unspliced';
+} else {
+    die "$0: developer forgot to include handling for '-s $spliced'!\n";
+}
+chomp(my $nfinal = `grep "^>" $use.fa | wc -l`);
+&execute("cp $use.fa $finalpref.fa", 1, $LOG);
+&execute("cp $use.psl $finalpref.psl", 1, $LOG);
+&execute("cp $use.bb $finalpref.bb", 1, $LOG) if -e "$use.bb";
+&execute("cp $use.bb.header.txt $finalpref.bb.header.txt", 1, $LOG) if -e "$use.bb.header.txt";
+
+unless ($keep) {
+    &execute("rm -rf $_", 1, $LOG) foreach ($sampdir, $trindir);
+}
+
+&execute("$bin/fastaLengths -f $finalpref.fa", 1, $LOG);
+&logreport("\n\n$nfinal$slabel transcripts retained.\n\n*** Please scp $finalpref.bb to its final home on the tracks server! ***", 1, $LOG) if -e "$finalpref.bb.header.txt";
+&logreport("\n$0 $geneid complete!", 1, $LOG);
+exit;
+

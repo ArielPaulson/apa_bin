@@ -1,0 +1,348 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my $watch;
+#$watch = 'M01285:59:000000000-AV70C:1:1101:3765:10340';  # read to watch operations for
+
+my ($table, $bc5, $bc3, $fullseq) = @ARGV;   ### describe $fullseq...
+(my $outpref = $table) =~ s/\.txt(\.gz)?$/.reconstructed-fragments/;
+my $outfile = "$outpref.txt";
+$outfile .= '.gz' if $table =~ /\.gz$/;
+my $log = "$outpref.log";
+my $outfa = "$outpref.fa.gz";
+my $outfaw = "$outpref.with-adapters.fa.gz";
+print "LOG: $log\n";
+
+my ($samp, $org) = ($table =~ /\/(.*)\.(Drosophila|Danio|Pombe|Schmidtea|MiniGene)/);   ########### MAKE THIS BETTER
+
+my ($retry, @comp, @fasta, @fastaw, %nolfq, %emufq, %stats);
+my $outRL = 101;  # emulating results from 101-bp HiSeq run
+(my $outfq1E = $outfile) =~ s/\.txt/.${outRL}bp-emu_1.fastq/;
+(my $outfq2E = $outfile) =~ s/\.txt/.${outRL}bp-emu_2.fastq/;
+(my $outfq1N = $outfile) =~ s/\.txt/.no-overlap_1.fastq/;
+(my $outfq2N = $outfile) =~ s/\.txt/.no-overlap_2.fastq/;
+
+my $bc5L = length($bc5);
+my $bc3L = length($bc3);
+my $bc5null = ' ' x $bc5L;
+my $bc3null = ' ' x $bc3L;
+
+my $IN = &open2('R', $table, 'input fractions table');
+print STDERR "Processing...\n";
+while (<$IN>) {
+    chomp;
+    next if $. == 1;
+    print " $.\n" if $. % 10000 == 0;
+    my (
+        $header, $fragmaperr, $pattern, $ORFpattern, $topscore, $nextscore, 
+        $E1_B5_Start, $E1_B5_End, $E1_B3_Start, $E1_B3_End,           # read 1 barcode positions
+        $E1_Pre_B5, $E1_B5, $E1_Read, $E1_B3, $E1_Post_B3, $E1_Qual,  # read 1 fractions
+        $E2_B3_Start, $E2_B3_End, $E2_B5_Start, $E2_B5_End,           # read 2 barcode positions
+        $E2_Pre_B5, $E2_B5, $E2_Read, $E2_B3, $E2_Post_B3, $E2_Qual   # read 2 fractions
+        ) = split /\t/, $_;
+    my $nbc = ($E1_B5=~/\S/ ? 1:0) + ($E1_B3=~/\S/ ? 1:0) + ($E2_B5=~/\S/ ? 1:0) + ($E2_B3=~/\S/ ? 1:0);
+    my ($agree1, $agree2, $consensus, $disagree, $dispct, $OL, $LS, $longsep, $extra);
+    my $E1_Len = length($E1_Read);
+    my $E2_Len = length($E2_Read);
+    my $bc5ok = ($E1_B5 eq $bc5 || $E2_B5 eq $bc5) ? 1 : 0;
+    my $bc3ok = ($E1_B3 eq $bc3 || $E2_B3 eq $bc3) ? 1 : 0;
+    ## BCM: barcode match count (must be 2 or 4)
+    ## BCS: barcode sequence (must match expected)    *** NOTE: ENFORCING THIS MEANS THAT BOTH RECOVERED BARCODE SEQUENCES MUST BE PERFECT ***
+    ## BCE: barcode-based ORF ends (must be 5' complete, at least)
+    my $fate = ($nbc != 2 && $nbc != 4) ? 'BCMBAD' :
+        (!$bc5ok || !$bc3ok) ? 'BCSBAD' :
+        ($ORFpattern =~ /^50/) ? 'BCEBAD' : 'OK';
+#    print "$pattern $ORFpattern $nbc\n";
+    
+    my $bc_comp;
+    $bc_comp .= "EXP\t$bc5\t$bc3\n";
+    $bc_comp .= "OBS1\t".($E1_B5=~/\S/?$E1_B5:$bc5null)."\t".($E1_B3=~/\S/?$E1_B3:$bc3null)."\n";
+    $bc_comp .= "OBS2\t".($E2_B5=~/\S/?$E2_B5:$bc5null)."\t".($E2_B3=~/\S/?$E2_B3:$bc3null)."\n";
+    print "$header\n$bc_comp\n" if $header eq $watch;
+    
+    my $longsep = 0;
+    if ($nbc == 4) {
+        ## pattern is or repaired to 11-11
+        $LS = 'SHORT';
+        if ($E1_Read eq $E2_Read) {
+            $consensus = $E1_Read;
+            $agree1 = $fullseq ? $E1_Read : '.' x $E1_Len;
+            $agree2 = $fullseq ? $E1_Read : '.' x $E1_Len;
+        } else {
+            my @E1_Read = split //, $E1_Read;
+            my @E2_Read = split //, $E2_Read;
+            my @E1_Qual = split //, $E1_Qual;
+            my @E2_Qual = split //, $E2_Qual;
+            my $disagree;
+            for (my $i = 0; $i <= $#E1_Read; $i++) {
+                if ($E1_Read[$i] eq $E2_Read[$i]) {
+                    $consensus .= $E1_Read[$i];
+                    $agree1 .= $fullseq ? $E1_Read[$i] : '.';
+                    $agree2 .= $fullseq ? $E1_Read[$i] : '.';
+                } else {
+                    $disagree++;
+                    if (ord($E1_Qual[$i]) >= ord($E2_Qual[$i])) {
+                        $consensus .= $E1_Read[$i];
+                        $agree1 .= $fullseq ? $E1_Read[$i] : '.';
+                        $agree2 .= $E2_Read[$i];
+                    } else {
+                        $consensus .= $E2_Read[$i];
+                        $agree1 .= $E1_Read[$i];
+                        $agree2 .= $fullseq ? $E2_Read[$i] : '.';
+                    }
+                }
+            }
+            $dispct = $disagree/$E1_Len;
+        }
+        $OL = $E1_Len;
+    } elsif ($nbc == 2) {
+        ## pattern is or repaired to 10-01
+        $LS = 'LONG';
+        ## Identify region of overlap, if possible
+        my $e1ols;  # Start of imputed E1-E2 overlap on E1
+        my $e1ole;  #   End of imputed E1-E2 overlap on E1
+        my $e2ols;  # Start of imputed E1-E2 overlap on canonicalized E2
+        my $e2ole;  #   End of imputed E1-E2 overlap on canonicalized E2
+        my ($match, $retried);
+        ## Below, a series of short-match attempts because this is far faster in-script (albeit weaker) than trying to compare sequences outside with blast/blat
+        ## PASS 1: begin at -20 + 20mer, end at -10 + 10mer, compare each kmer
+        my $offset = 20;
+        my $fraglen = 20;
+        {
+            ## the minimum allowed match is the last 10mer from E1
+            next if $fraglen < 10;
+            my $frag = substr($E1_Read, $E1_Len-$fraglen, $fraglen);
+            if ($E2_Read =~ /$frag/g) {
+                $e2ole = pos($E2_Read);  # because $frag always ends at the end of E1
+                $match = $&;
+            } else {
+                $fraglen--;
+                redo;
+            }
+        }
+        ## If final 10-mer is mismatched, prior loop will fail...
+        ## PASS 2: begin at -20 + 20mer, end at -20 + 10mer, compare each kmer (pass 1 in reverse, sort of)
+        unless ($e2ole) {
+            {
+                ## the minimum allowed match is the second-to-last non-overlapping 10mer from E1
+                next if $fraglen < 10;
+                my $frag = substr($E1_Read, $E1_Len-$offset, $fraglen);
+                if ($E2_Read =~ /$frag/g) {
+                    $e2ole = pos($E2_Read)+$offset-$fraglen;  # because $frag ends $offset-$fraglen bp from the end of E1
+                    $match = $&;
+                } else {
+                    $fraglen--;
+                    redo;
+                }
+            }
+        }
+        ## If both last and second-to-last non-overlapping 10mers are mismatched, both prior loops will fail...
+        ## Fall back 20bp and repeat
+        ## PASS 3: begin at -40 + 20mer, end at -30 + 10mer, compare each kmer
+        unless ($e2ole) {
+            ## if overlap failed, last 10 bp may have been unmatchable, fall back 20bp and repeat
+            $retry++;
+            $offset = 40;
+            $fraglen = 20;
+            my $noffset = $offset - $fraglen;  # fixed dist from E1 end
+            {
+                next if $fraglen < 10;
+                my $frag = substr($E1_Read, $E1_Len-$noffset-$fraglen, $fraglen);
+                if ($E2_Read =~ /$frag/g) {
+                    $e2ole = pos($E2_Read)+$noffset;
+                    $match = $&;
+                } else {
+                    $fraglen--;
+                    redo;
+                }
+            }
+        }
+        ## Again, prior loop may fail...
+        ## PASS 4: begin at -40 + 20mer, end at -40 + 10mer, compare each kmer
+        unless ($e2ole) {
+            ## if overlap failed, last 10 bp may have been unmatchable, fall back 20bp and repeat
+            $retry++;
+            $offset = 40;
+            $fraglen = 20;
+            {
+                next if $fraglen < 10;
+                my $frag = substr($E1_Read, $E1_Len-$offset, $fraglen);
+                if ($E2_Read =~ /$frag/g) {
+                    $e2ole = pos($E2_Read)+$offset-$fraglen;
+                    $match = $&;
+                } else {
+                    $fraglen--;
+                    redo;
+                }
+            }
+        }
+        if ($e2ole) {
+            ## fragments overlap by (at least) 10-20bp, alignment occurred somewhere within the last 40bp of E1, but location on E2 will vary.
+            my ($E1_Pre, $E1_Frag, $E1_Post, $E2_Pre, $E2_Frag, $E2_Post);
+            $e1ols = $E1_Len-$e2ole;
+            $e1ole = $E1_Len;
+            if ($e1ols < 0) {
+                ## E1 STARTS LATER THAN E2
+                $e2ols = -1 * $e1ols;
+                $E1_Frag = substr($E1_Read, 0, $e1ole);
+                $E2_Frag = substr($E2_Read, $e2ols, $e2ole);
+                $E2_Pre = substr($E2_Read, 0, $e2ols);
+                $consensus = $E2_Pre;
+                $agree1 = ' ' x length($E2_Pre);
+                $agree2 = $fullseq ? $E2_Pre : '.' x length($E2_Pre);
+            } else {
+                $e2ols = 0;
+                $E1_Frag = substr($E1_Read, $e1ols, $e1ole);
+                $E2_Frag = substr($E2_Read, $e2ols, $e2ole);
+                $E1_Pre = substr($E1_Read, 0, $e1ols);
+                $consensus = $E1_Pre;
+                $agree1 = $fullseq ? $E1_Pre : '.' x length($E1_Pre);
+                $agree2 = ' ' x length($E1_Pre);
+            }
+            if ($E1_Frag eq $E2_Frag) {
+                $consensus .= $E1_Frag;
+                $agree1 .= $fullseq ? $E1_Frag : '.' x length($E1_Frag);
+                $agree2 .= $fullseq ? $E1_Frag : '.' x length($E2_Frag);
+            } else {
+                my @E1_Frag = split //, $E1_Frag;
+                my @E2_Frag = split //, $E2_Frag;
+                my $E1_FQual = substr($E1_Qual, $e1ols, $e1ole);
+                my $E2_FQual = substr($E2_Qual, $e2ols, $e2ole);
+                my @E1_FQual = split //, $E1_FQual;
+                my @E2_FQual = split //, $E2_FQual;
+                for (my $i = 0; $i <= $#E1_Frag; $i++) {
+                    if ($E1_Frag[$i] eq $E2_Frag[$i]) {
+                        $consensus .= $E1_Frag[$i];
+                        $agree1 .= $fullseq ? $E1_Frag[$i] : '.';
+                        $agree2 .= $fullseq ? $E1_Frag[$i] : '.';
+                    } else {
+                        $disagree++;
+                        if (ord($E1_FQual[$i]) >= ord($E2_FQual[$i])) {
+                            $consensus .= $E1_Frag[$i];
+                            $agree1 .= $fullseq ? $E1_Frag[$i] : '.';
+                            $agree2 .= $E2_Frag[$i];
+                        } else {
+                            $consensus .= $E2_Frag[$i];
+                            $agree1 .= $E1_Frag[$i];
+                            $agree2 .= $fullseq ? $E2_Frag[$i] : '.';
+                        }
+                    }
+                }
+                $OL = length($E1_Frag);
+                $dispct = $disagree/($OL||1);
+            }
+            if ($E1_Len-$e1ols > $E2_Len) {
+                $E1_Post = substr($E1_Read, $e1ols+$E2_Len, $E1_Len);
+                $consensus .= $E1_Post;
+                $agree1 .= $fullseq ? $E1_Post : '.' x length($E1_Post);
+                $agree2 .= ' ' x length($E1_Post);
+            } else {
+                $E2_Post = substr($E2_Read, $e2ole, $E2_Len);
+                $consensus .= $E2_Post;
+                $agree1 .= ' ' x length($E2_Post);
+                $agree2 .= $fullseq ? $E2_Post : '.' x length($E2_Post);
+            }
+            $extra = "($e1ols, $e1ole, $e2ols, $e2ole, $fraglen, $offset, $match)";
+        } else {
+            $longsep = 1;  # fragments do not overlap by at least 10bp
+            ## If no overlap, concat with linker (for now; later may try to rescue match with blat first)
+            $disagree = $OL = 0;
+            my $linker = 'N' x 10;
+            my $gap = '/' x 10;
+            $consensus = $E1_Read . $linker . $E2_Read;
+            my $E1 = $fullseq ? $E1_Read : '.' x length($E1_Read);
+            my $E2 = $fullseq ? $E2_Read : '.' x length($E2_Read);
+            $agree1 = $E1 . $gap . (' ' x length($E2_Read));
+            $agree2 = (' ' x length($E1_Read)) . $gap . $E2;
+        }
+    }
+    
+    my $LS2 = $longsep ? 'LONGSEP' : $LS;
+    $fate = 'DIFF' if $fate eq 'OK' && $dispct > 0.25;
+    $stats{$LS2}{$fate}++;
+    $stats{TOTAL}{$fate}++;
+    
+    my $CL = length($consensus);
+    push @comp, '@'."$header\n$LS2, $fate, $extra, $OL, $CL, ".($disagree||0).", ".sprintf("%0.2f",100*$dispct)."\n$bc_comp'$agree1' ".length($agree1)."\n'$agree2' ".length($agree2)."\n'$consensus' $CL\n\n";
+    
+    if ($fate eq 'OK') {
+        my $rl5 = $outRL-$bc5L;  # remainder of an $outRL-bp read after removing 5' barcode
+        my $rl3 = $outRL-$bc3L;  # remainder of an $outRL-bp read after removing 3' barcode
+        my $useRL2;
+        if ($longsep) {
+            push @{ $nolfq{1} }, '@'."$header\n$E1_Read\n+\n".('I'x$E1_Len)."\n";
+            push @{ $nolfq{2} }, '@'."$header\n".${ &revcomp($E2_Read) }."\n+\n".('I'x$E2_Len)."\n";
+            $rl5 = $E1_Len if $rl5 > $E1_Len;
+            $rl3 = $E2_Len if $rl3 > $E2_Len;
+            $useRL2 = $E2_Len;
+        } else {
+            push @fasta, ">$header\n$consensus\n";
+            push @fastaw, ">$header\n$bc5$consensus$bc3\n";
+            $rl5 = $CL if $rl5 > $CL;
+            $rl3 = $CL if $rl3 > $CL;
+            $useRL2 = $CL;
+        }
+        next unless $rl3 >= 20 && $rl5 >= 20;  # one alone is not good enough, both must have mappable length
+        push @{ $emufq{1} }, '@'."$header:$samp:$org 1:EL$outRL:CL$CL:$longsep:BL$bc5L:RL$rl5\n".substr($consensus, 0, $rl5)."\n+\n".('I'x$rl5)."\n";
+        push @{ $emufq{2} }, '@'."$header:$samp:$org 2:EL$outRL:CL$CL:$longsep:BL$bc3L:RL$rl3\n".${ &revcomp(substr($consensus, $useRL2-$rl3, $rl3)) }."\n+\n".('I'x$rl3)."\n";
+    }
+}
+close $IN;
+
+my $logmsg;
+foreach my $LS2 (qw/ SHORT LONG LONGSEP TOTAL /) {
+    my $subtotal;
+    foreach my $fate (qw/ BCMBAD BCSBAD BCEBAD DIFF OK /) {
+        $logmsg .= "$LS2\t$fate\t$stats{$LS2}{$fate}\n" if $stats{$LS2}{$fate};
+        $subtotal += $stats{$LS2}{$fate};
+    }
+    $logmsg .= "$LS2\tTOTAL\t$subtotal\n";
+}
+$logmsg .= "RETRIES\t\t$retry\n";
+my $LOG = &open2('W', $log, 'log file');
+print $LOG $logmsg;
+close $LOG;
+print STDERR "$logmsg\n";
+
+print STDERR "Writing $outfile\n";
+my $OUT = &open2('W', $outfile, 'output fragments table');
+print $OUT @comp;
+close $OUT;
+if (@fasta) {
+    print STDERR "Writing $outfa\n";
+    my $FA = &open2('W', $outfa, 'output fragments fasta');
+    print $FA @fasta;
+    close $FA;
+}
+if (@fastaw) {
+    print STDERR "Writing $outfaw\n";
+    my $FAW = &open2('W', $outfaw, 'output fragments-with-adapters fasta');
+    print $FAW @fastaw;
+    close $FAW;
+}
+if (%nolfq) {
+    print STDERR "Writing $outfq1N\n";
+    my $FQ1 = &open2('W', $outfq1N, 'output no-overlap fragments end-1 fastq');
+    print $FQ1 @{ $nolfq{1} };
+    close $FQ1;
+    print STDERR "Writing $outfq2N\n";
+    my $FQ2 = &open2('W', $outfq2N, 'output no-overlap fragments end-2 fastq');
+    print $FQ2 @{ $nolfq{2} };
+    close $FQ2;
+}
+if (%emufq) {
+    print STDERR "Writing $outfq1E\n";
+    my $FQ1 = &open2('W', $outfq1E, 'output ${outRL}bp-emulated fragments end-1 fastq');
+    print $FQ1 @{ $emufq{1} };
+    close $FQ1;
+    print STDERR "Writing $outfq2E\n";
+    my $FQ2 = &open2('W', $outfq2E, 'output ${outRL}bp-emulated fragments end-2 fastq');
+    print $FQ2 @{ $emufq{2} };
+    close $FQ2;
+}
+
+print "$0 complete!\n";
+exit;

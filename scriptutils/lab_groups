@@ -1,0 +1,37 @@
+GROUP	LAB
+g1019	Abmayr
+g1013	Baumann
+g1005	Conaway
+g1006	Conaway
+g1011	Gerton
+g1025	Gibson
+g1010	Hawley
+g1020	Jaspersen
+g1001	Krumlauf
+g2006	Kulesa
+g1004	LinhengLi
+g1023	RongLi
+g1022	Si
+g1027	Shilatifard
+g1008	Trainor
+g1018	Workman
+g1017	Washburn
+g1002	Xie
+g1021	Yu
+g1028	Zeitlinger
+fs_piotrowskilab	Piotrowski
+fs_sanchezlab	Sanchez
+fs_bioinformatics	Bioinfo
+fs_genomicslab	Genomics
+fs_cyto	Cytometry
+fs_admins	Sys Admins
+fs_gradschool	Grad School
+imaging_group	Imaging
+librarygroup	LIMS
+informationtech	IT
+g2015	Microscopy
+g1024	Blanchette
+g1026	Mak
+g0000	Core
+g9999	Multiple	
+gXXXX	Unknown

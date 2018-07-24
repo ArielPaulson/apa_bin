@@ -1,0 +1,46 @@
+#!/usr/bin/env Rscript
+
+load(commandArgs(trailing=TRUE)[1])  ## RData file
+
+comp.names <- c("Promoter (9-10kb)","Promoter (8-9kb)","Promoter (7-8kb)","Promoter (6-7kb)","Promoter (5-6kb)","Promoter (4-5kb)","Promoter (3-4kb)","Promoter (2-3kb)","Promoter (1-2kb)","Promoter (<=1kb)","5' UTR","1st Exon","1st Intron","Other Exon","Other Intron","3' UTR","Downstream (<=1kb)","Downstream (1-2kb)","Downstream (2-3kb)","Downstream (3-4kb)","Downstream (4-5kb)","Distal Intergenic")  # all possible compartment names, in order
+
+rn <- rownames(annoBars)
+rnovel <- setdiff(rn, comp.names)
+rn <- c(comp.names, rnovel)  # put known compartments first, IN ORDER, then anything else
+annoBars <- zerofy(annoBars[match(rn,rownames(annoBars)),])
+rownames(annoBars) <- rn
+
+barcols <- c(promoter10,genebody,tailreg5,intergen,rainbow(length(rnovel)))
+pcts <- round(rbind(
+    promoter=annoBars[10,],
+    genic=colSums(annoBars[10:16,]),
+    intergenic=annoBars[22,]
+))
+keep <- rowSums(annoBars)>0
+annoBars <- annoBars[keep,]
+barcols <- barcols[keep]
+
+if (!tranches) {
+    ## Cluster columns (samples)
+    nr <- nrow(annoBars)
+    col.ord <- reorder.hclust2(hclust(dist(t(annoBars)),"average"), t(annoBars[2:nr-1,]), mean)$order
+    annoBars <- annoBars[,col.ord]
+}
+
+write.table2(annoBars, paste0(outpref,"txt"), row.head="Compartment")
+
+png(paste0(outpref,"png"), 750+imar2, imght)
+par(mar=c(5,mar2,4,2), cex=1.2, las=1)
+b <- barplot(annoBars[,N:1], col=barcols, border=NA, space=0.05, horiz=TRUE, xlim=c(0,180), xaxt="n", main="Peak Frequency per Compartment")
+axis(1, at=seq(0,100,10))
+text(100, rev(b), paste0(apply(pcts,2,paste,collapse=" / "),"%"), pos=4)
+legend("right", bty="n", pch=15, pt.cex=1.5, col=barcols, legend=rownames(annoBars))
+mtext("Pct of Peaks in Compartment", 1, 3, F, 50, cex=1.2)
+mtext("P1k / P1k+Gene / Distal%", 1, -1.1, F, 102, adj=0, cex=1.1)
+if (tranches) mtext(paste("\nIn",T,"Tranches from Max P-Value to Min"), 3, 0, F, 90, cex=1.2)
+dev.off()
+
+save.image(paste0(outpref,"RData"))
+message("peakFeaturesFix '",sub("\\.$","",outpref),"' complete!")
+quit()
+

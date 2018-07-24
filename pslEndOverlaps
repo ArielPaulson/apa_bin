@@ -1,0 +1,78 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Getopt::Long;
+use strict;
+
+## Extracts unaligned flanks of partly-blatted reads and writes to fasta
+
+
+
+### Inputs
+my $psl;
+my $fa;
+my $out;
+my $minbp;
+
+
+
+### Get, test arguments
+GetOptions("p=s"=>\$psl, "f=s"=>\$fa, "o=s"=>\$out, "m=i"=>\$minbp);
+($out = $psl) =~ s/\.psl$/.endOverlaps.psl/ unless $out;
+$minbp = 1 unless $minbp;
+
+
+### Globals
+my @headers;
+my %seq;
+my %aln;
+
+
+
+### Main
+
+## Read fasta
+my $FA = &open2('R', $fa, 'Input fasta');
+my $header;
+while (<$FA>) {
+    s/[\n\r]+$//;
+    if (/^>(\S+)/) {
+	$header = $1;
+	push @headers, $header;
+    } else {
+	$seq{$header} .= $_;
+    }
+}
+close $FA;
+
+## Prep alignment maps
+$aln{$_} = [9E9, -1, 0] foreach @headers;   # initial start, end = impossibly large, small; last elem is length
+
+## Read PSL
+my $IN = &open2('R', $psl, 'Input PSL');
+while (<$IN>) {
+    s/[\n\r]+$//;
+    next if $. < 6;
+    my @data = split;
+    my ($ident, $mismatch, $reps, $Ns, $qgaps, $qgapbp, $tgaps, $tgapbp, $strand, $target, $tlen, $tstart, $tend, $query, $qlen, $qstart, $qend, $blocks, $blocksizes, $tstarts, $qstarts) = @data[0..20];
+    die "Query '$query' not found in input fasta!\n" unless exists $seq{$query};
+    $aln{$query}->[0] = $qstart if $qstart < $aln{$query}->[0];
+    $aln{$query}->[1] = $qend if $qend > $aln{$query}->[1];
+    $aln{$query}->[2] = $qlen;
+}
+close $IN;
+
+## Process PSL & write output
+my $OUT = &open2('W', $out, 'Output fasta');
+foreach my $header (@headers) {
+    my ($minstart, $maxend, $qlen) = @{ $aln{$header} };
+    if ($minstart >= $minbp) {
+	print $OUT ">$header:5:0-$minstart\n",${&blockify(substr($seq{$header},0,$minstart))},"\n";
+    }
+    if ($qlen-$maxend >= $minbp) {
+	print $OUT ">$header:3:$maxend-$qlen\n",${&blockify(substr($seq{$header},$maxend,$qlen))},"\n";
+    }
+}
+close $OUT;
+
+print "pslEndOverlaps $psl complete!\n";
+exit;

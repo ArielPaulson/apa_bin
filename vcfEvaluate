@@ -1,0 +1,285 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+## Takes a VCF + params file
+## Analyzes variants for: NCBI novelty and orthology
+## ** USE A SMALL VCF **: This takes a long time to run!
+
+
+## Dependencies
+my $bin = '/home/apa/local/bin';
+my $blastall = 'blastall';
+
+
+## Inputs
+my $invcf;   # input VCF   (also, output location will be "$invcf.vcfEvaluate")
+my $outvcf;  # output VCF  (optional; will symlink to "$invcf.vcfEvaluate/output.vcf.gz")
+my $params;  # params file
+my $clobber; # clobber existing output? (default no)
+
+
+GetOptions("i=s"=>\$invcf, "o=s"=>\$outvcf, "p=s"=>\$params, "clobber"=>\$clobber);
+
+
+## Tests, Output locations
+&validate('file', $params, 'parameters file', 1);
+&validate('file', $invcf, 'input VCF', 1);
+my $outdir = "$invcf.vcfEvaluate";
+my $orthodir = "$outdir/snpReveal";
+my $transdir = "$outdir/makeSnpEffFasta";
+my $blastdir = "$outdir/variantBlast";
+&validate('dir', $outdir, 'output path', $clobber);
+system "mkdir $_" foreach ($orthodir, $transdir, $blastdir);
+my $finalvcf = "$outdir/vcfEvaluate.final.vcf";
+
+
+## Globals
+my %params;
+my %variants;
+my %vcfAdd;
+my (%efflib, %fracnames);
+&load_efflib;  # loads the above two
+
+
+## Read parameters
+system "cp $params $outdir/vcfEvaluate.params";  # keep a local copy for reference
+my $PAR = &open2('R', $params, 'parameters file');
+while (<$PAR>) {
+    s/[\n\r]+$//;
+    s/^\s*//;
+    s/\s*$//;
+    my ($param, $value) = split /\t/, $_;
+    if ($param eq 'GENOME') {
+        die "$0: 'GENOME' param already specified!\n" if $params{GENOME};
+        $params{GENOME} = $value;    # e.g. 'mm10'
+    } elsif ($param eq 'ANNOTATION') {
+        die "$0: 'ANNOTATION' param already specified!\n" if $params{ANNOTATION};
+        $params{ANNOTATION} = $value;  # e.g. 'Ens_87', 'EnsGen_34'
+    } elsif ($param eq 'SOURCE.ORG') {
+        die "$0: 'SOURCE.ORG' param already specified!\n" if $params{SOURCE.ORG};
+        $params{SOURCE.ORG} = $value;
+    } elsif ($param eq 'ORTHOLOG') {
+        $params{ORTHOLOG}{$value} = 1;
+    } elsif ($param eq 'MINIDT.ORTHO') {
+        die "$0: 'MINIDENT.ORTHO' param already specified!\n" if $params{MINIDENT.ORTHO};
+        $params{MINIDENT.ORTHO} = $value;
+    } elsif ($param eq 'MINIDT.BLAST') {
+        die "$0: 'MINIDENT.BLAST' param already specified!\n" if $params{MINIDENT.BLAST};
+        $params{MINIDENT.BLAST} = $value;
+    } elsif ($param eq 'BLAST.DBDIR') {
+        chomp(my $rooted = `readlink -f $value`);
+        $params{BLAST.DBDIR}{$rooted} = 1;  # may have > 1 blast db location
+    } elsif ($param eq 'USE.EFFECTS') {
+        $params{USE.EFFECTS}{$_} = 1 foreach split /,/, $value;
+#    } elsif ($param eq '') {
+    } else {
+        die "$0: unrecognized parameter type '$param'!\n";
+    }
+}
+close $PAR;
+
+
+## Validate params / apply some default values where necessary
+die "$0: No genome indicated!\n" unless $params{GENOME};
+die "$0: No genome annotation indicated!\n" unless $params{ANNOTATION};
+die "$0: No source organism indicated!\n" unless $params{SOURCE.ORG};
+die "$0: No blast database locations indicated!\n" unless $params{BLAST.DBDIR};
+&validate('dir', $_, 'Blast database directory') foreach sort keys %{ $params{BLAST.DBDIR} };
+$params{MINIDT.ORTHO} = 0.5 unless $params{MINIDT.ORTHO};
+$params{MINIDT.BLAST} = 0.9 unless $params{MINIDT.BLAST};
+if (!$params{ORTHOLOG} || exists $params{ORTHOLOG}{DEFAULTS}) {
+    $params{ORTHOLOG} = map {($_=>1)} ('Homo sapiens','Mus musculus','Gallus gallus','Anolis carolinensis','Xenopus tropicalis','Danio rerio','Drosophila melanogaster','Caenorhabditis elegans','Saccharomyces cerevisiae');
+    delete $params{ORTHOLOG}{DEFAULTS}; 
+}
+unless ($params{USE.EFFECTS}) {
+    foreach my $effect (keys %efflib) {
+        $params{USE.EFFECTS}{$effect} = 1 if $efflib{$effect}->[0] == 1;  # top-tier variants only
+    }
+}
+
+
+## Generate mutated transcripts for Blast
+
+################################ FIXME!!  OLDER ANNOT VERSIONS MUST USE ARCHIVE BIOMARTS!!!
+
+my $transpref = "$transdir/vcf";
+my $table = "$transpref.variant-table.txt";
+(my $ftable = $table) =~ s/txt$/filtered.txt/;
+my $fasta = "$transpref.single_variant_sequences.txt";
+## get $table
+system "$bin/makeSnpEffFasta -i $invcf -o $transpref -m makeTable -g $params{GENOME} -a $params{ANNOTATION}";
+## filter $table -> $ftable
+open my $ITAB, '<', $table;
+open my $OTAB, '>', $ftable;
+while (<$ITAB>) {
+    chomp;
+    if ($. == 1) {
+        print $OTAB "$_\n";
+    } else {
+        my @fields = split /\t/, $_;   # TranscriptID VcfTag NucStr NucVar NucPos NucRef NucAlt PepStr PepVar PepPos PepRef PepAlt TransBio GeneBio Effect snpEffStr
+        my ($transcript, $key, $gsbio, $effect) = @fields[0,1,13,14];  # 'key' is chr:pos:ref:alt
+        if ($gsbio eq 'protein_coding' && exists $params{USE.EFFECTS}{$effect}) {
+            print $OTAB "$_\n";
+            $variants{$transcript}{$key}{$effect} = 1;  # can have > 1 effect per transcript/variant combo...
+        }
+    }
+}
+close $ITAB;
+close $OTAB;
+## convert $ftable to $fasta
+system "$bin/makeSnpEffFasta -i $invcf -o $transpref -m makeFasta -g $params{GENOME} -a $params{ANNOTATION} -t $ftable";
+
+
+## Run Blast
+system "$bin/variantBlast           ";
+
+
+## Read Blast tables
+
+
+
+## Run Orthology
+open my $PAR2, "> $outdir/snpReveal.params";
+print $PAR2 "OUTDIR\t$orthodir\n";
+print $PAR2 "SOURCE\t$params{SOURCE.ORG}\n";
+print $PAR2 "MINIDENT\t$params{MINIDENT.ORTHO}\n";
+print $PAR2 "ORTHOLOG\t$_\n" foreach sort keys %{ $params{ORTHOLOG} };
+system "$bin/snpReveal            ";
+
+
+## Read Orthology tables
+
+
+
+################################ FIXME: IS THIS EVEN NECESSARY?
+## Read VCF, retain variants of interest
+my $IN1 = &open2('R', $invcf, 'input VCF');
+while (<$IN1>) {
+    chomp;
+    my @data = split /\t/, $_;
+    my $key = join(":", @data[0,1,3,4]);  # chr, pos, ref, alt
+    my ($snpEff) = ($data[7] =~ /;ANN=([^;]+);/);
+    foreach (split /,/, $snpEff) {
+        ## T|missense_variant|MODERATE|si:ch211-210b2.1|ENSDARG00000097620|transcript|ENSDART00000157207.1|protein_coding|3/3|c.823G>T|p.Ala275Ser|944/1365|823/1077|275/358||
+        my @fields = split /\|/, $_;
+        my ($effect, $transcript) = @fields[1,6];
+        $transcript =~ s/\.\d+$//;
+        $variants{$transcript}{$key}{$effect} = 1 if exists $params{USE.EFFECTS}{$effect};  # can have > 1 effect per transcript/variant combo...
+    }
+}
+close $IN1;
+
+
+## Read VCF again -> add blast, orthology fields to INFO field -> final VCF
+my $OUT = &open2('W', $finalvcf, 'final VCF');
+my $IN2 = &open2('R', $invcf, 'input VCF');
+while (<$IN2>) {
+    chomp;
+    my @data = split /\t/, $_;
+    my ($snpEff) = ($data[7] =~ /;ANN=([^;]+);/);
+    foreach my $effect
+
+
+        
+}
+close $IN2;
+close $OUT;
+system "ln -sf $finalvcf $outvcf" if $outvcf;  # symlink to "official" output VCF, if any
+
+
+
+
+
+
+exit;
+
+
+
+
+
+sub load_efflib {
+    
+    ## keys are [priority, snpEff impact class] as decided by me
+    ## priorities = output files
+    ## 1: high-priority protein-coding exon/splice/reg variants
+    ## 2: low-priority protein-coding exon/splice/reg variants
+    ## 3: other exon/splice variants
+    ## 4: non-exonic variants
+    ## 5: proximal intergenic variants
+    ## 6: distal intergenic variants
+    ## 7: effect codes not classified below (indicates need to update this script!)
+    ## 8: effect codes that experienced errors
+    ## 
+    ## all snpEff codes as of v4.3, but script will warn if it finds novel ones.
+    ## see also: http://snpeff.sourceforge.net/VCFannotationformat_v1.0.pdf
+    ## novel variant codes will go to a separate output file
+    
+    %fracnames = ( 1=>'high-priority-exonic', 2=>'low-priority-exonic', 3=>'misc-exonic', 4=>'non-exonic', 5=>'proximal-intergenic', 6=>'distal-intergenic', 7=>'novel-unknown', 8=>'error' );
+    
+    %efflib = (
+        ## snpEff HIGH
+        'chromosome_number_variation' => [1, 'HIGH'], 
+        'exon_loss_variant' => [1, 'HIGH'], 
+        'frameshift_variant' => [1, 'HIGH'], 
+        'rare_amino_acid_variant' => [1, 'HIGH'], 
+        'splice_acceptor_variant' => [1, 'HIGH'], 
+        'splice_donor_variant' => [1, 'HIGH'], 
+        'start_lost' => [1, 'HIGH'], 
+        'stop_gained' => [1, 'HIGH'], 
+        'stop_lost' => [1, 'HIGH'], 
+        'transcript_ablation' => [1, 'HIGH'], 
+        ## snpEff MODERATE
+        '3_prime_UTR_truncation' => [1, 'MODERATE'], 
+        '5_prime_UTR_truncation' => [1, 'MODERATE'], 
+        'conservative_inframe_deletion' => [1, 'MODERATE'], 
+        'conservative_inframe_insertion' => [1, 'MODERATE'], 
+        'disruptive_inframe_deletion' => [1, 'MODERATE'], 
+        'disruptive_inframe_insertion' => [1, 'MODERATE'], 
+        'inframe_deletion' => [1, 'MODERATE'], 
+        'inframe_insertion' => [1, 'MODERATE'], 
+        'nonsynonymous_variant' => [1, 'MODERATE'], 
+        'missense_variant' => [1, 'MODERATE'], 
+        'regulatory_region_ablation' => [1, 'MODERATE'], 
+        'TFBS_ablation' => [1, 'MODERATE'], 
+        ## snpEff LOW
+        '5_prime_UTR_premature_start_codon_gain_variant' => [1, 'LOW'], 
+        'initiator_codon_variant' => [2, 'LOW'], 
+        'splice_region_variant' => [2, 'LOW'], 
+        'start_retained' => [2, 'LOW'], 
+        'stop_retained_variant' => [2, 'LOW'], 
+        'synonymous_variant' => [2, 'LOW'], 
+        ## snpEff MODIFIER
+        '3_prime_UTR_variant' => [2, 'MODIFIER'], 
+        '5_prime_UTR_variant' => [2, 'MODIFIER'], 
+        'coding_sequence_variant' => [2, 'MODIFIER'], 
+        'regulatory_region_amplification' => [2, 'MODIFIER'],
+        'regulatory_region_variant' => [2, 'MODIFIER'],
+        'TF_binding_site_variant' => [2, 'MODIFIER'],
+        'TFBS_amplification' => [2, 'MODIFIER'],
+        'non_coding_transcript_exon_variant' => [3, 'MODIFIER'], 
+        'non_coding_transcript_variant' => [3, 'MODIFIER'], 
+        'exon_variant' => [3, 'MODIFIER'],
+        'feature_elongation' => [3, 'MODIFIER'],
+        'feature_truncation' => [3, 'MODIFIER'],
+        'gene_variant' => [3, 'MODIFIER'],
+        'mature_miRNA_variant' => [3, 'MODIFIER'],
+        'miRNA' => [3, 'MODIFIER'],
+        'NMD_transcript_variant' => [3, 'MODIFIER'],
+        'transcript_amplification' => [3, 'MODIFIER'],
+        'transcript_variant' => [3, 'MODIFIER'],
+        'intragenic_variant' => [4, 'MODIFIER'], 
+        'conserved_intron_variant' => [4, 'MODIFIER'], 
+        'intron_variant' => [4, 'MODIFIER'],
+        'downstream_gene_variant' => [5, 'MODIFIER'], 
+        'upstream_gene_variant' => [5, 'MODIFIER'], 
+        'conserved_intergenic_variant' => [6, 'MODIFIER'], 
+        'intergenic_region' => [6, 'MODIFIER'] 
+    );
+    
+}
+
+

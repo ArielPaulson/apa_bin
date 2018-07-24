@@ -1,0 +1,70 @@
+#!/usr/bin/perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+# takes a set of exon defs and returns a transcriptome size.
+# 'size' is the number of genomic bp which contribute to at least one exon.
+# inputs may be gtf, gff, or bed (0-based starts), or a file with extension 'txt':
+# 'txt' files must have first 3 columns = chr, start, end (other cols optional) -- starts are 1-based.
+# output is the size, printed to stdout.
+
+my $file;     # input file (bed, gtf, gff, txt=1-based bed)
+my $format;   # input file format, if not discernible from extension
+my $uxons;    # if uxons, skip merging step
+
+my $exontmp = "transcriptomeLength.$$.exon.tmp";  # temp exon bed file
+my $uxontmp = "transcriptomeLength.$$.uxon.tmp";  # temp uxon bed file
+
+my %formats = ('bed',1, 'txt',1, 'gtf',2, 'gff',2);  # known input formats
+
+GetOptions("i=s" => \$file, "f=s" => \$format, "uxons"=>\$uxons);
+
+($format) = ($file =~ /\.(\w{3})$/) unless $format;
+$format = "\L$format";
+die "Unknown format '$format': must be one of bed, gtf, gff, txt!\n" unless $formats{$format};
+
+if ($format eq 'bed') {
+    system "cp $file $exontmp";
+} else {
+    open IN, $file or die "$0: Cannot open '$file' for reading: $!\n";
+    open OUT, "> $exontmp" or die "$0: Cannot open '$exontmp' for writing: $!\n";
+    if ($formats{$format} == 1) {
+        while (<IN>) {
+            $_ =~ s/[\n\r]+$//;
+            my ($chr, $start, $end) = (split /\t/, $_)[0..2];
+            $start--;
+            print OUT "$chr\t$start\t$end\n";
+        }
+    } elsif ($formats{$format} == 2) {
+        while (<IN>) {
+            $_ =~ s/[\n\r]+$//;
+            my @data = (split /\t/, $_);
+            next unless $data[2] eq 'exon';
+            $data[3]--;
+            print OUT join("\t", @data[0,3,4]),"\n";
+        }
+    }
+    close OUT;
+    close IN;
+}
+
+if ($uxons) {
+    $uxontmp = $exontmp;
+} else {
+    system "/home/apa/local/bin/sortBedCoord -i $exontmp --overwrite";
+    system "mergeBed -i $exontmp > $uxontmp";
+}
+
+my $Tsize;
+open IN, $uxontmp or die "$0: Cannot open '$uxontmp' for reading: $!\n";
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    my ($chr, $start, $end) = split /\t/, $_;
+    $Tsize += $end-$start;
+}
+close IN;
+
+system "rm -f transcriptomeLength.$$.*.tmp";
+print "$Tsize\n";
+exit;

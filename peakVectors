@@ -1,0 +1,66 @@
+#!/usr/bin/perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my $peaks;    # bed file or macs xls file; must have one of these extensions
+my $IP;       # IP file; must have extension 'bam', 'wig', 'bg', 'bedgraph' (not case sensitive)
+my $input;    # input file; same format as $IP
+my $peaksfmt; # format for peaks file (autodetect)
+my $IPfmt;    # format for IP file
+my $inpfmt;   # format for input file
+my $bedtmp = "peakVectors.$$.bed.tmp";   # temp bed file for intersections
+my $inttmp = "peakVectors.$$.int.tmp";   # temp output file for intersections
+
+GetOptions("p=s" => \$peaks, "ip=s" => \$IP, "in=s" => \$input);
+
+($peaksfmt) = ($peaks =~ /\.(bed|xls)$/i);
+$peaksfmt = "\L$peaksfmt";
+
+($IPfmt) = ($IP =~ /\.(bam|wig|bg|bedgraph)$/i);
+$IPfmt = "\L$IPfmt";
+
+($inpfmt) = ($inp =~ /\.(bam|wig|bg|bedgraph)$/i);
+$inpfmt = "\L$inpfmt";
+
+my %okfmt = ('peaks' => {'bed',1,'xls',1}, 'ipinp' => {'bam',1,'wig',1,'bg',1,'bedgraph',1});
+
+die "Peaks file '$peaks' must have extension 'bed' or 'xls'!\n" unless $okfmt{peaks}{$peaksfmt};
+die "IP file '$IP' must have extension 'bam', 'wig', 'bg', or 'bedgraph'!\n" unless $okfmt{ipinp}{$IPfmt};
+die "Input file '$inp' must have extension 'bam', 'wig', 'bg', or 'bedgraph'!\n" unless $okfmt{ipinp}{$inpfmt};
+die "IP and input have differing formats!\n" if $IPfmt ne $inpfmt;
+
+open IN, $peaks or die "$0: Cannot open peaks file '$peaks': $!\n";
+my (@bedout, $i);
+if ($peaksfmt eq 'bed') {
+    while (<IN>) {
+	next if $_ =~ /^#/ || $_ =~ /^track/;
+	$i++;
+	$_ =~ s/[\n\r]+$//;
+	my @data = split /\t/, $_;
+	my $id = $data[3] || $i;
+	$peakData{$id} = $_;
+	push @bedout, join("\t",(@data[0..2],$id));
+    }
+} elsif ($peaksfmt eq 'xls') {
+    while (<IN>) {
+	next if $. < 20;
+	$i++;
+	$_ =~ s/[\n\r]+$//;
+	my @data = split /\t/, $_;
+	my $id = $data[] || $i;
+	$peakData{$id} = $_;
+	push @bedout, join("\t",(@data[],$id));
+    }
+}
+close IN;
+
+open OUT, "> $bedtmp";
+print OUT "$_\n" foreach @bedout;
+close OUT;
+
+if ($IPfmt eq 'bam') {
+    
+} elsif ($IPfmt eq 'wig' || $IPfmt eq 'bg' || $IPfmt eq 'bedgraph') {
+    
+}

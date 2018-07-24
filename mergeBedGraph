@@ -1,0 +1,74 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+# Deps:
+
+## Inputs
+my $out;       # output file
+my @inputs;    # list of dataset files (arguments left over from GetOptions)
+my $dirname;   # use dataset file directory for column name? (otherwise, filename as given)
+my $nodirname; # remove dataset file directory from file name to create column name? (otherwise, filename as given)
+my $strip;     # any other substring (regexp) to remove from dataset file name during column name conversion
+my $zeroes;    # include positions with no coverage in any bedgraph?
+
+GetOptions(
+    "o=s" => \$out, 
+    "strip=s" => \$strip, 
+    "dirname" => \$dirname, 
+    "nodirname" => \$nodirname,
+    "zeroes" => \$zeroes
+    );
+
+@inputs = @ARGV;
+
+## Globals
+my @names;   # filenames for the header
+my %matrix;  # data matrix
+
+
+## Main
+
+foreach my $file (@inputs) {
+    
+    # decide on sample name
+    my $name;
+    if ($dirname) {
+	($name) = ($file =~ /([^\/]+)\/[^\/]+$/);  # only the file's parent directory
+    } elsif ($nodirname) {
+	($name) = ($file =~ /([^\/]+)$/);  # only the file's name
+    } else {
+	$name = $file;  # file's path as given
+    }
+    $name =~ s/\.(bg|bedgraph|wig)$//i;
+    $name =~ s/$strip//;
+    push @names, $name;
+    
+    # read bedgraph
+    open my $IN, '<', $file or die "$0: Cannot read bedGraph '$file': $!\n";
+    while (<$IN>) {
+	$_ =~ s/[\n\r]+$//;
+	my ($chr, $start, $end, $value) = split /\t/, $_;
+	$matrix{$chr}{$_}{$name} = $value foreach ($start..$end);
+    }
+    close $IN;
+}
+
+# write all-sample matrix
+open my $OUT, '>', $out or die "$0: Cannot write to output bedGraph matrix '$out': $!\n";
+print $OUT join("\t", ("Chr\tPos", @names)), "\n";
+foreach my $chr (sort keys %matrix) {
+    my @positions = sort {$a <=> $b} keys %{ $matrix{$chr} };
+    if ($zeroes) {
+	foreach my $pos ($positions[0]..$positions[-1]) {
+	    print $OUT join("\t", ("$chr\t$pos", map { $matrix{$chr}{$pos}{$_} } @names)), "\n";
+	}
+    } else {
+	foreach my $pos (@positions) {
+	    print $OUT join("\t", ("$chr\t$pos", map { $matrix{$chr}{$pos}{$_} } @names)), "\n";
+	}
+    }
+}
+close $OUT;
+exit;

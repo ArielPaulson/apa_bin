@@ -1,0 +1,144 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## Generates a mappability .wig for a genome (or subsequence thereof), given a fasta and a window size
+## This is exact-match mappability, so does not consider mismatches.
+## Like a moving average, each position is given a score representing the {winsize}-mer mappability centered at that position.
+## Also like a moving average, the terminal {winsize}/2 bp per chromosome cannot be scored.
+## If the window size is even, the "center" position is 5' of the true halfway point (e.g. 100-mer true center is position 50.5, thus reported at position 50)
+
+## Inputs
+my $fasta;
+my $winsize;
+my $target;
+my $self;
+my $stdio;
+
+GetOptions("f=s" => \$fasta, "w=i" => \$winsize, "t=s" => \$target, "self" => \$self, "" => \$stdio);
+
+die "$0: Winsize must be an integer > 1!\n" if ($winsize <= 1 || $winsize =~ /\D/);
+
+## Globals
+my %offsets;
+my %seq;
+my @headers;
+my %mappability;
+my %maprange;
+my %coords;
+
+
+## Main
+
+
+## Get Sequence
+
+if ($target) {
+    if ($target =~ /(\S+):(\d+)-(\d+)/) {
+	$coords{chr} = $1;
+	$coords{start} = $2;
+	$coords{end} = $3;
+	die "$0: Cannot define target start without also defining end!\n" if $coords{start} && !$coords{end};  # but $end && !$start is ok, as $start in BED coords can be zero
+    } else {
+	$coords{chr} = $target;
+    }
+} else {
+    $self = undef;  # be sure to deactivate $self unless a $target is defined
+}
+
+my $header;
+if ($stdio) {
+    $header = 1;  # in case input has no header
+    while (<>) {
+	$_ =~ s/[\n\r]+$//;
+	if ($_ =~ /^>(.*)/) {
+	    $header = $1;
+	} else {
+	    $seq{$header} .= $_;
+	}
+    }
+} else {
+    open my $FA, '<', $fasta or die "$0: Cannot open fasta file '$fasta': $!\n";
+    while (<$FA>) {
+	$_ =~ s/[\n\r]+$//;
+	if ($_ =~ /^>(.*)/) {
+	    if ($self) {
+		if ($1 eq $coords{chr}) {   # if $self, only define $header if $header is the sequence to analyze
+		    $header = $1;
+		    push @headers, $header;
+		}
+	    } else {
+		$header = $1;
+		push @headers, $header;
+	    }
+	} elsif ($header) {   # only populate defined $header sequences
+	    $seq{$header} .= $_;
+	}
+    }
+    close $FA;
+}
+
+## Select target regions, if any
+
+if (%coords) {
+   if ($coords{end}) {
+       $seq{ $coords{chr} } = substr($seq{ $coords{chr} }, $coords{start}, $coords{end}-$coords{start});
+   }
+}
+
+## Set position flanks, given window size
+
+if ($winsize % 2 == 1) {
+    $offsets{5} = $offsets{3} = ($winsize-1)/2;
+} else {
+    $offsets{5} = $offsets{3} = $winsize/2;
+    $offsets{5}--;
+}
+
+## Calculate mappability per {winsize}-mer (assign 1|0 for uniqueness)
+
+foreach my $header (@headers) {
+    my $seqlen = length($seq{$header});
+    my $Nkmers = $seqlen-$winsize+1;
+    $maprange{$header} = $Nkmers;
+    my $i_start = $offsets{5}+1;  # 1-based
+    my $i_end = $i_start+$Nkmers;
+    print STDERR "$header: 0-$Nkmers\n";
+    print STDERR "irange: $i_start-$i_end\n";
+    print STDERR "TARGET: $coords{start}-$coords{end}\n" if %coords;
+    
+    ## 1. Find ith consecutive kmer.
+    ## 2. Skip if center position already has value (meaning kmer has already been seen).
+    ## 2. Find next instance of kmer, if any.
+    ## 3. If any, score original center as 0. Then find all subsequent matches, and score their centers as 0.
+    ## 4. If none, score original center as 1.
+    
+    for (my $i = $i_start; $i <= $i_end; $i++) {
+	print STDERR "$i\n" if $i % 1000 == 0;
+	next if defined $mappability{$header}{$i};  # deja vu
+	my $kmer = substr($seq{$header}, $i-1, $winsize);
+	my $pos = $i;
+	my $copies = 0;
+	{
+	    $pos = index($seq{$header}, $kmer, $pos+1);
+	    if ($pos != -1) {
+		$mappability{$header}{$pos+$offsets{5}+1} = 0;  # another instance exists
+		$copies++;
+		redo;
+	    }
+	}
+	$mappability{$header}{$i} = 1 unless $copies;  # unique
+    }
+}
+
+## Generate bedGraph output
+
+foreach my $header (@headers) {
+    my $truestart = %coords ? $coords{start} : 0;
+    my $trueend = %coords ? $coords{end} : $maprange{$header};
+    foreach my $i (0..$maprange{$header}) {
+	print "$header\t$i\t",$i+1,"\t$mappability{$header}{$i}\n";
+    }
+}
+

@@ -1,0 +1,399 @@
+#!/usr/bin/env perl
+
+
+### STUFF TO ADD:
+### Finish HaplotypeCaller workflow.
+### Switch to run GATK caller identically N times, then return only calls seen at least M times.
+### Switch for calling with Samtools, not GATK.
+
+
+=pod
+
+=head1 SYNOPSIS
+
+GATK is a caller for GATK pipeline components.  There are four, in order:
+    
+ /home/apa/local/bin/GATK align    -n $name -o $outdir <more 'align' parameters...>
+ /home/apa/local/bin/GATK correct  -n $name -o $outdir <more 'correct' parameters...>
+ /home/apa/local/bin/GATK call     -n $name -o $outdir <more 'call' parameters...>
+ /home/apa/local/bin/GATK annotate -n $name -o $outdir <more 'call' parameters...>
+ /home/apa/local/bin/GATK analyze  -n $name -o $outdir
+
+=head1 OPTIONS
+
+=item S<GENERAL PARAMETERS>
+
+=over
+
+=item B<-n run_name>
+
+Sample name; will become prefix for all output files.
+
+=item B<-o output_path>
+
+Output directory.
+
+=item B<-g geno_name>
+
+Name of a genome build in /n/data1/genomes/indexes/, e.g. 'mm10'.
+
+=item B<-t N_threads>
+
+Number of threads for multithreaded processes; default 1
+
+=item B<-r RAM_string>
+
+RAM limit for limitable processes, like java and samtools sort; default '20G'.
+
+=item B<--picard picard_version_dir>
+
+Picard version (a directory name in /n/local/stage/picard/); default 'current'.
+
+=item B<--GATK gatk_version_dir>
+
+GATK version (a directory name in /n/local/stage/gatk/); default 'current'.
+
+=item B<--java java_executable>
+
+Path to Java executable; default 'java'.
+
+=back
+
+=item S<'align' PARAMETERS>
+
+=over
+
+=item B<--DNA>
+
+Align DNA-seq (use bwa-mem).  One of --DNA or --RNA is required.
+
+=item B<--RNA>
+
+Align RNA-seq (use STAR).  One of --DNA or --RNA is required.
+
+=item B<-f1 end_1_fastq>
+
+Path to end-1 fastq.
+
+=item B<-f2 end_2_fastq>
+
+Path to end-2 fastq, if any.
+
+=item B<-a anno_name>
+
+Annotation build for selected genome (genome given by -g); the path /n/data1/genomes/indexes/$geno/$anno/ must exist.
+
+=item B<--align-only>
+
+Only run initial alignment step and then stop (pipeline will continue if called again, without --align-only).
+
+=back
+
+=item S<'correct' PARAMETERS>
+
+=over
+
+=item B<-k known_variant_vcf>
+
+Path to dbSNP or other known-variant VCF file; may be gzipped.
+
+=item B<-m max_read_depth>
+
+Maximum read depth for GATK to correct a region; if over this limit, GATK will ignore it.  Default 100,000.
+
+=item B<--keep-tmp>
+
+Keep the intermediate BAM files for batch-realignment and batch-recalibration steps?  Default no.
+
+=back
+
+=item S<'call' PARAMETERS>
+
+=over
+
+=item B<-c caller_name>
+
+h|H for GATK HaplotypeCaller, u|U for GATK UnifierGenotyper, s|S for Samtools Mpileup
+
+=item B<-k known_variant_vcf>
+
+Path to dbSNP or other known-variant VCF file; may be gzipped.
+
+=item B<-d downsampling_percent>
+
+If downsampling: downsample each bam to what percent of the original reads?  Default 100.
+
+=item B<-i N_iterations>
+
+If downsampling: repeat downsampling how many times?  Default 1.
+
+=item B<-mi mininum_seen_iters>
+
+If downsampling: what is the minimum number of times a variant must be seen to be believed?  Default 1.  (Cannot exceed -i, obviouisly)
+
+=item B<-sg snpEff_geno_label>
+
+A snpEff genome name.  Default will be "$geno.$anno", if both -g and -a specified.
+
+=item B<--snpeff snpeff_version_dir>
+
+snpEff version (a directory name in /n/local/stage/snpeff/ -OR- /n/data1/genomes/indexes/snpEff/); default 'current'.
+
+=back
+
+=item S<OTHER FLAGS>
+
+=over
+
+=item B<--help> 
+
+Display this help screen.
+
+=back
+
+=cut
+
+require '/home/apa/apa_routines.pm';
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my ($runmode, $name, $outdir, $fastq1, $fastq2, $geno, $anno, $STAR_idx, $threads, $ram, $known_vcf, $max_reads, $caller, $downsamp, $iters, $miniter, $detect_regions, $snpEff_geno, $snpEff_ver, $picard_ver, $GATK_ver, $java_exe, $RNA, $DNA, $align_only, $keep_tmp, $help, @bams, @vcfs);
+
+GetOptions(
+    "n|name=s"=>\$name, 
+    "o|outdir=s"=>\$outdir, 
+    "f1|fastq1=s"=>\$fastq1, 
+    "f2|fastq2=s"=>\$fastq2, 
+    "g|geno=s"=>\$geno, 
+    "a|anno=s"=>\$anno, 
+    "c|threads=i"=>\$threads, 
+    "r|RAM=s"=>\$ram, 
+    "k|known=s"=>\$known_vcf, 
+    "m|max-reads=i"=>\$max_reads, 
+    "d|downsample=i"=>\$downsamp,
+    "i|iterations=i"=>\$iters,
+    "mi|miniter=i"=>\$miniter,
+    "sg|snpeff-geno=s"=>\$snpEff_geno, 
+    "detect-regions"=>\$detect_regions, 
+    "snpeff=s"=>\$snpEff_ver, 
+    "picard=s"=>\$picard_ver, 
+    "GATK=s"=>\$GATK_ver, 
+    "java=s"=>\$java_exe, 
+    
+    "RNA"=>\$RNA, 
+    "DNA"=>\$DNA, 
+    "align-only"=>\$align_only, 
+    "keep"=>\$keep_tmp, 
+    "help"=>\$help 
+) or pod2usage(2);
+
+pod2usage(1) if $help;
+#pod2usage(-exitstatus => 0, -verbose => 2) if $man;
+
+$align_only = 0 unless $align_only;
+$keep_tmp = 0 unless $keep_tmp;
+$use_haplo = 0 unless $use_haplo;
+$threads = 1 unless $threads;
+$ram = '1G' unless $ram;
+$max_reads = 100000 unless $max_reads;
+$fastq2 = 'NA' unless $fastq2;
+$known_vcf = 'NA' unless $known_vcf;
+
+@bams = @ARGV;
+$runmode = shift @bams;  # only thing 'guaranteed' to exist
+my $bamstr = join ',', @bams;
+
+my $picard_verstr = "/n/local/stage/picard/$picard_ver/";
+die "$0: Indicated Picard location '$picard_verstr' does not exist!\n" unless -d $picard_verstr;
+if ($picard_ver eq 'current') {
+    chomp($picard_ver = `readlink -f /n/local/stage/picard/current`);
+    $picard_verstr = "/n/local/stage/picard/$picard_ver (current)";
+}
+
+my $GATK_verstr = "/n/local/stage/gatk/$GATK_ver/";
+die "$0: Indicated GATK location '$GATK_verstr' does not exist!\n" unless -d $GATK_verstr;
+if ($GATK_ver eq 'current') {
+    chomp($GATK_ver = `readlink -f /n/local/stage/gatk/current`);
+    $GATK_verstr = "/n/local/stage/gatk/$GATK_ver (current)";
+}
+
+die "$0: Indicated Java executable '$java_exe' does not exist!\n" if $java_exe && ! -e $java_exe;
+chomp($java_exe = `readlink -f \$(which java)`) unless $java_exe;
+
+my $GAdir = "/n/data1/genomes/indexes/$geno/$anno";
+my $scripts = '/home/apa/local/bin/gatk';
+my $cmd;
+
+if ($runmode eq 'align') {
+
+## https://software.broadinstitute.org/gatk/best-practices/
+## http://wiki.stowers-institute.org/research/Bioinformatics/Analysis/SNPs
+# alias=$1      # sample name
+# outdir=$2     # output dir
+# fastq1=$3     # end 1 fastq
+# fastq2=$4     # end 2 fastq, or "NA" if single-end
+# genome=$5     # Genome build name from /n/data1/genomes/indexes
+# cores=$6      # cores for BWA-MEM
+# RAM=$7        # RAM for java/samtools, e.g. '50G'  # future: qsub -l h_vmem ?
+# run_mode=$8   # 0=run all; 1=run high-core (align/sort) only; 2=run low-core (post-align/sort) only.  1 + 2 = 0, basically.
+# picard_v=$9   # optional Picard version directory (default 'current')
+# GATK_v=${10}  # optional GATK version directory (default 'current')
+# 
+# alias=$1        # sample name
+# outdir=$2       # output dir
+# fastq1=$3       # end 1 fastq
+# fastq2=$4       # end 2 fastq, or "NA" if single-end
+# geno=$5         # Genome build name from /n/data1/genomes/indexes
+# anno=$6         # Transcriptome build name associated with $geno
+# STAR_idx=$7     # STAR index name (i.e. STAR_{51,76,101,151}bp, depending on available builds at /n/data1/genomes/indexes/$geno/$anno)
+# cores=$8        # cores for STAR, samtools
+# RAM=$9          # RAM for java/samtools, e.g. '50G'  # future: qsub -l h_vmem ?
+# run_mode=${10}  # 0=run all; 1=run high-core (align/sort) only; 2=run low-core (post-align/sort) only.  1 + 2 = 0, basically.
+    
+    ## QC that applies to both alignment modes
+    my $error = ($name && $outdir && $fastq1 && $fastq2 && $geno && $threads && $ram) ? 0 : 1;
+    my $errstr = "NAME: $name\nOUTDIR: $outdir\nFASTQ1: $fastq1\nFASTQ2: $fastq2\nGENO: $geno\nCORES: $threads\nRAM: $ram";  # base err str for both
+    
+    if ($DNA) {
+        
+        die "$0: Missing some needed parameters, please see below:\n$errstr\n" if $error;
+        
+        $cmd = "$scripts/gatk-1-align-DNA.sh $name $outdir $fastq1 $fastq2 $geno $threads $ram $align_only $picard_ver $GATK_ver $java_exe";
+        
+    } elsif ($RNA) {
+        
+        ## RNAseq-specific QC
+        die "$0: genome/annotation combination not found in /n/data1/genomes/indexes!\n" unless -d $GAdir;
+        chomp(my $readlen = `zcat $fastq1 | head -2 | tail -1 | awk '{ print length(\$1) }'`);
+        chomp(my @STARs = sort {$a <=> $b} split /\n/, `ls -d $GAdir/STAR_* | sed 's/.*STAR_//' | sed 's/bp//'`);  ## SORT INCREASING !!!
+        die "$0: No STAR index length provided, and no STAR indexes found for $geno/$anno!\n" unless @STARs;
+        my $STARs = join ',', @STARs;
+        foreach my $L (@STARs) {   ## MUST BE SORTED INCREASING !!!
+            if ($L >= $readlen) {
+                $STAR_idx = "STAR_${L}bp";
+                last;
+            }
+        }
+        die "$0: No STAR index length provided, and no sufficient STAR indexes found for $geno/$anno!\nDetected Read Length: $readlen\nSTAR Index Lengths: $STARs\n" unless @STARs;
+        $error = $error || !$anno || !$STAR_idx;
+        $errstr .= "ANNO: $anno\nSTAR IDX: $STAR_idx";
+        die "$0: Missing some needed parameters, please see below:\n$errstr\n" if $error;
+        
+        $cmd = "$scripts/gatk-1-align-RNA.sh $name $outdir $fastq1 $fastq2 $geno $anno $STAR_idx $threads $ram $align_only $picard_ver $GATK_ver $java_exe";
+        
+    } else {
+        
+        die "$0: run mode 'align' must be accompanied by one of '--DNA' or '--RNA'!\n";
+        
+    }
+    
+    
+} elsif ($runmode eq 'correct' || $runmode eq 'call') {
+    
+    
+    my $error = ($name && $outdir && $bamstr && $geno && $known_vcf && $ram) ? 0 : 1;
+    my $errstr = "NAME: $name\nOUTDIR: $outdir\nGENO: $geno\nKNOWN VCF: $known_vcf\nRAM: $ram";  # base err str for both
+    my $errbam = join("\n", "INPUT BAMS: $bams[0]", map {"          : $bams[$_]"} 1..$#bams);
+    
+    if ($runmode eq 'correct') {
+        
+# alias=$1      # sample name
+# outdir=$2     # output dir
+# bams=$3       # single bam, or CSV list of read-grouped bams, e.g. outputs from gatk-align.sh
+# genome=$4     # UCSC genome name; must also be a build in /n/data1/genomes/indexes
+# knownvcf=$5   # path to known-snp vcf file, to be used for recalibration (check /n/data1/dbSNP)
+# RAM=$6        # RAM for java, samtools e.g. '50G'  # future: qsub -l h_vmem ?
+# keeptmp=$7    # DEPRECATED (always on now): keep temp data (i.e., realigned and recalibrated bams etc)
+# maxreads=$8   # max reads in a window for indel realignment (GATK default 20k, this default 200k)
+# picard_v=$9   # optional Picard version directory (default 'current')
+# GATK_v=${10}  # optional GATK version directory (default 'current')
+
+        $error = $error || !$keep_tmp || !$max_reads;
+        $errstr .= "$errstr\nKEEP TMP: $keep_tmp\nMAX READS: $max_reads\n$errbam";
+        die "$0: Missing some needed parameters, please see below:\n$errstr\n" if $error;
+        
+        $cmd = "$scripts/gatk-2-correct.sh $name $outdir $bamstr $geno $known_vcf $ram $keep_tmp $max_reads $picard_ver $GATK_ver $java_exe";
+        
+    } elsif ($runmode eq 'call') {
+        
+# alias=$1         # sample name
+# outdir=$2        # output dir
+# bams=$3          # single multi-sample bam, or CSV list of recalibrated bams, i.e. outputs from gatk-2-correct.sh
+# genome=$4        # genome build name; must also be a build in /n/data1/genomes/indexes
+# knownvcf=$5      # path to known-variant vcf file, to be used for 'SnpSift annotate'
+# RAM=$6           # -Xmx RAM for java, samtools e.g. '50G'
+# caller=$7        # 'h' = GATK HaplotypeCaller, 'u' = UnifiedGenotyper, 's' = samtools mpileup
+# snpEff_geno=$8   # snpEff genome version, e.g. "Zv9.72"
+# downsample=$9    # if downsampling -- what downsampling percent to use? (on [0-100], not [0-1])
+# replicates=${10} # if downsampling multiple times -- how many times?  Default 1.
+# minreps=${11}    # if downsampling -- how many times must variant be seen to be believed? (cannot exceed $replicates, obviously)
+# snpEff_v=${12}   # specific version directory of snpEff to use, e.g. "snpEff_4_3", "snpEff_3_3h" (default: 'current')
+# picard_v=${13}   # optional Picard version directory (default 'current')
+
+        die "$0: genome/annotation combination not found in /n/data1/genomes/indexes!\n" unless -d $GAdir;
+        $snpEff_geno = "$geno.$anno" if $anno && !$snpEff_geno;
+        die "$0: No snpEff genome name given, and no annotation build name given either!\n" unless $snpEff_geno;
+        
+        $error = $error || !defined $use_haplo || !$snpEff_geno || !$snpEff_ver;
+        $errstr .= "NAME: $name\nOUTDIR: $outdir\nGENO: $geno\nKNOWN VCF: $known_vcf\nRAM: $ram\nUSE HAPLOTYPER: $use_haplo\nSNPEFF GENOME: $snpEff_geno\nSNPEFF VERSION: $snpEff_ver\n$errbam";
+        die "$0: Missing some needed parameters, please see below:\n$errstr\n" if $error;
+        
+        $cmd = "$scripts/gatk-3-call.sh $name $outdir $bamstr $geno $known_vcf $ram $use_haplo $snpEff_geno $downsamp $iters $miniter $snpEff_ver $picard_ver $GATK_ver $java_exe";
+        
+    }
+    
+    
+} elsif ($runmode eq 'annotate') {
+
+# alias=$1       # sample name
+# outdir=$2      # output dir
+# vcfs=$3        # single or CSV list of SNP+Indel (merged) VCFs, i.e. outputs from gatk-3-call.sh
+# genome=$4      # genome build name; must also be a build in /n/data1/genomes/indexes
+# knownvcf=$5	   # path to known-variant vcf file, to be used for 'SnpSift annotate'
+# RAM=$6         # -Xmx RAM for java, samtools e.g. '50G'
+# snpEff_geno=$7 # snpEff genome version, e.g. "Zv9.72"
+# snpEff_v=$8    # specific version directory of snpEff to use, e.g. "snpEff_4_3", "snpEff_3_3h" (default: 'current')
+# picard_v=$9    # optional Picard version directory (default 'current')
+# GATK_v=${10}   # optional GATK version directory (default 'current')
+# java=${11}     # optional path to java executable
+    
+    $cmd = "$scripts/gatk-4-annotate.sh $name $outdir $vcfs $geno $known_vcf $ram $snpEff_geno $snpEff_ver $picard_ver $GATK_ver $java_exe";
+    
+    
+} elsif ($runmode eq 'analyze') {
+    
+# vcf=$1      # input vcf to operate on
+# sample=$2   # sample name (for R plots)
+# geno=$3     # genome build name, e.g. "danRer10"
+# anno=$4     # annot build name, e.g. "Ens_80"
+# analyze=$5  # perform analysis? (otherwise just splits genic/intergenic and tabularizes)
+# outdir=$6   # output dir
+# dnsvcfs=$7  # optional additional downsampled VCFs (comma-delim) to subset based in hom/het windows -- MUST BE BGZIPPED AND TABIXED
+    
+    unless ($name && $outdir) {
+        my $errstr = "NAME: $name\nOUTDIR: $outdir\n";
+        die "$0: Missing some needed parameters, please see below:\n$errstr\n";
+    }
+    my $vcf = $vcfs[0];
+    my $other_vcfs = $#vcfs>0 ? join(',', @vcfs[1..$#vcfs]) : undef;
+    $geno = 'NA' unless $geno;
+    $anno = 'NA' unless $anno;
+    $detect_regions = 0 unless $detect_regions;
+    
+    $cmd = "$scripts/gatk-5-analyze.sh $vcf $sample $geno $anno $detect_regions $outdir $other_vcfs";
+    
+    
+} else {
+    
+    
+    die "$0: run mode '$runmode' not valid!\n";
+    
+    
+}
+
+
+print "RUNNING: $cmd\n";
+system $cmd;
+exit;
+

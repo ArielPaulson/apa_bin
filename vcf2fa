@@ -1,0 +1,222 @@
+#!/usr/bin/perl
+
+# Author: lh3
+
+
+## A hacked version of vcfutils.pl from Samtools, with only a modified vcf2fq function
+## Example intended usage:  samtools mpileup -uf in.bam | bcftools view -cg - | /home/apa/local/bin/vcf2fq -p out.prefix
+
+
+
+use strict;
+#use warnings;
+use Getopt::Long;
+
+my $_d = 0;
+my $_D = 9E9;
+my $_Q = 10;
+my $_h = 0;
+my $c = 1;
+my ($vcf, $prefix, $ref_fa, $noins, $nodel, $nohom);
+
+GetOptions("v=s"=>\$vcf, "p=s"=>\$prefix, "r=s"=>\$ref_fa, "d=i"=>\$_d, "D=i"=>\$_D, "Q=i"=>\$_Q, "h=i"=>\$_h, "c"=>\$c, "no-ins"=>\$noins, "no-del"=>\$nodel, "no-hom"=>\$nohom);
+
+#####  There once was an option "l" -- what was it?  #####
+
+die(qq/
+Usage:   vcf2fq [options] <all-site.vcf>
+
+Options: -p STR    output prefix            [mandatory; no default]
+         -r STR    reference fasta          [mandatory; no default]
+         -v STR    vcf input                [or pipe to script]
+         -c 1|0    VCF has called variants? [$c]
+         -h 1|0    use degen bases?         [$_h]
+         -d INT    minimum depth            [$_d]
+         -D INT    maximum depth            [$_D]
+         -Q INT    min RMS mapQ             [$_Q]
+         --no-ins  ignore insertions
+         --no-del  ignore deletions
+         --no-hom  ignore homopolymer run changes
+\n/) if (@ARGV == 0 && -t STDIN);  # removed -l, indel filtering window
+
+my %het = (AC=>'M', AG=>'R', AT=>'W', CA=>'M', CG=>'S', CT=>'Y', GA=>'R', GC=>'S', GT=>'K', TA=>'W', TC=>'Y', TG=>'K');
+my ($last_chr, $seq, $qual, $last_pos, $totlen, $patched, @gaps, %fasta, %reflens, %stats, %ballot);
+
+die "No -p prefix specified!\n" unless defined $prefix;
+#die "No -r reference fasta specified!\n" unless defined $fasta;
+
+if ($ref_fa) {
+    open my $REF, '<', $ref_fa or die "Reference fasta '$ref_fa' unreadable: $!\n";
+    my $header;
+    while (<$REF>) {
+	s/[\n\r]+$//;
+	if (/^>(.*)/) {
+	    $header = $1;
+	} else {
+	    $fasta{$header} .= $_;
+	}
+    }
+    close $REF;
+    
+    %reflens = map {($_=>length($fasta{$_}))} keys %fasta;
+}
+
+my $VCF;
+if ($vcf) {
+    open $VCF, '<', $vcf or die "$0: Cannot read vcf file '$vcf': $!\n";
+} else {
+    open $VCF, '-';
+}
+
+open my $FA, '>', "$prefix.fasta";
+open my $LOG, '>', "$prefix.log";
+print $LOG "CHR\tPOS\tTYPE\tREF\tREFD\tALT\tALTD\tCOMMENTS\n";
+
+$last_chr = '';
+while (<$VCF>) {
+    next if /^#/;
+    my @fields = split;
+    if ($last_chr ne $fields[0]) {
+	if ($last_chr) {
+	    if ($last_pos < $reflens{$last_chr}) {   ### CHANGE: chromosomal 3' gap fill with reference sequence
+		$seq .= substr($fasta{$last_chr}, $last_pos, $reflens{$last_chr}-$last_pos);
+		print $LOG "$last_chr\t$last_pos\t3'GAP\tNA\tNA\tNA\tNA\t3' Gap Fill ",$last_pos+1,"-$reflens{$last_chr}\n";
+		$patched += $reflens{$last_chr}-$last_pos;
+	    }
+	    print STDERR "$last_chr: ",length($seq)," bp\n";
+	    print $FA ">$last_chr\n";
+	    &v2q_print_str(\$seq);
+#	    &v2q_post_process($last_chr, \$seq, \$qual, \@gaps, $opts{l});
+	}
+	($last_chr, $last_pos) = ($fields[0], 0);
+	$seq = '';
+	$qual = '';
+	@gaps = ();
+    }
+    die "vcf is not sorted!\n" if $fields[1] - $last_pos < 0;
+    if ($fields[1] - $last_pos > 1) {
+	if ($ref_fa) {
+	    $seq .= lc(substr($fasta{$fields[0]}, $last_pos, $fields[1]-$last_pos-1));   ### CHANGE: gap fill with reference sequence
+	    $patched += $fields[1]-$last_pos-1;
+	} else {
+	    $seq .= 'n' x ($fields[1] - $last_pos - 1);
+	}
+#	$qual .= '!' x ($fields[1] - $last_pos - 1);
+	print $LOG "$fields[0]\t$fields[1]\tGAP\tNA\tNA\tNA\tNA\tGap fill ",$last_pos+1,"-",$fields[1]-1,"\n";
+	$stats{gap}++;
+    }
+#    if (length($fields[3]) == 1 && $fields[7] !~ /INDEL/ && $fields[4] =~ /^([A-Za-z.])(,[A-Za-z])*$/) {  # a SNP or reference
+    if ($fields[4] eq '.') {  # no variant found
+	$seq .= $fields[3];
+	$stats{unchg}++;
+    } else {  # some variant found
+#	next if $fields[7] =~ /^INDEL/;
+        my ($major, @others) = split /,/, $fields[4];
+	my ($ref, $alt) = ($fields[3], $major);
+	my $depth = ($fields[7] =~ /DP=(\d+)/);
+	my $radepth = ($fields[7] =~ /DP4=([\d,]+)/);
+	my @radepth = split /,/, $radepth;
+	my ($refdepth, $altdepth) = ($radepth[0]+$radepth[1], $radepth[2]+$radepth[3]);
+	my ($refsize, $altsize) = (length($ref), length($alt));
+	my $type = $refsize == 1 && $altsize == 1 ? 'SNP' : $refsize > 1 && $altsize > 1 ? 'HOM' : $altsize > $refsize ? 'INS' : 'DEL';
+	next if $type eq 'INS' && $noins;
+	next if $type eq 'DEL' && $nodel;
+	next if $type eq 'HOM' && $nohom;
+	
+	
+	### MAJOR PROBLEM: Deletions and shortened homopolymers must trigger competition with overshadowed downstream variants.
+	
+	
+	my $lentag = $type eq 'INS' ? " (".length($alt).")" : "";
+	my ($b, $q);
+	$q = $1 if ($fields[7] =~ /FQ=(-?[\d\.]+)/);
+	if ($depth < $_d) {
+	    $base = lc($ref);
+	    $stats{under}++;
+	} elsif ($depth > $_D) {
+	    $base = lc($ref);
+	    $stats{over}++;
+	} elsif ($q < 0) {
+	    $_ = ($fields[7] =~ /AF1=([\d\.]+)/) ? $1 : 0;
+	    if ($_ < .5 || $alt eq '.' || $alt eq 'X') {
+		$b = $ref;
+#		print $LOG "$fields[0]\t$fields[1]\t$type\t$ref\t$refdepth\t$alt\t$altdepth\tRef wins, $refdepth-$altdepth\n";
+	    } else {
+		$b = $alt;
+		print $LOG "$fields[0]\t$fields[1]\t$type\t$ref\t$refdepth\t$alt\t$altdepth\tAlt wins, $altdepth-$refdepth$lentag\n";
+		$stats{"HOM_$type"}++;
+	    }
+#	    $q = -$q;
+	    $base = uc($b);
+	} else {
+	    if ($refdepth >= $altdepth) {
+		$b = $_h ? $het{"$ref$alt"} : $ref;   # het; ref >= alt
+#		print $LOG "$fields[0]t$fields[1]\t$type\t$ref\t$refdepth\t$alt\t$altdepth\tHet, keep ref $ref\n";
+	    } else {
+		$b = $_h ? $het{"$ref$alt"} : $alt;   # het; ref < alt
+		print $LOG "$fields[0]t$fields[1]\t$type\t$ref\t$refdepth\t$alt\t$altdepth\tHet, keep alt $alt\n";
+		$stats{"HET_$type"}++;
+	    }
+	    $b ||= 'N';
+	    $base = uc($b);
+	}
+	if ($ballot{active}) {
+	    ## voting is active, for variant precedence within a deletion window
+	    ## %ballot structure:
+	    ## {active} : 1|0 : voting is active
+	    ## {i} : pos int : voting scope (enables distinct voting events for nested deletions)
+	    ##     : METHOD STILL WEAK: how to separate triple-nested vs two distinct nested, how to deal with overlapping non-nested, etc...
+	    ## {i}{coord} : [start,end] : position of deletion window i
+	    ## {nest} : {i1}{i2} : nesting relationships, if any
+	    ## {over} : {i1}{i2} : overlap relationships, if any
+	    ## {over}{i1}{i2} : [start,end] : overlap coordinates
+	    ## {var}{i} : [pos, support, ref, alt] : variant within deletion window i (may belong to multiple i's) -- ALSO INCLUDE DELETION ITSELF
+	    ## {winnow}{i} : [pos, support, ref, alt] : winning variant for deletion window i (w/o recursion)
+	    ## {winner}{i} : [pos, support, ref, alt] : winning variant for deletion window i (w/ recursion; if null, then window i itself lost a vote)
+	    
+	    
+	    
+	} else {
+	    $seq .= $base;
+	}
+#	$b = (($fields[7] =~ /MQ=(\d+)/ && $1 >= $_Q) && ($fields[7] =~ /DP=(\d+)/ && $1 >= $_d && $1 <= $_D)) ? uc($b) : lc($b);
+#	$q = int($q + 33 + .499);
+#	$q = chr($q <= 126 ? $q : 126);
+#	$qual .= $q;
+#    } elsif ($fields[4] ne '.') {  # an INDEL
+#	push(@gaps, [$fields[1], length($fields[3])]);
+    }
+    $last_pos = $fields[1];
+}
+print $FA ">$last_chr\n";
+&v2q_print_str(\$seq);
+#&v2q_post_process($last_chr, \$seq, \$qual, \@gaps, $opts{l});
+print $LOG "";
+print $LOG "$_\t$stats{$_}\n" foreach sort keys %stats;
+print "$0 complete: $totlen total bp | $patched gap bp\n";
+exit;
+
+
+
+#sub v2q_post_process {
+#  my ($chr, $seq, $qual, $gaps, $l) = @_;
+#  for my $g (@$gaps) {
+#	my $beg = $g->[0] > $l? $g->[0] - $l : 0;
+#	my $end = $g->[0] + $g->[1] + $l;
+#	$end = length($$seq) if ($end > length($$seq));
+#	substr($$seq, $beg, $end - $beg) = lc(substr($$seq, $beg, $end - $beg));
+#  }
+#  print "\@$chr\n"; &v2q_print_str($seq);
+#  print "+\n"; &v2q_print_str($qual);
+#}
+#
+#
+
+sub v2q_print_str {
+  my ($s) = @_;
+  my $l = length($$s);
+  $totlen += $l;
+  for (my $i = 0; $i < $l; $i += 60) {
+	print $FA substr($$s, $i, 60), "\n";
+  }
+}

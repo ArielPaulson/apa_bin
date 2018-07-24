@@ -1,0 +1,221 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+
+### Filters single or paired fastqs to remove reads with kmers occurring less than some minimum N times.
+### Horrifically slow; will keep looking for some existing pre-compiled alternative...
+
+
+
+### Dependencies
+my $jellyfish = '/n/local/stage/jellyfish/jellyfish-2.2.4/bin/jellyfish';
+
+
+
+### Inputs
+my $e1;
+my $e2;
+my $k;
+my $Nmin;
+my $cores;
+my $outprefix;
+my $orphans;
+my $keep;
+
+
+
+### Get, test args
+GetOptions("e1=s"=>\$e1, "e2=s"=>\$e2, "k=i"=>\$k, "n=i"=>\$Nmin, "c=i"=>\$cores, "o=s"=>\$outprefix, "orphans"=>\$orphans, "keep"=>\$keep);
+$e1 = &validate('file', $e1, 'Input end-1 fastq', 1);
+$e2 = &validate('file', $e2, 'Input end-2 fastq');
+die "$0: Kmer size 'k' must be a positive integer!\n" if (!$k || $k =~ /\D/);
+die "$0: Kmer minimum occurrance 'n' must be a positive integer!\n" if (!$Nmin || $Nmin =~ /\D/);
+die "$0: N jellyfish cores 'cores' must be a positive integer!\n" if $cores =~ /\D/;
+$cores = 1 unless $cores;
+($outprefix = $e1) =~ s/(_1)?\.f[astq]+(\.gz)?/.k${k}_n$Nmin/ unless $outprefix;
+my $gzip = $e1 =~ /\.gz$/ ? 1 : 0;
+
+
+
+### Temp location & files
+my $tmp = "fastqKmerFilter.$$.tmp";
+$tmp = &validate('dir', $tmp, 'Temp directory', 1);
+
+
+
+### Globals
+my %filter;  # kmers to reject
+my %fq;      # filtered fastq records
+my %stats;   # reporting stats
+
+
+
+### Run Jellyfish
+print "Preparing fastq data...\n";
+system "zcat $e1 > $tmp/fq";
+chomp(my $recs = `cat $tmp/fq | wc -l`);
+$stats{ALL1} = $recs / 4;
+$stats{SM1} = $stats{OK1} = 0;
+print "End 1: $stats{ALL1} records\n";
+if ($e2) {
+    system "zcat $e2 >> $tmp/fq";
+    chomp(my $recs2 = `cat $tmp/fq | wc -l`);
+    $stats{ALL2} = ($recs2-$recs) / 4;
+    $stats{SM2} = $stats{OK2} = 0;
+    print "End 2: $stats{ALL2} records\n";
+}
+chomp(my $bytes = `ls -l $tmp/fq | awk '{ print \$5 }'`);
+
+my $cmd = "$jellyfish count -m $k -s $bytes -t $cores -o $tmp/db $tmp/fq";
+print "$cmd\n"; system $cmd;
+
+my $cmd = "$jellyfish dump -c -t -U ".($Nmin-1)." -o $tmp/txt $tmp/db";
+print "$cmd\n"; system $cmd;
+
+
+
+### Read in kmers to remove
+print "Reading kmers...\n";
+my %kc;
+my $IN = &open2('R', "$tmp/txt", 'Jellyfish kmer dump');
+while (<$IN>) {
+    chomp;
+    my ($kmer, $n) = split;
+    $kc{$n}++;
+#    $kmer = $kmer;    # assumes kmers are in UPPERCASE
+    $filter{$kmer}{R} = ${ &revcomp($kmer) };  # kmer revcomp
+    $filter{$kmer}{E} = $n;  # expected count
+    $filter{$kmer}{O} = 0;   # observed count (initial)
+}
+print " $. low-coverage kmers:\n";
+print " $kc{$_} @ ${_}x\n" foreach sort {$a <=> $b} keys %kc;
+close $IN;
+
+
+
+### Filter fastq(s)
+print "Filtering end-1 fastq: ",`date`;
+my $E1 = &open2('R', $e1, 'End 1 input fastq');
+&process_fastq($E1, 1);
+close $E1;
+
+if ($e2) {
+    print "Filtering end-2 fastq: ",`date`;
+    my $E2 = &open2('R', $e2, 'End 2 input fastq');
+    &process_fastq($E2, 2);
+    close $E2;
+}
+
+
+
+### Write results
+my ($O1, $O1O, $O2, $O2O);
+my $ext = $gzip ? 'fastq.gz' : 'fastq';
+
+my $outfq1 = $outprefix;
+$outfq1 .= "_1" if $e2;
+$O1 = &open2('W', "$outfq1.$ext", 'End 1 output fastq');
+$O1O = &open2('W', "$outfq1.orphans.$ext", 'End 1 orphans output fastq') if $e2 && $orphans;   # orphans only exist for paired-end data
+
+if ($e2) {
+    my $outfq2 = $outprefix;
+    $outfq2 .= "_2";
+    $O2 = &open2('W', "$outfq2.$ext", 'End 2 output fastq');
+    $O2O = &open2('W', "$outfq2.orphans.$ext", 'End 2 orphans output fastq') if $orphans;
+}
+
+print "Writing output fastq(s)...\n";
+$stats{PAIRS} = $stats{ORPHS} = 0;
+foreach my $header (keys %fq) {
+    if ($e2) {
+	if (exists $fq{$header}{1} && exists $fq{$header}{2}) {
+	    print $O1 $fq{$header}{1};
+	    print $O2 $fq{$header}{2};
+	    $stats{PAIRS}++;
+	} elsif ($orphans) {
+	    if (exists $fq{$header}{1}) {
+		print $O1O $fq{$header}{1};
+	    } else {
+		print $O2O $fq{$header}{2};
+	    }
+	    $stats{ORPHS}++;
+	}
+    } else {
+	print $O1 $fq{$header}{1};  # if !$e2, then header passed in E1
+    }
+}
+close $O1;
+close $O2 if $e2;
+close $O1O if $e2 && $orphans;
+close $O2O if $e2 && $orphans;
+
+system "rm -rf $tmp" unless $keep;
+$stats{ALLK} = scalar keys %filter;
+$stats{RMK} = scalar keys %{ $stats{K} };
+$stats{RP1} = sprintf("%0.2f", 100*$stats{RM1}/$stats{ALL1});
+$stats{RP2} = sprintf("%0.2f", 100*$stats{RM2}/$stats{ALL2});
+print "Kmers: $stats{ALLK} total | $stats{RMK} matched\nFastq End 1: $stats{ALL1} in | $stats{OK1} keep | $stats{RM1} drop ($stats{RP1}%); $stats{SM1} too short\n";
+if ($e2) {
+    print "Fastq End 2: $stats{ALL2} in | $stats{OK2} keep | $stats{RM2} drop ($stats{RP2}%); $stats{SM2} too short\n";
+    print "Paired Headers: $stats{PAIRS} | Orphaned Headers: $stats{ORPHS}\n";
+}
+exit;
+
+
+
+sub process_fastq {
+    
+    my ($FH, $end) = @_;
+    my $N = $stats{"ALL$end"};
+    my $i = my $r = 0;
+    my ($header, $pass, $rec);
+    
+    while (<$FH>) {
+	$rec .= $_;
+	chomp;
+	$i++;
+	if ($i == 1) {
+	    $header = $_;
+	} elsif ($i == 2) {
+	    my $seq = $_;   # assumes sequences are in UPPERCASE
+	    $pass = 1;      # init as success and prove otherwise
+	    if (length($seq) >= $k) {
+		foreach my $kmer (keys %filter) {
+		    if ($seq =~ /$kmer/) {
+			$pass = 0;
+			$filter{$kmer}{O}++;
+			$stats{"RM$end"}++;
+			$stats{K}{$kmer} = 1;
+			delete $filter{$kmer} if $filter{$kmer}{O} == $filter{$kmer}{E};  # $filter will still have data at end, since we stop matching kmers after 1 hit.
+			last;
+		    } elsif ($seq =~ /$filter{$kmer}{R}/) {
+			$pass = 0;
+			$filter{$kmer}{O}++;
+			$stats{"RM$end"}++;
+			$stats{K}{$kmer} = 1;
+			delete $filter{$kmer} if $filter{$kmer}{O} == $filter{$kmer}{E};
+			last;
+		    }
+		}
+	    } else {
+		$pass = 0;
+		$stats{"RM$end"}++;
+		$stats{"SM$end"}++;  # read shorter than kmer
+	    }
+	} elsif ($i == 4) {
+	    if ($pass) {
+		$fq{$header}{$end} = $rec;
+		$stats{"OK$end"}++;
+	    }
+	    $i = 0;
+	    $rec = '';
+	    $r++;
+	    print " $r/$N: ",`date` if $r % 10000 == 0;
+	}
+    }
+    
+}

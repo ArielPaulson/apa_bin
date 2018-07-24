@@ -1,0 +1,538 @@
+#!/usr/bin/env perl
+require '/home/apa/local/bin/apa_routines.pm';
+use Data::Dumper;
+use Getopt::Long;
+use Pod::Usage;
+use LWP::Simple;
+use strict;
+
+## Inputs
+my $file;     # fastq/fasta file
+my $outdir;   # output dir; die if exists
+my $clobber;  # output dir; clobber
+my $deforg;   # default organism (as "Genus_species")
+my $keep;     # keep intermediate data?
+my $noloco;   # skip homopolymer/low-complexity filtering?
+my $noblast;  # just separate read groups, no blast analysis?
+my ($help, $man, $version);
+
+## Inputs with Defaults
+my $cores = 2;
+my $polyN = 10;
+my $locoB = 2;
+my $adapN = 15;
+my $adapType = 'TruSeq';
+my $batchsize = 100;
+my $idtmin = 75;
+
+GetOptions(
+    "f=s" => \$file,
+    "o=s" => \$outdir,
+    "oc=s" => \$clobber,
+    "c=i" => \$cores,
+    "a=s" => \$adapType,
+    "p=i" => \$polyN,
+    "l=i" => \$locoB,
+    "d=i" => \$adapN,
+    "b=i" => \$batchsize,
+    "r=s" => \$deforg,
+    "i=i" => \$idtmin,
+    "keep" => \$keep,
+    "noloco" => \$noloco,
+    "noblast" => \$noblast,
+    "help" => \$help,
+    "man" => \$man,
+    "version" => \$version
+    );
+
+$deforg =~ s/_/ /g;
+$outdir = create_writedir($outdir, $clobber, $0);
+
+## Globals
+my @order;        # read input order
+my %headercount;  # counts per read header
+my %blast2true;  # first field of header (breaks on whitespace) -- what header looks like in blast output
+my %seq;          # read sequences
+my %seqstats;     # summary stats for sequence
+my %adaphits;     # hits to adapters
+my %blast;        # blast results
+my %catheaders;   # headers per read category "type" (e.g. adapter, low-comp, polyA, good, etc)
+my @GI;           # GI numbers for top blast subjects
+my %GIheader;     # read headers per GI number
+my %headerGI;     # GI numbers per read header
+my %GIorg;        # organism for each GI number
+my %found;        # GI number recovered from annot search? (1|0)
+my %annot;        # NCBI annotations
+my %noannot;      # GIs that should have had NCBI annotations, but didn't
+my @batchres;     # NCBI query-batch result files
+my %sortorg;      # results by organism type (default vs others)
+my %subjhits;     # results by subject
+my %nopassdata;   # report data for non-passing blast queries
+my %noanndata;    # report data for psssing but unannotatable blast queries
+my $filtblasthead;  # filtered blast output file header line
+my $polyA = 'A' x $polyN;  # minimum polyA run
+my $polyC = 'C' x $polyN;  # minimum polyC run
+my $polyG = 'G' x $polyN;  # minimum polyG run
+my $polyT = 'T' x $polyN;  # minimum polyT run
+my @bases = qw/ A C G T N /;  # DNA bases
+my %counts = map {($_=>0)} qw/ GOOD POLY LOCO HASN ADAP /;  # read counts per category
+
+## Paths and Files
+my $tmp = "$outdir/readSampleEval.$$.tmp";
+my $polyfa = "$outdir/homopolymer_reads.fa";
+my $locofa = "$outdir/low_complexity_reads.fa";
+my $hasNfa = "$outdir/reads_with_Ns.fa";
+my $adapfa = "$outdir/adapter_reads.fa";
+my $goodfa = "$outdir/good_reads.fa";
+my $noblastfa = "$outdir/good_reads_not_blastable.fa";
+my $nopassfa = "$outdir/good_reads_blastable_not_passing.fa";
+my $nopassrep = "$outdir/good_reads_blastable_not_passing.report.txt";
+my $noannfa = "$outdir/good_reads_blastable_passing_not_annotatable.fa";
+my $noannrep = "$outdir/good_reads_blastable_passing_not_annotatable.report.txt";
+my $blat = "$tmp/blatx";
+my $adapters = "/home/apa/local/bin/scriptutils/adapter_collection.fa";
+system "mkdir -p $tmp";
+die "Failed to create temp directory '$tmp'\n" unless -d $tmp;
+
+
+## Main
+
+## Get reads
+my $IN1;
+if ($file =~ /\.gz$/) {
+    open $IN1, '-|', "gunzip -c $file" or die "$0: Cannot read input file '$file'\n";
+} else {
+    open $IN1, '<', $file or die "$0: Cannot read input file '$file'\n";
+}
+my $header;
+while (<$IN1>) {
+    $_ =~ s/[\n\r]+$//;
+    if ($_ =~ /^>(\S+)/) {
+	$header = $1;
+	push @order, $header;
+	$blast2true{ (split /\s+/, $header)[0] } = $header;  # what will come out of blast
+	if ($header =~ /^(\d+)_(\d+)$/) {  # N-mode header (enumerated unique sequences)
+	    $headercount{$header} = $2;  # prevalence for sequence $header
+	} else {                           # K-mode or other header
+	    $headercount{$header} = 1;   # prevalence for sequence $header
+	}
+    } else {
+	$seq{$header} .= $_;  # read sequence
+    }
+}
+close $IN1;
+
+unless ($noloco) {
+    ## homopolymer quantitation per read
+    foreach my $header (keys %seq) {
+	my (%temp, %maxruns);
+	# base frequencies
+	$temp{$_}++ foreach split //, $seq{$header};
+	$seqstats{$header} = join "\t", map { $temp{$_} } @bases;
+	# largest homopolymer run per base
+	foreach my $base (@bases) {
+	    my @runs = map { length($_) } split /[^$base]/, $seq{$header};
+	    $maxruns{$base} = (sort {$b <=> $a} @runs)[0];
+	}
+	$seqstats{$header} .= join "\t", ('', map { $maxruns{$_} } @bases);
+    }
+}
+
+## write adapter fasta for blat
+#open my $OUT1, '>', $adapters or die "$0: Cannot write the adapter fasta '$adapters': $!\n";
+#if ($adapType eq 'TruSeq') {
+#    print $OUT1 ">Truseq_Adaptor\nAGATCGGAAGAGCACACGTCTGAACTCCAGTCACCCGTCCCGATCTCGTATG\n";
+#    print $OUT1 ">SmallRNA_Adaptor\nCAAGCAGAAGACGGCATACGAGATNNNNNNGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA\n";
+#} elsif ($adapType eq 'Nextera') {
+#    print $OUT1 ">Nextera_circularized_junction_adapter\nCTGTCTCTTATACACATCTAGATGTGTATAAGAGACAG\n";
+#    print $OUT1 ">Nextera_read_1_external_adapter\nATCGGAAGAGCACACGTCTGAACTCCAGTCAC\n";
+#    print $OUT1 ">Nextera_read_2_external_adapter\nGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT\n";
+#} else {
+#    die "Unknown adapter type '$adapType': must be 'TruSeq' or 'Nextera'!\n";
+#}
+#close $OUT1;
+
+## adapter-detection blat
+my $cmd = "blat -extendThroughN $adapters $file $blat";
+print "$cmd\n";
+system $cmd;
+
+## siphon off adapter hits
+open my $IN2, '<', $blat or die "$0: Cannot read adapter blat results '$blat': $!\n";
+while (<$IN2>) {
+    next if $. < 6;  # header lines
+    my @data = split /\t/, $_;
+    $adaphits{$data[9]} = 1 if $data[0] >= $adapN;  # must have >= $adapN matches versus adapter
+}
+close $IN2;
+
+## read fractionation
+open my $GOOD, '>', $goodfa;
+open my $POLY, '>', $polyfa;
+open my $LOCO, '>', $locofa;
+open my $HASN, '>', $hasNfa;
+open my $ADAP, '>', $adapfa;
+foreach my $header (@order) {
+    if ($adaphits{$header}) {
+	print $ADAP ">$header\n$seq{$header}\n";
+	$counts{ADAP}++;
+	$catheaders{ADAP}{$header}++;
+    } elsif (!$noloco && $seq{$header} =~ /($polyA|$polyC|$polyG|$polyT)/) {
+	print $POLY ">$header\n$seq{$header}\n";
+	$counts{POLY}++;
+	$catheaders{POLY}{$header}++;
+    } elsif ($seq{$header} =~ /N/) {
+	print $HASN ">$header\n$seq{$header}\n";
+	$counts{HASN}++;
+	$catheaders{HASN}{$header}++;
+    } elsif ($noloco) {
+	print $GOOD ">$header\n$seq{$header}\n";
+	$counts{GOOD}++;
+    } else {
+	my %bases = map {($_=>1)} (split //, $seq{$header});
+	if (scalar (keys %bases) <= $locoB) {
+	    print $LOCO ">$header\n$seq{$header}\n";
+	    $counts{LOCO}++;
+	    $catheaders{LOCO}{$header}++;
+	} else {
+	    print $GOOD ">$header\n$seq{$header}\n";
+	    $counts{GOOD}++;
+	}
+    }
+}
+close $GOOD;
+close $POLY;
+close $LOCO;
+close $HASN;
+close $ADAP;
+
+print "ADAPTOR $counts{ADAP} | HOMOPOLYMER $counts{POLY} | LOW-COMP $counts{LOCO} | WITH Ns $counts{HASN} | GOOD $counts{GOOD}\n";
+
+&finalize_and_exit if $noblast;
+
+## megablast "good" reads against nt
+my $cmd = "megablast -F F -a $cores -m 8 -d /n/data1/blast/db/nt -i $goodfa > $goodfa.megablast";
+print "$cmd\n";
+system $cmd unless -e "$goodfa.megablast";
+
+## take only highest-scoring alignment(s) per read
+my $cmd = "/home/apa/local/bin/filterAligns -f $goodfa.megablast -q $goodfa -t blast --best --lost --more";
+print "$cmd\n";
+system $cmd unless -e "$goodfa.megablast.best";
+
+## process megablast results
+open my $IN3, '<', "$goodfa.megablast.best" or die "$0: Cannot read '$goodfa.megablast.best': $!\n";
+while (my $line = <$IN3>) {
+    if ($. == 1) {
+	$filtblasthead = $line;
+	next;
+    }
+    chomp($line);
+    my @data = split /\t/, $line;  # ($header, $subj, $idt, $mlen, $mms, $Ngaps, $qpos1, $qpos2, $spos1, $spos2, $eval, $score, $strand, $IdtBp, $QLen, $QLenPct, $AQIdtPct, $TQIdtPct, $SLen, $SLenPct, $ASIdtPct, $TSIdtPct)
+    my ($blastheader, $subj, $TQIdtPct) = @data[0,1,17];
+    my $header = $blast2true{$blastheader};
+    $catheaders{BLAST}{$header}++;
+    if ($TQIdtPct >= $idtmin) {  # passing end-to-end identity %
+	$catheaders{PASS}{$header} = 1;
+	my $gi = (split /\|/, $subj)[1];
+	$GIheader{$gi}{$header} = $subj;
+	$headerGI{$header}{$gi} = $subj;
+    } else {
+	push @{ $nopassdata{$header} }, "$line\n";
+    }
+}
+close $IN3;
+@GI = sort keys %GIheader;
+
+## account for unblastables
+system "mv $goodfa.megablast.lost $noblastfa";
+open my $IN4, '<', $noblastfa or die "$0: Cannot read '$noblastfa': $!\n";
+while (<$IN4>) {
+    chomp;
+    $catheaders{NOBLAST}{$1} = 1 if $_ =~ /^>(.*)/;
+}
+close $IN4;
+
+## get annotations for best-blast-subject GIs from NCBI
+my $nbatch = scalar(@GI) % $batchsize == 0 ? scalar(@GI)/$batchsize : int(scalar(@GI)/$batchsize)+1;
+print "Running $nbatch NCBI queries of $batchsize terms each.\n";
+my ($i, $j) = (0, -1);
+foreach my $n (1..$nbatch) {
+    print " Batch $n\n";
+    my $gbfile = "$tmp/batch.$n.gb";
+    push @batchres, $gbfile;
+    
+    unless (-e $gbfile) {  # if output file for batch $n already exists, skip this step
+	$i = $j + 1;
+	$j = $i + $batchsize - 1 > $#GI ? $#GI : $i + $batchsize - 1;
+	my @batch = @GI[$i..$j];
+	
+	my $allGI = 'id=' . (join ',', @batch);
+	my $efetch = "http://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=nucleotide&id=$allGI&rettype=gb";
+	my $result = get($efetch);  # efetch call 
+	open my $OUT2, '>', $gbfile;
+	print $OUT2 "$result\n";
+	close $OUT2;
+    }
+    
+    ## process Genbank records
+    my ($gi, $def, $src, $org);  # values from corresponding Genbank fields
+    open my $IN5, '<', $gbfile or die "$0: Cannot open Genbank data file '$gbfile': $!\n";
+    while (<$IN5>) {
+	if ($_ =~ /^\/\//) {
+	    $gi = $org = undef;
+	} elsif ($_ =~ / GI:(\d+)/) {
+	    $gi = $1;
+	    $found{GI}{$gi}++;
+	    $found{HEADER}{$_}++ foreach keys %{ $GIheader{$gi} };
+	} elsif ($_ =~ /^DEFINITION\s+(.*)/) {
+	    ($def = $1) =~ s/\s*$//;
+	} elsif ($_ =~ /^SOURCE\s+(.*)/) {
+	    ($src = $1) =~ s/\s*$//;
+	} elsif ($_ =~ /^\s+ORGANISM\s+(.*)/) {
+	    ($org = $1) =~ s/\s*$//;
+	    $annot{$org}{TOT}++;  # total hits per organism
+	    $annot{$org}{GI}{$gi} = 1;  # unique organism-GI pairs
+	    $GIorg{$gi} = [$org, $src, $def];
+	    foreach my $header (keys %{ $GIheader{$gi} }) {
+		$annot{$org}{HEADER}{$header} = 1;  # unique organism-header pairs
+		$subjhits{$org}{$src}{$def}{$header} = 1;  # unique organism-source-definition-header sets
+		$GIheader{$gi}{$header} = $org;   # overwrite subject with organism where available
+		$headerGI{$header}{$gi} = $org;
+	    }
+	    $def = $src = '';  # ZAP
+	}
+    }
+    close $IN5;
+    sleep 1;
+}
+
+my %fates;
+foreach my $header (keys %{ $found{HEADER} }) {
+    ## first reduce annots to only one organism
+    my %allGI = %{ $headerGI{$header} };
+    my %allorg = map {($GIorg{$_}->[0]=>1)} keys %allGI;
+    my $ftype;
+    if (scalar (keys %allorg) == 1) {  
+	## only annotated to one org
+	$ftype = 'MONO';
+    } elsif (exists $allorg{$deforg}) {  
+	## annotated to > 1 org, including the default org: remove all non-default orgs
+	$ftype = 'DEF';
+	foreach my $gi (keys %allGI) {
+	    my $org = $GIorg{$gi}->[0];
+	    next if $org eq $deforg;
+	    delete $annot{$org}{HEADER}{$header};
+	    delete $annot{$org}{GI}{$gi};
+	    delete $headerGI{$header}{$gi};
+	    delete $GIheader{$gi}{$header};
+	    foreach my $src (keys %{ $subjhits{$org} }) {
+		foreach my $def (keys %{ $subjhits{$org}{$src} }) {
+		    delete $subjhits{$org}{$src}{$def}{$header};
+		}
+	    }
+	}
+    } else {  
+	## annotated to > 1 org, but not the default org: retain only the most-supported org
+	$ftype = 'MULTI';
+	my %allhits = map {($annot{$_}{TOT}=>$_)} keys %allorg;  # built-in tiebreaking; effectively chooses one at random
+	my $tophit = (sort {$b <=> $a} keys %allhits)[0];
+	my $toporg = $allhits{$tophit};
+	foreach my $gi (keys %allGI) {
+	    my $org = $GIorg{$gi}->[0];
+	    next if $org eq $toporg;
+	    delete $annot{$org}{HEADER}{$header};
+	    delete $annot{$org}{GI}{$gi};
+	    delete $headerGI{$header}{$gi};
+	    delete $GIheader{$gi}{$header};
+	    foreach my $src (keys %{ $subjhits{$org} }) {
+		foreach my $def (keys %{ $subjhits{$org}{$src} }) {
+		    delete $subjhits{$org}{$src}{$def}{$header};
+		}
+	    }
+	}
+    }
+    # re-test
+    $fates{$ftype}++;
+    my %allGI2 = %{ $headerGI{$header} };
+    my %allorg2 = map {($GIorg{$_}->[0]=>1)} keys %allGI2;
+    my $orgs2 = scalar keys %allorg2;
+    print "$header\t$ftype\t$orgs2\n",Dumper($headerGI{$header}),"\n" unless $orgs2 == 1;
+}
+#print "DOUBLES: ", scalar(keys %doubles), "\n";
+print "$_\t$fates{$_}\n" foreach keys %fates;
+
+## account for reads lost at various annotation stages
+open my $NOPASS, '>', $nopassfa;
+open my $NOPASSREP, '>', $nopassrep;
+print $NOPASSREP $filtblasthead;
+foreach my $header (keys %{ $catheaders{BLAST} }) {
+    unless ($catheaders{PASS}{$header}) {
+	$catheaders{NOPASS}{$header} = 1;  # best blast hit was still sub-par
+	print $NOPASS ">$header\n$seq{$header}\n";
+	print $NOPASSREP @{ $nopassdata{$header} };
+    }
+}
+close $NOPASS;
+close $NOPASSREP;
+
+open my $NOANN, '>', $noannfa;
+open my $NOANNREP, '>', $noannrep;
+print $NOANNREP "SUBJECT\tTOT_SEQ\tUNQ_SEQ\n";
+foreach my $header (keys %{ $catheaders{PASS} }) {
+    unless ($found{HEADER}{$header}) {
+	$catheaders{NOANN}{$header} = 1;  # no Genbank data for best-subject GI number
+	print $NOANN ">$header\n$seq{$header}\n";
+	foreach my $gi (keys %{ $headerGI{$header} }) {
+	    unless (exists $GIorg{$gi}) {
+		my $tseqs = my $useqs = 0;
+		foreach my $header (keys %{ $GIheader{$gi} }) {
+		    $tseqs += $headercount{$header};
+		    $useqs++;
+		}
+		my $subj = $GIheader{$gi}{$header};
+		print $NOANNREP "$subj\t$tseqs\t$useqs\n";
+	    }
+	}
+    }
+}
+close $NOANN;
+close $NOANNREP;
+
+## tally number of reads falling into various categories...
+foreach my $gi (@GI) {
+    $counts{GLOST}++ unless $found{GI}{$gi};  # GI numbers with no Genbank data
+}
+$counts{QNOBLAST} = scalar keys %{ $catheaders{NOBLAST} };  # unblastable reads
+$counts{QBLAST} = scalar keys %{ $catheaders{BLAST} };      # blastable reads
+$counts{QPASS} = scalar keys %{ $catheaders{PASS} };        # blastable reads with high-quality alignments
+$counts{QANN} = scalar keys %{ $found{HEADER} };            # annotated reads
+$counts{GANN} = scalar keys %{ $found{GI} };                # unique GI numbers providing annotation
+
+print "QUERIES: BLASTED $counts{QBLAST} | PASSED $counts{QPASS} | ANNOTATED $counts{QANN} | UNBLASTABLE $counts{QNOBLAST}\n";
+#print "GI NUMS : $counts{} | : $counts{} | : $counts{}\n";
+
+## if sample was top-K sequences:
+##  for each annotating organism and read category, translate unique-sequences-per-subject into read-counts-per-subject
+##   otherwise, counts stay same...
+my %hittotals;
+foreach my $org (keys %annot) {
+    my $subj = scalar keys %{ $annot{$org}{GI} };
+    my $tseqs = my $useqs = 0;
+    foreach my $header (keys %{ $annot{$org}{HEADER} }) {
+	$tseqs += $headercount{$header};
+	$useqs++;
+    }
+    $sortorg{O}{$org} = [$subj, $tseqs, $useqs];
+    $hittotals{$org}{ALL}{ALL} = $tseqs;
+}
+my @preblast = qw/ ADAP LOCO POLY NOBLAST NOPASS NOANN /;
+foreach my $etc (@preblast) {
+    my $subj = 'NA';
+    my $tseqs = my $useqs = 0;
+    foreach my $header (keys %{ $catheaders{$etc} }) {
+	$tseqs += $headercount{$header};
+	$useqs++;
+    }
+    $sortorg{E}{$etc} = [$subj, $tseqs, $useqs];
+}
+
+## write hits-per-organism summary
+open my $OUT3, '>', "$outdir/readSampleEval.report.txt";
+print $OUT3 "ORGANISM\tSUBJS\tTOT_SEQ\tUNQ_SEQ\n";
+foreach my $etc (@preblast) {
+    my ($subj, $tseqs, $useqs) = @{ $sortorg{E}{$etc} };
+    print $OUT3 "$etc\t$subj\t$tseqs\t$useqs\n";
+}
+foreach my $org (sort { $hittotals{$b}{ALL}{ALL} <=> $hittotals{$a}{ALL}{ALL} } keys %{ $sortorg{O} }) {
+    my ($subj, $tseqs, $useqs) = @{ $sortorg{O}{$org} };
+    print $OUT3 "$org\t$subj\t$tseqs\t$useqs\n" if $subj;
+}
+close $OUT3;
+
+## translate unique-seq-count to actual-read-count for every subject 
+my (%defout, %srcout);
+foreach my $org (keys %subjhits) {
+#    print "$org\n";
+    foreach my $src (keys %{ $subjhits{$org} }) {
+#	print "$org: $src\n";
+	my %srcheaders;
+	foreach my $def (keys %{ $subjhits{$org}{$src} }) {
+	    next unless scalar(keys %{ $subjhits{$org}{$src}{$def} })>0;
+	    my $tseqs = my $useqs = 0;
+	    foreach my $header (keys %{ $subjhits{$org}{$src}{$def} }) {
+		$srcheaders{$header} = 1;
+		$tseqs += $headercount{$header};
+		$useqs++;
+	    }
+	    push @{ $defout{$org}{$src}{$tseqs} }, "$org\t$src\t$def\t$tseqs\t$useqs\n" if $useqs;
+	    $hittotals{$org}{$src}{$def} = $tseqs;
+	}
+	my $tseqs = my $useqs = 0;
+	foreach my $header (keys %srcheaders) {
+	    $tseqs += $headercount{$header};
+	    $useqs++;
+	}
+	push @{ $srcout{$org}{$tseqs} }, "$org\t$src\tALL\t$tseqs\t$useqs\n" if $useqs;
+	$hittotals{$org}{$src}{ALL} = $tseqs;
+    }
+}
+
+## write reads-per-organism-and-subject report
+open my $OUT4, '>', "$outdir/readSampleEval.subjects.txt";
+print $OUT4 "ORGANISM\tSOURCE\tDEFINITION\tTOT_SEQ\tUNQ_SEQ\n";
+foreach my $org (sort { $hittotals{$b}{ALL}{ALL} <=> $hittotals{$a}{ALL}{ALL} } keys %subjhits) {
+    foreach my $src (sort { $hittotals{$org}{$b}{ALL} <=> $hittotals{$org}{$a}{ALL} } keys %{ $subjhits{$org} }) {
+	print $OUT4 @{ $srcout{$org}{$_} } foreach (sort {$b <=> $a} keys %{ $srcout{$org} });
+    }
+    foreach my $src (sort { $hittotals{$org}{$b}{ALL} <=> $hittotals{$org}{$a}{ALL} } keys %{ $subjhits{$org} }) {
+	foreach my $def (sort { $hittotals{$org}{$src}{$b} <=> $hittotals{$org}{$src}{$a} } keys %{ $subjhits{$org}{$src} }) {
+	    my $nlines = 0;
+	    foreach my $tseqs (sort {$b <=> $a} keys %{ $defout{$org}{$src} }) {
+		next if $nlines > 10;
+		$nlines += scalar @{ $defout{$org}{$src}{$tseqs} };
+		print $OUT4 @{ $defout{$org}{$src}{$tseqs} };
+	    }
+	}
+    }
+}
+close $OUT4;
+
+&finalize_and_exit;
+
+#####  END OF MAIN  #####
+
+
+
+
+
+
+sub finalize_and_exit {
+    
+    ## write "executive summary"
+    open my $OUT5, '>', "$outdir/readSampleEval.seqstats.txt";
+    print $OUT5 "Type\tHeader\tA\tC\tG\tT\tN\tmA\tmC\tmG\tmT\tmN\n";
+    print $OUT5 "ADAPTOR\t$_\t$seqstats{$_}\n" foreach keys %{ $catheaders{ADAP} };
+    print $OUT5 "LOWCOMP\t$_\t$seqstats{$_}\n" foreach keys %{ $catheaders{LOCO} };
+    print $OUT5 "HOMOPOL\t$_\t$seqstats{$_}\n" foreach keys %{ $catheaders{POLY} };
+    print $OUT5 "WITH_N\t$_\t$seqstats{$_}\n" foreach keys %{ $catheaders{HASN} };
+    print $OUT5 "NOBLAST\t$_\t$seqstats{$_}\n" foreach keys %{ $catheaders{NOBLAST} };
+    print $OUT5 "NOPASS\t$_\t$seqstats{$_}\n" foreach keys %{ $catheaders{NOPASS} };
+    print $OUT5 "NOANN\t$_\t$seqstats{$_}\n" foreach keys %{ $catheaders{NOANN} };
+    print $OUT5 "ANN\t$_\t$seqstats{$_}\n" foreach keys %{ $found{HEADER} };
+    close $OUT5;
+    
+    ## remove temp data, maybe
+    unless ($keep) {
+	system "rm -f $blat";
+	system "rm -f $goodfa.megablast";
+	system "rm -f $goodfa.best";
+	system "rm -f $goodfa.lost";
+	system "rm -f $_" foreach @batchres;
+    }
+    
+    ## exit!
+    print "$0 Complete!\n";
+    exit;
+    
+}

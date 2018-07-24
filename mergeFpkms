@@ -1,0 +1,20 @@
+#!/usr/bin/perl
+use strict;
+
+my %fpkms;
+
+foreach my $file (@ARGV) {
+    open IN, $file;
+    while (<IN>) {
+	my ($gene, $fpkm) = (split /\t/, $_)[0,9];
+	$fpkms{$gene}{$file} += $fpkm;  # hedging aganst the cases where > 1 record exists for a gene
+    }
+    close IN;
+}
+
+print join ("\t", ("Gene", @ARGV)), "\n";
+foreach my $gene (sort keys %fpkms) {
+    print join ("\t", ($gene, map { $fpkms{$gene}{$_} } @ARGV)), "\n";
+}
+exit;
+

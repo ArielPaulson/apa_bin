@@ -1,0 +1,36 @@
+#!/usr/bin/env Rscript
+source("/home/apa/apa_tools.R")
+
+ca <- commandArgs(trailing=TRUE)
+outfile <- ca[1]
+maxgap <- as.numeric(ca[2])
+if (is.na(maxgap)) maxgap <- Inf
+bams <- ca[3:length(ca)]
+
+perbam <- refnames <- new.list(bams)
+tmp <- tempfile()
+for (i in 1:length(bams)) {
+    message(paste("Scanning",bams[i]))
+    system(paste("samtools view",bams[i],"| cut -f3-4 >",tmp))
+    x <- read.delim(tmp, as.is=TRUE, header=FALSE)
+    y <- lapply(split(x[,2], x[,1]), diff)
+    z <- merge.table.list(lapply(y, function(d){ dt=table(d); dt[as.numeric(names(dt))<=maxgap] }))
+#    colnames(z) <- paste0(colnames(z),"bp")
+    perbam[[i]] <- cbind(bam=i, ref=1:length(y), set=1, aligns=sapply(y,length), z)
+    refnames[[i]] <- names(y)
+}
+
+final <- as.data.frame(rownameless(merge.table.list(perbam)))
+final[,1] <- bams[final[,1]]
+final[,2] <- unlist(refnames)
+final$set <- "COUNTS"
+
+final.pct <- final
+final.pct$set <- "PERCENT"
+final.pct[,4:ncol(final)] <- final[,4:ncol(final)]/final$aligns
+
+final.cpct <- final.pct
+final.cpct$set <- "CUMUL.PCT"
+for (i in 1:nrow(final)) final.cpct[i,5:ncol(final)] <- cumsum(unlist(final.pct[i,5:ncol(final)]))
+
+write.table2(rbind(final,final.pct,final.cpct), outfile)

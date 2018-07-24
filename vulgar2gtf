@@ -1,0 +1,184 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+#### NEEDS WORK ####
+
+# S44850863 0 899 + scaffold_57 458281 461118 + 4388 M 196 196 5 0 2 I 0 560 3 0 2 M 107 107 5 0 2 I 0 1148 3 0 2 M 91 91 5 0 2 I 0 217 3 0 2 M 498 498 G 0 1 M 7 7
+# M Match | G Gap | N Non-equivalenced region | 5 5' splice site | 3 3' splice site | I Intron | S Split codon | F Frameshift 
+
+my $input;     # exonerate --est2genome output (original, or tabularized with filterAligns), or a list of vulgar lines
+my $format;    # format of input file -- see %ok_fmt below
+my $output;    # output gtf
+my $transfa;   # original transcripts fasta (input to exonerate or wherever the vulgar lines came from)
+my $genomefa;  # reference fasta (input to exonerate)
+my $printfa;   # output new models fasta, based on genome sequence?
+
+GetOptions();
+
+my (%chromosomes, %transcripts, %represent, %transcopies, $footprint);
+
+print "Loading genome...\n";
+open IN, $genomefa or die "$0: Cannot open genome fasta '$genomefa': $!\n";
+my $chr;
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    if ($_ =~ /^>(\S+)/) {
+	$chr = $1;
+    } else {
+	$chromosomes{$chr} .= $_;
+    }
+}
+close IN;
+print scalar(keys %chromosomes), " chromosomes.\n";
+
+print "Loading transcripts...\n";
+open IN, $transfa or die "$0: Cannot open transcripts fasta '$transfa': $!\n";
+my $trans;
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    if ($_ =~ /^>(\S+)/) {
+	$trans = $1;
+    } else {
+	$transcripts{$trans} .= $_;
+    }
+}
+close IN;
+print scalar(keys %transcripts), " transcripts.\n";
+
+print "Reading input...\n";
+open IN, $input, or die "$0: Cannot open input '$input' for reading: $!\n";
+if ($format eq '') {
+    while (<IN>) {
+	$_ =~ s/[\n\r]+$//;
+	&parse_vulgar($_);
+    }
+} elsif ($format eq '') {   # expand to handle other formats
+}
+close IN;
+
+exit;
+%
+
+sub parse_vulgar {
+    
+    my $vulgar = shift;
+    # 1.00	1948	1956	SB_10024 0 1956 + scaffold_400 46535 79225 + 8966 M 459 459 G 1 0 M 517 517 5 0 2 I 0 25903 3 0 2 M 181 181 5 0 2 I 0 57 3 0 2 M 194 194 G 5 0 M 188 188 5 0 2 I 0 37 3 0 2 M 64 64 5 0 2 I 0 4729 3 0 2 M 191 191 G 2 0 M 154 154
+    my ($pct, $mlen, $slen, $query, $qpos1, $qpos2, $qstrand, $target, $tpos1, $tpos2, $tstrand, $score, @align) = split /\s+/, $vulgar;
+#	print "$type, $pct, $mlen, $slen, $query, $qpos1, $qpos2, $qstrand, $target, $tpos1, $tpos2, $tstrand, $score\n";
+    ($qstrand eq '+') ? ( ($qstart, $qend) = ($qpos1, $qpos2) ) : ( ($qstart, $qend) = ($qpos2, $qpos1) );
+    ($tstrand eq '+') ? ( ($tstart, $tend) = ($tpos1, $tpos2) ) : ( ($tstart, $tend) = ($tpos2, $tpos1) );
+    $footprint = "$tpos1-$tpos2";
+    # M 459 459 G 1 0 M 517 517 5 0 2 I 0 25903 3 0 2 M 181 181 5 0 2 I 0 57 3 0 2 M 194 194 G 5 0 M 188 188 5 0 2 I 0 37 3 0 2 M 64 64 5 0 2 I 0 4729 3 0 2 M 191 191 G 2 0 M 154 154
+    # M Match | G Gap | N Non-equivalenced region | 5 5' splice site | 3 3' splice site | I Intron | S Split codon | F Frameshift 
+    warn "Duplicate footprint! $query $target $footprint" if (exists $represent{$query}{$target}{$footprint});
+    my (@qdata, @tdata, @qmatches, @tmatches, @qexons, @texons, $qexonSeq, $texonSeq, @qexonSE, @texonSE, $spacer, $qplus, $tplus, $totalgap, $offset, $headgap);
+    ($qplus, $qedge, $tedge) = ($qstart, 0, $tstart);
+    my $transseq = $qstrand eq '+' ? $transcripts{$query} : &revcomp($transcripts{$query});
+    $transcopies{$query}++;   # number of alignments seen for this transcript
+    foreach $i (0..$#align) {
+	if ($align[$i] eq 'M') {
+	    my ($qsection, $tsection) = ($qplus + $align[$i+1], $tplus + $align[$i+2]);
+	    ($qplus, $tplus) = (0, 0);
+	    $qedge += $align[$i+1];
+	    $tedge += $align[$i+2];
+	    
+	    my $qmatch = substr($transseq, $qedge, $qsection);
+	    my $tmatch = substr($chromosomes{$target}, $tedge, $tsection);
+	    push @qmatches, $qmatch;
+	    push @tmatches, $tmatch;
+	    $qexonSeq .= $qmatch;
+	    $texonSeq .= $tmatch;
+
+
+
+
+
+
+
+
+
+
+
+################ EXON STARTS/ENDS MUST BE BASED ON QEDGE, TEDGE
+
+
+
+
+
+
+
+
+
+
+
+
+	    push @qexonSE, ($qstart, $qend);
+	    push @texonSE, ($tstart, $tend);
+	} elsif ($align[$i] eq '5') {
+	    $qedge += $align[$i+1];
+	    $tedge += $align[$i+2];
+	} elsif ($align[$i] eq 'I') {
+	    $qedge += $align[$i+1];
+	    $tedge += $align[$i+2];
+	    # official intron: stop building the pending exon and store it
+	    my $qeCoord = join "\t", (sort {$a <=> $b} @qexonSE)[0,-1];
+	    my $teCoord = join "\t", (sort {$a <=> $b} @texonSE)[0,-1];
+	    push @qexons, [$qexonSeq, $qeCoord];
+	    push @texons, [$texonSeq, $teCoord];
+	    $qexonSeq = $texonSeq = '';
+	    @qexonSE = @texonSE = ();
+	} elsif ($align[$i] eq '3') {
+	    $qedge += $align[$i+1];
+	    $tedge += $align[$i+2];
+	} elsif ($align[$i] eq 'G') {
+	    my ($qgap, $tgap);
+	    if ($align[$i+1] > 0) {
+		$qgap .= '-' foreach (1..$align[$i+1]);
+		push @tmatches, $qgap;	# yes, switch.  Exonerate and/or vulgar format is imprecise
+		$totalgap += $align[$i+1];
+		$texonSeq .= $qgap;
+		push @qexonSE, ($qstart, $qend);
+	    } else {
+		$tgap .= '-' foreach (1..$align[$i+2]);
+		push @qmatches, $tgap;
+		$qexonSeq .= $tgap;
+		push @texonSE, ($tstart, $tend);
+	    }
+	    $qplus += $align[$i+1];
+	    $tplus += $align[$i+2];
+	}
+    }
+    if ($qstrand eq '-' && $qedge < $slen) {
+	my $qmatch = substr($transseq, $qedge, $slen);	# use $slen to guarantee a run to end, regardless of leftover distance
+	push @qmatches, $qmatch;
+	$qexon .= $qmatch;
+    }
+    my $qeCoord = join "\t", (sort {$a <=> $b} @qexonSE)[0,-1];
+    my $teCoord = join "\t", (sort {$a <=> $b} @texonSE)[0,-1];
+    push @qexons, [$qexonSeq, $qeCoord];
+    push @texons, [$texonSeq, $teCoord];
+    $qexonSeq = $texonSeq = '';
+    @qexonSE = @texonSE = ();
+    
+    ($qstrand eq '+') ? ($offset = $qstart) : ($offset = $slen - $mlen - $qstart - $totalgap);
+    $headgap .= ' ' foreach (1..$offset);
+    unshift @tmatches, $headgap;
+    $represent{$query}{$target}{$footprint}{L} = $input;
+    $represent{$query}{$target}{$footprint}{Q} = join '', @qmatches;
+    $represent{$query}{$target}{$footprint}{T} = join '', @tmatches;
+    
+    foreach (0..$#qexons) {
+	my ($qseq, $qcoord) = @$qexons[$_];
+	my ($tseq, $tcoord) = @$texons[$_];
+	my @qbases = split //, "\U$qseq";
+	my @tbases = split //, "\U$tseq";
+	my $same;
+	foreach (0..$#qbases) {
+	    $same++ if $qbases[$_] eq $tbases[$_];
+	}
+	my $score = sprintf("%0.2f", 100*$same/($#qbases+1));
+	push @{ $represent{$query}{$target}{$footprint}{G} }, "$target\t$format\texon\t$tcoord\t$score\t$strand\t.\tgene_id = \"$query:$transcopies{$query}\";\n";
+    }
+}

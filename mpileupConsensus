@@ -1,0 +1,109 @@
+#!/usr/bin/env perl
+use strict;
+
+my ($mpi, $ref, $prefix) = @ARGV;
+my $DEPTH = 2;  # min depth cutoff for reporting variants
+
+my (%refseq, %reflen);
+if ($ref) {
+    open my $REF, '<', $ref or die "$0: reference fasta '$ref' unreadable: $!\n";
+    my $header;
+    while (<$REF>) {
+	s/[\n\r]+$//;
+	if (/^>(\S+)/) {
+	    $header = $1;
+	} else {
+	    $refseq{$header} .= uc($_);
+	}
+    }
+    close $REF;
+    %reflen = map {($_=>length($refseq{$_}))} keys %refseq;
+}
+
+my %ignorable = map {($_=>1)} qw/ . , ^ $ * ! ~ < > /;   # < > should be treated as *, at some point
+my %consensus;
+
+my ($last_header, $last_pos);
+open my $MPI, '<', $mpi or die "$0: mpiluep output '$mpi' unreadable: $!\n";
+while (<$MPI>) {
+    my ($header, $pos, $ref, $depth, $calls, $quals) = split;  # leave \n on $quals -- we don't use it
+    if ($header ne $last_header) {
+	## Start of new sequence
+	push @{ $consensus{$header} }, ">$header\n";
+	$last_pos = 0;
+    }
+    if ($pos-$last_pos>1) {
+	## Gap: patch with reference sequence
+	push @{ $consensus{$header} }, split //, substr($refseq{$header}, $last_pos, $pos-$last_pos-1);
+    }
+    if ($depth < $DEPTH) {
+	## Depth too low; report reference instead
+	push @{ $consensus{$header} }, uc($ref);
+    } else {
+	my ($dots);
+	$dots++ while $calls =~ /[.,]/g;
+	if ($dots/$depth >= 0.5) {
+	    ## Reference has majority -- continue
+	    push @{ $consensus{$header} }, uc($ref);
+	} else {
+	    my (%tally, %indels, $type, $bp, $seq, $redo);
+	    ## First record (and remove) indels
+	    {
+		if (($type, $bp) = ($calls =~ /([+-])(\d+)/)) {
+		    $calls =~ s/$type$bp(\w{$bp})//;  # destroy matched indel record
+		    $indels{$type}{uc($1)}++;     # indel sequence = votes
+		    $tally{$type}++;
+		    $redo = 1;  # may be another
+		} else {
+		    $redo = 0;  # there is no other
+		}
+		redo if $redo;
+	    }
+	    ## Then tally everything else
+	    foreach my $char (split //, $calls) {
+		$tally{uc($char)}++ unless $ignorable{$char};
+	    }
+	    ## Then first-pass voting
+	    my $cand = join('', sort keys %tally);
+	    print STDERR "$.: $cand\n" if $cand =~ /[^ACGT+-]/;
+	    my $winner = (sort {$tally{$b} <=> $tally{$a}} keys %tally)[0];  # only one, or random if tied
+	    if ($winner eq '-') {
+		## Provisional deletion win
+		if (scalar(keys %{ $indels{'-'} })==1) {
+		    ## Confirmed deletion win
+		    
+		    # record what?
+		    # now enter downstream-competition mode (if not in it already)
+		    
+		} else {
+		    ## Deletions overall have the plurality, but there are more than one.
+		    ## Define consensus deletion and see if it still wins the vote.
+		    
+		}
+	    } elsif ($winner eq '+') {
+		## Provisional insertion win
+		if (scalar(keys %{ $indels{'+'} })==1) {
+		    ## Confirmed insertion win
+		    push @{ $consensus{$header} }, (keys %{ $indels{'+'} })[0];
+		} else {
+		    ## Insertions overall have the plurality, but there are more than one.
+		    ## Define consensus insertion and see if it still wins the vote.
+
+		}
+	    } else {
+		push @{ $consensus{$header} }, $winner;
+	    }
+	}
+    }
+    ($last_header, $last_pos) = ($header, $pos);
+}
+close $MPI;
+
+open my $OUT, '>', "$prefix.fasta" or die "$0: output fasta '$prefix.fasta' unwriteable: $!\n";
+open my $LOG, '>', "$prefix.log" or die "$0: output log '$prefix.log' unwriteable: $!\n";
+
+
+close $OUT;
+close $LOG;
+print "$0 complete!\n";
+exit;

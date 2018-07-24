@@ -1,0 +1,31 @@
+#!/bin/bash
+
+rmd=$1
+html_final=$2
+
+html_tmp=$(echo "$rmd" | sed 's/\.rmd$/.html/i')
+rm -f "$html_tmp"
+
+export PATH=/n/apps/CentOS7/install/pandoc-1.17.2/bin:$PATH
+
+R-3.4.1 -e "rmarkdown::render('$rmd')"
+
+perl -i -pe 's/max-width: 940px/max-width: 1400px/' "$html_tmp"
+
+theme=$(grep -P "^\s*theme:" $rmd | wc -l)
+
+cksum "$html_tmp"
+if [ $theme -gt 0 ]; then
+    ## With-theme modifications
+    perl -e 'my $x = `cat $ARGV[0]`; $x =~ s!</code></pre></div>\s*<pre><code>(.*)</code></pre>\s*<div [^>]+><pre [^>]+><code [^>]+>!<br><br>$1<br><br>!sg; open OUT, "> $ARGV[0]"; print OUT $x; close OUT' "$html_tmp"
+else
+    ## No-theme modifications
+    perl -e 'my $x = `cat $ARGV[0]`; $x =~ s!</code></pre>\s*<pre><code>!<br><br>!m; open OUT, "> $ARGV[0]"; print OUT $x; close OUT' "$html_tmp"
+fi
+cksum "$html_tmp"
+
+if [ ! -z "$html_final" ]; then
+    mv "$html_tmp" "$html_final"
+fi
+
+

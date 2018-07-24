@@ -1,0 +1,3 @@
+
+ls -la $(find /home/apa/bioan/Piotrowski/mal/cbio.mal.102/ -newermt $(date +%Y-%m-%d -d '2 months ago') -type f -print)
+

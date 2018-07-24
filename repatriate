@@ -1,0 +1,60 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my ($test, $crop, $dirs, $delim);
+GetOptions("test"=>\$test, "crop"=>\$crop, "dirs"=>\$dirs, "delim=s"=>\$delim);
+my @files = glob "*";
+my ($maxfile, %folders);
+
+foreach my $file (@files) {
+    my $isfile = 1;
+    if (-d $file) {
+	$folders{$file} = 1;
+	print "DIRECTORY:  $file\n" if $test;
+	$isfile = 0 unless $dirs;
+    }
+    if ($isfile) {
+	my $L = length($file);
+	$maxfile = $L if $L > $maxfile;
+    }
+}
+
+if ($dirs) {
+    my @tmp = @files;
+    @files = ();
+    foreach my $fileA (@tmp) {
+	foreach my $fileB (@tmp) {
+	    next if $fileA eq $fileB;
+	    if ($fileA =~ /^$fileB/ && -d $fileB) {
+		## $fileA is likely the file (or subdir), while $fileB is likely the directory
+		push @files, $fileA;  # treat as 'file'
+		delete $folders{$fileA} if -d $fileA;
+	    }
+	}
+    }
+}
+
+foreach my $file (@files) {
+    next if -d $file && !$dirs;
+    my ($longest, $cropfile);
+    foreach my $dir (keys %folders) {
+	if ($file =~ /^$dir/) {
+	    $longest = $dir if length($dir) > length($longest);
+	}
+    }
+    if ($longest) {
+	$cropfile = $file;
+	$cropfile =~ s/^$longest$delim// if $crop;
+	if ($test) {
+	    printf("%-${maxfile}s  =>  $longest/$cropfile\n", $file);
+	} else {
+	    system "mv $file $longest/$cropfile";
+	}
+    } else {
+	printf("%-${maxfile}s    (ignore)\n", $file) if $test;
+    }
+}
+exit;
+

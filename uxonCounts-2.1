@@ -1,0 +1,233 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## Takes a BAM file and an uxon BED file (or GTF) and returns (approximate) genewise read counts + manual RPKMs. 
+
+## Inputs
+my $defs;     # exon/uxon definitions
+my $bam;      # BAM file
+my $outfile;  # output filename (optional)
+my $Mval;     # true M value for RPKM (optional)
+my $stranded; # report strand-specific counts?
+my $switch;   # switch strandedness?  (e.g. if using Illumina stranded protocol)
+my $asis;     # report uxon counts/RPKMs as-is; do not aggregate at gene level
+my $primary;  # use only BAM alignments flagged as primary?
+my $keep;     # do not delete intermediate datasets once run completes?
+
+GetOptions("d=s" => \$defs, "b=s" => \$bam, "o=s" => \$outfile, "M=i" => \$Mval, "stranded" => \$stranded, "switch" => \$switch, "as-is"=>\$asis, "primary" => \$primary, "keep" => \$keep);
+
+## Globals
+my %knownExt = map {($_=>1)} qw/ bed gtf gff /;  # valid $defs extensions
+my %exonNumber;   # exon numbering per transcript
+my $known_M = $Mval ? 1 : 0;  # was M-value specified?
+
+my (%length, %counts, %covpct, %bpcov, %uxoncts, %uxonlen, %uxoncvg, %gene_strand, %RPKM);  # various hashes
+
+## test extension, create tempdir
+my ($ext) = ($defs =~ /\.(bed|gff|gtf)/i);
+$ext = "\L$ext";
+die "$0: Unknown uxon definition file type '$ext': must be one of bed, gtf, gff.\n" unless $knownExt{$ext};
+my ($bampath) = ($bam =~ /^(.*)\/[^\/]+$/);
+$bampath = '.' unless $bampath;   # bam file might not have explicit path
+($outfile = $bam) =~ s/bam$/uxonCounts/i unless $outfile;
+my $tempcvg = "uxonCounts.$$.tmp.int";
+
+my $coverageBed = '/n/apps/CentOS7/install/bedtools-2.19.0/bin/coverageBed';
+$coverageBed = '/n/local/stage/bedtools/bedtools2-2.19.0/bin/coverageBed' unless -e $coverageBed;
+
+## read GTF or uxon bed
+chomp(my $now = `date`);
+print "Reading $defs : $now\n";
+
+if ($ext eq 'bed') {
+    &process_bed($defs);
+} else {
+    my $exontmp = "uxonCounts.$$.tmp.exons";
+    my $uxontmp = "uxonCounts.$$.tmp.uxons";
+    my $cmd = "/home/apa/local/bin/gtf2exons $defs > $exontmp";  # extract exons from GTF
+    print "$cmd : $now\n";
+    system $cmd;
+    my $cmd = "/home/apa/local/bin/exons2uxons $exontmp bed > $uxontmp";  # convert to uxons
+    print "$cmd : $now\n";
+    system $cmd;
+    &process_bed($uxontmp);
+    $defs = $uxontmp;
+}
+
+my $defstmp = "uxonCounts.$$.tmp.def";
+system "cp $defs $defstmp";
+if ($stranded) {
+    chomp(my $Nstr = `grep "[+-]\$" $defstmp | wc -l`);
+    chomp(my $Nambig = `grep "[.]\$" $defstmp | wc -l`);
+    if ($Nstr==0) {
+	die "$0: called with '--stranded' but exon defs '$defs' have no strands!\n";
+    } elsif ($Nambig) {
+	print "Ambiguous strand reassignment...\n";
+	my $c6A = `cut -f6 $defstmp | sort | uniq -c`;
+	print "$c6A\n";
+	system "perl -i -pe 's/\\.\$/\+/' $defstmp";
+	my $c6B = `cut -f6 $defstmp | sort | uniq -c`;
+	print "$c6B\n";
+    } else {
+	## defs bed OK; continue
+    }
+}
+
+my $abam = "uxonCounts.$$.tmp.bam";
+if ($primary) {
+    system "samtools view -h -F 256 $bam | samtools view -bS - > $abam";
+} else {
+    system "ln -sf $bam $abam";
+}
+
+if ($stranded) {
+    
+    ## run coverageBed
+    my $cmd = "$coverageBed -s -abam $abam -b $defstmp > $tempcvg.S";    # SENSE-STRAND COUNTS
+    chomp(my $now = `date`);
+    print "$cmd : $now\n";
+    system $cmd;
+    
+    ## read coverageBed results and summarize
+    chomp(my $now = `date`);
+    print "Post-processing $tempcvg.S : $now\n";
+    open IN, "$tempcvg.S" or die "$0: Cannot open '$tempcvg.S' for reading: $!\n";
+    while (<IN>) {
+	$_ =~ s/[\n\r]+$//;
+	my @data = split /\t/, $_;
+	my ($uxon, $count, $nzb) = @data[3,-4,-3];
+	my ($gene, $else) = split /:/, $uxon;
+	$gene = $uxon if $asis;
+	&postprocess_uxon($gene, $uxon, $count, $nzb, 'S');    # PROCESS SENSE-STRAND COUNTS
+    }
+    close IN;
+
+    ## run coverageBed
+    my $cmd = "$coverageBed -S -abam $abam -b $defstmp > $tempcvg.A";    # ANTI-STRAND COUNTS
+    chomp(my $now = `date`);
+    print "$cmd : $now\n";
+    system $cmd;
+    
+    ## read coverageBed results and summarize
+    chomp(my $now = `date`);
+    print "Post-processing $tempcvg.A : $now\n";
+    open IN, "$tempcvg.A" or die "$0: Cannot open '$tempcvg.A' for reading: $!\n";
+    while (<IN>) {
+	$_ =~ s/[\n\r]+$//;
+	my @data = split /\t/, $_;
+	my ($uxon, $count, $nzb) = @data[3,-4,-3];
+	my ($gene, $else) = split /:/, $uxon;
+	$gene = $uxon if $asis;
+	&postprocess_uxon($gene, $uxon, $count, $nzb, 'A');    # PROCESS ANTI-STRAND COUNTS
+    }
+    close IN;
+    
+} else {
+    
+    ## run coverageBed
+    my $cmd = "$coverageBed -abam $abam -b $defstmp > $tempcvg";    # BOTH-STRAND COUNTS
+    chomp(my $now = `date`);
+    print "$cmd : $now\n";
+    system $cmd;
+    
+    ## read coverageBed results and summarize
+    chomp(my $now = `date`);
+    print "Post-processing $tempcvg : $now\n";
+    open IN, $tempcvg or die "$0: Cannot open '$tempcvg' for reading: $!\n";
+    while (<IN>) {
+	$_ =~ s/[\n\r]+$//;
+	my @data = split /\t/, $_;
+	my ($uxon, $count, $nzb) = @data[3,-4,-3];
+	my ($gene, $else) = split /:/, $uxon;
+	$gene = $uxon if $asis;
+	&postprocess_uxon($gene, $uxon, $count, $nzb, 'B');    # PROCESS BOTH-STRAND COUNTS
+    }
+    close IN;
+    
+}
+
+
+#print "M: $Mval\n";
+## convert covered bp to percent
+foreach my $SAB (qw/ S A B /) {
+    foreach my $gene (keys %uxonlen) {
+	$covpct{$SAB}{$gene} = sprintf("%0.2f", 100*$bpcov{$SAB}{$gene}/($length{$gene}||1));
+	$RPKM{$SAB}{$gene} = sprintf("%0.4f", (1E9 * $counts{$SAB}{$gene}) / ($length{$gene} * $Mval));
+    }
+}
+
+## write
+open OUT, "> $outfile" or die "$0: Cannot open '$outfile' for writing: $!\n";
+if ($stranded) {
+    print OUT "Gene\tUxonLen\tStrand\tCounts.S\tCounts.A\tCovPct.S\tCovPct.A\tRPKM.S\tRPKM.A\n";   # \tUxon|Len|Counts|CovBp\n";
+    foreach my $gene (sort keys %uxonlen) {
+	print OUT "$gene\t$length{$gene}\t$gene_strand{$gene}\t";
+	if ($switch) {
+	    print OUT "$counts{A}{$gene}\t$counts{S}{$gene}\t$covpct{A}{$gene}\t$covpct{S}{$gene}\t$RPKM{A}{$gene}\t$RPKM{S}{$gene}\n";
+	} else {
+	    print OUT "$counts{S}{$gene}\t$counts{A}{$gene}\t$covpct{S}{$gene}\t$covpct{A}{$gene}\t$RPKM{S}{$gene}\t$RPKM{A}{$gene}\n";
+	}
+    }
+} else {
+    print OUT "Gene\tUxonLen\tCounts\tCovPct\tRPKM\n";   # \tUxon|Len|Counts|CovBp\n";
+    foreach my $gene (sort keys %uxonlen) {
+	print OUT "$gene\t$length{$gene}\t$counts{B}{$gene}\t$covpct{B}{$gene}\t$RPKM{B}{$gene}\n";
+
+    }
+}
+close OUT;
+
+##    experimental output
+#    print OUT "$gene\t$length{$gene}\t$counts{$gene}\t$covpct{$gene}\t";
+#    print OUT "$_|$uxonlen{$gene}{$_}|$uxoncts{$gene}{$_}|$uxoncvg{$gene}{$_} " foreach sort keys %{ $uxonlen{$gene} };
+#    print OUT "\n";
+
+
+
+## exit
+system "rm -f uxonCounts.$$.tmp.*" unless $keep;
+chomp(my $now = `date`);
+print "Complete: $now";
+print " (M = $Mval)" unless $known_M;
+print "\n";
+exit;
+
+
+
+
+sub process_bed {
+    my $file = shift;
+    open IN, $file or die "$0: Cannot read exon definitions file '$file': $!\n";
+    while (<IN>) {
+	next if ($_ =~ /^track/ || $_ =~ /^#/);
+	$_ =~ s/[\n\r]+$//;
+	my @data = split /\t/, $_;
+	my ($gene, $uxon) = split /:/, $data[3];
+	$gene = $uxon = $data[3] if $asis;
+	my $len = $data[2]-$data[1];   # BEDS ARE 0-BASED
+	$uxon =~ s/\|/,/g;   # convert | to , if uxon ID
+	$length{$gene} += $len;
+	$gene_strand{$gene} = $data[5];
+	$uxonlen{$gene}{$uxon} = $len;
+	$counts{$_}{$gene} = $covpct{$_}{$gene} = $uxoncts{$_}{$gene}{$uxon} = $uxoncvg{$_}{$gene}{$uxon} = 0 foreach (1,2);  # ensure printable values
+    }
+    close IN;
+}
+
+
+sub postprocess_uxon {
+    my ($gene, $uxon, $count, $nzb, $SAB) = @_;
+    $counts{$SAB}{$gene} += $count;
+    $bpcov{$SAB}{$gene} += $nzb;
+    unless ($asis) {
+	$uxon =~ s/^$gene://;   # remove gene name from uxon ID
+	$uxon =~ s/\|/,/g;      # convert | to , if uxon ID
+    }
+    $uxoncts{$SAB}{$gene}{$uxon} = $count;
+    $uxoncvg{$SAB}{$gene}{$uxon} = $nzb;
+    $Mval += $count unless $known_M;
+}
+
+

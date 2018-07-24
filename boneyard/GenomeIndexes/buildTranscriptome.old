@@ -1,0 +1,1518 @@
+#!/usr/bin/env perl
+require "$ENV{SIMR_APA_BIN}/apa_routines.pm";
+use Getopt::Long;
+use Data::Dumper;
+use Cwd;
+use strict;
+no strict 'refs';
+
+
+
+## Author: Ariel Paulson (apa@stowers.org)
+## Builds an already-prepared Ensembl transcriptome (to the staging location).
+## Underlying genome must be published already!!!
+## This is the second script in the annotation-build pipeline.
+## The first script was 'prepareTranscriptome'.
+## The next script is 'publishBuild'.
+## 
+## Env vars $SIMR_APA_BIN, $SIMR_BUILDROOT must be set
+## 
+## ./buildTranscriptome <genome> <transcriptome> [--clobber] [--no-alias]
+
+
+
+## OVERVIEW:
+##
+## Outputs, prefixed with "GenomeLabel.AnnotLabel":
+##  1. Tophat/Cufflinks-ready GTF, GFF files
+##  2. Gene, transcript, and exon BED files
+##  3. A genewise biotype/status file, if possible (or: complete gene & transcript datasets?)
+##  4. A README describing the annotation set and its construction
+## * All chromosome names are made to match the genome fasta
+## * All supercontig annotations remapped into UCSC random chrs where possible
+
+## NOTES:
+## This script is massive and sprawling and has crept out to several times its original intended scope.
+## That said, it still works reliably.
+## The purpose is to take in a GTF + supplementary tabular datasets, and output most of the files in a transcriptome index directory.
+## It is designed around Ensembl GTFs and data conventions, but can be extended to others, so long as key conditions are met.
+## It is currently being ported to R, where the code is vastly simpler and can rely on txdb objects.
+##   ** However, runtime in R can be 100 times longer. **
+
+### Parsing theory:
+## 1. Most everything boils down to exon records, because few other records are guaranteed to exist.
+## 2. From exons, and their associated gene/transcript data, exon->trans, exon->gene, and trans->gene relationships are extracted.
+## 3. From exons per transcript, transcriptwise introns are extracted.
+## 4. From exons and introns per gene, unique exons, unioned-exons and intersected-introns are obtained.
+## 5. From exon and CDS entries, UTRs are extracted.
+
+
+### FIXME / TO DO:
+### FIX EXON PHASE HANDLING FOR ENSEMBL -- ADD CDS, UTR ENTRIES TO GFFS
+
+
+
+
+
+##########  SECTION 1:
+##########  Set up some global objects
+##########  Get cmd line
+
+
+## Envar test; core process directories
+my $idxroot = '/n/data1/genomes/indexes';
+my $apabin = $ENV{SIMR_APA_BIN};
+die "$0: shell environment variable \$SIMR_APA_BIN is not set!\n" unless $apabin;
+my $buildroot = $ENV{SIMR_BUILDROOT};
+die "$0: shell environment variable \$SIMR_BUILDROOT is not set!\n" unless $buildroot;
+
+
+## Dependencies
+#{ mv rm cat pwd date perl sort tail chmod cksum whoami readlink }
+my $complementBed = 'complementBed';
+my $tophat        = 'tophat';
+my $samtools      = 'samtools';
+my $mergeBed      = '/n/apps/CentOS7/install/bedtools-2.19.0/bin/mergeBed';                       ## samtools 2.19, CentOS7
+$mergeBed         = '/n/local/stage/bedtools/bedtools2-2.19.0/bin/mergeBed' unless -e $mergeBed;  ## samtools 2.19, CentOS6
+my $sortBedCoord      = "$apabin/sortBedCoord";
+my $gtf2bb            = "$apabin/gtf2bb";
+my $SimpleBiotypeR    = "$buildroot/code/tools/SimpleBiotype.R";
+my $transdata_fix2    = "$buildroot/code/tools/transdata_fix2.pl";
+my $gtf2txdb          = "$buildroot/code/tools/gtf2txdb.R";
+my $igv_transcriptome = "$buildroot/code/tools/igv-transcriptome.sh";
+my $make_ribo_ncrna   = "$buildroot/code/tools/make_ribo_ncrna_files.sh";
+my $GenomeBpTypes     = "$buildroot/code/tools/GenomeBpTypes.sh";
+my $convertR          = "$buildroot/code/tools/cuffconvert.R";  # Malcolm's script to add tss_id, p_id to GTF
+my $fastq             = "$buildroot/code/data/dummy.fastq";     # dummy fastq to get tophat to preindex transcriptome
+my $biomaster         = "$buildroot/code/data/biotypes_master.txt";
+my $DATABASES         = "$buildroot/code/data/_DATABASES_AND_URLS";
+
+
+## Parse command line
+my ($noalias, $clobber);
+my $geno = $ARGV[0];   # a short label for the genome build; must already exist in $SIMR_BUILDROOT/builds/
+my $anno = $ARGV[1];   # a short label for this annotation build (DO NOT include genome info -- that gets added on automatically)
+GetOptions(
+    "clobber"=>\$clobber,   # clobber existing build dir
+    "no-alias"=>\$noalias   # do not realias chromosome names (because they are the same).  ALSO -- this will not filter out irrelevant chromosomes, like HapMaps & patches.
+    );
+
+
+## Arg tests
+die "$0: Genome build not specified!\n" unless $geno;
+die "$0: Transcriptome build not specified!\n" unless $anno;
+
+
+## Some globals
+my ($chromdat, $provider, $annver);
+my ($genedefs, $genedesc, $uniprot, $goxrefs, $entrez, $homebase);
+my $UTRweld = 0;  # becomes "1" if provider is Flybase
+my $started = &timestamp('FULL');
+chomp(my $user = `whoami`);
+my @errors;
+
+
+# Provider/filetype combinations below have tailored parsers.  Others are sent to generic parsers.
+my %providers = ( 
+    'Sanger' => {'GFF',1},
+    'Flybase' => {'GFF',1},
+    'Ensembl' => {'GTF',1}
+    );
+my %strconv = ('1' => '+', '+' => '+', '-1' => '-', '-' => '-', '.' => '.', '' => '.');
+my %sidename = ('3' => 'three', '5' => 'five');
+my %featpref = ('EXON'=>'EXO', 'UXON'=>'UXO', 'INTRON'=>'INT', 'IINTRON'=>'IIN', 'CDS'=>'CDS', 'UTR'=>'UTR');
+
+
+## More variable declarations
+my (@to_GTF, %trans2gene, %genedata, %transcounts);
+my %blacklist;
+my $genome_provider;
+my $wdir = cwd();
+my $gidxdir = "$idxroot/$geno";
+my $gprepdir = "$buildroot/preps/$geno";
+my $aprepdir = "$gprepdir/$anno";
+my $biomartdir = "$aprepdir/biomart";
+my $gbuilddir = "$buildroot/builds/$geno";
+my $abuilddir = "$gbuilddir/$anno";
+my $readme = "$gbuilddir/$geno.README.txt";
+my $chrsizes = "$gbuilddir/$geno.chrom.sizes";
+my $ctgpos = "$gbuilddir/$geno.ctgPos.txt";   # may not exist
+my $fasta = "$gbuilddir/$geno.fa";
+my $fai = "$gbuilddir/$geno.fa.fai";
+my $chromdat = "$gprepdir/$geno.chrom_data.txt";
+my $genedesc = "$biomartdir/bsd.txt";
+my $goxrefs = "$biomartdir/xrefs.txt";
+my $entrez = "$biomartdir/entrez.txt";
+my $refseq = "$biomartdir/refseq.txt";
+my $uniprot = "$biomartdir/uniprot.txt";
+my $unigene = "$biomartdir/unigene.txt";
+my $homebase;  # must wait until later, when we figure out what "home base" means...
+chomp(my $genedefs = `ls -S $aprepdir/*.gtf* | head -1`);
+print "Prep dir: $aprepdir\n";
+die "$0: no genedefs found in prep location!\n" unless -e $genedefs;
+
+
+
+
+
+##########  SECTION 2:
+##########  Test more command-line args
+##########  Parse support files
+##########  Set up output files
+
+
+## Check chrom sizes file
+if (-s $chrsizes) {
+    print "chrom.sizes file '$chrsizes' validated.\n";
+    $chrsizes;
+} else {
+    print "Neither '$fai' nor '$chrsizes' could be validated: Intergene BED file cannot be created.\n";
+}
+
+
+## Read in _VARIABLES, _TVARIABLES files; get some params
+my %VARS = %{ &read_VARIABLES($geno) };
+my %TVARS = %{ &read_VARIABLES($geno, $anno) };
+my $home_db = $TVARS{home_db}{VALUE};
+$homebase = (glob "$biomartdir/$home_db.txt")[0];      ## now we can fill this in
+$TVARS{home_db}{VALUE} = $TVARS{home_url}{VALUE};  ## Now replace!  This way the useful version (url) gets into the README
+my @ord_vars;
+foreach my $key (sort { $TVARS{$a}{LINE} <=> $TVARS{$b}{LINE} } keys %TVARS) {
+    push @ord_vars, $key if $TVARS{$key}{LABEL};  # only variables with labels are shown in build README
+}
+my $genome_provider = $VARS{provider}{VALUE};
+my $provider = $TVARS{provider}{VALUE};
+my $annver = $TVARS{version}{VALUE};
+
+
+## Test build label
+unless ($anno) {
+    print "WARNING: No label was specified!  Using '${provider}_$annver' instead.\n";
+    $anno = "${provider}_$annver";
+}
+my $label = "$geno.$anno";
+
+
+## Test provider string
+my $file_ext;
+if ($providers{$provider}) {
+    $provider = "\L$provider";
+    $provider =~ s/(\w)/\U$1/;
+    (my $genedefs2 = $genedefs) =~ s/\.(gz|bz2)$//;
+    ($file_ext) = ($genedefs2 =~ /([^\.]+)$/);
+    $file_ext = "\U$file_ext";
+    die "$0: Files of type '$file_ext' not yet supported for $provider!\n" unless $providers{$provider}{"\U$file_ext"};
+    $UTRweld = 1 if $provider eq 'Flybase';
+}
+
+
+## Output filename variables
+my $gtf_cufflinks = "$label.cuff.gtf";
+my $gtf_remapped = "$label.remap.gtf";
+my $gff = "$label.gff";
+my $refflat = "$label.refFlat.txt";
+my $genebed = "$label.genes.bed";
+my $transbed = "$label.trans.bed";
+my $exonbed = "$label.exons.bed";
+my $uxonbed = "$label.uxons.bed";
+my $intronbed = "$label.introns.bed";
+my $iintronbed = "$label.iintrons.bed";
+my $itgcbed = "$label.intergenes.bed";
+my $UTRbed = "$label.UTRs.bed";
+my $CDSbed = "$label.CDSs.bed";
+my $genedata = "$label.genedata.txt";
+my $transdata = "$label.transdata.txt";
+my $README = "$label.README.txt";
+
+
+## Create write directory
+if ($clobber) {
+    system "rm -Rf $abuilddir" if -d $abuilddir;
+} else {
+    die "$0: Build directory '$abuilddir' already exists!  Not going to clobber." if -d $abuilddir;
+}
+mkdir $abuilddir or die "$0: Failed to create build directory '$abuilddir': $!\n";
+
+
+## Set up chromosome renaming (and if necessary, coord remapping)
+my (%aliases, %aliases, %chrlen, %cp, %genetypes, %simplebio, %uxonlen);
+if ($chromdat && !$noalias) {
+    open IN, $chromdat or die "$0: Could not open chromosome data file '$chromdat'!\n";
+    while (<IN>) {
+        $_ =~ s/[\n\r]//g;
+        next unless $_;  # skip blank rows
+        my @data = split /\t/, $_;
+        if ($. == 1) {
+            ## TYPICAL COLUMNS: 
+            ## GoldenPath UCSC.Name Ensembl.Name UCSC.Length Ensembl.Length Assembly Class Circular Content UCSC.uppercase.md5sum Ensembl.uppercase.md5sum Issues Comments
+            foreach my $i (0..$#data) {
+                if ($data[$i] =~ /(\S+)\.Name/) {
+                    $aliases{A}{$i} = $1;  # columns positions of chrom names, e.g. 1 = UCSC, 2 = Ensembl
+                    $aliases{P}{$1} = 1;   # store provider names
+                } elsif ($data[$i] eq 'Class') {
+                    $aliases{C} = $i;      # chromosome class, only want 'REF' (below)
+                }
+            }
+        } else {
+            foreach my $i (keys %{ $aliases{A} }) {
+                foreach my $j (keys %{ $aliases{A} }) {
+                    next if $i == $j;
+                    next unless $data[$i] && $data[$j];   # chromosome must be defined for BOTH providers, otherwise this record is not a mapping.
+                    next if $data[$aliases{C}] ne 'REF';  # must be considered reference-class sequence
+                    $aliases{ $aliases{A}{$i} }{ $data[$i] }{ $aliases{A}{$j} } = $data[$j];  # this creates complete cross-aliasing for any number of providers
+                }
+            }
+        }
+    } 
+    close IN;
+    
+    print "$0: *** WARNING ***: the annotation provider '$provider' is not represented in the aliases file.\n Annotations from non-matching chromosome names will be lost...\n" unless $aliases{P}{$provider};
+    print "$0: *** WARNING ***: the genome provider '$genome_provider' is not represented in the aliases file.\n Annotations from non-matching chromosome names will be lost...\n" unless $aliases{P}{$genome_provider};
+} else {
+    print "Chromosome data not provided (or ignored): no names will be changed.\n";
+}
+
+
+## Read chrom.sizes file, which determines the chromosome order in the outputs
+my @chrs;
+open IN, $chrsizes or die "$0: Could not open chrom.sizes file '$chrsizes': $!\n";
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    my ($chr, $size) = split /\t/, $_;
+    $chrlen{$chr} = $size;
+    push @chrs, $chr;   # maintain sequence order / restrictions for this build -- this is why chrom.sizes is specified separately from chrom_data
+} 
+close IN;
+#print "EXP CHRS: @chrs\n";
+
+
+## Optional UCSC ctgPos.txt file, which indicates many->one chr mappings (i.e. UCSC "random" chromosomes) and start pos offsets
+if (-e $ctgpos) {
+    die "$0: Contig position file specified, but not chrom_data.txt file!\n" unless $chromdat;
+    open IN, $ctgpos or die "$0: Could not open ctgPos.txt file '$ctgpos': $!\n";
+    while (<IN>) {
+        $_ =~ s/[\n\r]+$//;
+        my ($contig, $size, @chrdata) = split /\t/, $_;   # @chrdata = ($chrom, $chromStart, $chromEnd), unfortunately no strand info but it probably doesn't matter for random-chr remappings (which will all be incorporated in +)
+        $contig =~ s/\.\d+$//;      # drop any ".#" suffixes
+        $cp{$contig} = \@chrdata;
+    }
+    close IN;
+}
+
+
+## Biotype string conversion file (for "SimpleBiotype" column)
+open IN, $biomaster;
+while (<IN>) {
+    next if $. == 1;
+    $_ =~ s/[\n\r]+$//;
+    my ($ensbio, $simbio, $else) = split /\s/, $_, 3;
+    $simplebio{"\L$ensbio"} = $simbio;
+}
+close IN;
+
+
+## Gene biotype-status-description (BSD) dataset (data usually not found in GTF)
+if ($genedesc) {
+    open IN, $genedesc or die "$0: Could not open gene biotype-status-description file '$genedesc': $!\n";
+    while (<IN>) {
+        next if $. == 1;
+        $_ =~ s/[\n\r]+$//;
+        my ($geneID, $biotype, $status, $desc) = split /\t/, $_;
+        my $simplebiotype;
+        if (exists $simplebio{"\L$biotype"}) {
+            $simplebiotype = $simplebio{"\L$biotype"}
+        } else {
+            print "\n\n**WARNING** No SimpleBiotype found for Ensembl gene biotype '$biotype'!\n\n";
+        }
+        $genetypes{$geneID} = [$biotype, $simplebiotype, $status, $desc];
+    }
+    close IN;
+}
+
+
+
+
+
+##########  SECTION 3:
+##########  Parse primary dataset (GTF, GFF)
+##########  Do chrom name conversion, and coord remapping if necessary
+
+
+## Read GTF
+print "Parsing input data: ".`date`;
+my %parsers = %{ &load_parsers };
+my $IN = &open2('R', $genedefs, 'Input GTF');
+my @rawdata = (<$IN>);
+close $IN;
+
+
+## Parse GTF
+my %MASTER;
+$parsers{$provider}{$file_ext}->(\@rawdata);  # loads %MASTER
+#my @ochrs = sort keys %{ $MASTER{GENE} };
+#print "OBS CHRS: @ochrs\n";
+
+
+## master data object: 
+## levels: 1 = GENE | TRANS | EXON | INTRON | UTR
+## GENE feature data hash:   coord, name, strand, totlen, uxlen, nexons, biotype, status, CDS, ntrans, desc, TRANS=>hash, EXON=>hash, INTRON=>hash, UTR=>hash
+## TRANS feature data hash:  coord, name, strand, totlen, splen, nexons, biotype, status, CDS, maxintron, gene, EXON=>hash, INTRON=>hash, UTR=>hash
+## EXON feature data hash:   coord, length, gene, TRANS=>transID=>[rank,CDS,phase]
+## INTRON feature data hash: coord, length, gene, transID=>rank
+## CDS feature data hash:    coord, length, gene, transID=>[rank,phase]
+## UTR feature data hash:    coord, length, gene, transID=>[rank,side]
+
+
+## convert chromosome entries (and coords, if necessary)
+if ($provider ne $genome_provider && $chromdat) {  # if no chr alias file, then chrom names same -- i.e. all scaffolds
+    my %rarm;
+    print "Realiasing / remapping coordinates: ".`date`;
+    foreach my $feature (qw/ GENE TRANS EXON INTRON CDS UTR GTF /) {
+        $rarm{$feature}{$_} = 0 foreach qw/ aliased remapped unchanged /;  # guarantee printable values
+        foreach my $chr (keys %{ $MASTER{$feature} }) {
+            if ($aliases{$provider}{$chr}{$genome_provider}) {   # shared chr (between genome build & annotation)
+                my $chr1 = $aliases{$provider}{$chr}{$genome_provider};  # switch chr name to alias name genome build 
+                $MASTER{$feature}{$chr1} = $MASTER{$feature}{$chr};      # graft feature data onto renamed branch
+                delete $MASTER{$feature}{$chr};     # remove old branch
+                #                print "Realiased: $chr -> $chr1\n";
+                $rarm{$feature}{aliased}++;
+            } elsif ($cp{$chr}) {      # contig, not chr
+                my ($cchr, $cstart, $cend) = @{ $cp{$chr} };
+                foreach my $ID (keys %{ $MASTER{$feature}{$chr} }) {
+                    my ($start, $end) = split /\t/, $MASTER{$feature}{$chr}{$ID}{coord};
+                    my ($start1, $end1) = ($start + $cstart, $end + $cstart);
+                    $MASTER{$feature}{$chr}{$ID}{coord} = "$start1\t$end1";
+                    $MASTER{$feature}{$cchr}{$ID} = $MASTER{$feature}{$chr}{$ID};   # graft new coords + feature data onto renamed branch
+                }
+                delete $MASTER{$feature}{$chr};     # remove old branch
+                #                print "Remapped: $chr -> $cchr\n";
+                $rarm{$feature}{remapped}++;
+            } else {
+                #                print "Unchanged: $chr\n";
+                $rarm{$feature}{unchanged}++;
+            }
+        }
+    }
+    #    print "$_: $rarm{$_}{aliased} aliased | $rarm{$_}{remapped} remapped | $rarm{$_}{unchanged} unchanged\n" foreach qw/ GENE TRANS EXON /;
+}
+
+
+
+
+
+##########  SECTION 4:
+##########  MOVE TO WRITE DIRECTORY
+##########  Write outputs
+
+
+####################  WE ARE NOW INSIDE THE WRITE DIRECTORY  ####################
+chdir $abuilddir or die "$0: Failed to cd into build directory '$abuilddir': $!\n";
+
+
+## Temp dir for uxons, gtf ops
+my $tempdir = "annotation_build_temp_data.$$";
+system "mkdir -p $tempdir";
+die "$0: Failed to create exon-merge temp dir '$tempdir'!\n" unless -d $tempdir;
+print "Writing to temp dir '$tempdir'\n";
+
+
+## Write transcript-level outputs
+print "Generating exon and transcript outputs: ".`date`;
+open TDAT, "> $transdata";   # trans only
+print TDAT "TransID\tName\tGeneID\tChr\tStart\tEnd\tStrand\tTot_Len\tmRNA_Len\tN_Exons\tMax_Intron\tGenomic_CDS_Start\tGenomic_CDS_End\tBiotype\tSimpleBiotype\n";
+open TBED, "> $transbed";    # trans only
+# print TBED "track name=$transbed visibility=pack\n";
+foreach my $chr (@chrs) {    # for ordered output
+    #print "CHR: $chr | TRANS: ",scalar(keys %{ $MASTER{TRANS}{$chr} }),"\n";
+    next unless $MASTER{TRANS}{$chr};    # may have no annotations for this sequence (e.g. scaffolds)
+    ## TRANS feature data hash:  coord, name, strand, totlen, splen, nexons, biotype, status, CDS, maxintron, gene, EXON=>hash, INTRON=>hash, UTR=>hash
+    foreach my $transID (sort { $MASTER{TRANS}{$chr}{$a}{coord} <=> $MASTER{TRANS}{$chr}{$b}{coord} } keys %{ $MASTER{TRANS}{$chr} }) {
+        my ($coord, $name, $strand, $totlen, $splen, $nexons, $biotype, $simplebio, $status, $CDS, $maxintron, $geneID) = map { $MASTER{TRANS}{$chr}{$transID}{$_} } qw/ coord name strand totlen splen nexons biotype simplebiotype status CDS maxintron gene /;
+        my ($start, $end) = split /\t/, $coord;
+        $CDS = "\t" unless $CDS;
+        $start--;   # 0-BASED FOR BED FORMAT
+        my $bed = join "\t", ($chr, $start, $end, $transID, 1, $strand);  # '1' for score
+        my $dat = join "\t", ($transID, $name, $geneID, $chr, $coord, $strand, $totlen, $splen, $nexons, $maxintron, $CDS, $biotype, $simplebio);
+        print TDAT "$dat\n";
+        print TBED "$bed\n";
+    }
+}
+close $_ foreach qw/ TBED TDAT /;
+
+
+## Write exon-level outputs
+open EBED, "> $exonbed";   # exon only
+# print EBED "track name=$exonbed visibility=pack\n";
+foreach my $chr (@chrs) {    # for ordered output
+    next unless $MASTER{EXON}{$chr};     # may have no annotations for this sequence (e.g. scaffolds)
+    ## EXON feature data hash:   coord, length, TRANS=>transID=>[phase,CDS]
+    foreach my $exonID (sort { $MASTER{EXON}{$chr}{$a}{coord} <=> $MASTER{EXON}{$chr}{$b}{coord} } keys %{ $MASTER{EXON}{$chr} }) {
+        my ($coord, $geneID) = map { $MASTER{EXON}{$chr}{$exonID}{$_} } qw/ coord gene /;
+        my $strand = $MASTER{GENE}{$chr}{$geneID}{strand};
+        my ($start, $end) = split /\t/, $coord;
+        $start--;   # 0-BASED FOR BED FORMAT
+        print EBED join "\t", ($chr, $start, $end, $exonID, 1, "$strand\n");
+    }
+}
+close EBED;
+
+
+## Write intron-level outputs
+open IBED, "> $intronbed";   # intron only
+# print IBED "track name=$intronbed visibility=pack\n";
+foreach my $chr (@chrs) {    # for ordered output
+    next unless $MASTER{INTRON}{$chr};     # may have no annotations for this sequence (e.g. scaffolds)
+    ## INTRON feature data hash: coord, length, transID=>rank
+    foreach my $intronID (sort { $MASTER{INTRON}{$chr}{$a}{coord} <=> $MASTER{INTRON}{$chr}{$b}{coord} } keys %{ $MASTER{INTRON}{$chr} }) {     # coord sort
+        my ($coord, $geneID) = map { $MASTER{INTRON}{$chr}{$intronID}{$_} } qw/ coord gene /;
+        my $strand = $MASTER{GENE}{$chr}{$geneID}{strand};
+        my ($start, $end) = split /\t/, $coord;
+        $start--;   # 0-BASED FOR BED FORMAT
+        print IBED join "\t", ($chr, $start, $end, $intronID, 1, "$strand\n");
+    }
+}
+close IBED;
+
+
+## Write uxon-level outputs (part 1)
+my %sidetally2;
+open UBED, "> $UTRbed";   # UTR only
+# print UBED "track name=$exonbed visibility=pack\n";
+foreach my $chr (@chrs) {    # for ordered output
+    next unless $MASTER{UTR}{$chr};     # may have no annotations for this sequence (e.g. scaffolds)
+    ## UTR feature data hash:    coord, length, transID=>[rank,side]
+    foreach my $utrID (sort { $MASTER{UTR}{$chr}{$a}{coord} <=> $MASTER{UTR}{$chr}{$b}{coord} } keys %{ $MASTER{UTR}{$chr} }) {     # coord sort
+        my ($coord, $geneID) = map { $MASTER{UTR}{$chr}{$utrID}{$_} } qw/ coord gene /;
+        my $strand = $MASTER{GENE}{$chr}{$geneID}{strand};
+        my ($start, $end) = split /\t/, $coord;
+        $start--;   # 0-BASED FOR BED FORMAT
+        my (%UTRsort, %sidetally);
+        foreach my $transID (keys %{ $MASTER{UTR}{$chr}{$utrID}{TRANS} }) {  # are we doing anything with this loop?  ########  NEED UTR/INTRON/CDS DATASETS
+            my ($rank, $side) = @{ $MASTER{UTR}{$chr}{$utrID}{TRANS}{$transID} };
+            $sidetally{$side}++;
+            #            push @{ $UTRsort{1} }, "$side:$rank";
+            push @{ $UTRsort{$side} }, $transID;
+        }
+        $sidetally2{ scalar(keys %sidetally) }++;
+        my $sides = join '|', sort keys %UTRsort;
+        # my $sides = '3('.scalar(@{ $UTRsort{3} }).'):5('.scalar(@{ $UTRsort{5} }).')';
+        # my $sides = join ',', @{ $UTRsort{1} };
+        # print UBED join "\t", ($chr, $start, $end, $utrID, 1, $sides, $rank, $length, $geneID, "$strand\n");
+        print UBED join "\t", ($chr, $start, $end, $utrID, $sides, "$strand\n");
+    }
+}
+close UBED;
+
+
+## Error-checking UTR placement.
+## Each UTR coordinate should only exist on one side of the transcript pool or the other,
+##  we are assuming that a distinct UTR interval cannot be used at 5' by one transcript yet 3' by some other.
+##  If any are, that sounds like a defect in the Ensembl gene model, i.e. the transcript pool supports 2 genes not 1.
+print "\nSides per UTR:\n";
+print "$_\t$sidetally2{$_}\n" foreach keys %sidetally2;
+
+
+## Write CDS-level outputs
+open CBED, "> $CDSbed";   # CDS only
+# print CBED "track name=$exonbed visibility=pack\n";
+foreach my $chr (@chrs) {    # for ordered output
+    next unless $MASTER{CDS}{$chr};     # may have no annotations for this sequence (e.g. scaffolds)
+    foreach my $cdsID (sort { $MASTER{CDS}{$chr}{$a}{coord} <=> $MASTER{CDS}{$chr}{$b}{coord} } keys %{ $MASTER{CDS}{$chr} }) {     # coord sort
+        my ($coord, $geneID) = map { $MASTER{CDS}{$chr}{$cdsID}{$_} } qw/ coord gene /;
+        my ($start, $end) = split /\t/, $coord;
+        $start--;   # 0-BASED FOR BED FORMAT
+        my $strand = $MASTER{GENE}{$chr}{$geneID}{strand};
+        print "$cdsID has no strand!\n" unless $strand;
+        print CBED join "\t", ($chr, $start, $end, $cdsID, 1, "$strand\n");
+    }
+}
+close CBED;
+
+
+## Write GFF/GTF outputs
+open GFF, "> $gff";                # genes, transcripts, & exons
+open GTF, "> $gtf_cufflinks";    # exons only, but recapitulates transcript structure
+foreach my $chr (@chrs) {        # for ordered output
+    next unless $MASTER{GENE}{$chr};    # may have no annotations for this sequence (e.g. scaffolds)
+    foreach my $geneID (sort { $MASTER{GENE}{$chr}{$a}{coord} <=> $MASTER{GENE}{$chr}{$b}{coord} } keys %{ $MASTER{GENE}{$chr} }) {
+        next unless $geneID;  # get one blank per chrom, not established where that's coming from...
+        my ($gcoord, $name, $strand, $gbiotype) = map { $MASTER{GENE}{$chr}{$geneID}{$_} } qw/ coord name strand biotype /;
+        my @translist = keys %{ $MASTER{GENE}{$chr}{$geneID}{TRANS} };
+        print GFF "$chr\t$gbiotype\tgene\t$gcoord\t.\t$strand\t.\tID=$geneID;name=$name\n";
+        foreach my $transID (sort { $MASTER{TRANS}{$chr}{$a}{coord} <=> $MASTER{TRANS}{$chr}{$b}{coord} } @translist) {
+            my ($tcoord, $name, $maxintron, $tbiotype) = map { $MASTER{TRANS}{$chr}{$transID}{$_} } qw/ coord name maxintron biotype /;
+            print GFF "$chr\t$tbiotype\tmRNA\t$tcoord\t.\t$strand\t.\tID=$transID;Parent=$geneID;name=$name\n";
+            
+            my %components;
+            ## EXON feature data hash:   coord, length, gene, TRANS=>transID=>[rank,CDS,phase]
+            ## INTRON feature data hash: coord, length, gene, transID=>rank
+            ## CDS feature data hash:    coord, length, gene, transID=>[rank,phase]
+            ## UTR feature data hash:    coord, length, gene, transID=>side
+            foreach my $exonID (keys %{ $MASTER{TRANS}{$chr}{$transID}{EXON} }) {
+                #                print "$exonID\n" if $transID eq 'ENSMUST00000070533';
+                my $ecoord = $MASTER{EXON}{$chr}{$exonID}{coord};
+                my $erank = $MASTER{EXON}{$chr}{$exonID}{TRANS}{$transID}->[0];
+                $components{$ecoord}{EXON} = {
+                    'GFF' => "$chr\t$tbiotype\texon\t$ecoord\t.\t$strand\t.\tID=$exonID; Parent=$transID; rank=$erank\n",
+                    'GTF' => "$chr\t$tbiotype\texon\t$ecoord\t.\t$strand\t.\tgene_id \"$geneID\"; transcript_id \"$transID\"; exon_number \"$erank\"\n"
+                };
+            }
+            foreach my $intronID (keys %{ $MASTER{TRANS}{$chr}{$transID}{INTRON} }) {
+                #                print "$intronID\n" if $transID eq 'ENSMUST00000070533';
+                my $icoord = $MASTER{INTRON}{$chr}{$intronID}{coord};
+                my $irank = $MASTER{INTRON}{$chr}{$intronID}{TRANS}{$transID};
+                $components{$icoord}{INTRON} = {
+                    'GFF' => "$chr\t$tbiotype\tintron\t$icoord\t.\t$strand\t.\tID=$intronID; Parent=$transID; rank=$irank\n",
+                    #                    'GTF' => "$chr\t$tbiotype\tintron\t$icoord\t.\t$strand\t.\tgene_id \"$geneID\"; transcript_id \"$transID\"; intron_number \"$irank\"\n"
+                };
+            }
+            foreach my $utrID (keys %{ $MASTER{TRANS}{$chr}{$transID}{UTR} }) {
+                #                print "$utrID\n" if $transID eq 'ENSMUST00000070533';
+                my $ucoord = $MASTER{UTR}{$chr}{$utrID}{coord};
+                my ($erank, $side) = @{ $MASTER{UTR}{$chr}{$utrID}{TRANS}{$transID} };
+                $components{$ucoord}{UTR} = {
+                    'GFF' => "$chr\t$tbiotype\t$sidename{$side}_prime_UTR\t$ucoord\t.\t$strand\t.\tID=$utrID; Parent=$transID; rank=$erank\n",
+                    #                    'GTF' => "$chr\t$tbiotype\t${side}UTR\t$ucoord\t.\t$strand\t.\tgene_id \"$geneID\"; transcript_id \"$transID\"; exon_number \"$erank\"\n"
+                };
+            }
+            foreach my $cdsID (keys %{ $MASTER{TRANS}{$chr}{$transID}{CDS} }) {
+                #                print "$cdsID\n" if $transID eq 'ENSMUST00000070533';
+                my $ccoord = $MASTER{CDS}{$chr}{$cdsID}{coord};
+                my ($erank, $phase) = @{ $MASTER{CDS}{$chr}{$cdsID}{TRANS}{$transID} };
+                next unless $erank;  # also get (rare, sporadic) ectopic CDS entries -- haven't identified origin
+                $components{$ccoord}{CDS} = {
+                    'GFF' => "$chr\t$tbiotype\tCDS\t$ccoord\t.\t$strand\t$phase\tID=$cdsID; Parent=$transID; rank=$erank\n",
+                    'GTF' => "$chr\t$tbiotype\tCDS\t$ccoord\t.\t$strand\t$phase\tgene_id \"$geneID\"; transcript_id \"$transID\"; exon_number \"$erank\";\n"
+                };
+            }
+            foreach my $coord (sort {$a <=> $b} keys %components) {
+                foreach my $feature (qw/ INTRON EXON CDS UTR /) {
+                    print $_ $components{$coord}{$feature}{$_} foreach qw/ GFF GTF /;
+                }
+            }
+        }
+    }
+}
+close GTF;
+close GFF;
+
+
+## Write input GTF with coords remapped.
+## Input GTF may have meny more feature lines / annotation fields than cuff.gtf.
+## Cuff.gtf holds exon/CDS only, and minimal annotation fields.
+open GTF2, "> $gtf_remapped";    # original GTF lines, but remapped into build coords
+foreach my $chr (@chrs) {        # for ordered output
+    foreach my $ID (sort { $MASTER{GTF}{$chr}{$a}{coord} <=> $MASTER{GTF}{$chr}{$b}{coord} } keys %{ $MASTER{GTF}{$chr} }) {
+        print GTF2 (join "\t", ($chr, map {$MASTER{GTF}{$chr}{$ID}{$_}} qw/ seg1 coord seg2 /)),"\n";
+    }
+}
+close GTF2;
+
+
+## Flatten exons into uxons
+print "Merging exons to uxons by gene...\n";
+
+
+## Write temp exon data
+my (%gdat, %geneord);   # %gdat = temp thing for converting uxon coords from genes to chroms/strands
+print " Reading in $exonbed: ".`date`;
+open IN, $exonbed or die;  # expecting an exons.bed file
+open OUT, "> $tempdir/premerge.bed";
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    next if ($_ =~ /^track/ || $_ =~ /^#/);
+    my ($chr, $start, $end, $id, $score, $strand) = split /\t/, $_;
+    my ($geneID, $num) = split /:/, $id;
+    print OUT "$geneID\t$start\t$end\t$num\n";
+    $gdat{$geneID}{COORD} = [$chr, $strand];
+    push @{ $gdat{$geneID}{EXONS} }, "$_\n";
+    $geneord{$geneID} = $.;   # overwrites but maintains rank
+}
+close IN;
+close OUT;
+system "sort -k1,1 -k2,2n $tempdir/premerge.bed > $tempdir/premerge.bed.sorted";
+system "$mergeBed -nms -i $tempdir/premerge.bed.sorted > $tempdir/postmerge.txt";
+
+
+## Read temp uxon data
+my (@uxonout, %iintdata);
+open IN, "$tempdir/postmerge.txt" or die "$0: Failed to open '$tempdir/postmerge.txt': $!\n";
+while (<IN>) {
+    chomp;
+    my ($geneID, $start, $end, $ids) = split /\t/, $_;
+    my ($chr, $str) = @{ $gdat{$geneID}{COORD} };
+    my @nums = split /;/, $ids;
+    $_ =~ s/^EXO// foreach @nums;  # remove 'e' from exon numbers
+    my $newid = "$geneID:$featpref{UXON}" . (join '|', sort {$a <=> $b} @nums);
+    $MASTER{GENE}{$chr}{$geneID}{uxlen} += $end-$start;   # uxonic length per gene: STILL 0-BASED
+    push @uxonout, "$chr\t$start\t$end\t$newid\t1\t$str\n";
+    
+    push @{ $iintdata{geneord}{$chr} }, $geneID unless $iintdata{ustarts}{$geneID};
+    push @{ $iintdata{ustarts}{$geneID} }, $start;
+    push @{ $iintdata{uends}{$geneID} }, $end;
+}
+close IN;
+
+
+## Write uxon-level outputs (part 2)
+print "Generating uxon and gene outputs: ".`date`;
+open UBED, "> $uxonbed";
+# print UBED "track name=$uxonbed visibility=pack\n";
+print UBED @uxonout;
+close UBED;
+
+
+## Write iintron-level outputs
+open IIBED, "> $iintronbed";
+# print IIBED "track name=$iintronbed visibility=pack\n";
+foreach my $chr (@chrs) {
+    foreach my $geneID (@{ $iintdata{geneord}{$chr} }) {
+        my $strand = $gdat{$geneID}{COORD}->[1];
+        my @starts = @{ $iintdata{ustarts}{$geneID} };
+        my @ends = @{ $iintdata{uends}{$geneID} };
+        foreach my $i (0..$#starts-1) {
+            my $j = $i + 1;
+            my $istart = $ends[$i];  # these are defined by uxons bed, so already 1-based
+            my $iend = $starts[$j];
+            print IIBED "$chr\t$istart\t$iend\t$geneID:$featpref{IINTRON}$j\t1\t$strand\n";
+        }
+    }
+}
+close IIBED;
+
+
+## Write gene-level outputs
+my %itgcdata;
+open GDAT, "> $genedata";  # gene only
+print GDAT "GeneID\tName\tChr\tStart\tEnd\tStrand\tTot_Len\tUxon_Len\tN_Trans\tN_Exons\tGenomic_CDS_Start\tGenomic_CDS_End\tBiotype\tSimpleBiotype\tStatus\tDescription\n";
+open GBED, "> $genebed";   # gene only
+# print GBED "track name=$genebed visibility=pack\n";
+foreach my $chr (@chrs) {    # for ordered output
+    next unless $MASTER{GENE}{$chr};     # may have no annotations for this sequence (e.g. scaffolds)
+    ## GENE feature data hash:   coord, name, strand, totlen, uxlen, nexons, biotype, status, CDS, ntrans, desc, TRANS=>hash, EXON=>hash, INTRON=>hash, UTR=>hash
+    foreach my $geneID (sort { $MASTER{GENE}{$chr}{$a}{coord} <=> $MASTER{GENE}{$chr}{$b}{coord} } keys %{ $MASTER{GENE}{$chr} }) {     # coord sort
+        next unless $geneID;  # get one blank per chrom, not established where that's coming from...
+        my ($coord, $name, $strand, $totlen, $uxlen, $Ntrans, $Nexons, $CDS, $biotype, $simplebio, $status, $desc) = map { $MASTER{GENE}{$chr}{$geneID}{$_} } qw/ coord name strand totlen uxlen ntrans nexons CDS biotype simplebiotype status desc /;
+        $CDS = "\t" unless $CDS;
+        my ($start, $end) = split /\t/, $coord;
+        $start-- if $start > 0;   # 0-BASED FOR BED FORMAT
+        print GBED join "\t", ($chr, $start, $end, $geneID, 1, "$strand\n");
+        print GDAT join "\t", ($geneID, $name, $chr, $coord, $strand, $totlen, $uxlen, $Ntrans, $Nexons, $CDS, $biotype, $simplebio, $status, "$desc\n");
+        push @{ $itgcdata{starts}{$chr}{$start}{$strand} }, $geneID;
+        push @{ $itgcdata{ends}{$chr}{$end}{$strand} }, $geneID;
+    }
+}
+close $_ foreach qw/ GBED GDAT /;
+
+
+## Ensure all bed files have correct chrom and position order
+print "Sorting bed files...\n";
+foreach my $bedtype (qw/ genes trans exons uxons introns iintrons CDSs UTRs /) {
+    my $bedfile = "$label.$bedtype.bed";
+    next unless -e $bedfile;
+    system "$sortBedCoord -i $bedfile -s $chrsizes --overwrite";
+}
+
+
+## Write intergene-level outputs
+print "Creating intergene bed file...\n";
+my $cbtmp = "complementBed.$$.tmp";
+my $cmd = "$complementBed -i $genebed -g $chrsizes > $cbtmp";
+print "$cmd\n";
+system $cmd;
+if (open IN, $cbtmp) {
+    print "Reading intergenes...\n";
+    open OUT, "> $itgcbed";
+    while (<IN>) {
+        chomp;
+        my ($chr, $start, $end) = split /\t/, $_;
+        my ($W5, $C5, $W3, $C3);
+        if ($itgcdata{ends}{$chr}{$start}{'+'}) {
+            $W5 = '5:+:' . join(',', @{ $itgcdata{ends}{$chr}{$start}{'+'} });
+        }
+        if ($itgcdata{ends}{$chr}{$start}{'-'}) {
+            $C5 = '5:-:' . join(',', @{ $itgcdata{ends}{$chr}{$start}{'-'} });
+        }
+        if ($itgcdata{starts}{$chr}{$end}{'+'}) {
+            $W3 = '3:+:' . join(',', @{ $itgcdata{starts}{$chr}{$end}{'+'} });
+        }
+        if ($itgcdata{starts}{$chr}{$end}{'-'}) {
+            $C3 = '3:-:' . join(',', @{ $itgcdata{starts}{$chr}{$end}{'-'} });
+        }
+        my $all5 = $W5 && $C5 ? "$W5|$C5" : 
+            $W5 ? $W5 : 
+            $C5 ? $C5 : "$chr:START";
+        my $all3 = $W3 && $C3 ? "$W3|$C3" : 
+            $W3 ? $W3 : 
+            $C3 ? $C3 : "$chr:END";
+        print OUT "$chr\t$start\t$end\t$all5|$all3\n";
+    }
+    close IN;
+    close OUT;
+    print "Wrote intergenes!\n";
+    #system "$sortBedCoord -i $itgcbed -s $chrsizes --overwrite";
+    #system "rm -f $cbtmp";
+} else {
+    print "Failed to open complementBed results: intergenes bed file not created!\n";
+}
+
+
+
+
+
+
+##########  SECTION 5A:
+##########  Postprocessing, modify outputs
+##########  Run external scripts that generate more files, etc.
+
+
+## Add tss_id, p_id to GTF files
+foreach my $gtf ($gtf_cufflinks, $gtf_remapped) {
+    print "Adding cufflinks attributes to $gtf...\n";
+    system "$convertR $gtf";  # add tss_id, p_id fields
+    system "tail -n +3 $gtf > x";   # drop GTF header added by $convertR
+    system "mv x $gtf";
+    system "perl -i -pe 's/;(\\S)/; \$1/g' $gtf";   # space out column-9 entries
+    system "perl -i -pe 's/exon_number (\\d+)/exon_number \"\$1\"/' $gtf";  # re-quote exon numbers, if any
+    system "perl -i -pe 's/\"\$/\";/' $gtf";  # lines ending with p_id fields don't end with ';', fix this
+    system "$sortBedCoord -i $gtf -s $chrsizes --gtf --overwrite";
+}
+
+
+## Preindex the .cuff.gtf file -- CAN TAKE UP TO 1 HOUR
+print "Pre-indexing transcriptome...  (Mammalian genomes can take > 1 hour)\n";
+my $th_cmd = "$tophat --no-coverage-search --no-novel-juncs -G $gtf_cufflinks";
+
+
+## Bowtie2 index
+my $cmd = "$th_cmd --transcriptome-index $gtf_cufflinks.index/$geno.$anno.cuff $gidxdir/$geno $fastq";
+print "$cmd\n"; system $cmd;
+my $gtfi_fa = (glob "$gtf_cufflinks.index/*.fa")[0];
+my $cmd = "$samtools faidx $gtfi_fa";
+print "$cmd\n"; system $cmd;
+
+
+## Bowtie1 index
+my $cmd = "$th_cmd --bowtie1 --transcriptome-index $gtf_cufflinks.index/BT1.tmp/$geno.$anno.cuff $gidxdir/$geno $fastq";
+print "$cmd\n"; system $cmd;
+my $cmd = "mv $gtf_cufflinks.index/BT1.tmp/*.ebwt $gtf_cufflinks.index/";
+print "$cmd\n"; system $cmd;
+my $cmd = "rm -rf $gtf_cufflinks.index/BT1.tmp*";
+print "$cmd\n"; system $cmd;
+
+print "\nPWD:",`pwd`;
+
+
+## Various external scripts and their output files...
+
+print "Adding SimpleBiotype column to gene/transdata.txt...\n";
+my $cmd = "$SimpleBiotypeR $geno $anno";
+print "$cmd\n"; system $cmd;
+
+print "Expanding transdata.txt...\n";
+my $cmd = "$transdata_fix2 $geno $anno 2> $aprepdir/transdata_fix2.log";
+print "$cmd\n"; system $cmd;
+my $tds_old = -s "$transdata.old";
+my $tds_new = -s "$transdata";
+die "$0: transdata_fix2.pl failed to run successfully!\n" unless $tds_new > $tds_old;
+
+print "Converting GTF to R txdb...\n";
+my $cmd = "$gtf2txdb $geno $anno";
+print "$cmd\n"; system $cmd;
+my $txdb = "$label.gtf.txdb.sqlite";
+
+print "Building IGV .genome file, ref* files, and bigBed...\n";
+my $cmd = "$igv_transcriptome $geno $anno";
+print "$cmd\n"; system $cmd;
+my $igvGenome = "$label.igv.genome";
+my $bigBed = "$label.gtf.bb";
+
+print "Converting GTF to bigBed...\n";
+my $cmd = "$gtf2bb $gtf_remapped $chrsizes $bigBed";
+print "$cmd\n"; system $cmd;
+my $refGene = "$label.refGene.txt";
+my $refFlat = "$label.refFlat.txt";
+my $refFlatPc = "$label.refFlat_protein_coding.txt";
+
+print "Building Cufflinks ribo.gtf and Picard riboList/ncrnaList files...\n";
+my $cmd = "$make_ribo_ncrna $geno $anno";
+print "$cmd\n"; system $cmd;
+my $riboGtf = "$label.ribo.gtf";
+my @riboList = glob "$label.riboList.*.txt";
+my @ncrnaList = glob "$label.ncrnaList.*.txt";
+my @riboListNames = map { 'Picard Ribosome Interval List' } @riboList;
+my @ncrnaListNames = map { 'Picard ncRNA Interval List' } @ncrnaList;
+
+print "Classifying genomic bp types...\n";
+my $gbpTypes = "$label.GenomeBpTypes.txt";
+my $cmd = "$GenomeBpTypes $geno $anno $gbpTypes 1";
+print "$cmd\n"; system $cmd;
+
+print "Postprocessing complete: ",`date`;
+
+
+
+
+
+##########  SECTION 5B:
+##########  Transfer in Entrez, Uniprot, home-base ID and GO-xrefs files, if exist
+##########  Size and cksum all outputs
+##########  Write README file, error log
+
+
+## get file sizes and checksums, printf dimensions, etc. -> README file
+
+print "Summarizing...\n";
+
+
+## Arrange files and file labels in desired README order
+my @meta_names = map { "$_ Metadata" } qw/ Gene Transcript /;  # Peptide Exon /;
+my @meta_files = map { "$label.${_}data.txt" } qw/ gene trans /;  # pep exon /;
+my @model_names = ('Cufflinks GTF', 'Remapped Original GTF', 'GTF as txdb (R)', 'GFF');
+my @model_files = ($gtf_cufflinks, $gtf_remapped, $txdb, $gff);
+my @bed_names = map { "$_ Bed" } qw/ Gene Transcript Intergene /;
+my @bed_files = map { "$label.$_.bed" } qw/ genes trans intergenes /;
+my @genebed_names = map { "$_ Bed (genewise)" } qw/ Exon Unioned-Exon Intron Intersected-Intron CDS UTR /;
+my @genebed_files = map { "$label.$_.bed" } qw/ exons uxons introns iintrons CDSs UTRs /;
+my @riboetc_names = ('Ribosome GTF', @riboListNames, @ncrnaListNames);
+my @riboetc_files = ("$label.ribo.gtf", @riboList, @ncrnaList);
+my @supporting_names = ('Genome Bp Types Table', 'refGene', 'refFlat (All)', 'refFlat (Protein-Coding)', 'IGV Genome File', 'GTF BigBed Track');
+my @supporting_files = ($gbpTypes, $refGene, $refFlat, $refFlatPc, $igvGenome, $bigBed);
+my (@idconv_names, @idconv_files);
+
+
+## Supporting datasets from Biomart (getEnsembl)
+## Couple import to addition of these files to README
+## Any or all of these files may not exist
+if (-e $entrez) {
+    my $this_entrez = "$label.entrez_ids.txt";
+    system "cp $entrez $this_entrez";
+    push @idconv_names, 'Entrez ID Conversion File';
+    push @idconv_files, $this_entrez;
+}
+if (-e $refseq) {
+    my $this_refseq = "$label.refseq_ids.txt";
+    system "cp $refseq $this_refseq";
+    push @idconv_names, 'Refseq ID Conversion File';
+    push @idconv_files, $this_refseq;
+}
+if (-e $uniprot) {
+    my $this_uniprot = "$label.uniprot_ids.txt";
+    system "cp $uniprot $this_uniprot";
+    push @idconv_names, 'Uniprot ID Conversion File';
+    push @idconv_files, $uniprot;
+}
+if (-e $unigene) {
+    my $this_unigene = "$label.unigene_ids.txt";
+    system "cp $unigene $this_unigene";
+    push @idconv_names, 'Unigene ID Conversion File';
+    push @idconv_files, $unigene;
+}
+if (-e $homebase) {
+    my $this_homebase = "$label.${home_db}_ids.txt";
+    system "cp $homebase $this_homebase";
+    push @idconv_names, 'Home-Base ID Conversion File';
+    push @idconv_files, $this_homebase;
+}
+if (-e $goxrefs) {
+    my $this_goxrefs = "$label.GO_xref_ids.txt";
+    system "cp $goxrefs $this_goxrefs";
+    push @idconv_names, 'GO xref ID Conversion File';
+    push @idconv_files, $this_goxrefs;
+}
+if ($VARS{org}{VALUE}=="Drosophila melanogaster") {
+    my $CGrefs = "$aprepdir/CG.txt";
+    if (-e $CGrefs) {
+        my $this_CGrefs = "$label.CG_ids.txt";
+        system "cp $CGrefs $this_CGrefs";
+        push @idconv_names, 'CG ID Conversion File';
+        push @idconv_files, $this_CGrefs;
+    }
+}
+
+
+## Get 5 types of transcriptome sizes
+## Total
+system "$mergeBed -i $uxonbed > $tempdir/uxo";
+chomp(my $tsize = `cat $tempdir/uxo | awk '{ S+=(\$3-\$2) } END { print S }'`);
+## CDS
+system "$mergeBed -i $CDSbed > $tempdir/cds";
+chomp(my $csize = `cat $tempdir/cds | awk '{ S+=(\$3-\$2) } END { print S }'`);
+## protein-coding
+system "perl -e 'chomp(my \@gids = split /\\n/, `grep -P \"\\tprotein_coding\\t\" $genedata | cut -f1`); my \%gids = map {(\$_=>1)} \@gids; open EX, \"$uxonbed\"; while (<EX>) { my \$gid = (split /[\\t:]/, \$_)[3]; print $_ if \$gids{\$gid}; }' > $tempdir/pcx";
+system "$mergeBed -i $tempdir/pcx > $tempdir/pcu";
+chomp(my $psize = `cat $tempdir/pcu | awk '{ S+=(\$3-\$2) } END { print S }'`);
+## ncRNA
+system "perl -e 'chomp(my \@gids = split /\\n/, `grep -P \"\\t\\\\S+RNA\\t\" $genedata | cut -f1`); my \%gids = map {(\$_=>1)} \@gids; open EX, \"$uxonbed\"; while (<EX>) { my \$gid = (split /[\\t:]/, \$_)[3]; print $_ if \$gids{\$gid}; }' > $tempdir/ncx";
+system "$mergeBed -i $tempdir/ncx > $tempdir/ncu";
+chomp(my $nsize = `cat $tempdir/ncu | awk '{ S+=(\$3-\$2) } END { print S }'`);
+## pseudogene/misc
+system "perl -e 'chomp(my \@gids = split /\\n/, `grep -P \"\\t(\\\\S*pseudogene|misc)\\t\" $genedata | cut -f1`); my \%gids = map {(\$_=>1)} \@gids; open EX, \"$uxonbed\"; while (<EX>) { my \$gid = (split /[\\t:]/, \$_)[3]; print $_ if \$gids{\$gid}; }' > $tempdir/scx";
+system "$mergeBed -i $tempdir/scx > $tempdir/scu";
+chomp(my $ssize = `cat $tempdir/scu | awk '{ S+=(\$3-\$2) } END { print S }'`);
+
+my @tsize_heads1 = ('Exonic Bp: Total', 'Exonic Bp: Coding', 'Exonic Bp: CDS', 'Exonic Bp: ncRNA', 'Exonic Bp: Pseudo/misc');
+my @tsize_heads2 = ($tsize, $psize, $csize, $nsize, $ssize);
+
+## File sizes and checksums
+my (%nums, %lens);
+my $fail;
+foreach my $file (@meta_files, @model_files, @bed_files, @genebed_files, @riboetc_files, @supporting_files, @idconv_files) {
+    unless (-e $file) {
+        $fail .= " $file\n";
+        next;
+    }
+    chomp($nums{$file}{M} = `cat $file | md5sum | cut -f1 -d' '`);
+    chomp($nums{$file}{B} = `cat $file | wc -c`);
+    chomp(my $istext = `file $file 2>&1 | grep text | wc -l`);    # 1|0 for text encoding
+    chomp($nums{$file}{L} = $istext ? `cat $file | wc -l` : '');
+    $lens{M} = length($nums{$file}{M}) if length($nums{$file}{M}) > $lens{M};     # for printf
+    $lens{B} = length($nums{$file}{B}) if length($nums{$file}{B}) > $lens{B};
+    $lens{L} = length($nums{$file}{L}) if length($nums{$file}{L}) > $lens{L};
+    $lens{F} = length($file) if length($file) > $lens{F};
+}
+print "$0: FAILING: the following expected files were not created:\n$fail\n" if $fail;
+
+
+## Format README header
+my @heads1 = ('Create Time','Created By','Gene Definitions', (map { $TVARS{$_}{LABEL} } @ord_vars), @tsize_heads1);
+my @heads2 = ($started, $user, $genedefs, (map { $TVARS{$_}{VALUE} } @ord_vars), @tsize_heads2);
+my $printf_col1 = (sort {$b <=> $a} map { length($_) } @heads1)[0];
+my $printf_col2 = (sort {$b <=> $a} map { length($_) } @heads2)[0];
+
+
+## README formats
+my $mspacer = '   ';    ## MUST BE 3 SPACES !!!  Scripts expect to separate the metadata columns on a MINIMUM of 3 spaces!
+my $mfmt = "%-${printf_col1}s$mspacer%s\n";
+my $lfmt = "%-$lens{F}s  %$lens{B}i  %$lens{M}s  %$lens{L}i\n";
+(my $hfmt = $lfmt) =~ s/i/s/g;
+
+
+## Write README
+open README, "> $README";      # input files, set component files, date, user
+print README "## Do not edit this file, except below the 'NOTES' line.  There are scripts which regenerate the README files, if needed. ##\n";
+print README "\nMETADATA START\n";
+printf README $mfmt, $heads1[$_], $heads2[$_] foreach (0..$#heads1);
+print README "METADATA END\n";
+printf README "\n$hfmt", 'FILE', 'BYTES', 'MD5SUM', 'LINES';
+print README "DATA TABLES:\n";
+printf README $lfmt, $_, $nums{$_}{B}, $nums{$_}{M}, $nums{$_}{L} foreach @meta_files;
+print README "GENE MODEL FILES:\n";
+printf README $lfmt, $_, $nums{$_}{B}, $nums{$_}{M}, $nums{$_}{L} foreach @model_files;
+print README "BED FILES:\n";
+printf README $lfmt, $_, $nums{$_}{B}, $nums{$_}{M}, $nums{$_}{L} foreach @bed_files;
+print README "FEATURE BED FILES (GENEWISE):\n";
+printf README $lfmt, $_, $nums{$_}{B}, $nums{$_}{M}, $nums{$_}{L} foreach @genebed_files;
+print README "RIBOSOME/NCRNA FILES:\n";
+printf README $lfmt, $_, $nums{$_}{B}, $nums{$_}{M}, $nums{$_}{L} foreach @riboetc_files;
+print README "ID-CONVERSION FILES:\n";
+printf README $lfmt, $_, $nums{$_}{B}, $nums{$_}{M}, $nums{$_}{L} foreach @idconv_files;
+print README "OTHER SUPPORTING FILES:\n";
+printf README $lfmt, $_, $nums{$_}{B}, $nums{$_}{M}, $nums{$_}{L} foreach @supporting_files;
+print README "END FILES\n\n\n### NOTES: ###\n\n";
+close README;
+
+
+## Previous code
+### Format README header
+#my @heads1 = ('Create Time','Created By','Gene Definitions', map { $TVARS{$_}{LABEL} } @ord_vars, @tsize_heads1);
+#my @heads2 = ($started, $user, $genedefs, map { $TVARS{$_}{VALUE} } @ord_vars, @tsize_heads2);
+#my $printf_col1 = (sort {$b <=> $a} map { length($_) } @heads1)[0];
+#my $printf_col2 = (sort {$b <=> $a} map { length($_) } @heads2)[0];
+### Write README
+#open README, "> $README";      # input files, set component files, date, user
+#print README "## Do not edit this file, except below the 'NOTES' line.  There are scripts which regenerate the README files, if needed. ##\n\n";
+#print README "METADATA START\n";
+#printf README "%-${printf_col1}s  %s\n", $heads1[$_], $heads2[$_] foreach (0..$#heads1);
+#print README "METADATA END\n\n";
+#printf README "\n%-$lens{F}s  %$lens{S}s  %$lens{C}s  %$lens{L}s\n", 'FILE', 'SIZE', 'CKSUM', 'LINES';
+#printf README "%-$lens{F}s  %$lens{S}i  %$lens{C}i  %$lens{L}i\n", $_, $nums{$_}{S}, $nums{$_}{C}, $nums{$_}{L} foreach @ann_files;
+#print README "\n### END FORMATTED TEXT BLOCK ###\n\n";
+#print README "### NOTES: ###\n\n";
+#close README;
+
+
+## Write error log, if any
+if (@errors) {
+    open ERR, "$label.errors.log";
+    print ERR @errors;
+    close ERR;
+}
+
+## Cleanup and exit
+#system "rm -Rf $tempdir";
+system "chmod a+rx $abuilddir";
+system "chmod a+rx $abuilddir/*";
+system "chmod a+rx $abuilddir/$gtf_cufflinks.index";
+system "chmod a+rx $abuilddir/$gtf_cufflinks.index/*";
+my $finished = &timestamp('FULL');
+print "\n$0 complete!\nPlease see: $abuilddir\n\nStarted : $started\nFinished: $finished\n";  
+exit;
+
+
+
+
+
+
+
+
+
+
+####################################################################################################################################################
+####################################################################################################################################################
+####################################################################################################################################################
+####################################################################################################################################################
+###################################################################  SUBROUTINES  ##################################################################
+###################################################################  SUBROUTINES  ##################################################################
+###################################################################  SUBROUTINES  ##################################################################
+####################################################################################################################################################
+####################################################################################################################################################
+####################################################################################################################################################
+####################################################################################################################################################
+
+
+
+
+
+
+
+
+
+
+sub load_parsers {
+    
+    ## This loads parsing subroutines into %parsers.  
+    ## Level 1 are accepted provider names
+    ## Level 2 are accepted filetypes from those providers
+
+    my %PARSERS;
+    
+    ## master data object: 
+    ## levels: 1 = GENE | TRANS | EXON | INTRON | UTR
+    ## GENE feature data hash:   coord, name, strand, totlen, uxlen, nexons, biotype, status, CDS, ntrans, desc, TRANS=>hash, EXON=>hash, INTRON=>hash, UTR=>hash
+    ## TRANS feature data hash:  coord, name, strand, totlen, splen, nexons, biotype, status, CDS, maxintron, gene, EXON=>hash, INTRON=>hash, UTR=>hash
+    ## EXON feature data hash:   coord, length, gene, TRANS=>transID=>[rank,CDS,phase]
+    ## INTRON feature data hash: coord, length, gene, transID=>rank
+    ## CDS feature data hash:    coord, length, gene, transID=>[rank,phase]
+    ## UTR feature data hash:    coord, length, gene, transID=>[rank,side]
+
+    
+    ###############################################################################################################################################
+    ##############################################################  ENSEMBL GTF  ##################################################################
+    ###############################################################################################################################################
+
+    $PARSERS{Ensembl}{GTF} = sub {
+        
+        ## 5-phase method: 
+        ## phase 1 gets genes/trans, classifies exons by coord/strand/CDS; 
+        ## phase 2 ID's + summarizes exons (OUTSOURCED)
+        ## phase 3 transfers exon hash to %MASTER (OUTSOURCED)
+        ## phase 4 consolidates gene, trans data in %MASTER
+        ## phase 5 extracts UTR data
+        
+        my @input = @{ $_[0] };
+        my (%EXON, %EXON2, %GEXON, %exonXO, $exonID, %typetally);
+        my ($N, $CHRS, $GENES, $TRANS, $EXONS, $XLINES, $CLINES, $LOSTG) = map { 0 } (1..8);   # initialize all as 0
+
+        # phase 1
+        
+        foreach my $line (@input) {
+            
+            $N++;  # ID line for any printed warnings
+            next if $line =~ /^#/;
+            $line =~ s/[\n\r]//g;
+            my @data = split /\t/, $line;      # expected $data[8], e.g.: gene_id "ENSMUSG00000063889"; transcript_id "ENSMUST00000151311"; exon_number "4"; gene_name "Crem"; transcript_name "Crem-020";
+            $data[8] =~ s/^\s*//;  # some Ensembl GTFs are improperly formatted
+            $typetally{$data[2]}++;
+
+            my ($chr, $coord) = ($data[0], "$data[3]\t$data[4]");
+            
+            $MASTER{GTF}{$chr}{$N}{coord} = $coord;
+            $MASTER{GTF}{$chr}{$N}{seg1} = join "\t", @data[1,2];
+            $MASTER{GTF}{$chr}{$N}{seg2} = join "\t", @data[5..8];
+            
+            if ($data[2] eq 'exon') {
+                
+                # store each exon
+                
+                $XLINES++;   # exon entries
+                my %annots = %{ annotize($data[8]) };   # convert (key value;) pairs to hash
+                my ($geneID, $transID, $rank) = ($annots{gene_id}, $annots{transcript_id}, $annots{exon_number});
+                my $length = $data[4]-$data[3]+1;
+                $MASTER{EXON}{$transID}{$rank}{coord} = $coord; 
+                $MASTER{EXON}{$transID}{$rank}{length} = $length; 
+                print "Cannot parse exon entry '$line'\n" unless $data[3];    # no start coord?
+                print "Rankless exon '$line'\n" unless $rank;  # no rank in transcript?
+                
+                ## initialize transcript data
+                
+                my $simple_biotype;
+                if (exists $simplebio{"\L$annots{transcript_biotype}"}) {
+                    $simple_biotype = $simplebio{"\L$annots{transcript_biotype}"}
+                } else {
+                    print "\n\n**WARNING** No SimpleBiotype found for Ensembl transcript biotype '$annots{transcript_biotype}'!\n\n";
+                }
+                $MASTER{TRANS}{$chr}{$transID} = { 'name' => $annots{transcript_name}, 'strand' => $data[6], 'biotype' => $annots{transcript_biotype}, 'simplebiotype' => $simple_biotype, 'gene' => $geneID } unless $MASTER{TRANS}{$chr}{$transID};
+                
+                ## initialize gene data or add transcript to gene
+                
+                if ($MASTER{GENE}{$chr}{$geneID}) {
+                    $MASTER{GENE}{$chr}{$geneID}{TRANS}{$transID} = 1;  # add transcript to the gene list
+                } else {
+                    $MASTER{GENE}{$chr}{$geneID} = { 'name' => $annots{gene_name}, 'strand' => $data[6] };
+                    $MASTER{GENE}{$chr}{$geneID}{TRANS}{$transID} = 1;
+                }
+                
+            } elsif ($data[2] eq 'CDS') {
+                
+                ## store CDS data under exon of origin
+                
+                $CLINES++;   # CDS entries; should be <= $XLINES
+                my %annots = %{ annotize($data[8]) };
+                my ($transID, $rank) = ($annots{transcript_id}, $annots{exon_number});
+                $MASTER{EXON}{$transID}{$rank}{CDS} = "$data[3]\t$data[4]";
+                $MASTER{EXON}{$transID}{$rank}{phase} = $data[7];
+            }
+        }
+        
+        print "\nObserved feature types:\n";
+        print "$typetally{$_}\t$_\n" foreach sort { $typetally{$b} <=> $typetally{$a} } keys %typetally;
+        print "\n";
+        
+        # phases 2-5, by way of &integrate: define unique exon sets, give new IDs, then replace the old gene & transcript exon sets with new the ones
+        &integrate(\%MASTER);
+        
+        # complete!
+    };
+
+    $PARSERS{Flybase}{GFF} = sub {
+        my @input = @{ $_[0] };
+        my (%novels, %MASTER);
+        foreach my $line (@input) {
+            $_ =~ s/[\n\r]//g;
+            my @data = split /\t/, $_;
+            if ($data[2] =~ /gene/) {    # gene, pseudogene
+            } elsif ($data[2] =~ /RNA/) {    # m r t mi pi sn sno
+            } elsif ($data[2] eq 'exon') {
+            } elsif ($blacklist{$data[2]}) {
+                next;   # not the feature type we're looking for
+            } else {
+                print "Novel feature type '$data[2]'!\n" unless $novels{$data[2]};
+                $novels{$data[2]}++;
+            }
+        }
+        return \%MASTER;
+    };
+
+    $PARSERS{Sanger}{GFF} = sub {
+        my @input = @{ $_[0] };
+        my (%MASTER, %EXON, %PRE);
+        my %repstuff = map {($_=>1)} qw/ repeat_region LTR /;
+        my %products;
+        
+        # mRNA SPAC13G6.05c ; systematic_id "SPAC13G6.05c" ; colour "7" ; gene "SPAC13G6.05c" ; Alias "trs33" ; db_xref "SPD:17/17B08" ; GO "GO:0006888; ER to Golgi vesicle-mediated transport <BR /> GO:0006886; intracellular protein transport <BR /> GO:0030008; TRAPP complex" ; controlled_curation "term=phenotype, inviable; qualifier=deletion; db_xref=PMID:20473289; cv=phenotype; date=20100406 ||| term=orthologous to S. cerevisiae YOR115C; date=19700101 ||| term=species distribution, conserved in Eukaryotes; date=20081110 ||| term=species distribution, conserved in Metazoa; date=20081110 ||| term=species distribution, conserved in Vertebrates; date=20081110 ||| term=species distribution, predominantly uniformly single copy (one to one); date=20081110 ||| term=species distribution, conserved in Fungi; date=20081110 ||| term=species distribution, conserved in Eukaryotes only; date=20081110 ||| term=warning, gene structure updated; db_xref=PMID:21511999; date=20110311" ; primary_name "trs33" ; product "TRAPP complex subunit Trs33 (predicted)" ; 
+
+        foreach my $line (@input) {
+            $_ =~ s/[\n\r]//g;
+            my @data = split /\t/, $_;
+            if ($data[2] =~ /RNA$/) {        # m r t mi pi sn sno misc real_m etc.
+                my %annots = %{ annotize($data[8]) };
+                my ($chr, $geneID, $transID) = ($data[0], $annots{gene}, $annots{systematic_id});
+                $products{ $annots{product} }++;
+                my $name = $annots{primary_name} || $annots{Alias};
+                my $nameflag;
+                $nameflag = 1 if ($annots{primary_name} && $annots{primary_name} != $annots{Alias});
+                $nameflag = 1 if ($annots{systematic_id} && $annots{systematic_id} != $annots{$data[2]});
+                print "$data[2] | $annots{systematic_id} = $annots{$data[2]} | $annots{primary_name} = $annots{Alias}\n" if $nameflag;
+                
+                ## create trans data
+                if ($MASTER{TRANS}{$chr}{$transID}) {
+                    print "Duplicate entry for $transID!\n";
+                } else {
+                    my %transannot = (
+                        DATA => { 'name' => $annots{$data[2]},   # probably the same as $name...?
+                                  'strand' => $data[6], 
+                                  'gene' => $geneID,
+                                  #                                  'biotype' => $annots{product},
+                                  'GXF' => $data[8]
+                        },
+                        EXONS => { }                  # will hold all exons for trans
+                        );
+                    $MASTER{TRANS}{$chr}{$transID} = ["$data[3]\t$data[4]", \%transannot];
+                }
+                
+                ## create gene data
+                if ($MASTER{GENE}{$chr}{$geneID}) { # gene already seen
+                    $MASTER{GENE}{$chr}{$geneID}->[1]->{TRANS}{$transID} = 1;   # add transcript id to hash
+                } else {
+                    my %geneannot = (
+                        DATA => { 'name' => $name, 
+                                  'strand' => $data[6], 
+                                  'biotype' => $data[1]
+                        },
+                        TRANS => { $transID => 1 }                  # will hold all transcripts for gene
+                        );
+                    $MASTER{GENE}{$chr}{$geneID} = ['', \%geneannot];
+                }
+
+            } elsif ($data[2] eq 'CDS') {
+                my %annots = %{ annotize($data[8]) };
+                my $transID = $annots{$data[2]};
+                push @{ $PRE{$transID}{CDS} }, "$data[3]\t$data[4]";
+            } elsif ($data[2] =~ /UTR$/) {   # 5'-UTR, 3'-UTR
+                my ($side) = ($data[2] =~ /^([53])/);
+                my %annots = %{ annotize($data[8]) };
+                my $transID = $annots{$data[2]};
+                push @{ $PRE{$transID}{UTR}{$side} }, "$data[3]\t$data[4]";
+            } elsif ($repstuff{$data[2]}) { # see hash def above
+            }
+        }
+
+        ## consolidate UTRs & CDSs into exons
+        ## UNDER CONSTRUCTION
+        #push @{ $MASTER{GENE}{$chr}{$geneID}->[0] }, @data[3,4];     # add exon coords to array
+        #$MASTER{TRANS}{$chr}{$transID}->[1]->{EXONS}{$ID} = [@data[3,4]];   # add exon id to hash
+        
+        open OUT, "> all_products.txt";
+        print OUT "$_\t$products{$_}\n" foreach (sort {$products{$b} <=> $products{$a}} keys %products);
+        close OUT;
+        return \%MASTER;
+    };
+
+    return \%PARSERS;
+}
+
+
+sub integrate {
+    
+    ## reorganizes exon data under the gene and transcript master hashes, among other things
+    ## main function is to flatten redundant exons, introns, and UTRs into single features, re-ID them, then assign them back to genes/transcripts of origin
+    
+    my (%EXONS, %INTRONS, %UTRS);
+    my ($N, $CHRS, $GENES, $TRANS, $EXONS, $GEXONS, $XLINES, $CLINES, $LOSTG) = map { 0 } (1..8);   # initialize all as 0
+    
+    foreach my $chr (keys %{ $MASTER{GENE} }) {
+        $CHRS++;
+        my %CHRDATA;
+        
+        foreach my $geneID (keys %{ $MASTER{GENE}{$chr} }) {
+            my $strand = $MASTER{GENE}{$chr}{$geneID}{strand};
+            $GENES++;
+            my %TEMP;   # %TEMP = 7 elements: 
+            # EXON (genewise unique exon coords => data hash), 
+            # INTRON (genewise unique intron coords => data hash), 
+            # CDS (genewise unique CDS coords => data hash), 
+            # UTR (genewise unique UTR coords => data hash), 
+            # GCDS (all gene CDS coords), 
+            # GEXBO (sorted exon boundaries for gene and trancripts),
+            # current (genewise feature ordering for exons, introns, UTRs), 
+            
+            @{ $TEMP{GCDS} } = ();  # even if empty, array must be defined
+            
+            foreach my $transID (keys %{ $MASTER{GENE}{$chr}{$geneID}{TRANS} }) {
+                $TRANS++;
+                
+                my (@ordexons, @TCDS, @TEXBO, $anyCDS);    # sorted exons, transcript CDS boundaries, transcript exon boundaries, does transcript have any CDS entries at all
+                my ($splen, $maxintron) = (0, 0);            # printable values, esp for $maxintron
+                foreach my $rank (sort {$a <=> $b} keys %{ $MASTER{EXON}{$transID} }) {   # first pass: arrange data and define transcript CDS regions
+                    my ($ecoord, $length, $CDS, $phase) = map { $MASTER{EXON}{$transID}{$rank}{$_} } qw/ coord length CDS phase /;
+                    my ($estart, $eend) = split /\t/, $ecoord;
+                    $TEMP{EXON}{$ecoord}{coord} = $ecoord;
+                    $TEMP{EXON}{$ecoord}{length} = $length;
+                    $TEMP{EXON}{$ecoord}{gene} = $geneID;
+                    $TEMP{EXON}{$ecoord}{TRANS}{$transID} = [$rank, $CDS, $phase];
+                    push @{ $TEMP{GEXBO} }, ($estart, $eend);
+                    #print "GEXBO: $start, $end\n";
+                    push @TEXBO, ($estart, $eend);
+                    push @ordexons, $ecoord;
+                    $splen += $length;
+                    if ($CDS) {
+                        $anyCDS = 1;
+                        my ($cstart, $cend) = split /\t/, $CDS;
+                        push @{ $TEMP{GCDS} }, ($cstart, $cend);
+                        push @TCDS, ($cstart, $cend);
+                    }
+                }
+                $MASTER{TRANS}{$chr}{$transID}{CDS} = join "\t", (sort {$a <=> $b} @TCDS)[0,-1];    # CDS coords for transcript
+                @ordexons = sort {$a <=> $b} @ordexons;   # genomic order, not transcript rank
+                
+                foreach my $rank (sort {$a <=> $b} keys %{ $MASTER{EXON}{$transID} }) {   # second pass: now that full transcript CDS has been defined, we can call all-UTR exons as 5' or 3'
+                    my ($ecoord, $length, $CDS, $phase) = map { $MASTER{EXON}{$transID}{$rank}{$_} } qw/ coord length CDS phase /;
+                    my ($estart, $eend) = split /\t/, $ecoord;
+                    if ($anyCDS) {        # if no CDS, then don't call any UTRs
+                        if ($CDS) {        # CDS exists
+                            
+                            my ($cstart, $cend) = split /\t/, $CDS;
+                            $TEMP{CDS}{$CDS}{coord} = $CDS;
+                            $TEMP{CDS}{$CDS}{length} = $cend-$cstart+1;
+                            $TEMP{CDS}{$CDS}{TRANS}{$transID} = [$rank, $phase];
+                            
+                            if ($CDS eq $ecoord) {    # CDS starts and ends with exon = no UTR
+                                next;   
+                            } else {                # some kind of UTR exists -- define it
+                                if ($cstart == $estart) {   # exon starts with CDS: 3' UTR
+                                    my ($ustart, $uend) = ($cend+1, $eend);
+                                    my $ucoord = "$ustart\t$uend";
+                                    $TEMP{UTR}{$ucoord}{gene} = $geneID;
+                                    $TEMP{UTR}{$ucoord}{coord} = $ucoord;
+                                    $TEMP{UTR}{$ucoord}{length} = $uend-$ustart+1;
+                                    $TEMP{UTR}{$ucoord}{TRANS}{$transID} = [$rank, 3];
+                                } elsif ($cend == $eend) {  # exon ends with CDS: 5' UTR
+                                    my ($ustart, $uend) = ($estart, $cstart-1);
+                                    my $ucoord = "$ustart\t$uend";
+                                    $TEMP{UTR}{$ucoord}{gene} = $geneID;
+                                    $TEMP{UTR}{$ucoord}{coord} = $ucoord;
+                                    $TEMP{UTR}{$ucoord}{length} = $uend-$ustart+1;
+                                    $TEMP{UTR}{$ucoord}{TRANS}{$transID} = [$rank, 5];
+                                } else {                    # exon neither starts nor ends with CDS: flanking UTRs                            
+                                    # assign 3' UTR flank
+                                    my ($ustart, $uend) = ($cend+1, $eend);
+                                    my $ucoord = "$ustart\t$uend";
+                                    $TEMP{UTR}{$ucoord}{gene} = $geneID;
+                                    $TEMP{UTR}{$ucoord}{coord} = $ucoord;
+                                    $TEMP{UTR}{$ucoord}{length} = $uend-$ustart+1;
+                                    $TEMP{UTR}{$ucoord}{TRANS}{$transID} = [$rank, 3];
+                                    # assign 5' UTR flank
+                                    my ($ustart, $uend) = ($estart, $cstart-1);
+                                    my $ucoord = "$ustart\t$uend";
+                                    $TEMP{UTR}{$ucoord}{gene} = $geneID;
+                                    $TEMP{UTR}{$ucoord}{coord} = $ucoord;
+                                    $TEMP{UTR}{$ucoord}{length} = $uend-$ustart+1;
+                                    $TEMP{UTR}{$ucoord}{TRANS}{$transID} = [$rank, 5];
+                                }
+                            }
+                            
+                        } else {    # all-UTR exon in coding transcript: is it 3' or 5'?
+                            my ($Cstart, $Cend) = split /\t/, $MASTER{TRANS}{$chr}{$transID}{CDS};  # whole-transcript CDS
+                            my $ucoord = $ecoord;
+                            $TEMP{UTR}{$ucoord}{gene} = $geneID;
+                            $TEMP{UTR}{$ucoord}{coord} = $ecoord;
+                            $TEMP{UTR}{$ucoord}{length} = $length;
+                            if ($eend < $Cstart) {
+                                $TEMP{UTR}{$ucoord}{TRANS}{$transID} = [$rank, 5];    # exon 5' to CDS
+                            } elsif ($estart > $Cend) {
+                                $TEMP{UTR}{$ucoord}{TRANS}{$transID} = [$rank, 3];    # exon 3' to CDS
+                            } else {
+                                print "Ambiguous UTR exon location! $rank($ecoord):$estart-$eend vs $transID:$Cstart-$Cend\n";
+                            }
+                        }
+                    }
+                }
+                
+                foreach my $i (0..$#ordexons-1) {    # for each exon except the last, in order,
+                    my ($istart, $iend) = split /\t/, $ordexons[$i];
+                    my ($jstart, $jend) = split /\t/, $ordexons[$i+1];
+                    my $intronlen = $jstart-$iend-1;  # length for downstream intron
+                    $maxintron = $intronlen if $intronlen > $maxintron;  # is it the longest for this transcript?
+                    my $icoord = ($iend+1) . "\t" . ($jstart-1);
+                    $TEMP{INTRON}{$icoord}{coord} = $icoord;
+                    $TEMP{INTRON}{$icoord}{length} = $intronlen;
+                    $TEMP{INTRON}{$icoord}{gene} = $geneID;
+                    $TEMP{INTRON}{$icoord}{TRANS}{$transID} = $i+1;
+                }
+                
+                my ($tstart, $tend) = (sort {$a <=> $b} @TEXBO)[0,-1];
+                $MASTER{TRANS}{$chr}{$transID}{coord} = "$tstart\t$tend";    # final, guaranteed transcript boundaries, in spite of annotations: first exon start and last exon end.
+                $MASTER{TRANS}{$chr}{$transID}{nexons} = scalar @ordexons;    # N exons per transcript
+                $MASTER{TRANS}{$chr}{$transID}{totlen} = $tend-$tstart+1;    # unspliced transcript length
+                $MASTER{TRANS}{$chr}{$transID}{splen} = $splen;                # spliced transcript length
+                $MASTER{TRANS}{$chr}{$transID}{maxintron} = $maxintron;        # largest intron length for this transcript
+            }
+            
+            my ($gstart, $gend) = (sort {$a <=> $b} @{ $TEMP{GEXBO} })[0,-1];
+            #print "STARTEND: $gstart, $gend\n";
+            $MASTER{GENE}{$chr}{$geneID}{coord} = "$gstart\t$gend";                # final, guaranteed gene boundaries
+            $MASTER{GENE}{$chr}{$geneID}{nexons} = scalar(@{ $TEMP{GEXBO} })/2; # unique exon coords for gene
+            $GEXONS += $MASTER{GENE}{$chr}{$geneID}{nexons};                    # unique exon coords for all genes
+            $MASTER{GENE}{$chr}{$geneID}{totlen} = $gend-$gstart+1;                # total locus length
+            $MASTER{GENE}{$chr}{$geneID}{biotype} = $genetypes{$geneID}->[0];    # gene biotype, from file
+            $MASTER{GENE}{$chr}{$geneID}{simplebiotype} = $genetypes{$geneID}->[1];    # simple biotype, from master
+            $MASTER{GENE}{$chr}{$geneID}{status} = $genetypes{$geneID}->[2];    # gene status, from file
+            $MASTER{GENE}{$chr}{$geneID}{desc} = $genetypes{$geneID}->[3];        # gene description, from file
+            $MASTER{GENE}{$chr}{$geneID}{CDS} = join "\t", (sort {$a <=> $b} @{ $TEMP{GCDS} })[0,-1];    # CDS coords for gene
+            $MASTER{GENE}{$chr}{$geneID}{ntrans} = scalar keys %{ $MASTER{GENE}{$chr}{$geneID}{TRANS} };    # number of transcripts per gene
+            
+            if ($strand eq '+') {
+                $TEMP{current}{EXON}{N} = 0;     # gene exon number: initialize 1 below first
+                $TEMP{current}{EXON}{I} = 1;     # and increment from there   
+            } elsif ($strand eq '-') {
+                $TEMP{current}{EXON}{N} = $MASTER{GENE}{$chr}{$geneID}{nexons} + 1;     # gene exon number: initialize 1 after last
+                $TEMP{current}{EXON}{I} = -1;    # and decrement from there
+            } else {
+                print "Bad strand '$strand' for gene $geneID!\n";
+            }
+            %{ $TEMP{current}{$_} } = %{ $TEMP{current}{EXON} } foreach qw/ INTRON CDS UTR /;     # DO NOT copy as reference!
+            
+            foreach my $feature (qw/ EXON INTRON CDS UTR /) {
+                foreach my $oldID (sort {$a <=> $b} keys %{ $TEMP{$feature} }) {
+                    $TEMP{current}{$feature}{N} += $TEMP{current}{$feature}{I};        # increment or decrement from current feature position for this gene
+                    my $newID = "$geneID:$featpref{$feature}$TEMP{current}{$feature}{N}";
+                    #print "$feature\t$newID\t$TEMP{$feature}{$oldID}{coord}\t". scalar(keys %{ $TEMP{$feature}{$oldID} }) ."\n";
+                    $CHRDATA{$feature}{$newID}{$_} = $TEMP{$feature}{$oldID}{$_} foreach keys %{ $TEMP{$feature}{$oldID} };  # copy coord-based old-ID and associated %TEMP keys to gene-based new-ID feature hash
+                    $CHRDATA{$feature}{$newID}{gene} = $geneID;
+                    $MASTER{GENE}{$chr}{$geneID}{$feature}{$newID} = 1;  # features per gene
+                    $MASTER{TRANS}{$chr}{$_}{$feature}{$newID} = 1 foreach keys %{ $TEMP{$feature}{$oldID}{TRANS} };  # features per transcript
+                }
+            }
+            $MASTER{GENE}{$chr}{$geneID}{nexons} = scalar keys %{ $MASTER{GENE}{$chr}{$geneID}{EXON} };            # number of unique exons coords per gene
+        }
+        %{ $EXONS{$chr} } = %{ $CHRDATA{EXON} };     # DO NOT copy as reference!
+        %{ $MASTER{$_}{$chr} } = %{ $CHRDATA{$_} } foreach qw/ INTRON CDS UTR /;
+    }
+    $MASTER{EXON} = \%EXONS;  # completely overwrite old exon hash with new
+    
+    ##    print "$N lines in | $XLINES exon lines | $CLINES CDS lines | $CHRS chrs | $GENES genes | $TRANS transcripts | $GEXONS exons, $LOSTG had no genes\n";
+    print "$CHRS chrs | $GENES genes | $TRANS transcripts | $GEXONS exons, $LOSTG had no genes\n";
+    print "GTF annotation column hashing appears to have failed!  No genes defined...\n" if $GENES == $CHRS;
+}
+
+
+sub annotize {
+    
+    my $STRING = shift;   # $provider, $file_ext are global
+    $STRING =~ s/[\n\r]+$//;
+    my %ANNOTS;
+    
+    if ($provider eq 'Ensembl') {
+        
+        if ($file_ext eq 'GFF') {
+        } elsif ($file_ext eq 'GTF') {
+            #$STRING =~ s/";$//;
+            #my @temp = (split /[\s\"\;]+/, $STRING);
+            #%ANNOTS = @temp[0..$#temp];   # makes a nice hash, once the effect of the leading space is dropped
+            %ANNOTS = (split /[\s\"\;]+/, $STRING);   # makes a nice hash as-is, now that Ensembl has fixed their format
+            #print scalar(@temp), " ", scalar(%ANNOTS), "\n";
+            #print Dumper(\%ANNOTS),"\n";
+        } else {
+        }
+        
+    } elsif ($provider eq 'Sanger') {
+        
+        if ($file_ext eq 'GFF') {
+            foreach (split /\s+;\s+/, $STRING) {
+                my ($key, $value) = split /\s+/, $_, 2;
+                ($ANNOTS{$key} = $value) =~ s/\"//g;
+            }
+        } elsif ($file_ext eq 'GTF') {
+        } else {
+        }
+        
+    } elsif ($provider eq 'Flybase') {
+        
+        if ($file_ext eq 'GFF') {
+            %ANNOTS = (split /[=\;]+/, $STRING);
+        } elsif ($file_ext eq 'GTF') {
+        } else {
+        }
+        
+    } else {
+        
+        if ($file_ext eq 'GFF') {
+        } elsif ($file_ext eq 'GTF') {
+        } else {
+        }
+        
+    }
+    
+    return \%ANNOTS;
+}

@@ -1,0 +1,243 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+
+#####  UNDER CONSTRUCTION  #####  Only default options work  #####
+
+
+
+## A lastz wrapper with minimal options -- focused on chromosome-chromosome, scaffold-scaffold, and scaffold-genome alignents.
+## Automatically detects multi-fasta references and manages alignments thereto, since lastz is too stupid to do this itself.    -- NOT YET ADDED --
+
+## Inputs
+my $qryFa;    # query fasta
+my $refFa;    # reference fasta
+my $output;   # output file
+my $runMode;  # can be: liftOver, pairwise, cigar.  For now, default/only mode is pairwise
+my $writelav; # 
+my $writeraw; # 
+
+
+GetOptions("q=s" => \$qryFa, "r=s" => \$refFa, "o=s" => \$output, "m=s" => \$runMode, "writelav" => \$writelav, "writeraw" => \$writeraw);
+
+## Notes on modes ##
+## Currently 2 "run modes" for this script: 
+## 1. "-m liftOver", generates a liftOver chain file for $qryFa => $refFa
+## 2. "-m pairwise", performs pairwise alignments a la blat; outputs cigar strings
+
+## Globals
+my $lastz = '/n/site/inst/Linux-x86_64/bioinfo/lastz/current/bin/lastz';
+my $tmp = "runLastz.$$.tmp";  # temp dir
+my @lines_in;   # intermediate data 1 - preprocessed lastz alignment lines
+my @lines_out;  # intermediate data 2 - filtered, finalized version of @lines_in
+my $summary_blurb;  # alignment summary blurb to print at end of run
+
+
+#if ($runMode eq '') {
+#} else {
+#    die "Unknown run mode '$runMode'!  Must be either 'pairwise', 'cigar', or 'liftOver'.\n";
+#}
+
+
+&process_lav;  # loads @lines_in
+&optimal_path; # loads @lines_out
+
+open my $OUT, '>', $output or die "$0: Cannot write to output handle '$output': $!\n";
+print $OUT join("\t", @$_), "\n" foreach @lines_out;
+close $OUT;
+
+print "ALIGN SUMMARY:\n$summary_blurb\n";
+
+exit;
+
+
+
+
+
+sub process_lav {
+    
+    ## RUN LASTZ WITH QUERY/SUBJECT REVERSED -- lastz .lav output documentation doesn't know what it's talking about
+    open my $IN, "$lastz $qryFa $refFa --strand=plus --ambiguous=n --ambiguous=iupac --chain |" or die "$0: Failed to open lastz output pipe: $!\n";
+    my ($LAV, $RAW);
+    
+    if ($writelav) {
+	open $LAV, '>', $writelav or die "$0: Failed to open lav handle '$writelav' for writing: $!\n";
+    }
+    if ($writeraw) {
+	open $RAW, '>', $writeraw or die "$0: Failed to open raw-txt handle '$writeraw' for writing: $!\n";
+    }
+    
+    my ($sStanza, $sBlock, $sNames, $qryStartGlobal, $refStartGlobal, $qryEndGlobal, $refEndGlobal, $qryEndPrev, $refEndPrev, $blockTotal, $qryGapTotal, $refGapTotal, $idtPctGlobal, $idtSum, $nLines);
+    while (<$IN>) {
+	print $LAV $_ if $writelav;
+	if ($_ =~ /^s {/) {
+	    $sStanza = 1;
+	} elsif ($sStanza && $_ =~ /^}/) {
+	    $sStanza = 0;
+	} elsif ($sStanza) {
+	    $_ =~ s/^\s+//;
+	    my @fields = split /\s+/, $_;
+	    $fields[0] =~ s/\"//g;
+	    $sBlock .= "$fields[1]\t$fields[2]\t";
+	    $sNames .= "\t$fields[0]";
+	}
+	next unless $_ =~ /^\s+l/;
+	chomp;
+	$_ =~ s/^\s+l\s+//;
+	my ($refStart, $qryStart, $refEnd, $qryEnd, $idtPct) = split /\s+/, $_;  # 1-based coords
+	my $refGap = $refEndPrev ? $refStart - $refEndPrev - 1 : 0;
+	my $qryGap = $qryEndPrev ? $qryStart - $qryEndPrev - 1 : 0;
+	my $blockLen = $refEnd - $refStart + 1;
+	my @array = ($refStart, $refEnd, $qryStart, $qryEnd, $blockLen, $idtPct, $refGap, $qryGap);
+	push @lines_in, \@array;
+	print $RAW join("\t",@array),"\n" if $writeraw;
+	$refEndPrev = $refEnd;
+	$qryEndPrev = $qryEnd;
+	$qryStartGlobal = $qryStart unless $qryStartGlobal;
+	$refStartGlobal = $refStart unless $refStartGlobal;
+	$qryEndGlobal = $qryEnd;
+	$refEndGlobal = $refEnd;
+	$qryGapTotal += $qryGap;
+	$refGapTotal += $refGap;
+	$blockTotal += $blockLen;
+	$idtSum += $idtPct/100 * $blockLen;
+	$nLines++;
+    }
+    close $IN;
+    close $LAV if $writelav;
+    close $RAW if $writeraw;
+    
+    my $idtPctGlobal = sprintf("%0.2f", 100 * $idtSum / $blockTotal);
+#    print "$sBlock\t$sNames\n";
+    my $summary_blurb = "$refStartGlobal\t$refEndGlobal\t$qryStartGlobal\t$qryEndGlobal\t$blockTotal\t$idtPctGlobal\t$refGapTotal\t$qryGapTotal";
+    
+}
+
+
+sub optimal_path {
+    
+    my (@templines, %unambiguous, %competing, $alt, $prevEnd, $blockNum);
+    
+    ## separate unambiguous alignment blocks from competing-alignment blocks
+    foreach my $i (0..$#lines_in) {
+	my ($refStart, $refEnd, $qryStart, $qryEnd, $blockLen, $idtPct, $refGap, $qryGap) = @{ $lines_in[$i] };
+	my ($refGap1, $qryGap1) = @{ $lines_in[$i+1] }[6,7];
+	if ($alt && $qryStart < $prevEnd) {
+	    push @{ $competing{$blockNum}{B} }, $lines_in[$i];   # the second competing alignment set
+#    	    print "$blockNum ALT B: $i\n";
+	} elsif ($alt && $qryStart > $prevEnd) {   # past competing alignments
+	    $alt = 0;
+	    $blockNum++;
+	    $unambiguous{$blockNum} = [$lines_in[$i]];
+#	    print "$blockNum KEEP: $i\n";
+	} elsif ($refGap1 < 0 || $qryGap1 < 0) {
+	    die "Nested sets of competing alignments!  No handling yet.\n" if $alt;
+	    $blockNum++;
+	    $alt = 1;
+	    $prevEnd = $qryEnd;
+	    push @{ $competing{$blockNum}{A} }, $lines_in[$i];   # the first competing alignment set
+#    	    print "$blockNum ALT A: $i\n";
+	} else {
+	    $blockNum++;
+	    $unambiguous{$blockNum} = [$lines_in[$i]];
+#	    print "$blockNum KEEP: $i\n";
+	}
+    }
+    
+    ## resolve competing alignment blocks (take path with most-covered bp)
+    foreach my $i (sort {$a <=> $b} keys %competing) {
+	my $start = (sort {$a <=> $b} map { $_->[2] } (@{ $competing{$i}{A} }, @{ $competing{$i}{B} }))[0];
+	my $end = $unambiguous{$i+1}->[0][2];
+	my $gap = $end-$start-1;
+	my ($Alen, $Blen, $Aidt, $Bidt);
+	foreach (@{ $competing{$i}{A} }) {
+	    $Alen += $_->[4];
+	    $Aidt += $_->[5];
+	}
+	foreach (@{ $competing{$i}{B} }) {
+	    $Blen += $_->[4];
+	    $Bidt += $_->[5];
+	}
+	if ($Alen > $Blen) {
+	    $unambiguous{$i} = $competing{$i}{A};
+#	    print "$i: $start-$end: A wins, length $Alen-$Blen (gap $gap)\n";
+	} elsif ($Blen > $Alen) {
+	    $unambiguous{$i} = $competing{$i}{B};
+#	    print "$i: $start-$end: B wins, length $Blen-$Alen (gap $gap)\n";
+	} elsif ($Aidt > $Bidt) {
+	    $unambiguous{$i} = $competing{$i}{A};
+#	    print "$i: $start-$end: A wins, idtpct $Aidt-$Bidt (length $Alen, gap $gap)\n";
+	} elsif ($Bidt > $Aidt) {
+	    $unambiguous{$i} = $competing{$i}{B};
+#	    print "$i: $start-$end: B wins, idtpct $Bidt-$Aidt (length $Alen, gap $gap)\n";
+	} else {
+	    die "$i: $start-$end: Competing blocks have equal coverage and sequence identity!  Cannot choose\n";
+	}
+    }
+    
+    ## unpack all blocks into linear array
+    foreach my $i (1..$blockNum) {
+	push @templines, $_ foreach @{ $unambiguous{$i} };
+    }
+    
+    ## update refGap, qryGap values per line, -> output
+    foreach my $i (0..$#templines) {
+	my @data = @{ $templines[$i] };  # ($refStart, $refEnd, $qryStart, $qryEnd, $blockLen, $idtPct, $refGap, $qryGap)
+	if ($i==0) {
+	    $data[6] = $data[7] = 0;
+	} else {
+	    my @data1 = @{ $templines[$i-1] };
+	    $data[6] = $data[0]-$data1[1]-1;
+	    $data[7] = $data[2]-$data1[3]-1;
+	}
+	push @lines_out, \@data;
+    }
+}
+
+
+sub process_cigar {
+    
+    my (%data, %lengths);
+    
+    open my $IN1, '<', $qryFa or die "$0: Cannot open '$qryFa' for reading: $!\n";
+    while (<$IN1>) {
+	chomp;
+	my ($seq, $len) = split /\t/, $_;
+	$lengths{$seq} = $len;
+    }
+    close $IN1;
+#    $lengths{'4MB.REGION'} = 3399500;
+    
+    open my $IN, "$lastz $refFa $qryFa --ambiguous=n --ambiguous=iupac --format=cigar |" or die "$0: Failed to open lastz output pipe: $!\n";
+    my ($LAV, $RAW);
+    
+    if ($writelav) {
+	open $LAV, '>', $writelav or die "$0: Failed to open lav handle '$writelav' for writing: $!\n";
+    }
+    if ($writeraw) {
+	open $RAW, '>', $writeraw or die "$0: Failed to open raw-txt handle '$writeraw' for writing: $!\n";
+    }
+    
+    open my $IN2, '<', "$tmp/cigar" or die "$0: Failed to read lastz output '$tmp/cigar': $!\n";
+    while (<$IN2>) {
+	chomp;
+	my ($cigar, $qry, $qstart, $qend, $qstr, $ref, $rstart, $rend, $rstr, $score, $align) = split /\s+/, $_, 11;
+	my ($qaln, $raln) = ($qend-$qstart, $rend-$rstart);
+	my $matched;
+	$matched += $1 while $align =~ /M (\d+)/g;
+	my $matchpct = sprintf("%0.2f", 100*$matched/$lengths{$qry});
+	push @{ $data{$qry}{$score} }, join("\t", $ref, $lengths{$ref}, $raln, $rstart, $rend, $qry, $lengths{$qry}, $qaln, $qstart, $qend, $qstr, $matched, "$matchpct\n");
+    }
+    close $IN2;
+    
+    open my $OUT, '>', $output or die "$0: Cannot open '$output' for writing: $!\n";
+    print $OUT "REF\tR.LEN\tR.ALN\tR.START\tR.END\tQRY\tQ.LEN\tQ.ALN\tQ.START\tQ.END\tQ.STR\tMATCHED\tMATCH%\n";
+    foreach my $qry (keys %data) {
+	my $topscore = (sort {$b <=> $a} keys %{ $data{$qry} })[0];
+	print $OUT @{ $data{$qry}{$topscore} };
+    }
+    close $OUT;
+}

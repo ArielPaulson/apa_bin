@@ -1,0 +1,86 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## Turns a raw-data Sample_Report.csv into a bioreports sample table, etc.
+
+my $csv;       # full path to Sample_Report.csv
+my $genomebp;  # if genomic DNA prep, give genome size for coverage calculation
+my $txomebp;   # if genomic RNA prep, give transcriptome size for coverage calculation
+my $flowcell;  # flowcell, in case cannot be extracted from path
+
+GetOptions("c=s"=>\$csv, "g=i"=>\$genomebp, "t=i"=>\$txomebp, "f=s"=>\$flowcell);
+die "Specify only one of -g (genome bp) or -t (transcriptome bp)!\n" if $genomebp && $txomebp;
+
+if ($csv !~ /^\//) {  # path does not start with a slash
+    chomp($csv = `readlink -f $csv`);  # ONLY works on linux
+    if (length($csv)==0) {  # 'readlink -f' didn't work
+	die "Bad CSV path.  Or, you are on a Mac, and did not give the full path to the file\n";
+    }
+}
+my @dirs = split /\//, $csv;
+#if (!$ordernum) {
+#    $ordernum = $dirs[-3];
+#    print STDERR "ORDER: $ordernum\n";
+#}
+if (!$flowcell) {
+    $flowcell = $dirs[-2];
+    print STDERR "FLOWCELL: $flowcell\n";
+}
+
+my %matrix;
+open my $IN, '<', $csv or die "Failed to read CSV file '$csv': $!\n";
+while (<$IN>) {
+    chomp;
+    next if $. == 1;
+    my ($fastq,$order,$type,$lane,$name,$library,$index,$null,$end,$genome,$lab,$totreads,$pfreads,$pfpct,$alnpct,$pairing,$readlen) = split /,/, $_;
+    next if $end == 2;  # already have data from end = 1
+    $matrix{$name}{sample} = $name;
+    $matrix{$name}{flowcell} = $flowcell;
+    $matrix{$name}{order} = $order;
+    $matrix{$name}{library} = $library;
+    $matrix{$name}{index} = $index;
+    $matrix{$name}{readlen} = $readlen;
+    $matrix{$name}{pairing} = $pairing;
+    $matrix{$name}{lanes}{$lane} = [$pfreads, $alnpct];
+}
+close $IN;
+
+my @fields = qw/ sample order library flowcell lanes index clusters readlen pairing /;  # also 'alnpct'
+my $depthbp;
+print join("\t", @fields);
+if ($genomebp) {
+    print "\tGenome Depth\n";
+    $depthbp = $genomebp;
+} elsif ($txomebp) {
+    print "\tTxome Depth\n";
+    $depthbp = $txomebp;
+} else {
+    print "\n";
+}
+foreach my $name (sort keys %matrix) {
+    my $depth;
+    foreach my $lane (keys %{ $matrix{$name}{lanes} }) {
+	my ($pfreads, $alnpct) = @{ $matrix{$name}{lanes}{$lane} };
+	$matrix{$name}{clusters} += $pfreads;
+	$matrix{$name}{alnpct} += $alnpct*$pfreads/100;
+    }
+    $matrix{$name}{alnpct} /= $matrix{$name}{clusters};
+    $depth = $matrix{$name}{clusters} * $matrix{$name}{readlen};
+    if ($matrix{$name}{pairing} eq 'paired') {
+	$depth *= 2;
+	$matrix{$name}{pairing} = 'PE';
+    } else {
+	$matrix{$name}{pairing} = 'SE';
+    }
+    my @lanes = sort {$a <=> $b} keys %{ $matrix{$name}{lanes} };
+    $matrix{$name}{lanes} = join('-', $lanes[0], $lanes[-1]);
+    
+    print join("\t", map { $matrix{$name}{$_} } @fields);
+    if ($genomebp || $txomebp) {
+	printf "\t%0.1fx\n", $depth/$depthbp;
+    } else {
+	print "\n";
+    }
+}

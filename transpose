@@ -1,0 +1,53 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use strict;
+
+my $transpose_fast = '/home/apa/local/bin/scriptutils/transpose-fast';
+
+my ($file, $delim, $stdio, $fast);
+GetOptions("i=s"=>\$file, "d=s"=>\$delim, ""=>\$stdio, "fast=s"=>\$fast);
+$delim = "\t" unless defined $delim;
+
+my (@lines, $IN, $ncols);
+
+if ($stdio) {
+    $IN = *STDIN;
+} else {
+    open $IN, $file or die "$0: cannot read input file '$file': $!\n";
+}
+
+if ($fast) {
+	
+	die "$0: Fast-transpose only works on tab-delimited data!\n" unless $delim eq "\t";
+	my ($cols, $max_row_bytes) = split /,/, $fast;
+	print STDERR "Fast-transposing with $cols columns and allowing $max_row_bytes max bytes per row...\n";
+	system "$transpose_fast $file $cols $max_row_bytes";
+	
+} else {
+	
+	print STDERR "Reading...\n";
+	while (<$IN>) {
+		s/[\n\r]+$//;
+		my @data = split /$delim/, $_;
+		my $I = $. > 1 ? $ncols : $#data;
+		foreach my $i (0..$#data) {
+			push @{ $lines[$i] }, $data[$i];
+		}
+		$ncols = $#data if $. == 1;  # set expected columns to whatever first row had; this way incomplete rows get flushed
+	}
+	close $IN;
+	
+	print STDERR "Writing...\n";
+	foreach my $i (0..$#lines) {
+		print join($delim, @{ $lines[$i] }), "\n";
+	}
+	
+	## Force-flush buffer before script commits suicide
+	$| = 1;
+	print '';
+	
+}
+
+print STDERR "$0 complete!\n";
+system "kill $$" unless $fast;  # avoid implicit exit(), esp. in case of massive input files
+

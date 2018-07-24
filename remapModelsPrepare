@@ -1,0 +1,370 @@
+#!/usr/bin/env perl
+require '/home/apa/local/bin/apa_routines.pm';
+use Getopt::Long;
+use File::Spec;
+use Pod::Usage;
+use strict;
+
+
+## Intended to map known genes into new genomes, a la UCSC.
+## Inputs: old genome fasta, old genome GTF, new genome fasta.
+## Outputs: new genome GTF.
+## Basically this is a wrapper for targeted Exonerate jobs.
+## For each gene:
+## 1. Gmaps first, last 5k of gene exonic space to determine boundaries.
+##    A. Retries with entire sequence if failure. (retry params -- full seq, full genome, intron 3MB, lower ident, multiple paths??)
+##    B. Extends partial matches by 1MB.
+## 2. Retrieves sequence for gmap hit region.
+## 3. Exonerates all transcripts for gene into region sequence.
+
+
+## Dependencies
+my $bin = '/home/apa/local/bin';
+my $exonerate2gtf = "$bin/exonerate2gtf";
+my $gtf2beds = "$bin/gtf2beds";
+my $gtf2fa = "$bin/gtf2fa";
+my $fasta2tab = "$bin/fasta2tab";
+my $tab2fasta = "$bin/tab2fasta";
+my $fastaFromBed = 'fastaFromBed';
+my $fastaExplode = 'fastaExplode';
+my $exonerate = 'exonerate';
+
+
+## Inputs
+my $outdir;      # output location
+my $clobber;     # output location, if clobbering allowed
+my $oldgenome;   # old genome toplevel fasta
+my $newgenome;   # new genome toplevel fasta
+my $oldgtf;      # gene models GTF for old genome
+my $tmp;         # specify existing temp location to restart pipeline (ASSUMES ALL SKIPPED STEPS WERE ALREADY COMPLETED !!!!!!)
+my $deploy = 'lepus';  # cluster/server where alignment jobs will be run  ## MUST HAVE GMAP BUILD TO FOR THAT SERVER -- SEE $gmap BELOW
+my $gmap_db;     # GMAP genome DB dir, **** which must be named "<genome name>.gmap" ****, i.e. arguments -D, -d to GMAP must match: -D $name.gmap -d $name
+my $gmap_chrdb;  # directory in which exist chromosomal GMAP DB dirs, **** each named "$chr.gmap" ****, i.e. arguments -D, -d to GMAP must match: -D $name.gmap -d $name
+my $chreqfile;   # IF $GMAP_CHRDB: must specify when to use which chr db, with this 2-col file: old chr name, new (db) chr name (expects 1 header row, too).
+
+
+## Get and Test Arguments
+GetOptions("o=s"=>\$outdir, "oc=s"=>\$clobber, "fo=s"=>\$oldgenome, "fn=s"=>\$newgenome, "g=s"=>\$oldgtf, "b=i"=>\$batchsize, "temp=s"=>\$tmp, "ggd=s"=>\$gmap_db, "gcd=s"=>\$gmap_chrdb, "ce=s"=>\$chreqfile);
+
+die "$0: Old-genome fasta '$oldgenome' does not exist!\n" unless -e $oldgenome;
+die "$0: New-genome fasta '$newgenome' does not exist!\n" unless -e $newgenome;
+die "$0: Old-genome GTF '$oldgtf' does not exist!\n" if $oldgtf && ! -e $oldgtf;
+
+
+## Test GMAP settings
+my $gmap = "/home/apa/local/install/gmap/gmap_$deploy/bin/gmap";
+my @chrdbs;
+die "$0: No GMAP build was found for server '$deploy'!\n" unless -e $gmap;
+die "$0: GMAP genomic database '$gmap_db' was not found!\n" unless -d $gmap_db;
+if ($gmap_chrdb) {
+    my $CE = &open2('R', $chreqfile, 'chromosome equivalence file');  # dies if $chreqfile not specified
+    while (<$CE>) {
+		next if $. == 1;
+		s/[\n\r]+$//;
+		my ($oldchr, $newchr, $newlen) = (split /\t/, $_)[0..2];  # ignoring any additional columns
+		$chreq{ON}{$oldchr} = $newchr;
+		$chreq{NO}{$newchr} = $oldchr;
+		$chreq{NL}{$newchr} = $newlen;
+		$chreq{DB}{$oldchr} = "$gmap_chrdb/$newchr.gmap";
+		die "$0: expected new-chromosome '$newchr' gmap db '$chreq{DB}{$oldchr}' does not exist!\n" unless -d $chreq{DB}{$oldchr};
+    }
+    close $CE;
+} else {
+	die "$0: No GMAP databases specified!\n";
+}
+
+my $newgrefs = "$tmp/new.gene.refs";
+my $gmap_gtf = "$tmp/to-gmap.gtf";
+my $gmap_in = "$outdir/gmap_in";
+my $gmap_out = "$outdir/gmap_out";
+my $gmap_array = "$outdir/gmap.array";
+my $exo_in = "$outdir/exonerate_in";
+my $exo_refs = "$outdir/exonerate_refs";
+my $exo_out = "$outdir/exonerate_out";
+my $exo_err = "$outdir/exonerate_err";
+my $exo_ann = "$outdir/exonerate_ann";
+my $exo_gtf = "$outdir/exonerate_gtf";
+my $exo_array = "$outdir/exonerate.array";
+my $qsub_in = "$outdir/qsub_in";
+my $qsub_out = "$outdir/qsub_out";
+my $qsub_sh_b = "$outdir/qsub.gmap.sh";
+my $qsub_sh_e = "$outdir/qsub.exonerate.sh";
+my $batch_array = "$outdir/batch.qsub.array";
+my $batch_err = "$outdir/batch.qsub.err";
+my $batch_out = "$outdir/batch.qsub.out";
+
+
+## Locations, Files and Filehandles
+my $skip = $tmp ? 1 : 0;
+if ($skip) {
+    $outdir = File::Spec->rel2abs($clobber);
+} else {
+    $outdir = 'remapModels' unless $outdir || $clobber;
+    $outdir = &create_writedir($outdir, $clobber, $0, "Output location");
+    $tmp = "$outdir/intermediate";
+    print STDERR "\nPreparing output locations...\n";
+    &validate('dir', $_) foreach ($tmp, $chrbatch, $newgrefs, $qsub_in, $qsub_out, $gmap_in, $qsub_out, $exo_in, $exo_refs, $exo_out, $exo_err, $exo_ann, $exo_gtf);
+}
+
+
+## Globals
+my %GTU;     # gene and transcript headers; gene-to-transcript mappings
+my %files;   # lookup for various gene- or transcript-related filenames
+my %locus;   # locus-level remappings (gmap)
+my %newgtf;  # exon-level remappings (exonerate)
+my %stats;   # some remapping stats
+my %chreq;   # chromosome equivalence table
+
+my $maxintron  =  100000;
+my $maxintron2 = 3000000;
+
+
+## Process GTF to get sequences and metadata
+print STDERR "\nProcessing genes: ",`date`;
+my $tmpgtf = "$tmp/GTF";
+(my $tmpgtfname = $gtf) =~ s/.*\///;
+$tmpgtfname =~ s/\.gtf$//i;
+$tmpgtfname = "$tmp/$tmpgtfname";
+unless ($skip) {
+	&execute("ln -sf $oldgtf $tmpgtf", 2);
+	&execute("$gtf2beds $tmpgtf $tmp", 2);
+}
+my $oldgbed = "$tmpgtfname.genes.bed";
+my $genefasta = "$tmp/genes.fa";
+my $transfasta = "$tmp/transcripts.fa";
+
+
+## Gene Chr Start End Strand TotLen UxonLen N_Trans N_Exons N_Uxons Genomic_CDS_Start Genomic_CDS_End annotation biotype db_xref gene_name proteinid source transcriptid
+## Load genewise data
+my $tmpgd = "$tmpgtfname.gene_data.txt";
+my $GD = &open2('R', $tmpgd, 'gene data file');
+while (<$GD>) {
+    next if $. == 1;
+    my ($gene, $chr, $start, $end, $strand, $uxlen, $nuxons) = (split /\t/, $_)[0..4,6,9];
+    $GTU{G}{$gene} = [$chr, $start, $end, $strand, $uxlen, $nuxons];
+    $GT{G2C}{$gene} = $chr;
+    $GT{C2G}{$chr}{$gene} = 1;
+}
+close $GD;
+
+
+## Transcript Gene Chr Start End Strand TotLen SpliceLen N_Exons N_Constitutive N_Singleton Genomic_CDS_Start Genomic_CDS_End annotation biotype db_xref gene_name proteinid source transcriptid
+## Load transcriptwise data
+my $tmptd = "$tmpgtfname.transcript_data.txt";
+my $TD = &open2('R', $tmptd, 'transcript data file');
+while (<$TD>) {
+    next if $. == 1;
+    my ($trans, $gene, $else) = split /\t/, $_, 3;
+    $GT{T2G}{$trans} = $gene;
+    $GT{G2T}{$gene}{$trans} = 1;
+}
+close $TD;
+
+
+## Load uxonic data
+my $tmpux = "$tmpgtfname.gene_uxons.bed";
+my $UX = &open2('R', $tmpux, 'uxons bed file');
+while (<$UX>) {
+	s/[\n\r]+$//;
+    my @data = split /\t/, $_;
+    my ($gene, $n) = split /:/, $data[3];
+    push @{ $GT{U}{$gene} }, [@data];
+}
+close $UX;
+
+
+
+unless ($skip) {
+	
+	print STDERR "\nProcessing all transcripts: ",`date`;
+	
+	## Make uxonic GTF with one master sequence per gene
+	open my $GTFO, '|-', "sort -k1,1d -k4,4n > $gmap_gtf";
+	foreach my $gene (keys %{ $GT{G} }) {
+		my ($chr, $start, $end, $strand, $uxlen, $nuxons) = @{ $GT{G}{$gene} };
+		foreach (@{ $GT{U}{$gene} }) {
+			my ($chr, $stsrt, $end, $name, $score, $strand) = @$_;
+			my ($gene, $u) = split /:/, $name;
+			print $GTFO join("\t", $chr, "uxon\texon", $start, $end, '.', $strand, '.', "gene_id \"$gene\"; transcript_id \"$gene.1\";\n");
+		}
+	}
+	close $GTFO;
+	
+	## Convert to sequence and explode into GMAP input files
+  &execute("$gtf2fa $oldgenome $gmap_gtf $gmap_fasta", 2);
+  &execute("$fastaExplode $gmap_fasta $gmap_in", 2);
+	
+  ## Generate/explode full transcript sequences
+  &execute("$gtf2fa $oldgenome $oldgtf $transfasta --with-gene", 2);
+  &execute("$fastaExplode $transfasta $exo_in", 2);
+
+  while read line
+do
+    trans=$(echo $line | cut -f1 -d' ')
+    echo $line > exonerate_ann/$trans.ann
+done < <(cat ~/bbuild/builds/mm10/Ens_80/mm10.Ens_80.transdata_new.txt | awk '{ print $1" + "$20" "$21 }')
+
+}  # END UNLESS $SKIP
+
+
+## Write exonerate script
+my $awk_str = 'BEGIN { OFS="\t" } { if ($3=="exon") { nex++; }; $1=chr; $4+=start; $5+=start; $9="gene_id \""gene"\"; transcript_id \""trans"\"; exon_number \""nex"\";"; print $0 }';
+my $exon_sh = "#!/bin/bash
+
+gene=\$1
+trans=\$2
+
+genefa=$exo_refs/\$gene.fa
+transfa=$exo_in/\$gene.\$trans.fa
+ann=$exo_ann/\$trans.ann
+out=$exo_out/\$gene.\$trans.out
+err=$exo_err/\$gene.\$trans.err
+gtf=$exo_gtf/\$gene.\$trans.gtf
+
+exonerate -m cdna2genome --refine full --revcomp --bestn 1 --minintron 1 --maxintron 1000000000 --showcigar --showtargetgff --annotation \$ann -t \$genefa -q \$transfa > \$out 2> \$err
+
+chrstastr=\$(grep \$gene *.bed | cut -f2 -d: | cut -f1,2,6)
+chr=\$(echo \$chrstastr | cut -f1 -d' ')
+start=\$(echo \$chrstastr | cut -f2 -d' ')
+strand=\$(echo \$chrstastr | cut -f3 -d' ')
+
+if [ \$strand == '+' ]; then
+    grep ^\$gene \$out | grep -P \"\\t(cds|exon)\\t\" | sort -k4,4n -k3,3dr | awk -F\"\\t\" -v chr=\$chr -v start=\$start -v gene=\$gene -v trans=\$trans '$awk_str' > \$gtf
+else
+    grep ^\$gene \$out | grep -P \"\\t(cds|exon)\\t\" | sort -k4,4nr -k3,3dr | awk -F\"\\t\" -v chr=\$chr -v start=\$start -v gene=\$gene -v trans=\$trans '$awk_str' | sort -k4,4n -k3,3dr > \$gtf
+fi
+";
+
+die;
+
+
+
+
+#########   WORKING HERE   #########
+
+
+
+
+
+## Write qsub scripts.
+## There are three stages, each run separately.
+## Stage 1: initial mapping.
+##  A. GMAP gene flanks vs new genome. (1 call per gene)
+##  B. Process GMAP results:
+##    i.   extract fully-successful mappings.
+##    ii.  re-run partially-successful and failed mappings; see re-run params description at top.
+##    iii. convert final coords per gene into references for exonerate.
+##  C. Exonerate all transcripts into their respective gene sequences from GMAP. (1 call per transcript)
+##  D. Process Exonerate results -> final GTF and reports.
+##  FUTURE: convert changes in new into VCF -> snpEff?
+
+#bash -c 'time ($gmap -D $db -d $dbname -n 0 -f 1 -K $maxintron $gmap_infa > $gmap_out.psl) 2> $gmap_out.err'
+#bash -c 'time ($gmap -D $gmap_db -d $gmap_dbname -n 0 -f 1 -K $maxintron2 $gmap_infa > $gmap_out.psl) 2> $gmap_out.err'
+
+
+print STDERR "\nWriting qsub scripts: ",`date`;
+my $QARR1 = &open2('W', $gmap_array, 'Gmap array');
+my $QARR2 = &open2('W', $exo_array, 'Exonerate array');
+foreach my $batchL (sort keys %{ $files{B} }) {
+    foreach my $batchN (sort {$a <=> $b} keys %{ $files{B}{$batchL} }) {
+		$gmap_batches++;
+		my $SCR1 = &open2('W', $files{B}{$batchL}{$batchN}{qsub_in}, 'qsub script');
+		print $QARR1 "$files{B}{$batchL}{$batchN}{qsub_in}\n";
+		my $gmapref = $new2bit;
+		if ($samechr) {
+			my $newchr = $chreq{ON}{$batchL};
+			my $newlen = $chreq{NL}{$newchr};
+			$gmapref .= ":$newchr:1-$newlen";
+		}
+		print $SCR1 "$gmap -D /n/data1/genomes/Mus_musculus/129S1/129S1.gmap -d 129S1 -f 1 -n 0 -t $cores $files{B}{$batchL}{$batchN}{gmap_in} > $files{B}{$batchL}{$batchN}{gmap_out} 2> $files{B}{$batchL}{$batchN}{gmap_err}";
+#		print $SCR1 "$filterAligns -f $files{B}{$batchL}{$batchN}{gmap_out} -q $files{B}{$batchL}{$batchN}{gmap_in} -t gmap --more --best --lost\n";
+#		print $SCR1 "tail -n +6 $files{B}{$batchL}{$batchN}{best_out} | awk 'BEGIN { OFS=\"\\t\" } { print \$14,\$16,\$17,\$10\".\"\$14\".\"\$16\".\"\$17,\$24,\$9 }' > $files{B}{$batchL}{$batchN}{best_out}.bed\n";
+#		print $SCR1 "$fastaFromBed -name -fi $newgenome -bed $files{B}{$batchL}{$batchN}{best_out}.bed -fo $files{B}{$batchL}{$batchN}{best_out}.fa\n";   ### DO NOT USE -s: NEW SEQUENCE MUST BE GENOMIC 5', NOT REVCOMP
+#		print $SCR1 "perl -i -pe 's/(\\w{50})/\$1\\n/g' $files{B}{$batchL}{$batchN}{best_out}.fa\n";
+#		print $SCR1 "$fastaExplode -f $files{B}{$batchL}{$batchN}{best_out}.fa -o $newgrefs\n";
+#		print $SCR1 "exit\n";
+		close $SCR1;
+		
+		foreach my $gene (sort keys %{ $files{B}{$batchL}{$batchN}{genes} }) {
+			next unless -e $files{G}{$gene}{new_fa};   # some genes may not have gmapted
+			$exo_batches++;
+			my $SCR2 = &open2('W', $files{G}{$gene}{qsub_in}, 'qsub script');
+			print $QARR2 "$files{G}{$gene}{qsub_in}\n";
+			print $SCR2 "#!/bin/bash\n\n## Gene $gene\n";
+			chomp(my $newcoord = split /\t/, `grep -P "\t$gene\t" $files{B}{$batchL}{$batchN}{best_out}.bed | tail -1 | sed "s/\t/,/g"`);   # should produce one string like "chrom,start,end,name,score,strand"
+			foreach my $trans (keys %{ $GT{G2T}{$gene} }) {
+			    print $SCR2 "\n## Transcript $trans\n";
+				print $SCR2 "time $exonerate -m cdna2genome -c $cores --revcomp --bestn 1 --minintron 1 --maxintron 1000000000 --showcigar --showtargetgff --annotation -t $files{G}{$gene}{new_fa} -q $files{T}{$trans}{exo_in} > $files{T}{$trans}{exo_out} 2> $files{T}{$trans}{exo_err}\n";
+				print $SCR2 "$exonerate2gtf -i $files{T}{$trans}{exo_out} -o $files{T}{$trans}{exo_pref} -r $files{G}{$gene}{new_fa} -n $newcoord\n";
+			}
+			close $SCR2;
+		}
+    }
+}
+close $QARR1;
+close $QARR2;
+
+
+my $QSHP = &open2('W', $qsub_sh_b, 'gmap qsub launcher');
+print $QSHP "qsub -t 1-$gmap_batches:1 -pe mpich $cores -q all.q -b y -cwd -N remapModels.gmap -o $batch_out -e $batch_err '\$(sed -n \${SGE_TASK_ID}p $batch_array)'\n";
+close $QSHP;
+
+my $QSHE = &open2('W', $qsub_sh_e, 'exonerate qsub launcher');
+print $QSHE "qsub -t 1-$exo_batches:1 -pe mpich $cores -q all.q -b y -cwd -N remapModels.exonerate -o $batch_out -e $batch_err '\$(sed -n \${SGE_TASK_ID}p $batch_array)'\n";
+close $QSHE;
+
+
+## Exit
+print STDERR "\n$0 complete: ",`date`;
+exit;
+
+
+
+
+
+
+
+
+sub write_seq {
+    
+    my ($HEADER, $SEQ, $FILE) = @_;
+    open my $FA, '>', $FILE or die "$0: Failed to write fasta file '$FILE': $!\n";
+    print $FA ">$HEADER\n",${ &blockify($SEQ) },"\n";
+    close $FA;
+    
+}
+#!/bin/bash
+
+
+sub exonerate_script {
+
+my $script = <<EOF;
+
+gene=\$1
+trans=\$2
+
+genefa=$exo_refs/\$gene.fa
+transfa=$exo_in/\$gene.\$trans.fa
+ann=$exo_ann/\$trans.ann
+out=$exo_out/\$gene.\$trans.out
+err=$exo_err/\$gene.\$trans.err
+gtf=$exo_gtf/\$gene.\$trans.gtf
+
+exonerate -m cdna2genome --refine full --revcomp --bestn 1 --minintron 1 --maxintron 1000000000 --showcigar --showtargetgff --annotation \$ann -t \$genefa -q \$transfa > \$out 2> \$err
+
+chrstastr=\$(grep \$gene *.bed | cut -f2 -d: | cut -f1,2,6)
+chr=\$(echo \$chrstastr | cut -f1 -d' ')
+start=\$(echo \$chrstastr | cut -f2 -d' ')
+strand=\$(echo \$chrstastr | cut -f3 -d' ')
+
+if [ \$strand == '+' ]; then
+    grep ^\$gene \$out | grep -P "\\t(cds|exon)\\t" | sort -k4,4n -k3,3dr | awk -F"\\t" -v chr=\$chr -v start=\$start -v gene=\$gene -v trans=\$trans 'BEGIN { OFS="\\t" } { if (\$3=="exon") { nex++; }; \$1=chr; \$4+=start; \$5+=start; \$9="gene_id \""gene"\"; transcript_id \""trans"\"; exon_number \""nex"\";"; print \$0 }' > \$gtf
+else
+    grep ^\$gene \$out | grep -P "\\t(cds|exon)\\t" | sort -k4,4nr -k3,3dr | awk -F"\\t" -v chr=$chr -v start=\$start -v gene=\$gene -v trans=\$trans 'BEGIN { OFS="\\t" } { if (\$3=="exon") { nex++; }; \$1=chr; \$4+=start; \$5+=start; \$9="gene_id \""gene"\"; transcript_id \""trans"\"; exon_number \""nex"\";"; print \$0 }' | sort -k4,4n -k3,3dr > \$gtf
+fi
+
+EOF
+
+return $script;
+
+}

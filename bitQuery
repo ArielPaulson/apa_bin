@@ -1,0 +1,34 @@
+#!/usr/bin/perl
+use strict;
+
+my $N = 12;
+my @bitvals = (0,1,2,4,8,16,32,64,128,256,512,1024);
+my @bitnames = map { "0x0$_" } qw/ 001 002 004 008 010 020 040 080 100 200 400 /;
+unshift @bitnames, 'NoFlag';  # the 'missing' flag
+my %aligns;
+my $flags;
+
+while (my $flag = <STDIN>) {
+    $flags++;
+    foreach my $bitval (@bitvals) {
+	$aligns{$bitval}++ if $flag & $bitval;
+    }
+}
+my $Nwidth = length($flags);
+$Nwidth = 7 if $Nwidth < 7;  # minimum width, for 'N.Lines'
+
+print "\n$flags Lines.\n\n";
+printf ("%-6s  %5s  %${Nwidth}s  %8s\n", qw/ Name Value N.Lines %.Lines /);
+foreach my $i (1..$N) {
+    my ($bitval, $bitname) = ($bitvals[$i-1], $bitnames[$i-1]);
+    my $Naligns = $aligns{$bitval};
+    printf ("%6s  %5d  %${Nwidth}d  %8.2f\n", $bitname, $bitval, $Naligns, 100*$Naligns/$flags);
+}
+
+
+###### ADD COMBINATORICS
+
+
+exit;
+
+

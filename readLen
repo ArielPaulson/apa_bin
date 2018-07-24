@@ -1,0 +1,12 @@
+#!/usr/bin/perl
+
+open IN, $ARGV[0] or die "Cannot read from '$ARGV[0]': $!\n";
+while (<IN>) {
+    $i++;
+    $i = 0 if $i == 4;
+    if ($i == 2) {
+	$_ =~ s/[\n\r]+$//;
+	print length($_), "\n";
+    }
+}
+

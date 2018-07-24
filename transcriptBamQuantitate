@@ -1,0 +1,212 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Data::Dumper;
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+die;   # THIS SHOULD BE FULLY DEPRECATED.  PLEASE USE BAMQUANTITATE.
+
+
+## Quantitates unstr / sense / antisense counts (and maybe pcts, RPKMs) for each reference in a bam file
+
+my $ndec = 6;  # decimals to carry for floats
+
+my ($bam, $geno, $anno, $outfile, $PE, $pct, $rpkm, $M,      $nomulti);  ## $nomulti mode not supported yet!
+
+GetOptions("b=s"=>\$bam, "g=s"=>\$geno, "a=s"=>\$anno, "o=s"=>\$outfile, "PE"=>\$PE, "pct"=>\$pct, "rpkm"=>\$rpkm, "Mval=i"=>\$M);   # , "n=s"=>\$nomulti
+
+die "$0: bam file '$bam' does not exist!\n" unless -e $bam;
+my $have_ga = $geno ? 1 : 0;
+$have_ga++ if $anno;
+die "$0: -g and -a must both be specified, or both blank!\n" if $have_ga == 1;
+my ($gdat, $tdat);
+if ($have_ga) {
+	$tdat = "/n/data1/genomes/indexes/$geno/$anno/$geno.$anno.transdata.txt";
+	$gdat = "/n/data1/genomes/indexes/$geno/$anno/$geno.$anno.genedata.txt";
+	die "$0: required transcript data file '$tdat' does not exist!\n" unless -e $tdat;  # assume if $tdat is OK, then so is $gdat.
+} else {
+	## aligned to transcript reference that was not tied to a geno/anno build
+	## do nothing yet
+}
+
+my $tmp = "transcriptBamQuantitate.$$.tmp";
+system "mkdir $tmp";
+die "$0: failed to create temp location '$tmp'!\n" unless -d $tmp;
+
+
+print "Reading annotations...\n"; 
+
+my ($isnum, %tname, %ti, %tstr, %tg, %gstr, %glen);
+
+system "samtools index $bam" unless -e "$bam.bai";
+chomp(my $test = `samtools idxstats $bam | head -1 | cut -f1`);
+if ($test eq '0') {
+	## assume aligned to transcriptome index and that transcript ids are numbers 0-N
+	$isnum = 1;
+	my $gtfi = "/n/data1/genomes/indexes/$geno/$anno/$geno.$anno.cuff.gtf.index";
+	my $tlst = "$gtfi/$geno.$anno.cuff.fa.tlst";
+	die "$0: BAM appears to have been aligned to transcriptome index at '$gtfi/', but associated .tlst file does not exist!\n" unless -e $tlst;
+	open TL, '<', $tlst;
+	while (<TL>) {
+		my ($i, $trans) = (split / /, $_)[0,1];
+		$tname{$i} = $trans;
+		$ti{$trans} = $i;
+	}
+	close TL;
+}
+
+if ($have_ga) {
+	
+	open TD, '<', $tdat;
+	while (<TD>) {
+		next if $. == 1;
+		s/[\n\r]+$//;
+		my ($trans, $gene, $strand) = (split /\t/, $_)[0,2,6];
+		$tstr{$trans} = $strand;
+		$tg{$trans} = $gene;
+		next unless $isnum;
+		$trans = $ti{$trans};   ## CONVERT NAME -> NUM
+		$tstr{$trans} = $strand;  # store with numeric key as well
+	}
+	close TD;
+
+	open GD, '<', $gdat;
+	while (<GD>) {
+		next if $. == 1;
+		s/[\n\r]+$//;
+		my ($gene, $strand, $uxlen) = (split /\t/, $_)[0,5,7];
+		$gstr{$gene} = $strand;
+		$glen{$gene} = $uxlen;
+	}
+	close GD;
+	
+}
+
+print "Splitting bam...\n"; 
+
+my $naligns;
+open PBAMS, '|-', "samtools view -bS - > $tmp/plus.S.bam";
+open PBAMA, '|-', "samtools view -bS - > $tmp/plus.A.bam";
+open MBAMS, '|-', "samtools view -bS - > $tmp/minus.S.bam" if $have_ga;
+open MBAMA, '|-', "samtools view -bS - > $tmp/minus.A.bam" if $have_ga;
+open SH, '-|', "samtools view -H $bam";
+while (<SH>) {
+	print PBAMS $_;
+	print PBAMA $_;
+	print MBAMS $_ if $have_ga;
+	print MBAMA $_ if $have_ga;
+}
+close SH;
+open SAM, '-|', "samtools view -F 4 $bam";
+while (<SAM>) {
+	$naligns++;
+	my ($name, $flags, $trans, $else) = split /\t/, $_, 4;
+	my $fwd = $flags & 16 ? 0 : 1;
+	my $end = $flags & 128 ? 2 : 1;
+	my $e1fwd = !$PE ? $fwd : ($end == 1 && $fwd) ? 1 : ($end == 2 && !$fwd) ? 1 : 0;
+	if ($have_ga) {
+		if ($tstr{$trans} eq '+') {
+			if ($e1fwd) {
+				print PBAMS $_;
+			} else {
+				print PBAMA $_;
+			}
+		} elsif ($tstr{$trans} eq '-') {
+			if ($e1fwd) {
+				print MBAMA $_;
+			} else {
+				print MBAMS $_;
+			}
+		} else {
+			$trans = $tname{$trans} if $isnum;   ## CONVERT NUM -> NAME
+			die "$0: BAM transcript '$trans' ($tname{$trans}) was not found in transcript annotations:\n$_";
+		}
+	} else {
+		if ($e1fwd) {
+			print PBAMS $_;
+		} else {
+			print PBAMA $_;
+		}
+	}
+}
+close $_ foreach qw/ SAM PBAMS PBAMA /;
+close MBAMS if $have_ga;
+close MBAMA if $have_ga;
+
+
+print "Writing values...\n";
+
+my (%idx, %stats);
+if ($nomulti) {
+#	## $nomulti must be the aligner name
+#	system "/home/apa/local/bin/stripMultireads --mode2 --index --\L$nomulti $tmp/*.bam";
+#	
+} else {
+	my @strands = $have_ga ? ('plus','minus') : ('plus');
+	foreach my $str (@strands) {
+		foreach my $SA (qw/ S A /) {
+			system "samtools index $tmp/$str.$SA.bam";
+			open IN, '-|', "samtools idxstats $tmp/$str.$SA.bam";
+			while (<IN>) {
+				next if /^\*/;
+				chomp;
+				my ($trans, $len, $reads) = split /\t/, $_;
+				$trans = $tname{$trans} if $isnum;
+				my $gene = $tg{$trans};
+				$stats{U} += $reads;
+				$stats{$SA} += $reads;
+				$idx{T}{$trans}{L} = $len;
+				$idx{T}{$trans}{$SA} += $reads;
+				$idx{T}{$trans}{U} += $reads;
+				if ($have_ga) {
+					$idx{G}{$gene}{L} = $glen{$gene};
+					$idx{G}{$gene}{$SA} += $reads;
+					$idx{G}{$gene}{U} += $reads;
+				} else {
+					$tstr{$trans} = '.';
+				}
+			}
+			close IN;
+		}
+	}
+}
+
+$M = $naligns unless $M;
+open OUT, '>', $outfile;
+print OUT "FEATURE\tID\tLENGTH\tSTRAND\tCTS.U\tCTS.S\tCTS.A";
+print OUT "\tPCT.U\tPCT.S\tPCT.A" if $pct;
+print OUT "\tRPKM.U\tRPKM.S\tRPKM.A" if $rpkm;
+print OUT "\n";
+if ($have_ga) {
+	foreach my $gene (sort keys %{ $idx{G} }) {
+		my $dat = "GENE\t$gene\t$idx{G}{$gene}{L}\t$gstr{$gene}";
+		my $cts = join("\t", map { $idx{G}{$gene}{$_} } qw/ U S A /);
+		my $pcts = join("\t", map { sprintf("%0.${ndec}f",$idx{G}{$gene}{$_}/$M) } qw/ U S A /);
+		my $rpkms = join("\t", map { sprintf("%0.${ndec}f",(1E9*$idx{G}{$gene}{$_})/($idx{G}{$gene}{L}*$M)) } qw/ U S A /);
+		print OUT "$dat\t$cts";
+		print OUT "\t$pcts" if $pct;
+		print OUT "\t$rpkms" if $rpkm;
+		print OUT "\n";
+	}
+}
+foreach my $trans (sort keys %{ $idx{T} }) {
+	my $dat = "TRANS\t$trans\t$idx{T}{$trans}{L}\t$tstr{$trans}";
+	my $cts = join("\t", map { $idx{T}{$trans}{$_} } qw/ U S A /);
+	my $pcts = join("\t", map { sprintf("%0.${ndec}f",$idx{T}{$trans}{$_}/$M) } qw/ U S A /);
+	my $rpkms = join("\t", map { sprintf("%0.${ndec}f",(1E9*$idx{T}{$trans}{$_})/($idx{T}{$trans}{L}*$M)) } qw/ U S A /);
+	print OUT "$dat\t$cts";
+	print OUT "\t$pcts" if $pct;
+	print OUT "\t$rpkms" if $rpkm;
+	print OUT "\n";
+}
+close OUT;
+
+print "UNSTR $stats{U}\n";
+print "SENSE $stats{S}\n";
+print "ANTI  $stats{A}\n";
+
+system "rm -rf $tmp";
+exit;
+

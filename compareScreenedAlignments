@@ -1,0 +1,207 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## Compares alignments pre- and post-screening (for vector, transposons, etc).
+## Allows sites of non-golden-path vector insertion to be determined.
+## Same set of reads must be aligned twice; one set as original reads, and the other as post-screening fragments.
+## Only reads that were affected by screening should be aligned.  Reads that with no vector or all-vector are not informative.
+
+
+
+## Inputs
+my $origaln;  # alignments of original read set
+my $fragaln;  # alignments of post-screening fragments (read names should have ".##" suffixes when > 1 fragment exists)
+my $type;     # type of alignment file ('bam' or 'psl') if not detectable in filename
+my $screenfa; # screened sequences (including X) of original reads
+my $outbed;   # output bed-like file
+
+GetOptions("o=s"=>\$origaln, "f=s"=>\$fragaln, "t=s"=>\$type, "s=s"=>\$screenfa, "b=s"=>\$outbed);
+
+
+## Validate inputs
+die "$0: Original-read alignments $fragaln' not found!\n" unless -e $fragaln;
+die "$0: Read-fragment alignments '$origaln' not found!\n" unless -e $origaln;
+my %okTypes = map {($_=>1)} qw/ bam psl /;
+($type) = ($origaln =~ /\.([^.]+)$/) unless $type;
+die "Unsupported alignment type '$type'!  Must be 'bam' or 'psl', if not detectable in filename\n" unless $okTypes{$type};
+
+
+## Globals and filehandles
+my %scrseq;   # screened read sequence
+my %aligns;   # alignment data
+my %stats;    # summary data
+my $SCRF;     # screened-sequence fasta FH
+open my $OUT, '>', $outbed or die "$0: Failed to write to '$outbed': $!\n";  # outbed FH
+
+
+
+## Read in original screened sequences
+print "Reading screened sequences...\n";
+if ($screenfa =~ /\.gz$/) {
+    open $SCRF, '-|', "gunzip -c $screenfa" or die "$0: cannot read screened-sequence fasta '$screenfa': $!\n";
+} else {
+    open $SCRF, '<', $screenfa or die "$0: cannot read screened-sequence fasta '$screenfa': $!\n";
+}
+my $header;
+while (<$SCRF>) {
+    s/[\n\r]+$//;
+    if (/^>(\S+)/) {
+	$header = $1;
+    } else {
+	$scrseq{$header} .= "\L$_";
+    }
+}
+close $SCRF;
+
+
+## Read in alignments
+if ($type eq 'bam') {
+    
+    print "Reading fragment bam...\n";
+    &read_bam($fragaln,'F');
+    print "Reading original bam...\n";
+    &read_bam($origaln,'O');
+    
+} elsif ($type eq 'psl') {
+    
+    print "Reading fragment psl...\n";
+    &read_psl($fragaln,'F');
+    print "Reading original psl...\n";
+    &read_psl($origaln,'O');
+    
+}    
+
+
+## Comparison and outbed
+## right now the only comparison is looking for reads that aligned _only_ as fragments, and not the entire read.
+print "Comparing and outputting...\n";
+foreach my $name (keys %aligns) {
+    my ($F, $O);
+    if (exists $aligns{$name}{F}) {
+	## read fragment alignment exists
+	$stats{FRAG_ALN}++;
+	$F = 1;
+    }
+    if (exists $aligns{$name}{O}) {
+	## whole-read alignment exists
+	$stats{ORIG_ALN}++;
+	$O = 1;
+    }
+    if ($F && $O) {
+	## both read-fragment and whole-read alignments exist
+	$stats{'FRAG+ORIG'}++;
+	foreach my $str (@{ $aligns{$name}{F} }) {
+	    $str =~ s/\tF\t/\tFRAG+ORIG\t/;
+	}
+	foreach my $str (@{ $aligns{$name}{O} }) {
+	    $str =~ s/\tP\t/\tFRAG+ORIG\t/;
+	}
+#	print STDERR "$name: FRAG+ORIG\n";
+    } elsif ($F && !$O) {
+	## no whole-read alignment existed
+	$stats{FRAG_ONLY}++;
+	foreach my $str (@{ $aligns{$name}{F} }) {
+	    $str =~ s/\tF\t/\tFRAG_ONLY\t/;
+	}
+#	print STDERR "$name: FRAG_ONLY\n";
+    } elsif ($O && !$F) {
+	## no read fragment alignment existed
+	$stats{ORIG_ONLY}++;
+	foreach my $str (@{ $aligns{$name}{O} }) {
+	    $str =~ s/\tF\t/\tORIG_ONLY\t/;
+	}
+#	print STDERR "$name: ORIG_ONLY\n";
+    } else {
+	$stats{NOTHING}++;
+#	print STDERR "$name: NOTHING\n";
+    }
+    ## print out read-fragment alignment(s) first, then whole-read alignment(s), on successive lines.
+    print $OUT @{ $aligns{$name}{F} } if $F;
+    print $OUT @{ $aligns{$name}{O} } if $O;
+}
+close $OUT;
+
+$stats{"${_}_TOT"} = scalar(keys %{ $stats{"${_}_TOT"} }) foreach qw/ FRAG ORIG /;
+
+system "/home/apa/local/bin/sortBedCoord -i $outbed --overwrite";  # sort final output bed by chrom, start, end, strand.
+
+print "$_\t$stats{$_}\n" foreach sort keys %stats;
+print "$0 complete!\n";
+exit;
+
+
+
+
+sub read_bam {
+    
+    my ($bam, $FO) = @_;
+    my $FOname = $FO eq 'F' ? 'read-fragment' : 'original-read';
+    
+    open my $IN, '-|', "samtools view $bam | cut -f1-4,6,10" or die "$0: Failed to 'samtools view' $FOname bam '$bam': $!\n";
+    while (<$IN>) {
+	chomp;
+	my ($name1, $flags, $chr, $start, $cigar, $seq) = split;
+	$seq = substr($seq, $1-1, length($seq)) if $cigar =~ /^(\d+)S/;  # crop any 5' soft-clipped bp
+	$seq = substr($seq, 0, length($seq)-$1) if $cigar =~ /(\d+)S$/;  # crop any 3' soft-clipped bp
+	my $len = length($seq);
+	my $end = $start + $len - 1;
+	my $strand = $flags & 16 ? '-' : '+';
+	(my $name = $name1) =~ s/\.\d+$//;  # clip fragment number
+	
+	if ($FO eq 'F') {
+	    ## Fragment handling
+	    my $screened = $scrseq{$name};
+	    ($screened = reverse $screened) =~ tr/acgt/tgca/ if $strand eq '-';
+	    my $pos = index($screened, "\L$seq");
+	    if ($pos == -1) {
+		print "$name1: Failed to match '$seq' in '\U$screened'!\n";
+	    } else {
+		substr($screened, $pos, $len) = $seq;
+	    }
+	    push @{ $aligns{$name}{F} }, "$chr\t$start\t$end\t$name1\t$len\t$strand\tF\t$screened\n";
+	    $stats{FRAG_TOT}{$name} = 1;
+	} else {
+	    ## Full-sequence handling
+	    push @{ $aligns{$name}{O} }, "$chr\t$start\t$end\t$name1\t$len\t$strand\tO\t$seq\n";
+	    $stats{ORIG_TOT}{$name} = 1;
+	}
+    }
+    close $IN;
+}
+
+
+sub read_psl {
+    
+    my ($psl, $FO) = @_;
+    my $FOname = $FO eq 'F' ? 'read-fragment' : 'original-read';
+    
+    open my $IN, '-|', "tail -n +6 $psl" or die "$0: Failed to open $FOname psl '$psl': $!\n";
+    while (<$IN>) {
+	my ($strand, $name1, $qlen, $qstart, $qend, $chr, $tstart, $tend) = (split /\t/, $_)[8..13,15,16];
+	(my $name = $name1) =~ s/\.\d+$//;  # clip fragment number
+	my $seq = "\U$scrseq{$name}";
+	$seq = substr($seq, $qstart-1, $qlen) if $qstart;  # crop any 5' soft-clipped bp
+	$seq = substr($seq, 0, $qlen-$qend) if $qend < $qlen;  # crop any 3' soft-clipped bp
+	
+	if ($FO eq 'F') {
+	    ## Fragment handling
+	    my $screened = $scrseq{$name};
+#	    ($screened = reverse $screened) =~ tr/acgt/tgca/ if $strand eq '-';
+	    my $pos = index($screened, "\L$seq");
+	    if ($pos == -1) {
+		print "$name1: Failed to match '$seq' in '\U$screened'!\n";
+	    } else {
+		substr($screened, $pos, $qlen) = $seq;
+	    }
+	    push @{ $aligns{$name}{F} }, "$chr\t$tstart\t$tend\t$name1\t$qlen\t$strand\tF\t$screened\n";
+	    $stats{FRAG_TOT}{$name} = 1;
+	} else {
+	    ## Full-sequence handling
+	    push @{ $aligns{$name}{O} }, "$chr\t$tstart\t$tend\t$name1\t$qlen\t$strand\tO\t$seq\n";
+	    $stats{ORIG_TOT}{$name} = 1;
+	}
+    }
+    close $IN;
+}

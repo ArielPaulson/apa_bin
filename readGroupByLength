@@ -1,0 +1,68 @@
+#!/usr/bin/env perl
+use strict;
+
+## Adds read groups to a bam, where each read is assigned to a read group for that read length.
+## if $splitdir, also splits bam by read group, into $splitdir.
+
+my ($inbam, $outbam, $splitdir) = @ARGV;
+my $tmp = "readGroupByLength.$$.tmp";
+my (%RG, $samheader);
+
+print "Scanning bam...\n";
+open my $OUT, '>', "$tmp.sam";
+open my $SAM, '-|', "samtools view $inbam";
+while (<$SAM>) {
+    chomp;
+    my @data = split /\t/, $_, 12;   # all post-quality tags retained in one string
+    $data[11] =~ s/\tRG:Z:\S+//;     # discard any existing read groups
+    my $bp = length($data[9]);
+    $RG{$bp}++;
+    print $OUT join("\t", @data, "RG:Z:$bp\n");
+}
+close $SAM;
+close $OUT;
+
+print "Generating output bam...\n";
+open my $SH, '-|', "samtools view -H $inbam";
+my ($prev_type, $added);
+while (<$SH>) {
+    my ($type) = ($_ =~ /^(\S+)/);
+    if ($type eq '@SQ' || $type eq '@HD') {
+        ## do nothing; handled below
+    } elsif ($prev_type eq '@SQ') {
+        ## End of @SQ lines, but other lines remain
+        ## Add @RG header lines AFTER @SQ lines
+        foreach my $bp (sort {$a <=> $b} keys %RG) {
+            next if $bp == 0;  # ???
+            $samheader .= "\@RG\tID:$bp\tPU:1\tLB:1\tSM:${bp}bp\tPL:illumina\n";
+        }
+        $added = 1;
+    }
+    $samheader .= $_ unless $type eq '@RG';  # discard any previous read groups
+    $prev_type = $type;
+}
+unless ($added) {
+    ## End of @SQ lines; no other lines remained
+    foreach my $bp (sort {$a <=> $b} keys %RG) {
+        next if $bp == 0;  # why is this necessary ???
+        $samheader .= "\@RG\tID:$bp\tPU:1\tLB:1\tSM:${bp}bp\tPL:illumina\n";
+    }
+}
+close $SH;
+
+open my $OUTH, '>', "$tmp.header.sam";
+print $OUTH $samheader;
+close $OUTH;
+
+system "cat $tmp.header.sam $tmp.sam | samtools view -h -bS - > $outbam";
+
+if ($splitdir) {
+    print "Splitting output bam by read group...\n";
+    system "mkdir -p $splitdir";
+    system "samtools split -u $splitdir/ungrouped.bam -f \"$splitdir/%!bp.bam\" $outbam";
+}
+
+system "rm -f $tmp.*";
+print "$0 complete!\n";
+exit;
+

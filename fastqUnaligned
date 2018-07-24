@@ -1,0 +1,438 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+# TO DO: single/double unmapped handling, orphans handling, treat-PE-as-SE mode
+#        also, complete that non-BAM file format handling
+
+# Deps: samtools, (rm, gzip)
+# Uses ONLY flag 128 (second-end), IGNORES flag 2 (properly paired)
+
+
+## Inputs
+my $fastq1;     # End 1 fastq to extract reads from
+my $fastq2;     # End 2 fastq to extract reads from (OPTIONAL)
+my $prefix;     # output fastq prefix
+my $orphans;    # IF PE: orphan-handling mode, must be 'separate', 'aligned', or 'single'; see below
+my $nogzip;     # do not compress outputs
+my $fasta;      # fastqs are actually fastas
+my $type;       # alternate file type of @align_files, if not bam (must all be same format).  Can be: 'blast' (headerless -m 8 blast output), 'psl' (headered blat output), 'psl0' (headerless blat output)
+my $aligned;    # write aligned reads to fastq, too.
+
+
+## Get, test args
+GetOptions("fq1=s"=>\$fastq1, "fq2=s"=>\$fastq2, "p=s"=>\$prefix, "o=s"=>\$orphans, "no-gzip"=>\$nogzip, "fasta"=>\$fasta, "aligned"=>\$aligned, "t=s"=>\$type);
+my @align_files = @ARGV;   # SAM/BAM files of other alignments (from $fastq) to identify which reads were mapped
+my $PE = $fastq2 ? 1 : 0;
+die "$0: Must specify output file prefix!\n" unless $prefix;
+die "$0: Fastq 1 '$fastq1' not found!!\n" unless -e $fastq1;  # must exist
+die "$0: Fastq 2 '$fastq2' not found!!\n" if $fastq2 && ! -e $fastq2;  # must exist if specified
+
+
+## Orphan mode, if $PE
+my @orphan_modes = qw/ aligned unaligned separate split single /;
+my %orphan_modes = map {($_=>1)} @orphan_modes;
+my ($O_none, $O_aln, $O_una, $O_sep1, $O_sep2, $O_sng1, $O_sng2);  # mode-flags
+if ($PE) {
+    if (exists $orphan_modes{$orphans}) {
+        ## Then OK.
+        ## In paired-end reads, orphans are ends that did not align, while the other end did align.
+        ## Thus the orphan-pair is neither aligned nor unaligned, so handling may vary on the user's needs:
+        ## '$orphans' values:
+        ## 'none'      : discard orphan pairs (effectively, 'aligned' without also using --aligned)
+        ## 'aligned'   : write orphan-pairs to aligned (if --aligned).
+        ## 'unaligned' : write orphan-pairs to unaligned.
+        ## 'separate1' : write orphan-pairs separately: create an orphans-only fastq pair.
+        ## 'separate2' : 'separate', but further split orphans: create one fq pair for end-1-orphans, and one fq pair for end-2-orphans.
+        ## 'single1'   : write orphaned ends, NOT the whole pair, as a single-end fastq.
+        ## 'single2'   : 'single', but write one single-end fastq for end-1-orphans, and another fastq for end-2-orphans.
+        die "$0: '-o aligned' also requires '--aligned' (or else orphans cannot print!)\n" if $orphans eq 'aligned' && !$aligned;
+    } elsif ($orphans) {
+        my $orph_str = join ', ', map { "'$_'" } @orphan_modes;
+        die "$0: Orphan handling must be one of: $orph_str, not '$orphans'!\n";
+    } else {
+        $orphans = 'none';   # default handling
+    }
+    ## Set only one mode-flag
+    ## Faster mode lookup than having to do string matching on every line on the BAM...
+    ($orphans eq 'aligned') ? ($O_aln=1) : ($orphans eq 'unaligned') ? ($O_una=1) : ($orphans eq 'separate2') ? ($O_sep2=1) : ($orphans eq 'separate1') ? ($O_sep1=1) : ($orphans eq 'single2') ? ($O_sng2=1) : ($orphans eq 'single1') ? ($O_sng1=1) : ($O_none=1);
+} else {
+    die "$0: Do not specify '-o' (orphan handling) unless alignments are paired-end!\n";
+}
+my $O_sep12 = $O_sep1 || $O_sep2;
+
+
+## Globals
+my @ends;      # ends to process: (1) or (1,2) depending on input
+my %headers;   # aligned headers from bam
+my %counts;    # stats
+my %files;     # output files
+my %records;   # fastq records
+
+
+## Filehandles etc.
+## Some of the end assignments may seem backwards, but this is because we are extracting UNALIGNED READS NOT ALIGNED.
+## E.g. if end 1 aligned, then the orphan is from end 2.
+## The term 'orphan pairs' refers to an (unaligned) orphan read and its (aligned) mate.
+my $ext = $fasta ? 'fasta' : 'fastq';
+my $ext2 = $nogzip ? $ext : "$ext.gz";
+$files{1}{IN} = $fastq1;
+if ($PE) {
+    @ends = (1,2);
+    $files{2}{IN} = $fastq2;
+    $files{1}{UNA} = "${prefix}_1.$ext2";                    ## End-1 reads for unaligned pairs (will also include End 1 reads for orphan pairs, "-o aligned")
+    $files{2}{UNA} = "${prefix}_2.$ext2";                    ## End-2 reads for unaligned pairs (will also include End 2 reads for orphan pairs, "-o aligned")
+    if ($O_sep1) {
+        ## Default handling
+        $files{1}{ORPH}  = "${prefix}_orphans_1.$ext2";      ## End-1 reads for ALL orphans
+        $files{2}{ORPH}  = "${prefix}_orphans_2.$ext2";      ## End-2 reads for ALL orphans
+    } elsif ($O_sep2) {
+        $files{1}{ORPH1} = "${prefix}_E1_orphans_1.$ext2";   ## End-1 reads for End-1 orphans (these reads did NOT align)
+        $files{2}{ORPH1} = "${prefix}_E1_orphans_2.$ext2";   ## End-2 reads for End-1 orphans (these reads aligned)
+        $files{1}{ORPH2} = "${prefix}_E2_orphans_1.$ext2";   ## End-1 reads for End-2 orphans (these reads aligned)
+        $files{2}{ORPH2} = "${prefix}_E2_orphans_2.$ext2";   ## End-2 reads for End-2 orphans (these reads did NOT align)
+    } elsif ($O_sng1) {
+        $files{1}{ORPH}  = "${prefix}_orphans.$ext2";        ## End-1 or End-2 orphans (all going to same file)
+        $files{2}{ORPH}  = "${prefix}_orphans.$ext2";        ## End-1 or End-2 orphans (all going to same file)
+    } elsif ($O_sng2) {
+        $files{1}{ORPH}  = "${prefix}_E1_orphans.$ext2";     ## End-1 orphans (not writing pairs, so this is the End-1 read)
+        $files{2}{ORPH}  = "${prefix}_E2_orphans.$ext2";     ## End-2 orphans (not writing pairs, so this is the End-2 read)
+    } else {
+        ## 'aligned', 'unaligned' do nothing here -- no new filehandles
+    }
+    if ($aligned) {
+        $files{1}{ALN} = "${prefix}_aligned_1.$ext2";        ## End-1 reads for aligned pairs
+        $files{2}{ALN} = "${prefix}_aligned_2.$ext2";        ## End-2 reads for aligned pairs
+    }
+} else {
+    @ends = (1);
+    $files{1}{UNA} = "$prefix.$ext2";
+    $files{1}{ALN} = "${prefix}_aligned.$ext2" if $aligned;
+}
+
+
+## Ensure some printable values
+$counts{$_} = 0 foreach qw/ PAIRS ALIGNS E1A E2A /;
+foreach my $i (0..2) {
+    $counts{$i}{$_} = 0 foreach qw/ ALN UNA ORPH /;
+}
+
+## Screen alignment files
+foreach my $aln (@align_files) {
+    print STDERR "Reading '$aln': ",`date`;
+    
+    if ($type eq 'psl' || $type eq 'psl0') {
+        ## BLAT
+        my $cmd = $type eq 'psl0' ? "cut -f10 $aln" : "tail -n +6 $aln | cut -f10";
+        open my $IN, '-|', $cmd;
+        my $end = 1;                       ## NO ENDEDNESS (yet)
+        while (<$IN>) {
+            chomp;
+            $headers{$_}{$end} = 1;
+            $counts{"E${end}A"}++;         ## alignment counts, NOT read counts.  May have multireads.
+        }
+        close $IN;
+    } elsif ($type eq 'blast') {
+        ## BLAST
+        open my $IN, '-|', "cut -f1 $aln";
+        my $end = 1;                       ## NO ENDEDNESS (yet)
+        while (<$IN>) {
+            chomp;
+            $headers{$_}{$end} = 1;
+            $counts{"E${end}A"}++;         ## alignment counts, NOT read counts.  May have multireads.
+        }
+        close $IN;
+    } else {
+        ## SAM/BAM
+        open my $IN, '-|', "samtools view -F 4 $aln | cut -f1-2";
+        while (<$IN>) {
+            chomp;
+            my ($header, $flags) = split;
+            my $end = $flags & 128 ? 2 : 1;
+            $headers{$header}{$end} = 1;   ## NOT SCOPED TO BAM.  We only care if end aligned somewhere, NOT if pair was concordant.
+            $counts{"E${end}A"}++;         ## alignment counts, NOT read counts.  May have multireads.
+        }
+        close $IN;
+    }
+    
+}
+$counts{ALIGNS} = $counts{E1A} + $counts{E2A};
+print STDERR "Finished reading alignments: ",`date`;
+
+
+## Prep not-specifically-orphan filehandle variables
+my $IN;      # incoming fastq
+my $ALN;     # aligned-read fastq for pending end
+my $UNA;     # unaligned-read fastq for pending end
+my $ORPH_E;  #  this-end orphans filehandle
+my $ORPH_O;  # other-end orphans filehandle (only used if $O_sep2)
+my %efiles;  # this-end file data
+
+
+## Open $O_sng1 persistent filehandle.
+## This handle must stay open for both ends; cannot close and re-open between ends.
+## This because the fastq is written gzipped, and the second-end pass cannot append to a gzipped file.
+if ($O_sng1) {
+    $ORPH_E = &open2('W', $files{1}{ORPH}, "'orphans = single1' fastq");   # open either end FH, doesn't matter, both will point to same file
+}
+
+
+## Filter fastq(s)
+foreach my $e (@ends) {
+    
+    ## $e = THIS READ END = FASTQ BEING FILTERED
+    ## THIS IS THE END WE ARE ON -- THIS IS THE ONLY END WE CAN WRITE READS FOR
+    %efiles = %{ $files{$e} };
+    print "END: $e\n",Dumper(\%efiles),"\n";
+    
+    my $o = $e == 1 ? 2 : 1;  # $o for 'other end'
+    $IN  = &open2('R', $efiles{IN},  "end-$e input fastq");
+    $UNA = &open2('W', $efiles{UNA}, "unaligned-pair end-$e fastq");
+    $ALN = &open2('W', $efiles{ALN}, "aligned-pair end-$e fastq") if $aligned;
+     
+    if ($O_sep2) {
+        ## In this case, have to special end-wise filehandles
+        ## For each end, only the fastqs holding reads reads for that end will write.
+        ## I.e.: End 1 will write end-1-orphans_1.fq.gz AND end-2-orphans_1.fq.gz.  Then switch.
+        ##       And, $ORPH_E will be for the end-1 orphan fastq and $ORPH_O will be for the end-2 orphan fastq.  Then they will reverse.
+        $ORPH_E = &open2('W', $efiles{"ORPH$e"}, "end-$e orphans fastq, read #$e");  ##  THIS-END ORPHAN -- THIS-END READ
+        $ORPH_O = &open2('W', $efiles{"ORPH$o"}, "end-$o orphans fastq, read #$e");  ## OTHER-END ORPHAN -- THIS-END READ
+    } elsif ($O_sep1 || $O_sng2) {
+        ## Typical orphan case
+        ## The filehandle $ORPH_E will switch between end-1 and end-2 output files, 
+        ##   -UNLESS- $O_sng1, in which case there is only one output file, which CANNOT be handled here (see above).
+        $ORPH_E = &open2('W', $efiles{ORPH}, "orphans fastq, read #$e");  ##   ANY-END ORPHAN -- THIS-END READ
+    }
+    
+    print STDERR "Filtering end-$e $ext: ",`date`;
+    my $R;  # record number
+    if ($ext eq 'fastq') {
+        my ($i, $header, $rec);
+        while (<$IN>) {
+            $i++;
+            $rec .= $_;   # INCL. NEWLINE
+            if ($i == 1) {
+                ($header = $_) =~ s/^@//;
+                $header = (split /\s+/, $header)[0];
+                $counts{PAIRS}++ if $e == 1;  # only count once per pair; if PE, assumes fq1 and fq2 have same headers (which they had better!)
+                $R++;
+                print " $R\n" if $R % 1E6 == 0;
+            } elsif ($i == 4) {
+                &process_header($header, $rec, $e, $o);
+                $i = 0;
+                $rec = undef;
+            }
+        }
+    } else {
+        ## else fasta
+        my ($header, $seq);
+        while (<$IN>) {
+            if (/^>(.*)[\r\n]$/) {
+                &process_header($header, $seq, $e, $o) if $seq;
+                $header = $1;
+                $seq = $_;
+                $counts{PAIRS}++ if $e == 1;  # only count once per pair; if PE, assumes fq1 and fq2 have same headers (which they had better!)
+                $R++;
+                print " $R\n" if $R % 1E6 == 0;
+            } else {
+                $seq .= $_;  # INCL. NEWLINE
+            }
+        }
+        &process_header($header, $seq, $e, $o);  # final record
+    }
+    
+    close $IN;
+    close $UNA;
+    close $ORPH_E if $ORPH_E && !$O_sng1;
+    close $ORPH_O if $ORPH_O;
+    
+    ## Purge empty files after each end
+    &purge($efiles{UNA},  $counts{$e}{UNA});
+    &purge($efiles{ALN},  $counts{$e}{ALN})  if $aligned;
+    &purge($efiles{ORPH}, $counts{$e}{ORPH}) if $PE && !$O_sng1;
+    if ($O_sep2) {
+        &purge($efiles{"ORPH$e"}, $counts{$e}{"ORPH$e"});
+        &purge($efiles{"ORPH$o"}, $counts{$e}{"ORPH$o"});
+    }
+    
+}
+close $ORPH_E if $O_sng1;  # NOW can close $O_sng1 $ORPH_E
+$counts{0}{ORPH} = $counts{1}{ORPH} + $counts{2}{ORPH};
+&purge($efiles{ORPH}, $counts{2}{ORPH}) if $PE;
+
+
+## Stat reporting
+print STDERR "ALIGNMENTS: @align_files\n";
+my $maxlen = (sort {$b <=> $a} (length($counts{PAIRS}), length($counts{ALIGNS})))[0];
+my $fmt = '%'.length($counts{PAIRS}).'i %s'."\n";
+if ($PE) {
+    print STDERR sprintf($fmt, $counts{ALIGNS} , 'total alignments');
+    print STDERR sprintf($fmt, $counts{E1A}    , 'end-1 alignments');
+    print STDERR sprintf($fmt, $counts{E2A}    , 'end-2 alignments');
+    print STDERR sprintf($fmt, $counts{PAIRS}  , 'total pairs');
+    print STDERR sprintf($fmt, $counts{0}{ALN} , 'fully aligned');
+    print STDERR sprintf($fmt, $counts{1}{ALN} , 'end 1 aligned');
+    print STDERR sprintf($fmt, $counts{2}{ALN} , 'end 2 aligned');
+    print STDERR sprintf($fmt, $counts{0}{UNA} , 'fully unaligned');
+    print STDERR sprintf($fmt, $counts{1}{UNA} , 'end-1 unaligned');
+    print STDERR sprintf($fmt, $counts{2}{UNA} , 'end-2 unaligned');
+    print STDERR sprintf($fmt, $counts{0}{ORPH}, 'orphan pairs');
+    print STDERR sprintf($fmt, $counts{2}{ORPH}, 'end-1 aligned ONLY');
+    print STDERR sprintf($fmt, $counts{1}{ORPH}, 'end-2 aligned ONLY');
+#    unless ($as_single) {
+#        print STDERR "End $_ Orphans: ",$counts{1}{"ORPH$_"}," FQ1, ",$counts{2}{"ORPH$_"}," FQ2 \n" foreach (1,2);    ## Why?
+#    }
+} else {
+    print STDERR sprintf($fmt, $counts{PAIRS}  , 'total reads');
+    print STDERR sprintf($fmt, $counts{ALIGNS} , 'total alignments');
+    print STDERR sprintf($fmt, $counts{1}{ALN}, 'reads aligned');
+    print STDERR sprintf($fmt, $counts{1}{UNA}, 'reads unaligned');
+}
+
+print STDERR "$0 complete: ",`date`;
+exit;
+
+
+
+
+
+sub purge {
+    
+    my ($FILE, $CTS) = @_;
+    
+    unless ($CTS) {
+        print STDERR "No reads were send to file $FILE: removing...\n";
+        #system "rm -f $FILE";
+    }
+    
+}
+
+
+
+
+
+sub process_header {
+    
+    ## Processing a single fastq record from a single end
+    ## BAM has already been scanned, and headers classified as to their alignment state
+    ## Now we will write the pending fastq record to some file (or not) depending on alignment state.
+    
+    my ($HEADER, $DATA, $E, $O) = @_;
+    my $STATUS = &get_header_end_status($HEADER, $E, $O);
+    
+    if (!defined $STATUS) {
+        
+        next;
+        
+    } elsif ($STATUS == 0) {
+        
+        ## fully unaligned; write pair
+        print $UNA $DATA;
+        
+    } elsif ($STATUS == 1 || $STATUS == 2) {
+        
+        ## 1: single-end, aligned
+        ## 2: paired-end, both aligned
+        print $ALN $DATA if $aligned;
+        
+    } elsif ($STATUS == 11 || $STATUS == 12 || $STATUS == 21) {
+        
+        ## paired-end, this end is the orphan
+        ## 11 : all orphaned ends to single-ended fastqs, one per end
+        ## 12 : all orphaned ends to one (pooled) single-ended fastq
+        ## 21 : both ends from any orphan pair go to a single fastq pair
+        print $ORPH_E $DATA;
+        
+    } elsif ($STATUS == 22.1) {
+        
+        ## paired-end, this end is the orphan
+        ## both ends from any orphan pair go to a single fastq pair
+        print $ORPH_E $DATA;
+        $counts{$E}{"ORPH$E"}++;  # also need cross-end counts
+        
+    } elsif ($STATUS == 22.2) {
+        
+        ## paired-end, one end is an orphan
+        ## both ends from end-N orphan pair go to the end-N-orphan fastq pair (i.e. fq_1 will be orphans and fq_2 will be aligned, or vice versa)
+        ## 22.2 means the OTHER end is the orphan
+        print $ORPH_O $DATA;
+        $counts{$E}{"ORPH$O"}++;  # also need cross-end counts
+        
+    } else {
+        
+        ## Barring classification failure, this is the aligned end from an orphan pair, and $orphans is 'single1' or 'single2'
+        ## So do nothing.
+        
+    }
+
+}
+
+
+
+
+
+sub get_header_end_status {
+    
+    ## Processing a single fastq record from a single end
+    ## BAM has already been scanned, and headers classified as to their alignment state
+    ## Now we will classify this particular read and return the classification
+    
+    my ($HEADER, $E, $O) = @_;
+    my ($THIS_ORPH, $status);
+    
+    if (!exists $headers{$HEADER}) {
+        ## SE/PE, no alignments
+        $status = 0;
+        $counts{$E}{UNA}++;
+        $counts{0}{UNA}++ if $E == 1;  # only count once per pair
+    } elsif (!$PE) {
+        ## SE, aligned
+        $status = 1;
+        $counts{$E}{ALN}++;
+    } else {
+        ## PE
+        if ($headers{$HEADER}{$E} && $headers{$HEADER}{$O}) {
+            ## Both ends aligned
+            $status = 2;
+            $counts{$E}{ALN}++;
+            $counts{0}{ALN}++ if $E == 1;  # only count once per pair
+        } else {
+            ## ORPHAN PAIR
+            ## Only one end aligned, either this end OR the other end
+            if (exists $headers{$HEADER}{$E}) {
+                ## This end was aligned
+                $counts{$E}{ALN}++;
+            } else {
+                ## This end was the orphan
+                $counts{$E}{UNA}++;
+                $counts{$E}{ORPH}++;
+                $THIS_ORPH = 1;
+            }
+            ## How is the orphan-pair handled, based on $orphans value?
+            if ($O_aln) {
+                $status = 2;    # treat as aligned pair
+            } elsif ($O_una) {
+                $status = 0;    # treat as unaligned pair
+            } elsif ($O_sep1) {
+                $status = 21;   # writing orphan pairs separately (single fastq pair)
+            } elsif ($O_sep2) {
+                $status = $THIS_ORPH ? 22.1 : 22.2;  # writing orphan pairs separately (different fastq pairs for each end)
+            } elsif ($O_sng1) {
+                $status = $THIS_ORPH ? 11 : undef;   # writing orphan ends separately  (one fastq for both ends)  //  do nothing if this is not the orphan end!
+            } elsif ($O_sng2) {
+                $status = $THIS_ORPH ? 12 : undef;   # writing orphan ends separately  (one fastq per end)        //  do nothing if this is not the orphan end!
+            } else {
+                ## ???
+                print "WARNING: Undetermined alignment state for '$HEADER'\n";
+                $status = undef;
+            }
+        }
+    }
+    
+    return $status;
+}
+
+

@@ -1,0 +1,908 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Data::Dumper;
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+## FIXME: miRBase bed quantitation must switch intersectBed -f values for different compartments
+
+
+## Quantitates unstranded, sense, and antisense counts/RPKMs for a given bam file and reference.
+## Quantitation is not fancy; methods used are htseq-count, samtools idxstats, or intersectBed.
+## Final counts include multireads, even for htseq-count (unless $no_multi is specified).
+## One of four approaches will be used, depending on params:
+## 1. Whole-genome alignment, and --3pass: three "htseq-count intersection-nonempty" runs will be made (sense, antisense, unstranded), see note below on why.
+## 2. Whole-genome alignment, NOT --3pass:   two "htseq-count intersection-nonempty" runs will be made (sense, antisense) if $stranded, else one run (unstranded).
+## 3. Transcriptome alignment, normal: uses "samtools idxstats" on strand-split bams for sense, antisense counts.  Returns both transcript- and gene-level counts.
+## 4. Transcriptome alignment, featurized: designed for ribosomes, but useful in any situation where reference sequences are composed of features, which are described by a bed file.
+##    Supplying the bed file (-b) will return reference-level and feature-level counts, using intersectBed.
+
+## Note about --3pass: the only reason to use it is to get accurate unstranded values for the extra htseq-count QC metrics: 
+##  __no_feature, __ambiguous, __too_low_aQual, __not_aligned, and __alignment_not_unique.  
+## These QC metrics are the only htseq-count values for which sense + antisense != unstranded, hence the need for a third pass.
+## NOTE, these metrics will ONLY be part of the output if --3pass.
+
+## TO DO: 
+## run all 3 htseqs in parallel with &babysit?
+## CHECK: with 3pass, do we see S/A overcounting at the gene level?
+
+
+my $samtools = 'samtools';
+my $intersectBed = '/n/apps/CentOS7/install/bedtools-2.26.0/bin/intersectBed';  # CentOS7
+$intersectBed = '/n/local/stage/bedtools/bedtools2-2.26.0/bin/intersectBed' unless -e $intersectBed;  # CentOS6
+my $htseq_count = 'htseq-count';
+my $bin = '/home/apa/local/bin';
+my $stripMultireads = "$bin/stripMultireads";
+
+my $inbam;    # input bam
+my $outfile;  # output text file (if $mirbase, please make this a file prefix, not a full filename, since 2 files will be written)
+my $geno;     # genome build, if needed
+my $anno;     # annotation build, if needed
+my $M;        # M value for RPKM calculation, default will be count sum
+my $no_multi; # do not quantitate multireads; $no_multi value must be an aligner name: bowtie[12]|tophat|bwa|bwax|star|shortstack
+my $bed;      # if $txome: reference->feature mapping provided in this BED file, if appropriate
+my $PE;       # 1|0 bam contains paired-end alignments
+my $txome;    # 1|0 bam was aligned to transcriptome only (i.e., quantitate references in bam header)
+my $mirbase;  # 1|0 bed file specified by -b is from a miRBase sub-build of a functional-RNA build (changes intersectBed behavior)
+my $do_class; # 1|0 object names are "$class|$id"; quantitate unique values of $class (by pooling all $id per $class), SEE NOTE BELOW.
+my $pass3;    # 1|0 use three-pass htseq-count to get accurate Unstranded/Sense/Antisense counts FOR EACH HTSEQ-COUNT QC METRIC (normal gene quant only needs 2 passes)
+my $switch;   # 1|0 switch sense and antisense?  (e.g. for Truseq stranded libraries)
+my $stranded; # 1|0 reads are stranded-- unnecessary if $pass3 or $switch specified.
+
+## Notes on -g, -a, and --transcriptome:
+## 1. If bam was aligned to a geno/anno tophat transcriptome index, supply all 3 args, so we know which transcriptome it was.
+## 2. If bam was aligned to a genome, supply only -g/-a, NOT --transcriptome.
+## 3. If bam was aligned to a fasta file (which was NOT a tophat transcriptome index), then use ONLY --transcriptome (and -b where appropriate).
+
+## Notes on supplying a bed file:
+## If #3 above, AND the fasta file was a set of reference sequences which have distinct sub-regions to quantitate (e.g. ribosomes), 
+##   then is it useful to supply the bed file of references/sub-regions with -b.  This enables quantitation of sub-regions.
+## If a bed file is supplied, ONLY those regions described in the bed file will be quantitated.
+## Also note, multiple sub-regions can share the same name, and only one summary count/RPKM will be returned for the sub-region name.
+## The classic use case is for ribosomes; this arrangement allows for multiple overlapping ribosome repeat fragments to be supplied, 
+##   but only one count/RPKM returned per unique subunit type (via $do_class, see below).  
+
+## Notes on $do_class:
+## If $bed, then feature names in the bed file are "$class|$id", quantitation will use intersectBed, and class counts will be summed from features.
+##   If making RPKMs, class length (K) is median feature length per class (class members are considered redundant).
+## If not $bed, then reference (fasta) names are "$class|$id", quantitation will use idxstats, and class counts will be summed from references.
+##   If making RPKMs, class length (K) is sum of all reference lengths per class (class members are considered unique).
+
+
+GetOptions("i=s"=>\$inbam, "g=s"=>\$geno, "a=s"=>\$anno, "b=s"=>\$bed, "o=s"=>\$outfile, "n=s"=>\$no_multi, "Mval=i"=>\$M, "PE"=>\$PE, "transcriptome"=>\$txome, "3pass"=>\$pass3, "class"=>\$do_class, "switch"=>\$switch, "stranded"=>\$stranded, "mirbase"=>\$mirbase) || die "$0: invalid command line!\n";
+
+## Validate some arguments
+die "$0: bam file '$inbam' does not exist!\n" unless -e $inbam;
+die "$0: no output filename specified!\n" unless $outfile;
+my $have_ga = $geno ? 1 : 0;
+$have_ga++ if $anno;
+die "$0: -g and -a must both be specified, or both blank!\n" if $have_ga == 1;
+my ($mstr, $gdat, $tdat, $gtf, $gtfi, $tlst);
+if ($have_ga) {
+    $mstr = 1;  # assuming that any genome-wide annot will have at least one object annotated to the (-) strand...
+    my $gapref = "/n/data1/genomes/indexes/$geno/$anno/$geno.$anno";
+    $tdat = "$gapref.transdata.txt";
+    $gdat = "$gapref.genedata.txt";
+    $gtf  = "$gapref.cuff.gtf";
+    $gtfi = "$gtf.index";
+    $tlst = "$gtfi/$geno.$anno.cuff.fa.tlst";
+    die "$0: required transcript data file '$tdat' does not exist!\n" unless -e $tdat;  # assume if $tdat is OK, then so is $gdat.
+    die "$0: cannot use -b when using -g/-a!\n" if $bed;
+} else {
+    ## aligned to reference that was not tied to a geno/anno build
+    if ($txome) {
+        ## ok, with or without $bed
+    } elsif ($bed) {
+        die "$0: can only use -b with --transcriptome!\n" unless $txome;
+    } else {
+        die "$0: if not using --transcriptome, must specify -g and -a !\n";
+    }
+}
+
+$stranded = 1 if $switch || $pass3 || $mirbase;  # these imply $stranded
+$do_class = 0 if $mirbase;  # mirbase has its own "class" handling
+
+my $tmp = "bamQuantitate.$$.tmp";
+system "mkdir $tmp";
+die "$0: failed to create temp location '$tmp'!\n" unless -d $tmp;
+
+my (%idx, %stats, $skipout);
+my @bamstr = $mstr ? qw/ plus minus / : 'plus';
+my @alnstr = $stranded ? qw/ S A / : 'S';
+my @USA = qw/ U S A /;
+my $htseq_python = '2.7.5';
+my $ndec = 6;  # decimals to carry for floats
+
+my %mirskip = map {($_=>1)} qw/ End5p End3p Loop /;  # if $mirbase, ignore these classes
+my %partrank = ('End5p',1, 'Mir5p',2, 'Loop',3, 'Mir3p',4, 'End3p',5);
+my @mirparts = qw/ END5 MIR5 LOOP MIR3 END3 /;  # header versions of %partrank keys, in rank order
+my @maprank = (1..5);  # sorted values of %partrank
+
+open my $LOG, '>', "$outfile.log";
+
+my ($inbam2, $inbai2);
+my $tmpbam = "$tmp/tmp.bam";
+my $tmpbai = "$tmp/tmp.bam.bai";
+&execute("ln -sf \$(readlink -f $inbam) $tmpbam", 1, $LOG, 2);
+if (-e "$inbam.bai") {
+    &execute("ln -sf \$(readlink -f $inbam.bai) $tmpbai", 1, $LOG, 2);
+} else {
+    (my $inbai = $inbam) =~ s/bam$/bai/;  # unfortunate naming convention for Picard BAI files
+    &execute("ln -sf \$(readlink -f $inbai) $tmpbai", 1, $LOG, 2) if -e $inbai;
+}    
+if ($no_multi) {
+    my $cmd = "$stripMultireads $tmpbam --mode2 --index --$no_multi";   # $no_multi must be the aligner name: bowtie[12]|tophat|bwa|bwax|star|shortstack
+    $cmd .= ' --PE' if $PE;
+    &execute($cmd, 1, $LOG, 2);
+    $inbam2 = "$tmp/tmp.stripMultireads.bam";
+    $inbai2 = "$tmp/tmp.stripMultireads.bam.bai";
+} else {
+    $inbam2 = $tmpbam;
+    $inbai2 = $tmpbai;
+}
+
+
+
+print "Reading annotations...\n"; 
+
+my (%rdat, %cdat, %bdat, %mdat, $isnum, %tname, %ti, %tstr, %tg, %gstr, %glen, %isQC);
+
+&execute("samtools index $inbam2", 1, $LOG, 2) unless -e "$inbai2";
+chomp(my $nreads = `bash -c 'paste -s -d+ <(samtools idxstats $inbam2 | cut -f3) | bc'`);
+
+my $do_rpkm;
+if (defined $M && $M == 0) {
+    ## RPKM calculation turned off by giving "-Mval 0"
+    $do_rpkm = 0;
+    print "RPKM calculation is OFF ($M)\n";
+} else {
+    $do_rpkm = 1;
+    $M = $nreads unless $M;
+    print "RPKM calculation is ON ($M)\n";
+}
+
+my $quantheader = "CTS.U\tCTS.S\tCTS.A";
+$quantheader .= $do_rpkm ? "\tRPKM.U\tRPKM.S\tRPKM.A" : '';
+my $outheader = "CLASS\tREFERENCE\tFEATURE\tLENGTH\tSTRAND\t$quantheader\n";
+my $mirheader = join("\t", qw/ REFERENCE LENGTH READS SENSE.PCT SENSE.RPKM SENSE.ALNBP /, map {"$_.PCT"} @mirparts)."\n";  # will be % sense-aligned bp
+(my $mirfile = $outfile) =~ s/\.txt$/.mirMap.txt/;  # mirbase-specific output     ## again, assuming if $mirbase, then $outfile should be a file prefix, not full filename
+$outfile = "$outfile.mirCts.txt" if $mirbase;       # usual output, mirbase spin  ## again, assuming if $mirbase, then $outfile should be a file prefix, not full filename
+
+
+if ($have_ga) {
+    
+    
+    
+    ## Process geno/anno data, if provided
+    
+    chomp(my $test = `samtools idxstats $inbam2 | head -1 | cut -f1`);
+    if ($txome || $test eq '0') {
+        ## assume aligned to transcriptome index and that transcript ids are numbers 0-N
+        $isnum = 1;
+        die "$0: BAM appears to have been aligned to transcriptome index at '$gtfi/', but associated .tlst file does not exist!\n" unless -e $tlst;
+        open my $TL, '<', $tlst;
+        while (<$TL>) {
+            my ($i, $trans) = (split / /, $_)[0,1];
+            $tname{$i} = $trans;
+            $ti{$trans} = $i;
+        }
+        close $TL;
+    }
+    open my $TD, '<', $tdat;
+    while (<$TD>) {
+        next if $. == 1;
+        s/[\n\r]+$//;
+        my ($trans, $gene, $strand) = (split /\t/, $_)[0,2,6];
+        $tstr{$trans} = $strand;
+        $tg{$trans} = $gene;
+        next unless $isnum;
+        $tstr{ $ti{$trans} } = $strand;  # store with numeric key as well
+    }
+    close $TD;
+    open my $GD, '<', $gdat;
+    while (<$GD>) {
+        next if $. == 1;
+        s/[\n\r]+$//;
+        my ($gene, $strand, $uxlen) = (split /\t/, $_)[0,5,7];
+        $gstr{$gene} = $strand;
+        $glen{$gene} = $uxlen;
+    }
+    close $GD;
+    
+    
+    
+} elsif ($bed) {
+    
+    
+    
+    ## Process bed data, if provided
+    
+    system "samtools index $inbam2" unless -e "$inbam2.bai";
+    chomp(my @bamrefs = split /\n/, `samtools idxstats $inbam2 | cut -f1`);
+    my %bamrefs = map {($_=>1)} @bamrefs;
+    my ($bl, %u, @clen);
+    open my $BED, '<', $bed;
+    while (<$BED>) {
+        chomp;
+        my ($ref, $start, $end, $feat, $score, $strand) = split /\t/, $_;
+        die "$0: bed file must have all 6 columns!\n" unless $strand;
+        die "$0: strand symbols in bed file must be '+' or '-', not '$strand'\n" if $strand ne '+' && $strand ne '-';
+        die "$0: bed reference '$ref' is not found in the bam file!\n" unless $bamrefs{$ref};
+        my $len = $end-$start;
+        $u{$feat}++;
+        $bdat{OUT_REF}{$ref}++;
+        $bdat{N}{$feat} = [$ref, $start, $end, $feat, $score, $strand];
+        $tstr{$ref} = $strand;
+        $bl++;
+        $mstr = 1 if $strand eq '-';
+        if ($mirbase) {
+            ## For mirbase data, what looks like $class is actually the working $feat
+            my ($part, $partID) = split /\|/, $feat;  # miRNA precursor transcript part, ID
+            $rdat{$ref}{F_LEN}{ $partrank{$part} } = $score if exists $partrank{$part};  # score=length // not storing isomirs // store length by part position (rank), for orderability
+            next if $mirskip{$partID};  # skip past ends and loops
+            ## at this point, $partID will be miRNA ID or isomir ID
+            $mdat{$partID}{CLASS} = $part =~ /^Iso/ ? 'ISOMIR' : 'MATURE';
+            $mdat{$partID}{LEN} = $score if $score > $mdat{$partID}{LEN};  # in case > 1, take longest just in case? (multiple identical miRs from different transcripts)
+            $mdat{$partID}{REF}{$ref} = 1;
+            foreach my $rank (1..5) {
+                $rdat{$ref}{F_BP}{$rank}{$_} = 0 foreach qw/ U S A /;  # pre-load empty values
+            }
+        } elsif ($do_class) {
+            ## Normal class handling
+            my $class = (split /\|/, $feat)[0];
+            push @clen, $len;
+            $cdat{$class}{NFEAT}++;  # N class features
+            $cdat{$class}{NREF}++ unless exists $rdat{$ref};  # N references  ## count each ref only once!
+        }
+        $rdat{$ref}{NFEAT}++;        # N ref features  ## MUST GO AFTER CLASS STUFF!
+    }
+    close $BED;
+    die "$0: bed names must unique!\n" if !$mirbase && $bl > scalar(keys %u);
+    foreach my $class (sort keys %cdat) {
+        ## official class length (for RPKMs) is the median of all class features
+        my @sortlen = sort {$a <=> $b} @clen;
+        my $nlen = scalar @clen;
+        if ($nlen % 2 == 0) {   # 2 central elements exist
+            my ($mid1, $mid2) = (($nlen/2)-1, $nlen/2);
+            $cdat{$class}{L} = ($clen[$mid1]+$clen[$mid2])/2;
+        } else {   # 1 central element exists
+            $cdat{$class}{L} = $clen[$#clen/2];
+        }
+    }
+    
+    
+    
+}
+
+
+
+## Get mean read length for RPKM scaling, if $mirbase
+
+my $mir_mean_readlen;
+if ($mirbase) {
+    my ($rl_sum, $rl_n);
+    foreach (split /\n/, `samtools view $inbam2 | cut -f10 | awk '{ print length($1) }' | /home/apa/local/bin/uniq_c`) {
+        chomp;
+        my ($N, $BP) = split;
+        $rl_sum += $BP*$N;
+        $rl_n += $N;
+    }
+    $mir_mean_readlen = sprintf("%0.6f",$rl_sum/($rl_n||1));
+    print "Mean aligned read length: $mir_mean_readlen\n";
+}
+
+
+
+## Split bam, if required
+
+if ($bed || $txome) {
+    
+    &logreport("Splitting bam...", 1, $LOG); 
+    
+    ## Plus, Minus according to strandedness of reference sequence (generally will be '+')
+    ## Sense, Antisense according to strandedness of read alignment
+    ## STRAND SWITCHING OCCURS HERE FOR TRANSCRIPTOME IDXSTATS FILES
+    
+    open my $PBAMS, '|-', "samtools view -bS - > $tmp/plus.S.bam";
+    open my $PBAMA, '|-', "samtools view -bS - > $tmp/plus.A.bam";
+    open my $MBAMS, '|-', "samtools view -bS - > $tmp/minus.S.bam" if $mstr;
+    open my $MBAMA, '|-', "samtools view -bS - > $tmp/minus.A.bam" if $mstr;
+    
+    open my $SH, '-|', "samtools view -H $inbam2";
+    while (<$SH>) {
+        print $PBAMS $_;
+        print $PBAMA $_;
+        print $MBAMS $_ if $mstr;
+        print $MBAMA $_ if $mstr;
+    }
+    close $SH;
+    
+    my %bstats;
+    open my $SAM, '-|', "samtools view -F 4 $inbam2";
+    while (<$SAM>) {
+        my ($name, $flags, $trans, $else) = split /\t/, $_, 4;
+        my $fwd;
+        if (!$stranded) {
+            $fwd = 1;
+        } elsif ($switch) {
+            $fwd = $flags & 16 ? 1 : 0;
+        } else {
+            $fwd = $flags & 16 ? 0 : 1;
+        }
+        my $end = $flags & 128 ? 2 : 1;
+        my $e1fwd = !$PE ? $fwd : ($end == 1 && $fwd) ? 1 : ($end == 2 && !$fwd) ? 1 : 0;  # 1|0, is end 1 on the (+) strand?
+        if ($mstr) {
+            ## don't run extra strand tests unless there was actually a minus-strand reference
+            if ($tstr{$trans} eq '+') {
+                ## Reference sequence is correct transcript sequence
+                if ($e1fwd) {
+                    print $PBAMS $_;
+                    $bstats{PBAMS}++;
+                } else {
+                    print $PBAMA $_;
+                    $bstats{PBAMA}++;
+                }
+            } elsif ($tstr{$trans} eq '-') {
+                ## Reference sequence is reversed transcript sequence (cut from genome without revcomping?)
+                if ($e1fwd) {
+                    print $MBAMA $_;
+                    $bstats{MBAMA}++;
+                } else {
+                    print $MBAMS $_;
+                    $bstats{MBAMS}++;
+                }
+            } else {
+                $trans = $tname{$trans} if $isnum;   ## CONVERT NUM -> NAME
+                die "$0: BAM transcript '$trans' ($tname{$trans}) was not found in transcript annotations:\n$_";
+            }
+        } else {
+            if ($e1fwd) {
+                print $PBAMS $_;
+                $bstats{PBAMS}++;
+            } else {
+                print $PBAMA $_;
+                $bstats{PBAMA}++;
+            }
+        }
+    }
+    close $SAM;
+    
+    close $PBAMS;
+    close $PBAMA;
+    close $MBAMS if $mstr;
+    close $MBAMA if $mstr;
+    
+    my $total;
+    $total += $_ foreach values %bstats;
+    my $width = length($total);
+    printf "+ REF SENSE: %${width}i\n", $bstats{PBAMS};
+    printf "- REF SENSE: %${width}i\n", $bstats{MBAMS};
+    if ($stranded) {
+        printf "+ REF ANTI:  %${width}i\n", $bstats{PBAMA};
+        printf "- REF ANTI:  %${width}i\n", $bstats{MBAMA};
+    }
+    print "\n";
+    
+    foreach my $str (@bamstr) {
+        foreach my $SA (@alnstr) {
+            if (-e "$tmp/$str.$SA.bam") {
+                system "samtools index $tmp/$str.$SA.bam";
+                system "samtools idxstats $tmp/$str.$SA.bam > $tmp/$str.$SA.idxstats.txt";
+            } else {
+                ## some bams may not have been created
+                ## leave an empty file just so that file-opening loops don't die
+                system "touch $tmp/$str.$SA.idxstats.txt";
+            }
+        }
+    }
+}
+
+
+
+
+## Actual quantitation
+
+if ($txome && $bed) {
+    
+    
+    
+    ## Designed for ribosome builds, or anything else like them.
+    ## Aligned to fasta; each reference sequence is composed of 1 or more features, described in the bed file.
+    ## Quantitating via idxstats & intersectBed.
+    ## Only references/features described in the bed file will be quantitated.
+    ## Returning reference-level and feature-level counts.
+    ## Also returning class-level counts if $do_class; bed names must be like "$class|$id".
+    
+    
+    
+    my ($pass, @sortref, %out);
+    
+    ## Get aggregate reference values
+    foreach my $str (@bamstr) {
+        foreach my $SA (@alnstr) {
+            $pass++;
+            open my $IDX, '<', "$tmp/$str.$SA.idxstats.txt";  # already $switch-corrected
+            while (<$IDX>) {
+                next if /^\*/;
+                chomp;
+                my ($ref, $length, $aligns, $non) = split /\t/, $_;
+                push @sortref, $ref if $pass == 1;
+                $stats{U} += $aligns;
+                $stats{$SA} += $aligns if $stranded;
+                $rdat{$ref}{L} = $length;
+                $rdat{$ref}{T_COUNTS}{U} += $aligns;
+                $rdat{$ref}{T_COUNTS}{$SA} += $aligns if $stranded;
+                ## total counts for REFERENCES ONLY -- cannot use feature-level-count sum, as these are only counts CONTAINED by features, NOT reads crossing boundaries.
+            }
+            close $IDX;
+        }
+    }
+    
+    ## Reads per reference feature
+    my $bed2 = "$tmp/tmp.bed";
+    my $nibed = "$tmp/tmp.noiso.bed";
+    my $Fval = '0.9999';   ### DO NOT USE 1: intersectBed can't handle 1
+    ## CORRECT FOR $SWITCH AGAIN HERE -- INTERSECTBED IS READING THE ORIGINAL BAM
+    my $sense_s = $switch ? '-S' : '-s';
+    my $anti_s  = $switch ? '-s' : '-S';
+    my $opencall;
+    
+    if ($mirbase) {
+        &execute("cut -f1-6 $bed | grep -vP \"\\tIso\" > $nibed", 1, $LOG, 2);  # no-isomiR bed
+        &execute("$intersectBed -wo -a $nibed -b $inbam2 $sense_s | cut -f1-6,13 > $tmp/intersectBed.nibp.S.txt", 1, $LOG, 2);
+        &execute("$intersectBed -wo -a $nibed -b $inbam2 $anti_s | cut -f1-6,13 > $tmp/intersectBed.nibp.A.txt", 1, $LOG, 2);
+        
+        foreach my $SA ('S', 'A') {
+            ## WHAT WE ARE DOING HERE:
+            ## Instead of counting feature-contained reads as usual, we are counting feature-contained *BP*.  Picard CollectRnaSeqMetrics-style.
+            ## A set of these counts will be collected for all non-isomir compartments of each miRBase transcript.
+            ## Total alignment count per transcript have already been collected above.
+            ## Below, contained-read counts for mature-miRs and isomiRs will be added.
+            open my $INT, '<', "$tmp/intersectBed.nibp.$SA.txt";
+            while (<$INT>) {
+                ## feature-level overlapping bp; must also summarize to reference level
+                chomp;
+                my ($ref, $start, $end, $feat, $length, $strand, $bp) = split /\t/, $_;
+                my ($part, $partID) = split /\|/, $feat;
+                my $rank = $partrank{$part} if exists $partrank{$part};  ## should be OK, since rankless isomirs are not in this bed file
+                #$rdat{$ref}{F_BP}{$rank} = [$partID, 0, 0, 0] unless exists $rdat{$ref}{F_BP}{$rank};  # feature name (stored by part position, for orderability), then U S A bp.
+                #my $bpi = $SA eq 'S' ? 2 : 3;
+                #$rdat{$ref}{F_BP}{$rank}->[$bpi] += $bp;
+                #$rdat{$ref}{F_BP}{$rank}->[1] += $bp;
+                $rdat{$ref}{F_BP}{$rank}{U} += $bp;
+                $rdat{$ref}{F_BP}{$rank}{$SA} += $bp;
+                $rdat{$ref}{T_BP}{U} += $bp;
+                $rdat{$ref}{T_BP}{$SA} += $bp;
+            }
+            close $INT;
+        }
+        
+        print "Out\n";
+        ## Write mirbase-specific output file
+        ##  REFERENCE  LENGTH  READS  READS.S%  ALN.BP  TOT.RPKM  END5.PCT  MIR5.PCT  LOOP.PCT  MIR3.PCT  END3.PCT  ## all sense RPKMs
+        open my $MIR, "> $mirfile";
+        print $MIR $mirheader;
+        foreach my $ref (sort keys %rdat) {
+            my $totpctS = sprintf("%0.2f",100*$rdat{$ref}{T_COUNTS}{S}/($rdat{$ref}{T_COUNTS}{U}||1));
+            my ($totrpkmS) = @{ &get_rpkms([$rdat{$ref}{L}], [$rdat{$ref}{T_BP}{S}]) };
+            $totrpkmS = 0 if $totrpkmS eq 'NA';
+            my @mapbpS = map {$rdat{$ref}{F_BP}{$_}{S}} @maprank;
+            my @maplen = map {$rdat{$ref}{F_LEN}{$_}} @maprank;
+            my @mappctS = @{ &get_pcts(\@mapbpS) };
+            foreach my $i (1..5) {
+                $mappctS[$i-1] = 'NA' unless $rdat{$ref}{F_LEN}{$i};  # 0-length parts aren't defined; make sure their percents are NA not 0
+            }
+            #$maprpkmS[$_] /= $mir_mean_readlen foreach (0..$#maprpkmS);  # "
+            print $MIR join("\t", $ref, $rdat{$ref}{L}, $rdat{$ref}{T_COUNTS}{U}, $totpctS, $totrpkmS, $rdat{$ref}{T_BP}{S}||0, @mappctS), "\n";
+        }
+        close $MIR;
+        
+        ## Now pick up where non-mir process would be
+        ## Below, quantitate mature miR and isomiR only
+        &execute("cut -f1-6 $bed | grep -vP \"\\t(End5p|End3p|Loop)\"> $bed2", 1, $LOG, 2);
+        &execute("cut -f1-6 $bed | grep -vP \"\\t(End5p|End3p|Loop)\"> $bed2", 1, $LOG, 2);
+        
+    } else {
+        
+        &execute("cut -f1-6 $bed > $bed2", 1, $LOG, 2);
+        
+    }
+    
+    if ($stranded) {
+        &execute("$intersectBed -c -F $Fval -a $bed2 -b $inbam2 $sense_s > $tmp/intersectBed.S.txt", 1, $LOG, 2);
+        &execute("$intersectBed -c -F $Fval -a $bed2 -b $inbam2 $anti_s > $tmp/intersectBed.A.txt", 1, $LOG, 2);
+        $opencall = "bash -c 'paste <(cat $tmp/intersectBed.S.txt) <(cut -f7 $tmp/intersectBed.A.txt)'";
+    } else {
+        &execute("$intersectBed -c -F $Fval -a $bed2 -b $inbam2 > $tmp/intersectBed.U.txt", 1, $LOG, 2);
+        $opencall = "cat $tmp/intersectBed.U.txt";
+    }
+    
+    my (%tempkeys, %tempdata);  # only for $mirbase
+    open my $INT, '-|', $opencall;
+    while (<$INT>) {
+        ## feature-level counts; must also summarize to reference- and then class-level (at least ref, class only if $do_class)
+        chomp;
+        my ($ref, $start, $end, $feat, $score, $strand, @C) = split /\t/, $_;
+        my ($U, $S, $A) = $stranded ? ($C[0]+$C[1], $C[0], $C[1]) : ($C[0], 'NA', 'NA');  # mathwise, 'NA' will have a numeric value of 0 in Perl
+        my @counts = ($U, $S, $A);   # use of "intersectBed -c" guarantees at least zeroes; no undef values
+        my ($class, $length, $key1, $key2, $ID);
+        
+        if ($mirbase) {
+            ## here we are reading in ONLY contained-read counts from mature, isomir features (no need to filter out ends/loops)
+            ## For mirbase data, what looks like $class is actually the working $feat
+            my ($part, $partID) = split /\|/, $feat;
+            $length = $mdat{$partID}{LEN};
+            $class = $mdat{$partID}{CLASS};    # MATURE or ISOMIR
+            my $nrefs = scalar keys %{ $mdat{$partID}{REF} };
+            $ref = "${nrefs}_references" if $nrefs > 1;
+            $key1 = $class;
+            $key2 = $ID = $partID;
+            push @{ $tempkeys{1} }, $key1 unless exists $tempkeys{2}{$key1};             # retain input order
+            push @{ $tempkeys{2}{$key1} }, $key2 unless exists $tempdata{$key1}{$key2};  # retain input order
+            $tempdata{$key1}{$key2}{DAT} = [$class, $ref, $ID, $length, $strand];
+            $tempdata{$key1}{$key2}{CTS} = \@counts;
+        } else {
+            ## normal workflow for feature-contained counts
+            $rdat{$ref}{F_COUNTS}{ $USA[$_] } += $counts[$_] foreach (0..2);  # feature-contained counts
+            if ($do_class) {
+                ## FEATURES ARE CLASSED, REFERENCES ARE NOT
+                $class = (split /\|/, $feat)[0];
+                $cdat{$class}{ $USA[$_] } += $counts[$_] foreach (0..2);  # feature-contained counts assignable to this class
+            } else {
+                $class = 'NA';
+            }
+            $length = $end - $start;
+            $ID = $feat;
+            my $outline = join("\t", $class, $ref, $ID, $length, $strand, @counts);
+            if ($do_rpkm) {
+                my @rpkms = @{ &get_rpkms([$length], \@counts) };
+                $outline .= join("\t", '', @rpkms);
+            }
+            push @{ $out{FEAT} }, "$outline\n";  # feature-level output
+        }
+    }
+    close $INT;
+
+    if ($mirbase) {
+        foreach my $key1 (qw/ MATURE ISOMIR /) {   # (sort @{ $tempkeys{1} }) {  # class
+            foreach my $key2 (sort @{ $tempkeys{2}{$key1} }) {  # mir/iso ID
+                my $outline = join("\t", @{ $tempdata{$key1}{$key2}{DAT} }, @{ $tempdata{$key1}{$key2}{CTS} });
+                if ($do_rpkm) {
+                    my @rpkms = @{ &get_rpkms([$tempdata{$key1}{$key2}{DAT}->[3]], \@{ $tempdata{$key1}{$key2}{CTS} }) };
+                    $outline .= join("\t", '', @rpkms);
+                }
+                push @{ $out{FEAT} }, "$outline\n";  # feature-level output
+            }
+        }
+    }
+    
+    unless ($mirbase) {
+        ## Reference-level output
+        foreach my $ref (@sortref) {
+            foreach (@USA) {
+                $rdat{$ref}{B_COUNTS}{$_} = $rdat{$ref}{T_COUNTS}{$_}-$rdat{$ref}{F_COUNTS}{$_};  # U, S, A boundary-overlapping counts (calculated, but not printed)
+                $cdat{'_boundary_reads'}{$_} += $rdat{$ref}{B_COUNTS}{$_};  # all non-contained read counts go to novel '_boundary_reads' class
+            }
+            my @counts = @{ &get_counts($rdat{$ref}{T_COUNTS}) };  # U, S, A total counts (boundary + contained)
+            my $outline = join("\t", "NA\t$ref\tALL\t$rdat{$ref}{L}\t.", @counts);  # class is NA for reference-level counts
+            if ($do_rpkm) {
+                my @rpkms = @{ &get_rpkms([$rdat{$ref}{L}], \@counts) };
+                $outline .= join("\t", '', @rpkms);
+            }
+            push @{ $out{REF} }, "$outline\n";
+        }
+        if ($do_class) {
+            ## Class-level output
+            foreach my $class (sort keys %cdat) {
+                my @counts = @{ &get_counts($cdat{$class}) };  # U, S, A counts
+                my $outline = join("\t", "$class\tALL\tALL\t$cdat{$class}{L}\t.", @counts);
+                if ($do_rpkm) {
+                    my @rpkms = @{ &get_rpkms([$cdat{$class}{L}], \@counts) };
+                    $outline .= join("\t", '', @rpkms);
+                }
+                push @{ $out{CLS} }, "$outline\n";  # reference-level output
+            }
+        }
+    }
+    
+    ## Write output
+    open my $OUT, "> $outfile";
+    print $OUT $outheader;
+    print $OUT @{ $out{CLS} } if $do_class;
+    print $OUT @{ $out{REF} } unless $mirbase;
+    print $OUT @{ $out{FEAT} };
+    close $OUT;
+    
+    
+    
+} elsif ($txome && $have_ga) {
+    
+    
+    
+    ## Expected reference: Tophat transcriptome index
+    ## Sense, antisense discovered in one pass, based on strand of alignment
+    ## Reference transcript IDs 0-N must be mapped to original transcript IDs
+    ## Also aggregate counts at gene level
+    
+    
+    
+    &logreport("Writing values...", 1, $LOG); 
+    
+    foreach my $str (@bamstr) {
+        foreach my $SA (@alnstr) {
+            open my $IN, '<', "$tmp/$str.$SA.idxstats.txt";  # already $switch-corrected
+            while (<$IN>) {
+                next if /^\*/;
+                chomp;
+                my ($trans, $len, $reads, $non) = split /\t/, $_;
+                $trans = $tname{$trans} if $isnum;
+                my $gene = $tg{$trans};
+                $stats{U} += $reads;
+                $stats{$SA} += $reads if $stranded;
+                $idx{TRANS}{$trans}{L} = $len;
+                $idx{TRANS}{$trans}{$SA} += $reads if $stranded;
+                $idx{TRANS}{$trans}{U} += $reads;
+                if ($have_ga) {
+                    $idx{GENE}{$gene}{L} = $glen{$gene};
+                    $idx{GENE}{$gene}{$SA} += $reads if $stranded;
+                    $idx{GENE}{$gene}{U} += $reads;
+                } else {
+                    $tstr{$trans} = '.';
+                }
+            }
+            close $IN;
+        }
+    }
+    &write_gt_output();
+    
+    
+    
+} elsif ($txome) {
+    
+    
+    
+    ## Non-Tophat transcriptome reference (i.e., regular fasta file).
+    ## Count with idxstats.
+    ## $do_class allowed; reference names must be "$class|$id"
+    
+    
+    
+    &logreport("Writing values...", 1, $LOG); 
+    
+    my ($pass, @sortref);
+    foreach my $str (@bamstr) {
+        foreach my $SA (@alnstr) {
+            $pass++;
+            open my $IN, '<', "$tmp/$str.$SA.idxstats.txt";  # already $switch-corrected
+            while (<$IN>) {
+                next if /^\*/;
+                chomp;
+                my ($ref, $len, $reads) = split /\t/, $_;
+                push @sortref, $ref if $pass == 1;
+                $stats{U} += $reads;
+                $stats{$SA} += $reads;
+                $rdat{$ref}{L} = $len;
+                $rdat{$ref}{$SA} += $reads if $stranded;
+                $rdat{$ref}{U} += $reads;
+                if ($do_class) {
+                    my $class = (split /\|/, $ref)[0];
+                    $rdat{$ref}{C} = $class;
+                    if ($pass == 1) {
+                        $cdat{$class}{L} += $len;
+                        $cdat{$class}{NFEAT}++;
+                    }
+                    $cdat{$class}{$SA} += $reads if $stranded;
+                    $cdat{$class}{U} += $reads;
+                }
+            }
+            close $IN;
+        }
+        unless ($stranded) {
+            foreach my $SA (@alnstr) {
+                $rdat{$_}{$SA} = 'NA' foreach keys %rdat;
+                $cdat{$_}{$SA} = 'NA' foreach keys %cdat;
+            }
+        }
+        open my $OUT, '>', $outfile;
+        print $OUT $outheader;
+        if ($do_class) {
+            foreach my $class (sort keys %cdat) {
+                my @counts = @{ &get_counts($cdat{$class}) };  # U, S, A counts
+                my $outline = join("\t", "$class\tALL\tALL\t$cdat{$class}{L}\t+", @counts);
+                if ($do_rpkm) {
+                    my @rpkms = @{ &get_rpkms([$cdat{$class}{L}], \@counts) };
+                    $outline .= join("\t", '', @rpkms);
+                }
+                print $OUT "$outline\n";
+            }
+        }
+        foreach my $ref (@sortref) {
+            my $class = $do_class ? $rdat{$ref}{C} : 'NA';
+            my @counts = @{ &get_counts($rdat{$ref}) };  # U, S, A counts
+            my $outline = join("\t", "$class\t$ref\t.\t$rdat{$ref}{L}\t+", @counts);
+            if ($do_rpkm) {
+                my @rpkms = @{ &get_rpkms([$rdat{$ref}{L}], \@counts) };
+                $outline .= join("\t", '', @rpkms);
+            }
+            print $OUT "$outline\n";
+        }
+        close $OUT;
+    }
+    
+    
+    
+} else {
+    
+    
+    
+    ## Since not $txome, then whole-genome alignment.
+    ## Quantitating via htseq-count.
+    
+    my $cmd = "$samtools view $inbam2";  ## MUST BE ALL-READS BAM (not primary): critical if counting multireads, no impact on output otherwise
+    $cmd .= " | perl -pe 's/\\s+NH:i:\\d+//'";  # HTSeq can only see/remove Tophat multireads -- this prevents that -- if you want no-multiread counts, then use $no_multi.
+    $cmd .= " | $htseq_count -s SVALUE -a 0 -m intersection-nonempty - $gtf > $tmp/htseq_counts.FNAME.txt";
+    my $s_sense = $switch ? 'reverse' : 'yes';
+    my $s_anti  = $switch ? 'yes' : 'reverse';
+    (my $cmdU = $cmd) =~ s/SVALUE/no/;
+    (my $cmdS = $cmd) =~ s/SVALUE/$s_sense/;
+    (my $cmdA = $cmd) =~ s/SVALUE/$s_anti/;
+    $cmdU =~ s/FNAME/unstr/;
+    $cmdS =~ s/FNAME/sense/;
+    $cmdA =~ s/FNAME/anti/;
+    
+    if ($pass3 || !$stranded) {
+        &execute("export PYENV_VERSION=$htseq_python && $cmdU", 1, $LOG, 2, 1);  ## REQUIRES BASH
+    }
+    if ($stranded) {
+        &execute("export PYENV_VERSION=$htseq_python && $cmdS", 1, $LOG, 2, 1);  ## REQUIRES BASH
+        &execute("export PYENV_VERSION=$htseq_python && $cmdA", 1, $LOG, 2, 1);  ## REQUIRES BASH
+    }
+    
+    my $HT;
+    if ($pass3) {
+        open $HT, '-|', "bash -c 'paste <(cat $tmp/htseq_counts.unstr.txt) <(cut -f2 $tmp/htseq_counts.sense.txt) <(cut -f2 $tmp/htseq_counts.anti.txt)'";
+    } elsif ($stranded) {
+        open $HT, '-|', "bash -c 'paste <(cat $tmp/htseq_counts.sense.txt) <(cut -f2 $tmp/htseq_counts.anti.txt)'";
+    } else {
+        open $HT, '-|', "cat $tmp/htseq_counts.unstr.txt";
+    }
+    while (<$HT>) {
+        chomp;
+        my ($gene, $U, $S, $A);
+        if ($pass3) {
+            ($gene, $U, $S, $A) = split /\t/, $_;
+        } elsif ($stranded) {
+            ($gene, $S, $A) = split /\t/, $_;
+            $U = $S + $A;
+        } else {
+            ($gene, $U) = split /\t/, $_;
+            $S = $A = 'NA';
+        }
+        my @counts = ($U, $S, $A);
+        if ($glen{$gene}) {
+            ## actual GTF gene
+            $idx{GENE}{$gene}{L} = $glen{$gene};
+            $idx{GENE}{$gene}{ $USA[$_] } += $counts[$_] foreach (0..2);
+            $stats{ $USA[$_] } += $counts[$_] foreach (0..2);
+        } elsif ($gene =~ /^__/) {
+            next unless $pass3;         # don't even show these unless guaranteed accurate, which requires $pass3.
+            $isQC{$gene} = 1;           # htseq-count QC rows
+            $idx{GENE}{$gene}{ $USA[$_] } += $counts[$_] foreach (0..2);  #### $U IS ONLY ACCURATE FOR $PASS3
+        } else {
+            die "$0: Non-GTF, non-htseq-QC \"gene\" '$gene'!  Cannot process.\n";
+        }
+    }
+    close $HT;
+
+    if ($pass3) {
+        my $qgene = '__quantitated';  ## novel htseq-count QC metric
+        $isQC{$qgene} = 1;
+        $idx{GENE}{$qgene}{$_} = $stats{$_} foreach @USA;
+    }
+    &write_gt_output();
+    
+    
+}
+
+
+
+print "NREADS: $nreads | M: $M\n";
+my $fmt = '%-5s %'.length($nreads).'i (%6.2f%)'."\n";
+$stats{N} = $nreads - $stats{U};
+printf $fmt, 'UNSTR', $stats{U}, 100*$stats{U}/($nreads||1);
+if ($stranded) {
+    $stats{S} = 0 unless $stats{S};
+    $stats{A} = 0 unless $stats{A};
+    printf $fmt, 'SENSE', $stats{S}, 100*$stats{S}/($nreads||1);
+    printf $fmt, 'ANTI ', $stats{A}, 100*$stats{A}/($nreads||1);
+}
+printf $fmt, 'NONE ', $stats{N}, 100*$stats{N}/($nreads||1);
+printf $fmt, 'TOTAL', $nreads,   100;
+
+system "rm -rf $tmp";
+exit;
+
+
+
+
+sub get_counts {
+    
+    my %hash = %{ $_[0] };
+    my @C;
+    if ($stranded) {
+        @C = map { $hash{$_}||0 } @USA;
+    } else {
+        @C = ($hash{U}, 'NA', 'NA');
+    }
+    return \@C;
+}
+
+
+sub get_rpkms {
+    
+    my ($K, $COUNTS) = @_;  # both are array refs
+    my @COUNTS = @$COUNTS;
+    my @K = $#{$K} ? @$K : map {$K} @COUNTS;  # specify one K value for each count, or one K value for all counts
+    die ($#K+1)." K values but ".($#COUNTS+1)." counts!\n" if $#K != $#COUNTS;
+    my @factor = map {1E9/(($_||1)*($M||1))} @K;
+    my @RPKMS;
+    foreach (0..$#COUNTS) {
+        push @RPKMS, (!defined $COUNTS[$_] || $COUNTS[$_] eq 'NA') ? 'NA' : sprintf("%0.${ndec}f",$COUNTS[$_]*$factor[$_]);
+    }
+    return \@RPKMS;
+}
+
+
+sub get_pcts {
+
+    my $COUNTS = shift;
+    my @COUNTS = @$COUNTS;
+    my $SUM;
+    $SUM += $_ foreach @COUNTS;
+    $SUM = 1 unless $SUM;
+    my @PCTS;
+    foreach (0..$#COUNTS) {
+        push @PCTS, (!defined $COUNTS[$_] || $COUNTS[$_] eq 'NA') ? 'NA' : sprintf("%0.2f",100*$COUNTS[$_]/$SUM);
+    }
+    return \@PCTS;
+}
+
+
+sub write_gt_output {
+    
+    open OUT, '>', $outfile;
+    print OUT $outheader;
+    if ($have_ga) {
+        foreach my $gene (sort keys %{ $idx{GENE} }) {
+            my $GQ = $isQC{$gene} ? 'QC' : 'GENE';
+            my $dat = "$GQ\t$gene\t.\t$idx{GENE}{$gene}{L}\t$gstr{$gene}";
+            my @counts = @{ &get_counts($idx{GENE}{$gene}) };
+            my $outline = join("\t", $dat, @counts);
+            if ($do_rpkm) {
+                if ($isQC{$gene}) {
+                    $outline .= "\tNA\tNA\tNA";
+                } else {
+                    my @rpkms = @{ &get_rpkms([$idx{GENE}{$gene}{L}], \@counts) };
+                    $outline .= join("\t", '', @rpkms);
+                }
+            }
+            print OUT "$outline\n";
+        }
+    }
+    if ($txome) {
+        foreach my $trans (sort keys %{ $idx{TRANS} }) {
+            my $dat = "TRANS\t$trans\t.\t$idx{TRANS}{$trans}{L}\t$tstr{$trans}";
+            my @counts = @{ &get_counts($idx{TRANS}{$trans}) };
+            my $outline = join("\t", $dat, @counts);
+            if ($do_rpkm) {
+                my @rpkms = @{ &get_rpkms([$idx{TRANS}{$trans}{L}], \@counts) };
+                $outline .= join("\t", '', @rpkms);
+            }
+            print OUT "$outline\n";
+        }
+    }
+    close OUT;
+
+}

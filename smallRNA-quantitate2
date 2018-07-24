@@ -1,0 +1,380 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use File::Path qw/ make_path remove_tree /;
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## INPUT: a small-RNA BAM file and an genome/annotation build
+## OUTPUT: strandwise counts/RPKMs per gene
+##         strandwise aligned-bp per genomic compartment (PC-CDS, PC-UTR, NC-exon, intron, intergene, ribosome) 
+
+
+## Inputs
+my $sr_bam;   # BAM file (aligned to sRNA fasta with Bowtie1)
+my $TE_bam;   # BAM file (aligned to TE fasta with Bowtie1)
+my $geno_bam; # BAM file (aligned to genome with Bowtie1)
+my $junc_bam; # BAM file (aligned to genome with Tophat)
+my $geno;     # genome build name in /n/data1/genomes/indexes
+my $anno;     # associated annotation build name (path /n/data1/genomes/indexes/$geno/$anno must exist)
+my $outpref;  # output file (optional; otherwise taken from bam)
+my $Mval;     # true M value for RPKM (optional)
+my $switch;   # switch strandedness?  (e.g. if using Illumina stranded protocol)
+my $primary;  # use only BAM alignments flagged as primary? (default: all alignments)
+my $keep;     # do not delete intermediate datasets once run completes?
+my $verbose;  # print commands to screen in real time
+
+GetOptions("gb=s"=>\$geno_bam, "tb=s"=>\$TE_bam, "sb=s"=>\$sr_bam, "g=s"=>\$geno, "a=s"=>\$anno, "o=s"=>\$outpref, "M=i"=>\$Mval, "switch"=>\$switch, "primary"=>\$primary, "keep"=>\$keep, "verbose"=>\$verbose);
+
+## test arguments, create tempdir
+die "No BAMs specified!\n" unless $geno_bam || $TE_bam || $sr_bam;
+(my $scriptname = $0) =~ s!.*/!!;
+my $genodir = "/n/data1/genomes/indexes/$geno";
+my $annodir = "$genodir/$anno";
+my $GA = "$annodir/$geno.$anno";
+my $srnadir = "$annodir/smallRNA";
+my $SR = "$srnadir/$geno.$anno.smallRNA";
+die "Expected annotations path '$annodir' does not exist!\n" unless -d $annodir;
+die "Expected smallRNA-annotations path '$srnadir' does not exist!\n" if $sr_bam && ! -d $srnadir;
+my $gdat = "$GA.genedata.txt";
+my $srdat = "$SR.genedata.txt";
+my $sw = $switch ? '--switch' : '';
+my $std = $verbose ? 1 : 0;
+chomp(my $geno_bam = `readlink -f $geno_bam`);
+my ($bampath) = ($geno_bam =~ /^(.*)\/[^\/]+$/);
+$bampath = '.' unless $bampath;   # bam file might not have explicit path
+($outpref = $geno_bam) =~ s/\.bam$/.$scriptname/i unless $outpref;
+
+my $tmpdir = "$scriptname.$$.tmp";
+system "rm -rf $tmpdir";
+system "mkdir $tmpdir";
+die "$0: Failed to create temp directory '$tmpdir'!\n" unless -d $tmpdir;
+
+my $log = "$outpref.log";
+my $LOG = &open2('W', $log, 'Log file');
+chomp(my $now = `date`);
+&logreport("\n$0 initializing: $now\npreparing data...", 1, $LOG);
+
+
+## Globals
+my %knownExt = map {($_=>1)} qw/ bed gtf gff /;  # valid $defs extensions
+my %exonNumber;   # exon numbering per transcript
+my $known_M = $Mval ? 1 : 0;  # was M-value specified?
+my $mergeBed = '/n/local/stage/bedtools/bedtools2-2.24.0/bin/mergeBed';
+my $intersectBed = '/n/local/stage/bedtools/bedtools2-2.24.0/bin/intersectBed';
+my $samtools = 'samtools';
+my $htseq_count = 'htseq-count';
+my $splitBam = '/home/apa/local/bin/splitBam';
+my $bam2track = '/home/apa/local/bin/bam2track';
+my $sortBedCoord = '/home/apa/local/bin/sortBedCoord';
+my $bamHeaderChromSizes = '/home/apa/local/bin/bamHeaderChromSizes';
+
+my (%gbio, %ulen, %counts, %RPKM);  # various hashes
+
+my %F;  # filename organization
+my @sets  = qw/ S T G /;  # input aligned read sets (bams)
+my %setnames = ('S'=>'sRNA', 'T'=>'TE', 'G'=>'Genome');  # names for above sets
+my %setbams = ('S'=>$sr_bam, 'T'=>$TE_bam, 'G'=>$geno_bam);  # bams for above sets
+
+foreach my $set (@sets) {
+	next unless -e $setbams{$set};
+	chomp($F{$set}{BAM_IN} = `readlink -f $setbams{$set}`);
+	$F{$set}{PREF} = "$tmpdir/$setnames{$set}";
+	$F{$set}{CHRSZ} = "$F{$set}{PREF}.chrom.sizes";
+	$F{$set}{BAM} = "$F{$set}{PREF}.bam";
+	$F{$set}{BAM_P} = "$F{$set}{PREF}.plus.bam";
+	$F{$set}{BAM_M} = "$F{$set}{PREF}.minus.bam";
+	$F{$set}{BG_P} = "$F{$set}{PREF}.plus.bg";
+	$F{$set}{BG_M} = "$F{$set}{PREF}.minus.bg";
+	$F{$set}{IDX_P} = "$F{$set}{PREF}.plus.idxstats.txt";
+	$F{$set}{IDX_M} = "$F{$set}{PREF}.minus.idxstats.txt";
+	$F{$set}{BP_P} = "$F{$set}{PREF}_bp_s";
+	$F{$set}{BP_M} = "$F{$set}{PREF}_bp_a";
+}
+
+my %B = (  # bed file organization (and names)
+    'ucds'  => { 'N'=>'CDS',       'I'=>"$tmpdir/ucds.bed",  'S'=>"$tmpdir/ucds_s",  'A'=>"$tmpdir/ucds_a"  },
+    'puxon' => { 'N'=>'PC Exons',  'I'=>"$tmpdir/puxon.bed", 'S'=>"$tmpdir/puxon_s", 'A'=>"$tmpdir/puxon_a" },
+    'nuxon' => { 'N'=>'NC Exons',  'I'=>"$tmpdir/nuxon.bed", 'S'=>"$tmpdir/nuxon_s", 'A'=>"$tmpdir/nuxon_a" },
+    'ribo'  => { 'N'=>'Ribosomes', 'I'=>"$tmpdir/ribo.bed",  'S'=>"$tmpdir/ribo_s",  'A'=>"$tmpdir/ribo_a"  },
+    'iint'  => { 'N'=>'Introns',   'I'=>"$tmpdir/iint.bed",  'S'=>"$tmpdir/iint_s",  'A'=>"$tmpdir/iint_a"  },
+    'hts'   => { 'N'=>'',          'I'=>"$GA.cuff.gtf",      'S'=>"$tmpdir/htseq_s", 'A'=>"$tmpdir/htseq_a" }  	
+	 ## no name needed for htseq "feature" -- not a feature -- just stored in this object for systematicness
+);
+
+my $totalbp = "$tmpdir/total_bp";
+my $itgcbp = "$tmpdir/itgc_bp";
+my $itgc = "$tmpdir/itgc.bed";
+my $chrsz = "$tmpdir/chrom.sizes";
+my $annot = "$tmpdir/gene.annot";
+
+## some of the above files are append-only; just remove any existing copies of all of them before continuing
+&execute("rm -f $totalbp $itgcbp", $std, $LOG, 2);
+foreach my $feat (keys %B) {
+	foreach my $SA (qw/ S A /) {
+		&execute("rm -f $B{$feat}{$SA}", $std, $LOG, 2);
+	}
+}
+
+## begin importing/creating bed files
+&execute("ln -sf $GA.intergenes.bed $itgc", $std, $LOG, 3);
+&execute("ln -sf $GA.iintrons.bed $B{iint}{I}", $std, $LOG, 3);
+&execute("ln -sf $genodir/$geno.chrom.sizes $chrsz", $std, $LOG, 3);
+
+## get modified gene data for sRNA build
+my (%alt_annot, %srna_bio);
+if ($sr_bam) {
+	my $SR = &open2('R', $srdat, 'smallRNA gene data file');
+	my @cols;
+	while (<$SR>) {
+		my @data = split /\t/, $_;
+		if ($. == 1) {
+			foreach my $i (0..$#data) {
+				$cols[0] = $i if $data[$i] eq 'Gene.ID';
+				$cols[1] = $i if $data[$i] eq 'Gene.Biotype';  
+				$cols[2] = $i if $data[$i] eq 'Gene.Symbol';   ## NOT SimpleBiotype, as below -- differs from $gdat, but not used at the moment
+				$cols[3] = $i if $data[$i] eq 'cDNA.Length';
+			}
+		} else {
+			my @data2 = @data[@cols];
+			$alt_annot{$data2[0]} = \@data2;
+			$srna_bio{$data2[1]} = 1;
+		}
+	}
+	close $SR;
+}
+
+## get gene data
+my $GDO = &open2('W', $annot, 'Temp gene annotation file');
+print $GDO join("\t", qw/ Gene Biotype Length smallRNA /), "\n";
+my $GD = &open2('R', $gdat, 'Gene data file');
+my @cols;
+while (<$GD>) {
+    my @data = split /\t/, $_;
+    if ($. == 1) {
+		foreach my $i (0..$#data) {
+			$cols[0] = $i if $data[$i] eq 'GeneID';
+			$cols[1] = $i if $data[$i] eq 'Biotype';
+			$cols[2] = $i if $data[$i] eq 'SimpleBiotype';
+			$cols[3] = $i if $data[$i] eq 'Uxon_Len';
+		}
+    } else {
+		my $gene = @data[$cols[0]];
+		die "$0: Line $. no gene!\n" unless $gene;
+		my (@data2, $sbio);
+		if (exists $alt_annot{$gene}) {
+			@data2 = @{ $alt_annot{$gene} };  # USE ALT DATA
+			$sbio = $data2[1];                # SimpleBiotype == Biotype in this case
+		} else {
+			@data2 = @data[@cols];            # USE PENDING DATA
+			$sbio = $data2[2];                # SimpleBiotype
+		}
+		$gbio{B}{$data2[1]}{$gene} = 1;       # by Biotype
+		$gbio{S}{$sbio}{$gene} = 1;           # by SimpleBiotype
+		$gbio{R}{$gene} = 1 if $data2[1] =~ /rRNA/;  # ribosomes, incl. mito and pseudo
+		$ulen{$gene} = $data2[3];
+		my $is_srna = ('FALSE','TRUE')[(exists $srna_bio{$data2[1]})];
+		print $GDO join("\t", $gene, $data2[1], $data2[3], $is_srna), "\n";
+    }
+}
+close $GD;
+close $GDO;
+
+## split uxons by protein coding, noncoding
+my $UX  = &open2('R', "$GA.uxons.bed", 'Input uxons bed');
+my $UXN = &open2('W', $B{nuxon}{I}, 'Output NC-uxons bed');
+my $UXP = &open2('W', $B{puxon}{I}, 'Output PC-uxons bed');
+my $UXR = &open2('W', $B{ribo}{I},  'Output ribosome bed');
+my %x;
+while (<$UX>) {
+    my @data = split /\t/, $_;
+    my $gene = (split /:/, $data[3])[0];
+    $x{T}++;
+    if (exists $gbio{S}{'protein_coding'}{$gene} || exists $gbio{S}{'pseudogene'}{$gene}) {
+		print $UXP $_;
+		$x{P}++;
+    } elsif (exists $gbio{R}{$gene}) {
+		print $UXR $_;
+		$x{R}++;
+    } else {
+		print $UXN $_;
+		$x{N}++;
+    }
+}
+close $_ foreach ($UX, $UXN, $UXP, $UXR);
+&logreport("UXON DISTRIBUTION: $x{T} T | $x{P} P | $x{N} N | $x{R} R", $std, $LOG);
+
+## flatten CDS bed
+my $cds = "$GA.CDSs.bed";
+my $pcds = "$tmpdir/pcds.bed";
+my $ncds = "$tmpdir/ncds.bed";
+&execute("awk '{ if (\$6==\"+\") print \$0 }' $cds > $pcds", $std, $LOG, 2);
+&execute("awk '{ if (\$6==\"-\") print \$0 }' $cds > $ncds", $std, $LOG, 2);
+&execute("$mergeBed -i $pcds | awk '{ print \$0\"\\tPCDS.\"NR\"\\t1\\t+\" }' >  $B{ucds}{I}", $std, $LOG, 2);
+&execute("$mergeBed -i $ncds | awk '{ print \$0\"\\tNCDS.\"NR\"\\t1\\t-\" }' >> $B{ucds}{I}", $std, $LOG, 2);
+&execute("$sortBedCoord -i $B{ucds}{I} --overwrite", $std, $LOG, 3);
+
+## process each alignment set
+foreach my $set (@sets) {
+	next unless $F{$set};  # may not have been provided
+	
+	if ($primary) {
+		&execute("$samtools view -h -F 256 $F{$set}{BAM_IN} | $samtools view -bS - > $F{$set}{BAM}", $std, $LOG, 2);
+	} else {
+		&execute("ln -sf $F{$set}{BAM_IN} $F{$set}{BAM}", $std, $LOG, 3);
+	}
+	
+	if ($set eq 'S' || $set eq 'T') {
+		
+		## references are genes/TEs; don't require full genomic methods
+		&logreport("quantitating $setnames{$set} alignments...", 1, $LOG);
+		
+		## convert BAM header to chrom.sizes
+		&execute("$bamHeaderChromSizes $F{$set}{BAM} $F{$set}{CHRSZ}", $std, $LOG, 2);
+		## split by strand
+		&execute("$splitBam $F{$set}{BAM}", $std, $LOG, 3);
+		## quantitate references
+		&execute("$samtools idxstats $F{$set}{BAM_P} > $F{$set}{IDX_P}", $std, $LOG, 2);
+		&execute("$samtools idxstats $F{$set}{BAM_M} > $F{$set}{IDX_M}", $std, $LOG, 2);
+		&execute("$bam2track -b $F{$set}{BAM_P} -c $F{$set}{CHRSZ} --BG1", $std, $LOG, 3);
+		&execute("$bam2track -b $F{$set}{BAM_M} -c $F{$set}{CHRSZ} --BG1", $std, $LOG, 3);
+		&execute("cut -f4 $F{$set}{BG_P} > $F{$set}{BP_P}", $std, $LOG, 2);
+		&execute("cut -f4 $F{$set}{BG_M} | sed 's/-//' > $F{$set}{BP_M}", $std, $LOG, 2);   ## remove minus signs from (-) strand bedGraph values!
+		
+	} elsif ($set eq 'G') {
+		
+		## references are chromosomes
+		&logreport("preparing $setnames{$set} bp coverage...", 1, $LOG);
+		
+		## make stranded genomic bedGraphs
+		&execute("$bam2track -b $F{$set}{BAM} -g $geno --BG1 --stranded $sw", $std, $LOG, 3);
+		&execute("cut -f4 $F{$set}{BG_P} >> $totalbp", $std, $LOG, 2);  # APPEND 
+		&execute("cut -f4 $F{$set}{BG_M} | sed 's/-//' >> $totalbp", $std, $LOG, 2);  # APPEND  # and remove minus signs!
+		&execute("perl -i -pe 's/(.*)(\\t\\S+)\$/\$1\\tX\$2\\t+/' $F{$set}{BG_P}", $std, $LOG, 3);  # add strand to bedGraphs
+		&execute("perl -i -pe 's/(.*)(\\t\\S+)\$/\$1\\tX\$2\\t-/' $F{$set}{BG_M}", $std, $LOG, 3);  # add strand to bedGraphs
+		
+		## count intergenes
+		&logreport("quantitating $setnames{$set}, intergenes...", 1, $LOG);
+		&execute("$intersectBed -wa -a $F{$set}{BG_P} -b $itgc | cut -f5 >> $itgcbp", $std, $LOG, 2);  # APPEND 
+		&execute("$intersectBed -wa -a $F{$set}{BG_M} -b $itgc | cut -f5 | sed 's/-//' >> $itgcbp", $std, $LOG, 2);  # APPEND  # and remove minus signs!
+		
+		## count other genomic features
+		my $sense = $switch ? '-S' : '-s';
+		my $anti  = $switch ? '-s' : '-S';
+		foreach my $feat (sort keys %B) {
+			next if $feat eq 'hts';  # passing: ucds puxon nuxon ribo iint
+			&logreport("quantitating $setnames{$set}, $B{$feat}{N}...", 1, $LOG);
+			&execute("$intersectBed $sense -wa -a $F{$set}{BG_P} -b $B{$feat}{I} | cut -f5 >> $B{$feat}{S}", $std, $LOG, 2);  # APPEND
+			&execute("$intersectBed $anti  -wa -a $F{$set}{BG_P} -b $B{$feat}{I} | cut -f5 >> $B{$feat}{A}", $std, $LOG, 2);  # APPEND
+			&execute("$intersectBed $sense -wa -a $F{$set}{BG_M} -b $B{$feat}{I} | cut -f5 | sed 's/-//' >> $B{$feat}{S}", $std, $LOG, 2);  # APPEND  # and remove minus signs!
+			&execute("$intersectBed $anti  -wa -a $F{$set}{BG_M} -b $B{$feat}{I} | cut -f5 | sed 's/-//' >> $B{$feat}{A}", $std, $LOG, 2);  # APPEND  # and remove minus signs!
+		}
+		
+		## htseq-count genes from genomic alignments
+		my $sense = $switch ? 'reverse' : 'yes';
+		my $anti  = $switch ? 'yes' : 'reverse';
+		&logreport("quantitating $setnames{$set}, genes (sense)...", 1, $LOG);
+		&execute("$samtools view $F{$set}{BAM} | perl -pe 's/\\s+NH:i:\\d+//' | $htseq_count -s $sense -a 0 -m intersection-nonempty - $B{hts}{I} > $B{hts}{S}", $std, $LOG, 2);
+		&logreport("quantitating $setnames{$set}, genes (antisense)...", 1, $LOG);
+		&execute("$samtools view $F{$set}{BAM} | perl -pe 's/\\s+NH:i:\\d+//' | $htseq_count -s $anti  -a 0 -m intersection-nonempty - $B{hts}{I} > $B{hts}{A}", $std, $LOG, 2);
+		## above: stripping NH tag removes multiread status for Tophat bams.  ShortStack bam multiread flags are not recognized by HTSeq count, so OK on that.
+		
+	}
+}
+
+## merge HTseq-count read genomic counts and direct-aligned sRNA idxstats counts (also read counts)
+&execute("cut -f1,3 $F{S}{IDX_P} >> $B{hts}{S}", $std, $LOG, 2);
+&execute("cut -f1,3 $F{S}{IDX_M} >> $B{hts}{A}", $std, $LOG, 2);
+
+&logreport("running R...", 1, $LOG);
+my $script = "$tmpdir/final.R";
+my $code = &Rscript;
+my $R = &open2('W', $script, 'R script');
+print $R $code;
+close $R;
+&execute("./$script > $script.Rout", $std, $LOG, 2);  # writes $outpref.txt
+
+## exit
+system "rm -rf $tmpdir" unless $keep;
+chomp(my $now = `date`);
+&logreport("$0 complete: $now", 1, $LOG);
+close $LOG;
+exit;
+
+
+
+
+
+sub Rscript {
+
+    my $code = <<EOF;
+#!/usr/bin/env Rscript
+
+colnames1 <- c("Length","Count.U","Count.S","Count.A","RPKM.U","RPKM.S","RPKM.A")
+
+gd <- read.delim("$annot", as.is=TRUE)
+gd <- gd[order(gd[,3],gd[,1]),]   # order by biotype, gene.ID
+gd <- gd[c(gd[,4],!gd[,4]),]      # further order by smallRNA, others
+hts.s <- read.delim("$B{hts}{S}", header=FALSE, as.is=TRUE)
+hts.a <- read.delim("$B{hts}{A}", header=FALSE, as.is=TRUE)
+hts.s <- aggregate(hts.s[,2], list(hts.s[,1]), sum)  # all smallRNA have 2 rows; add them
+hts.a <- aggregate(hts.a[,2], list(hts.a[,1]), sum)  # all smallRNA have 2 rows; add them
+hts <- cbind(NA, hts.s[,2]+hts.a[,2], hts.s[,2], hts.a[,2])[,c(1,2:4,2:4)]
+dimnames(hts) <- list(hts.s[,1],colnames1)
+
+non.gene <- grep("_",rownames(hts))
+gd.ord <- match(gd[,1],rownames(hts))
+hts[gd.ord,1] <- gd[,3]
+for (i in 5:7) hts[gd.ord,i] <- 1E9*(hts[gd.ord,i]/(as.numeric(sum(hts[gd.ord,2]))*hts[gd.ord,1]))
+hts[non.gene,5:7] <- NA
+hts <- hts[c(non.gene,gd.ord),]
+hts.grp <- c( rep("HTSEQ",length(non.gene)), gd[,2] )  # "HTSEQ" for HtSeq-count stats, biotypes for genes
+hts <- data.frame(Group=hts.grp, ID=rownames(hts), hts)
+
+feats <- c("ucds","puxon","nuxon","ribo","iint","itgc","total")
+fnames <- c("PC-CDS","PC-UTR","NC-EXON","RIBO","INTRON","INTERGENIC","TOTAL")
+F <- length(feats)
+
+fmat <- matrix(NA, F, length(colnames1), FALSE, list(fnames,colnames1))
+for (i in 1:(F-2)) {   # skipping intergenic, total: these are not split out by sense/antisense
+    prefix <- paste0("$tmpdir/",feats[i])
+    fmat[i,1] <- sum(as.numeric(system(paste0("/home/apa/local/bin/bedLengths -b ",prefix,".bed | cut -f7"), intern=TRUE)))
+    fmat[i,3] <- sum(scan(paste0(prefix,"_s"), what=0, sep="\\n"))
+    fmat[i,4] <- sum(scan(paste0(prefix,"_a"), what=0, sep="\\n"))
+}
+fmat[,2] <- rowSums(fmat[,3:4])
+fmat[2,] <- fmat[2,]-fmat[1,]  # remove CDS from PC-uxon -> UTR
+
+fmat[6,1] <- sum(as.numeric(system("/home/apa/local/bin/bedLengths -b $itgc | cut -f5", intern=TRUE)))
+fmat[7,1] <- sum(as.numeric(system("/home/apa/local/bin/bedLengths -b $chrsz | cut -f2", intern=TRUE)))
+fmat[6,2] <- sum(scan("$itgcbp", what=0, sep="\\n"))  # 'total' and 'itgc' only have totals, not sense/anti
+fmat[7,2] <- sum(scan("$totalbp", what=0, sep="\\n"))
+fmat <- data.frame(Group="BPTYPE",ID=rownames(fmat),fmat)
+
+TE.s <- as.matrix(read.delim("$F{T}{IDX_P}", header=FALSE, row.names=1))
+TE.a <- as.matrix(read.delim("$F{T}{IDX_M}", header=FALSE, row.names=1))
+TE <- cbind(TE.s[,1], TE.s[,2]+TE.a[,2], TE.s[,2], TE.a[,2])[,c(1:4,2:4)]
+colnames(TE) <- colnames1
+for (i in 5:7) TE[,i] <- 1E9*(TE[,i]/(as.numeric(sum(TE[,2]))*TE[,1]))
+TE <- TE[rownames(TE)!="*",]
+TE <- TE[order(rownames(TE)),]
+TE <- data.frame(Group="TE",ID=rownames(TE),TE)
+hts <- rbind(hts, TE)
+
+fmat <- fmat[c(1:F,F),]
+fmat[F+1,2] <- "TE"
+fmat[F+1,3] <- sum(TE[,3])
+fmat[F+1,5] <- sum(scan("$F{T}{BP_P}", what=0, sep="\\n"))
+fmat[F+1,6] <- sum(scan("$F{T}{BP_M}", what=0, sep="\\n"))
+fmat[F+1,4] <- sum(fmat[F+1,5:6])
+fmat[F+1,7:9] <- NA
+rownames(fmat) <- NULL
+
+out <- rbind(fmat,hts)
+write.table(out, "$outpref.txt", sep="\\t", quote=FALSE, row.names=FALSE)
+
+EOF
+
+    return $code;
+}
+

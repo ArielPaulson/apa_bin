@@ -1,0 +1,130 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+
+### Takes a meme.txt file and converts it to minimal meme format CORRECTLY, 
+###   instead of changing motif order like the meme-suite 'meme2meme' does.
+### Also has the option to use most-frequent base instead of degenerate consensus.
+
+
+
+### Inputs
+my $memetxt;    # input meme.txt file
+my $outmeme;    # output minimal-meme file
+my $names;      # can be number|consensus|max
+
+GetOptions("m=s"=>\$memetxt, "o=s"=>\$outmeme, "n=s"=>\$names);
+
+my %oknames = map {($_=>1)} qw/ number consensus max /;
+
+die "$0: 'names' argument must be one of 'number', 'consensus', 'max'!\n" unless $oknames{$names};
+
+my $memeheader = "MEME version 4.4
+
+ALPHABET= ACGT
+
+strands: #STRANDS#
+
+Background letter frequencies (from dataset with add-one prior applied):
+#BACKGROUND#
+";
+
+my (%mdat, $bkg, $motif, $pwm, $regex);
+
+open my $IN, '<', $memetxt or die "$0: Input '$memetxt' not readable: $!\n";
+while (<$IN>) {
+    s/[\n\r]+$//;
+    if (/^strands: (.*)/) {
+	my $str = $1;
+	$memeheader =~ s/#STRANDS#/$str/;
+    } elsif (/^Background letter frequencies \(from dataset with add-one prior applied\):/) {
+	$bkg = 1;
+    } elsif ($bkg == 1) {
+	$memeheader =~ s/#BACKGROUND#/$_/;
+	$bkg = 0;
+    } elsif (/^MOTIF\s+(\d+)\s+MEME/) {
+	$motif = $1;
+    } elsif (/^Multilevel\s+(\S+)/) {
+	$mdat{$motif}{MAX} = $1;
+    } elsif (/^\s+Motif\s+\d+\s+position-specific probability matrix/) {
+	$pwm = 1;
+    } elsif ($pwm == 1 && $_ =~ /^-/) {
+	$pwm = 2;
+    } elsif ($pwm == 2 && $_ =~ /^-/) {
+	$pwm = 0;
+    } elsif ($pwm == 2) {
+	$mdat{$motif}{PWM} .= "$_\n";
+    } elsif (/^\s+Motif\s+\d+\s+regular expression/) {
+	$regex = 1;
+    } elsif ($regex == 2) {
+	$mdat{$motif}{DEGEN} = &degen($_);
+	$regex = 0;
+    } elsif ($regex > 0) {
+	$regex++;
+    }
+}
+my $nmotifs = $motif;
+
+my $OUT;
+if ($outmeme) {
+    open $OUT, '>', $outmeme or die "$0: Cannot write to output '$outmeme': $!\n";
+} else {
+    $OUT = *STDOUT;
+}
+
+print $OUT "$memeheader\n";
+foreach my $motif (1..$nmotifs) {
+    my $name = 
+	$names eq 'number' ? $motif : 
+	$names eq 'consensus' ? $mdat{$motif}{DEGEN} : 
+	$names eq 'max' ? $mdat{$motif}{MAX} : 
+	'NA';
+    print $OUT "MOTIF $motif $name\n\n$mdat{$motif}{PWM}\n";
+}
+close $OUT;
+exit;
+
+
+
+sub degen {
+    
+    my %convert_degen = (
+	'AG'=>'R',
+	'CT'=>'Y',
+	'CG'=>'S',
+	'AT'=>'W',
+	'GT'=>'K',
+	'AC'=>'M',
+	'CGT'=>'B',
+	'AGT'=>'D',
+	'ACT'=>'H',
+	'ACG'=>'V',
+	'ACGT'=>'N'
+	);
+    
+    my $regex = shift;
+    
+    my (@degseq, $isclass, @classchar);
+    foreach my $char (split //, $regex) {
+	if ($char eq '[') {
+	    $isclass = 1;
+	} elsif ($char eq ']') {
+	    if ($#classchar == 0) {
+		push @degseq, $classchar[0];
+	    } else {
+		push @degseq, $convert_degen{ join('', sort @classchar) };
+	    }
+	    $isclass = 0;
+	    @classchar = ();
+	} elsif ($isclass) {
+	    push @classchar, $char;
+	} else {
+	    push @degseq, $char;
+	}
+    }
+    
+    return join('', @degseq);
+}

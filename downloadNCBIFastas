@@ -1,0 +1,177 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use LWP::Simple;
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+## Downloads NCBI nucleotide, EST, and peptide fastas for a given organism.
+## Splits out protein and nucleotide-core fastas into subsets based on sequence completeness; 
+##   see structure of %search_strings below.
+
+
+## Inputs
+my $organism;  # as 'Genus_species'
+my $count;     # only count N results available; do not download
+my $nodbs;     # do not make a blast database for each fasta? (default: will make)
+
+$organism = $ARGV[0];
+foreach (1..$#ARGV) {
+    $count = 1 if $ARGV[$_] eq '--count';
+    $nodbs = 1 if $ARGV[$_] eq '--no-dbs';
+}
+
+chomp(my $today = `date +%Y%m%d`);
+
+my $EUTILS  = 'http://eutils.ncbi.nlm.nih.gov/entrez/eutils';
+my $ESEARCH = "$EUTILS/esearch.fcgi";
+my $EFETCH  = "$EUTILS/efetch.fcgi";
+my $retmax = 500;  # records per batch
+
+## Molecule-type search fields: https://www.ncbi.nlm.nih.gov/books/NBK49540/
+my @search_strings = (
+    [ 'protein' , 'complete' , '+NOT+partial%5BTITL%5D'                                                     ], 
+    [ 'protein' , 'partial'  , '+AND+partial%5BTITL%5D'                                                     ],
+    [ 'nuccore' , 'complete' , '+AND+complete%5BTITL%5D+NOT+partial%5BTITL%5D+NOT+biomol_genomic%5BPROP%5D' ],
+    [ 'nuccore' , 'partial'  , '+AND+partial%5BTITL%5D+NOT+complete%5BTITL%5D+NOT+biomol_genomic%5BPROP%5D' ], 
+    [ 'nuccore' , 'mixed'    , '+AND+complete%5BTITL%5D+AND+partial%5BTITL%5D+NOT+biomol_genomic%5BPROP%5D' ],
+    [ 'nuccore' , 'misc'     , '+NOT+complete%5BTITL%5D+NOT+partial%5BTITL%5D+NOT+biomol_genomic%5BPROP%5D' ],
+    [ 'nucest'  , 'total'    , ''                                                                           ]
+    );
+my %monthnames = ('01','Jan', '02','Feb', '03','Mar', '04','Apr', '05','May', '06','Jun', '07','Jul', '08','Aug', '09','Sep', '10','Oct', '11','Nov', '12','Dec');
+
+(my $organism2 = $organism) =~ s/_/ /g;
+(my $organism3 = $organism) =~ s/_/\%20/g;
+
+my $fmt = '%-'.length($organism).'s  %-8s  %8s  %7i'."\n";
+(my $hfmt = $fmt) =~ s/i$/s/;
+my (@fastas, %fdat);
+my %lmax = ('N'=>length('File'), 'R'=>length('Records'), 'B'=>length('Bytes'), 'M'=>length('MD5sum'));  # initialize with column header sizes
+
+
+printf $hfmt, qw/ Organism Database Set Records / if $count;
+foreach my $search (@search_strings) {
+    my ($db, $set, $qextra) = @$search;
+    print STDERR "\nORGANISM: $organism\nDB: $db\nSET: $set\n" unless $count;
+    my $esearch = "$ESEARCH?db=$db&usehistory=y&term=$organism3%5BPORGN%5D$qextra";
+    #print STDERR "ESEARCH: $esearch\n";
+    my $esearch_result = get($esearch);
+    #print STDERR "ESEARCH_RESULT: $esearch_result\n";
+    my ($N, $key, $web) = ($esearch_result =~ m|<Count>(\d+)</Count>.*<QueryKey>(\d+)</QueryKey>.*<WebEnv>(\S+)</WebEnv>|s);
+    if ($count) {
+        printf $fmt, $organism2, $db, $set, $N;
+        next;
+    } else {
+        print "$db = $N\n";
+    }
+    print STDERR "Count = $N; QueryKey = $key; WebEnv = $web\n";
+    my $efetch = "$EFETCH?db=$db&WebEnv=$web&query_key=$key&rettype=fasta&retmode=text";
+    my $nbatch = int($N/$retmax);
+    $nbatch++ if $N/$retmax > $nbatch;
+    my $retstart = 0-$retmax;
+    my @output;
+    foreach my $i (1..$nbatch) {
+        sleep 1;  # slow down server hit rate
+        $retstart += $retmax;
+        print STDERR "Batch $i/$nbatch\n";
+        my $efetch1 = "$efetch&retstart=$retstart&retmax=$retmax";
+        #print STDERR "EFETCH $i: $efetch1\n";
+        my $efetch1_result = get($efetch1);
+        ## TROUBLESHOOTING (for split loops, etc)
+        #print STDERR "Writing xtest, ",length($efetch1_result)," bytes...\n";
+        #open OUT, "> xtest";
+        #print OUT $efetch1_result;
+        #close OUT;
+        #print STDERR "Continuing...\n";
+        push @output, split /\n/, $efetch1_result;
+        #last if $i == 2;  ## FOR TESTING ONLY
+    }
+    print STDERR "Splitting predictions from known...\n";
+    my (%models, $branch, $header, $sequence, %branchN);
+    foreach my $line (@output) {
+        next unless $line;
+        if ($line =~ /^>(.*)/) {
+            $header = $1;
+            $branch = $header =~ m/\WX[A-Z]_[\d.]+\|/ ? 'predicted' : 'known';
+        } else {
+            $branchN{$branch}++;
+            $models{$branch}{$header} .= $line;
+        }
+    }
+    print STDERR "$_\t$branchN{$_}\n" foreach qw/ known predicted /;
+    my $dbname = $db;
+    $dbname = 'EST' if $dbname eq 'nucest';
+    $dbname = 'nucleotide' if $dbname eq 'nuccore';
+    
+    foreach my $branch (qw/ known predicted /) {
+        my $fasta = "$organism.NCBI_${dbname}_${set}_$branch.$today.fa";
+        print STDERR "Writing $fasta\n";
+        open my $FA, '>', $fasta;
+        if ($branchN{$branch}) {
+            print $FA ">$_\n",${ &blockify($models{$branch}{$_}) },"\n" foreach keys %{ $models{$branch} };
+        }
+        ## else, at least write length-0 fasta to indicate there were none
+        close $FA;
+        
+        push @fastas, $fasta;
+        chomp($fdat{$fasta}{MD5SUM} = `md5sum $fasta | cut -f1 -d' '`);
+        $fdat{$fasta}{RECORDS} = $branchN{$branch};
+        $fdat{$fasta}{BYTES} = -s $fasta;
+        $fdat{$fasta}{QUERY} = $esearch;
+        $lmax{N} = length($fasta) if length($fasta) > $lmax{N};
+        $lmax{R} = length($fdat{$fasta}{RECORDS}) if length($fdat{$fasta}{RECORDS}) > $lmax{R};
+        $lmax{B} = length($fdat{$fasta}{BYTES}) if length($fdat{$fasta}{BYTES}) > $lmax{B};
+        $lmax{M} = length($fdat{$fasta}{MD5SUM}) if length($fdat{$fasta}{MD5SUM}) > $lmax{M};
+        if ($branch eq 'known') {
+            $lmax{K} = length($fasta) if length($fasta) > $lmax{K};
+        }
+        
+        unless ($nodbs || $fdat{$fasta}{BYTES} == 0) {
+            my $pflag = $db eq 'protein' ? 'T' : 'F';
+            print "Making blast database...\n";
+            system "formatdb -p $pflag -o F -l $fasta.log -i $fasta";
+        }
+    }
+}
+
+## Write explanatory README
+my ($yyyy, $mm, $dd) = ($today =~ /(\d{4})(\d{2})(\d{2})/);
+my $rmfmt = '%-'.$lmax{N}.'s  %'.$lmax{R}.'i  %'.$lmax{B}.'i  %'.$lmax{M}.'s'."\n";
+(my $rmfmtH = $rmfmt) =~ s/i /s /g;
+my $rmfmt2 = '%-'.($lmax{K}-4).'s  %s'."\n";
+my $RM = &open2('W', "$organism.NCBI.$today.README.txt", 'README file');
+print $RM "$organism2 fastas downloaded from NCBI on $monthnames{$mm} $dd, $yyyy.\n";
+print $RM "\nAll filenames have format: <organism>.NCBI_<database>_<completeness>_<certainty>.<download-date>.fa\n";
+print $RM "\nExplanation of terms:\n";
+print $RM "\ndatabase: NCBI database where sequence was obtained.  Can be:\n";
+print $RM "          'protein':    https://www.ncbi.nlm.nih.gov/protein\n";
+print $RM "          'nucleotide': https://www.ncbi.nlm.nih.gov/nucleotide\n";
+print $RM "          'EST':        https://www.ncbi.nlm.nih.gov/est\n";
+print $RM "\ncompleteness: Completeness of sequence.  Can be:\n";
+print $RM "       'complete': sequence is considered complete\n";
+print $RM "       'partial':  sequence is known to be incomplete\n";
+print $RM "       'mixed':    multi-model sequence; contains both complete and partial model sequences\n";
+print $RM "       'misc':     completness cannot be determined from sequence title\n";
+print $RM "       'total':    all sequences from the database, not separated by completeness.\n";
+print $RM "\ncertainty: Certainty of model from which sequence was derived.  Can be \n";
+print $RM "       'predicted': Sequences from RefSeq predicted models, i.e. those starting with 'X[A-Z]_' (XP_*, XM_*, etc.)\n";
+print $RM "       'known':     All other sequences, i.e. those NOT starting with 'X[A-Z]_'\n";
+print $RM "\nDownloaded fastas:\n\n";
+print $RM sprintf($rmfmtH, qw/ File Records Bytes MD5sum /);
+print $RM sprintf($rmfmt, $_, $fdat{$_}{RECORDS}, $fdat{$_}{BYTES}, $fdat{$_}{MD5SUM}) foreach @fastas;
+print $RM "\nQueries per fasta:\n\n";
+print $RM sprintf($rmfmt2, qw/ File EntrezQuery /);
+foreach (@fastas) {
+    next if /predicted/;  # known only
+    (my $label = $_) =~ s/known/*/;
+    print $RM sprintf($rmfmt2, $label, $fdat{$_}{QUERY});
+}
+print $RM "\n";
+close $RM;
+
+print "$0 $organism2 Complete!\n";
+exit;
+
+
+

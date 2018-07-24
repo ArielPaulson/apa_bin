@@ -1,0 +1,289 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+#use Math::Round;
+use strict;
+
+
+## Writes a standard CollectRnaSeqMetrics file extended by two fields, 'NCRNA_BASES' and 'PCT_NCRNA_BASES'.  
+## These numbers would otherwise contribute to 'UTR' values.
+## These do not include 'RIBO' values, which have their own fields.
+## ** ALSO **: Coverage histogram is restricted to protein-coding genes only (actually, not yet -- but will be soon)
+
+## FIXME:
+## pc-only code ready, but not engaged.  Must get ncRNA numbers from using pc-only/ribo + full/ribo, and do math on intergenic remainder.
+## also must get histo from pc-only run
+## non-plus-mode not wired up yet
+## by-chrom mode not wired up yet
+
+
+
+
+## Dependencies
+my $java = 'java';
+my $picardjar_current = my $picardjar_old = '/n/apps/CentOS7/bin/picard.jar';   # CENTOS7
+$picardjar_current = '/n/local/stage/picard/current/picard.jar' unless -e $picardjar_current;            # CENTOS6
+$picardjar_old = '/n/local/stage/picard/picard_1.96/CollectRnaSeqMetrics.jar' unless -e $picardjar_old;  # CENTOS6
+
+
+## Inputs
+my $geno;       # genome (directory from /n/data1/genomes/bowtie-index)
+my $anno;       # transcriptome (subdirectory of /n/data1/genomes/bowtie-index/$geno)
+my $sort;       # sort order for riboList files, either 'tophat2' (which is default) or 'default' (which is not default)
+### NOTE: the following three files must exist:
+### /n/data1/genomes/bowtie-index/$geno/$anno/$geno.$anno.refFlat.txt
+### /n/data1/genomes/bowtie-index/$geno/$anno/$geno.$anno.riboList.$sort.txt
+### /n/data1/genomes/bowtie-index/$geno/$anno/$geno.$anno.ncrnaList.$sort.txt
+my $bam;        # bam to analyze
+my $outfile;    # output file
+my $strand;     # strand argument to picard, if not 'FIRST_READ_TRANSCRIPTION_STRAND'
+my $java;       # java executable, if not sitewide 'java'
+my $mem;        # memory for java, if not '10G'
+my $tabular;    #  ####### NOT YET READY #######  write output in tabular (2-column) format instead of native (default) format.
+my $plus;       # run in 'plus' mode, which creates a separate ncRNA count category
+my $bychrom;    # output one file per chromosome, instead of one for the whole genome (i.e. $outfile.$chr)
+my $old;        # shortcut argument to set $picardjar = '/n/local/stage/picard/picard_1.96/CollectRnaSeqMetrics.jar'
+
+
+## Get, test arguments
+GetOptions("g=s"=>\$geno, "a=s"=>\$anno, "s=s"=>\$sort, "b=s"=>\$bam, "o=s"=>\$outfile, "t=s"=>\$strand, "j=s"=>\$java, "m=s"=>\$mem, "tabular"=>\$tabular, "plus"=>\$plus, "bychrom"=>\$bychrom, "old"=>\$old);
+
+die "$0: cannot run --bychrom yet!\n" if $bychrom;  ## NOT READY YET
+die "$0: cannot run --plus yet!\n" if $plus;  ## MAHOR ISSUES -- NEEDS LOTS OF WORK FOR VERTEBRATE TRANSCRIPTOMES
+
+$sort = 'tophat2' unless $sort;
+$mem = '10G' unless $mem;
+$java = 'java' unless $java;
+$java .= " -Xmx$mem";
+$strand = 'FIRST_READ_TRANSCRIPTION_STRAND' unless $strand;
+unless ($outfile) {
+    (my $basename = $bam) =~ s![^/]+$!CollectRnaSeqMetrics!;
+    $basename .= 'Plus' if $plus;
+    $basename .= '.byChrom' if $bychrom;
+    $outfile = "$basename.txt";
+}
+my $picardjar_use = $old ? $picardjar_old : $picardjar_current;
+
+
+## Location Prep & Files
+my $refFlat = "/n/data1/genomes/indexes/$geno/annotation/$anno/tables/$geno.$anno.refFlat.txt";
+my $refFlatPc = "/n/data1/genomes/indexes/$geno/annotation/$anno/tables/$geno.$anno.refFlat_protein_coding.txt";
+my $riboList = "/n/data1/genomes/indexes/$geno/annotation/$anno/extras/$geno.$anno.riboList.$sort.txt";
+my $ncrnaList = "/n/data1/genomes/indexes/$geno/annotation/$anno/extras/$geno.$anno.ncrnaList.$sort.txt";
+my $chromSizes = "/n/data1/genomes/indexes/$geno/extras/$geno.chrom.sizes";
+
+die "Expected refFlat file '$refFlat' does not exist!\n" unless -e $refFlat;
+die "Expected riboList file '$riboList' does not exist!\n" unless -e $riboList;
+die "Expected chromosome sizes file '$chromSizes' does not exist!\n" if $bychrom && ! -e $chromSizes;
+die "Expected protein-coding refFlat file '$refFlatPc' does not exist!\n" if $plus && ! -e $refFlatPc;
+die "Expected ncrnaList file '$ncrnaList' does not exist!\n" if $plus && ! -e $ncrnaList;
+
+my $tmp = "/tmp/CollectRnaSeqMetrics.$$";
+system "mkdir $tmp";
+die "Failed to create temp dir '$tmp'!\n" unless -d $tmp;
+print "TEMP: /tmp/CollectRnaSeqMetrics.$$\n";
+
+my $riboFile  = "$tmp/ribo.txt";
+my $ncrnaFile = "$tmp/ncrna.txt";
+my $pcFile = "$tmp/pc.txt";
+
+
+## Java Call Prep (Whole-Genome)
+my $jcall;
+if ($picardjar_use eq $picardjar_current) {
+    $jcall = "$java -jar $picardjar_use CollectRnaSeqMetrics";
+} elsif ($picardjar_use eq $picardjar_old) {
+    $jcall = "$java -jar $picardjar_use";
+}
+my $jargs = "VALIDATION_STRINGENCY=LENIENT STRAND_SPECIFICITY=$strand INPUT=$bam";  # common arguments
+my $riboCall  = "$jcall $jargs RIBOSOMAL_INTERVALS=$riboList  REF_FLAT=$refFlat   OUTPUT=$riboFile";    # to get only ribosomal counts
+my $ncrnaCall = "$jcall $jargs RIBOSOMAL_INTERVALS=$ncrnaList REF_FLAT=$refFlat   OUTPUT=$ncrnaFile";   # to get all ncRNA counts, including ribosomes
+my $pcCall    = "$jcall $jargs RIBOSOMAL_INTERVALS=$riboList  REF_FLAT=$refFlatPc OUTPUT=$pcFile";      # to get protein-coding-only gene counts
+
+
+## Globals
+my %data = ('R' => {'call'=>$riboCall,'file'=>$riboFile}, 'N' => {'call'=>$ncrnaCall,'file'=>$ncrnaFile}, 'P' => {'call'=>$pcCall,'file'=>$pcFile});
+my %chrdata;
+my @chroms;
+
+
+## Prepare per-chromosome globals, if $bychrom
+if ($bychrom) {
+    chomp(@chroms = split /\n/, `cut -f1 $chromSizes`);
+    foreach my $chr (@chroms) {
+        my $rFile = "$tmp/ribo.$chr.txt";
+        my $nFile = "$tmp/ncrna.$chr.txt";
+        my $pFile = "$tmp/pc.$chr.txt";
+        my $rCall = "$jcall $jargs RIBOSOMAL_INTERVALS=$riboList  REF_FLAT=$refFlat   OUTPUT=$rFile";
+        my $nCall = "$jcall $jargs RIBOSOMAL_INTERVALS=$ncrnaList REF_FLAT=$refFlat   OUTPUT=$nFile";
+        my $pCall = "$jcall $jargs RIBOSOMAL_INTERVALS=$riboList  REF_FLAT=$refFlatPc OUTPUT=$pFile";
+        foreach my $otherchr (@chroms) {
+            next if $chr eq $otherchr;
+            $rCall .= " IGNORE_SEQUENCE=$otherchr";
+            $nCall .= " IGNORE_SEQUENCE=$otherchr";
+            $pCall .= " IGNORE_SEQUENCE=$otherchr";
+        }
+        $chrdata{$chr} = { 'R' => {'call'=>$rCall,'file'=>$rFile}, 'N' => {'call'=>$nCall,'file'=>$nFile}, 'P' => {'call'=>$pCall,'file'=>$pFile} };  # create a separate %data hash for each chromosome
+    }
+}
+
+
+## Run Picard & Process Outputs
+my @sets = $plus ? qw/ N P / : qw/ R /;
+
+foreach my $set (@sets) {
+    print STDERR "\nRunning ($set): $data{$set}{call}\n";
+    system $data{$set}{call};
+    if ($plus) {
+        open my $IN, '<', $data{$set}{file} or die "$0: Failed to read '$data{$set}{file}': $!\n";
+        while (<$IN>) {
+            push @{ $data{$set}{data} }, [split /\t/, $_];
+        }
+        close $IN;
+    }
+}
+
+if ($bychrom) {
+    foreach my $chr (@chroms) {
+        foreach my $set (@sets) {
+            my ($chrcall, $chrfile) = ($chrdata{$chr}{$set}{call}, $chrdata{$chr}{$set}{file});
+            print STDERR "\nRunning ($set, $chr): $chrcall\n";
+            system $chrcall;
+            open my $IN, '<', $chrfile or die "$0: Failed to read '$chrfile': $!\n";
+            while (<$IN>) {
+                push @{ $chrdata{$chr}{$set}{data} }, [split /\t/, $_];
+            }
+            close $IN;
+        }
+    }
+}
+
+## LINES OF THE DEFAULT PICARD 'COLLECTRNASEQMETRICS' OUTPUT FILE & ARRAY INDICES:
+##  0: "## net.sf.picard.metrics.StringHeader"
+##  1: "# net.sf.picard.analysis.CollectRnaSeqMetrics "<PICARD CALL ARGUMENTS>
+##  2: "## net.sf.picard.metrics.StringHeader"
+##  3: "# Started on: "<TIME STAMP>
+##  4: 
+##  5: "## METRICS CLASS	net.sf.picard.analysis.RnaSeqMetrics"
+##  6: <METRICS NAMES>
+##  7: <METRICS VALUES>
+##  8: 
+##  9: "## HISTOGRAM	java.lang.Integer"
+## 10: "normalized_position	All_Reads.normalized_coverage"
+## 11-111: <HISTOGRAM> (pos\tvalue)
+## 112: 
+
+## METRICS NAMES & ARRAY INDICES:
+##  0 PF_BASES 
+##  1 PF_ALIGNED_BASES 
+##  2 RIBOSOMAL_BASES 
+##  3 CODING_BASES 
+##  4 UTR_BASES 
+##  5 INTRONIC_BASES 
+##  6 INTERGENIC_BASES 
+##  7 IGNORED_READS 
+##  8 CORRECT_STRAND_READS 
+##  9 INCORRECT_STRAND_READS 
+## 10 PCT_RIBOSOMAL_BASES 
+## 11 PCT_CODING_BASES 
+## 12 PCT_UTR_BASES 
+## 13 PCT_INTRONIC_BASES 
+## 14 PCT_INTERGENIC_BASES 
+## 15 PCT_MRNA_BASES 
+## 16 PCT_USABLE_BASES 
+## 17 PCT_CORRECT_STRAND_READS 
+## 18 MEDIAN_CV_COVERAGE 
+## 19 MEDIAN_5PRIME_BIAS 
+## 20 MEDIAN_3PRIME_BIAS 
+## 21 MEDIAN_5PRIME_TO_3PRIME_BIAS 
+## 22 SAMPLE 
+## 23 LIBRARY 
+## 24 READ_GROUP
+
+
+if ($plus) {
+    
+    if ($bychrom) {
+        
+        %{ $chrdata{$_} } = %{ &correct(\%{ $chrdata{$_} }) } foreach @chroms;
+        
+        #######################  MUST FIX FORMAT  !!!!!!
+        ## Write and Exit
+        open my $OUT, '>', $outfile or die "$0: Failed to write to '$outfile': $!\n";
+        print $OUT join("\t", @$_) foreach @{ $data{N}{data} };
+        close $OUT;
+        
+    } else {
+        
+        %data = %{ &correct(\%data) };
+        
+        ## Write and Exit
+        open my $OUT, '>', $outfile or die "$0: Failed to write to '$outfile': $!\n";
+        print $OUT join("\t", @$_) foreach @{ $data{N}{data} };
+        close $OUT;
+    }
+    
+} else {
+    
+    system "mv $riboFile $outfile";
+    
+}
+
+#system "rm -rf $tmp";
+print "CollectRnaSeqMetricsPlus $bam complete!\n";
+exit;
+
+
+
+
+sub correct {
+    
+    my $ref = shift;
+    my %hash = %$ref;
+    
+    ## TRUE TOTAL COUNT -- all-ncrna
+    my $total_bases = $hash{N}{data}->[7][1];
+    
+    ## TRUE RIBO COUNT -- pc-ribo
+    my $ribo_bases = $hash{P}{data}->[7][2];
+    
+    ## STARTING NCRNA COUNT -- all-ncrna (too high; must strip ribo and pc overlap)
+    my $nc_bases_1 = $hash{N}{data}->[7][2];
+    
+    ## STARTING PC COUNT -- all-ncrna (CDS+UTR; too low, competing w/ ncRNA)
+    my $pc_bases_1 = $hash{N}{data}->[7][3] + $hash{N}{data}->[7][4];
+    
+    ## TRUE PC COUNT -- pc-ribo (CDS+UTR)
+    my $pc_bases = $hash{P}{data}->[7][3] + $hash{P}{data}->[7][4];
+    
+    ## TRUE TOTAL COUNT (incl. ribo; compare to $total_bases above)
+    my $total_bases_1 = $pc_bases_1 + $nc_bases_1;
+    
+    ## TRUE NCRNA COUNT (total - pc - ribo)
+    my $nc_bases = $total_bases_1 - $pc_bases - $ribo_bases;
+    
+    ## REPLACE RIBOSOME BP, PCT WITH CORRECT VALUES -- all-ncrna
+    $hash{N}{data}->[7][2] = $ribo_bases;
+    $hash{N}{data}->[7][10] = sprintf("%0.6f", $ribo_bases/$total_bases);
+    
+    ## REPLACE CDS BP, PCT WITH CORRECT VALUES -- pc-ribo
+    $hash{N}{data}->[7][3] = $hash{P}{data}->[7][3];
+    $hash{N}{data}->[7][11] = sprintf("%0.6f", $hash{P}{data}->[7][3]/$total_bases);
+    
+    ## REPLACE UTR BP, PCT WITH CORRECT VALUES -- pc-ribo
+    $hash{N}{data}->[7][4] = $hash{P}{data}->[7][4];
+    $hash{N}{data}->[7][12] = sprintf("%0.6f", $hash{P}{data}->[7][4]/$total_bases);
+    
+    ## INJECT NCRNA PCT FIRST (AFTER RIBO PCT) -- all-ncrna
+    splice(@{ $hash{N}{data}->[6] }, 11, 0, 'PCT_NCRNA_BASES');  # add new field header
+    splice(@{ $hash{N}{data}->[7] }, 11, 0, sprintf("%0.6f", $nc_bases/$total_bases));  # add new field value (ncrna-only percent)
+    
+    ## INJECT NCRNA BP SECOND (AFTER RIBO BP) -- all-ncrna
+    splice(@{ $hash{N}{data}->[6] }, 3, 0, 'NCRNA_BASES');  # add new field header
+    splice(@{ $hash{N}{data}->[7] }, 3, 0, $nc_bases);      # add new field value (all-ncrna minus ribosomal)
+    
+    ## REPLACE HISTO WITH PC-ONLY HISTO -- pc-ribo
+    $hash{N}{data}->[$_] = $hash{P}{data}->[$_] foreach (11..111);
+    
+    return \%hash;
+}

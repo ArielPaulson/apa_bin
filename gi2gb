@@ -1,0 +1,141 @@
+#!/usr/bin/env perl
+use Data::Dumper;
+use Getopt::Long;
+use Pod::Usage;
+use LWP::Simple;
+use strict;
+
+my ($headerfile, $outdir, $uniprot) = @ARGV;
+
+my (@headers, @GI, @UNI, %GIdat, %GIheader, %UNIheader);
+
+open my $IN, $headerfile;
+while (<$IN>) {
+    chomp;
+    push @headers, $_;
+    my $gi = (split /\|/, $_)[1];
+    push @GI, $gi;
+    $GIheader{$gi}{$_} = 1;
+    if ($uniprot) {
+	my $uni = (split /\|/, $_)[3];
+	push @UNI, $uni;
+	$UNIheader{$uni}{$gi} = 1;
+    }
+}
+close $IN;
+
+my (%found, %annot, %GIorg, %subjhits, @output);
+
+system "mkdir -p $outdir";
+die "$0: failed to create output dir '$outdir'!\n" unless -d $outdir;
+
+my $batchsize = 200;
+my $ubatchsize = 200;
+
+## get annotations for best-blast-subject GIs from NCBI
+my $nbatch = scalar(@GI) % $batchsize == 0 ? scalar(@GI)/$batchsize : int(scalar(@GI)/$batchsize)+1;
+print "Running $nbatch NCBI queries of $batchsize terms each.\n";
+my ($i, $j) = (0, -1);
+foreach my $n (1..$nbatch) {
+    
+    my $gbfile = "$outdir/batch.$n.gb";
+    if (-e $gbfile) {  # if output file for batch $n already exists, skip this step
+	print " Batch $n exists, skipping\n";
+    } else {
+	$i = $j + 1;
+	$j = $i + $batchsize - 1 > $#GI ? $#GI : $i + $batchsize - 1;
+	my @batch = @GI[$i..$j];
+	print " Batch $n ",(scalar @batch),"\n";
+	
+	my $allGI = 'id=' . (join ',', @batch);
+	my $efetch = "http://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=nucleotide&id=$allGI&rettype=gb";
+	my $result = get($efetch);  # efetch call 
+	open my $OUT2, '>', $gbfile;
+	print $OUT2 "$result\n";
+	close $OUT2;
+	sleep 1;
+    }
+    
+    ## process Genbank records
+    my ($gi, $def, $src, $org);  # values from corresponding Genbank fields
+    open my $IN5, '<', $gbfile or die "$0: Cannot open Genbank data file '$gbfile': $!\n";
+    while (<$IN5>) {
+	if ($_ =~ /^\/\//) {
+	    $gi = $org = undef;
+	} elsif ($_ =~ / GI:(\d+)/) {
+	    $gi = $1;
+	    $found{GI}{$gi}++;
+	    $found{HEADER}{$_}++ foreach keys %{ $GIheader{$gi} };
+	} elsif ($_ =~ /^DEFINITION\s+(.*)/) {
+	    ($def = $1) =~ s/\s*$//;
+	} elsif ($_ =~ /^SOURCE\s+(.*)/) {
+	    ($src = $1) =~ s/\s*$//;
+	} elsif ($_ =~ /^\s+ORGANISM\s+(.*)/) {
+	    ($org = $1) =~ s/\s*$//;
+	    $annot{$org}{TOT}++;  # total hits per organism
+	    $annot{$org}{GI}{$gi} = 1;  # unique organism-GI pairs
+	    $GIorg{$gi} = [$org, $src, $def];
+	    foreach my $header (keys %{ $GIheader{$gi} }) {
+		$annot{$org}{HEADER}{$header} = 1;  # unique organism-header pairs
+		$subjhits{$org}{$src}{$def}{$header} = 1;  # unique organism-source-definition-header sets
+#		$GIheader{$gi}{$header} = $org;   # overwrite subject with organism where available
+#		$headerGI{$header}{$gi} = $org;
+		$GIdat{$gi} = "$header\t$gi\t$org\t$src\t$def";
+	    }
+	    $def = $src = '';  # ZAP
+	}
+    }
+    close $IN5;
+}
+
+## get annotations for best-blast-subject Uniprot IDs from Uniprot
+my %already;
+my $nbatch = scalar(@UNI) % $ubatchsize == 0 ? scalar(@UNI)/$ubatchsize : int(scalar(@UNI)/$ubatchsize)+1;
+print "Running $nbatch Uniprot queries of $ubatchsize terms each.\n";
+my ($i, $j) = (0, -1);
+foreach my $n (1..$nbatch) {
+    
+    my $unifile = "$outdir/batch.$n.uni";
+    if (-e $unifile) {  # if output file for batch $n already exists, skip this step
+	print " Batch $n exists, skipping\n";
+    } else {
+	$i = $j + 1;
+	$j = $i + $ubatchsize - 1 > $#UNI ? $#UNI : $i + $ubatchsize - 1;
+	my @batch = @UNI[$i..$j];
+	print " Batch $n ",(scalar @batch),"\n";
+	
+	my $allUNI = (join '+OR+', @batch);
+	my $efetch = "http://www.uniprot.org/uniprot/?query=$allUNI&sort=score&columns=id,protein names,genes,go&format=tab";
+	my $result = get($efetch);  # efetch call 
+	open my $OUT2, '>', $unifile;
+	print $OUT2 "$result\n";
+	close $OUT2;
+	sleep 1;
+    }
+    
+    ## process Uniprot records
+    open my $IN6, '<', $unifile or die "$0: Cannot open Uniprot data file '$unifile': $!\n";
+    while (<$IN6>) {
+	next if $. == 1;  # header
+	my ($uni, $prot, $symb, $go) = split /\t/, $_;
+	foreach my $gi (keys %{ $UNIheader{$uni} }) {
+	    push @output, "$GIdat{$gi}\t$_";
+	    $already{$gi} = 1;
+	}
+    }
+    close $IN6;
+}
+
+foreach my $gi (keys %GIdat) {
+    next if $already{$gi};
+    push @output, "$GIdat{$gi}\t\t\t\t\n";  # GIs with no matching uniprot data
+}
+
+
+open my $OUT, "> $outdir/gb_summary.txt";
+print $OUT "Header\tGI\tOrg\tSource\tDefinition\tUniprot ID\tUniprot Protein\tUniprot Symbol\tUniprot GO Terms\n";
+print $OUT @output;
+close $OUT;
+print "$0 complete!\n";
+exit;
+

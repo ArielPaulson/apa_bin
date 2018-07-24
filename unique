@@ -1,0 +1,9 @@
+#!/usr/bin/env perl
+use strict;
+
+my %x;
+while (<>) {
+  $x{$_} = $. unless $x{$_};  # tracks order of appearance
+}
+print sort { $x{$a} <=> $x{$b} } keys %x;
+exit;

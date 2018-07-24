@@ -1,0 +1,50 @@
+#!/usr/bin/env perl
+use strict;
+
+## takes an input fastq (or fastq.gz) and divides the records into N files
+## if input was gzipped, so will outputs.
+
+my ($input, $N) = @ARGV;
+die "$0: Cannot read from file '$input': $!\n" unless -e $input;
+die "$0: Number of outputs not specified!\n" unless $N;
+
+my ($gz, $input2);
+if ($input =~ /\.gz$/) {
+    $gz = 1;
+    ($input2 = $input) =~ s/\.gz//;
+} else {
+    $input2 = $input;
+}
+
+system "gunzip -c $input > $input2" if $gz;
+
+chomp(my $linesTot = `cat $input2 | wc -l`);
+my $recsTot = $linesTot / 4;
+
+my $recsMin = int($recsTot / $N);
+my $linesMin = $recsMin * 4;
+
+system "split -d -l $linesMin $input2 $input2.";
+
+my @outputs;
+foreach (glob "$input2.*") {
+    push @outputs, $_ unless $_ =~ /gz$/;
+}
+
+if ($linesMin * $N != $linesTot) {  # leftover records will exist
+    my $leftovers = pop @outputs;
+    system "split -l 4 $leftovers $leftovers.";
+    my @records = glob "$leftovers.*";
+    foreach my $i (0..$#records) {
+	system "cat $records[$i] >> $outputs[$i]";  # add each leftover record to a different output
+	unlink $records[$i];
+    }
+    unlink $leftovers;
+}
+
+if ($gz) {
+    system "gzip $input2.*";
+    unlink $input2;
+}
+print "$0: $input Done!\n";
+exit;

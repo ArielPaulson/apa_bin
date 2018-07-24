@@ -1,0 +1,87 @@
+#!/usr/bin/env perl
+use strict;
+
+# This wscript takes a GTF file and calculates K values for use with read counts from "htseq-count -m intersection-strict".
+# Basically it calculates, per gene, exonic bp which do not overlap any other gene.
+
+my ($gtf, $out) = @ARGV;
+die "GTF '$gtf' does not exist!\n" unless -e $gtf;
+
+my $tmp = "compareModels.$$.tmp";
+die "Tempdir '$tmp' already exists!\n" if -d $tmp;
+system "mkdir $tmp";
+die "Failed to create tempdir '$tmp'!\n" unless -d $tmp;
+
+my $bed = "compareModels.$$.tmp/bed";
+my $bedm = "compareModels.$$.tmp/merged";
+my $int = "compareModels.$$.tmp/int";
+
+print "Processing GTF...\n";
+system "/home/apa/local/bin/gtf2exons $gtf > $bed";
+system "/home/apa/local/bin/sortBedCoord -i $bed --overwrite";
+system "/home/apa/local/bin/exons2uxons $bed bed > $bedm";
+
+print "Intersecting...\n";
+system "intersectBed -wao -a $bedm -b $bedm > $int";
+
+my (%maps, %hits);
+
+print "Mapping...\n";
+open IN, $bedm or die "Failed to open file '$bedm': $!\n";
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    my @data = split /\t/, $_;
+    my ($gene, $num) = split /:/, $data[3];
+    my $len = $data[2]-$data[1];
+    $maps{$gene}{$data[3]} = { map {($_=>1)} ($data[1]+1..$data[2]) };
+}
+close IN;
+
+open IN, $int or die "Failed to open intersection file '$int': $!\n";
+while (<IN>) {
+    chomp;
+    my @data = split /\t/, $_;
+    next if $data[6] eq '.';  # no match
+    my @fields1 = @data[0..5];
+    my @fields2 = @data[6..11];
+    next if $fields1[3] eq $fields2[3];  # self match
+    my ($gene1) = (split /:/, $fields1[3])[0];
+    my ($gene2) = (split /:/, $fields2[3])[0];
+    my @coords = sort {$a <=> $b} (@fields1[1,2], @fields2[1,2]);
+    $hits{$gene1}{G}{$gene2}++;
+    $hits{$gene2}{G}{$gene1}++;
+    $hits{$gene1}{U}{$fields2[3]}++;
+    $hits{$gene2}{U}{$fields1[3]}++;
+    $maps{$gene1}{$fields1[3]}{$_} = 0 foreach ($coords[1]..$coords[2]);  # "erase" exonic portions overlapped by another gene
+    $maps{$gene2}{$fields2[3]}{$_} = 0 foreach ($coords[1]..$coords[2]);
+}
+close IN;
+
+system "rm -Rf compareModels.$$.tmp";
+
+print "Writing...\n";
+open OUT, "> $out";
+print OUT "Gene\tTotal.K\tUnique.K\tUxons.Tot\tUxons.OK\tUxons.Hit\tInt.Genes\tInt.Uxons\n";
+foreach my $gene (sort keys %maps) {
+    my ($uxonsTot, $uxonsAff, $uxonsNaf, $totK, $unqK);
+    foreach my $uxon (keys %{ $maps{$gene} }) {
+	$uxonsTot++;
+	my $affected = 0;
+	foreach my $pos (keys %{ $maps{$gene}{$uxon} }) {
+	    $totK++;
+	    if ($maps{$gene}{$uxon}{$pos}) {
+		$unqK++;
+	    } else {
+		$affected = 1;
+	    }
+	}
+	$uxonsAff++ if $affected;
+    }
+    $uxonsNaf = $uxonsTot-$uxonsAff;
+    my $NGhit = scalar keys %{ $hits{$gene}{G} };
+    my $NUhit = scalar keys %{ $hits{$gene}{U} };
+    print OUT "$gene\t$totK\t$unqK\t$uxonsTot\t$uxonsNaf\t$uxonsAff\t$NGhit\t$NUhit\n";
+}
+close OUT;
+exit;
+

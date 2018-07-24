@@ -1,0 +1,72 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my @essentials = qw/ LENGTH DEFINITION GENE GENEID ACCESSION VERSION GI SOURCE KEYWORDS /;	# currently captured elements, besides LOCUS
+
+my (%data, $pending, $locus, $features, $def);
+
+open IN, $ARGV[0] or die "$0: Cannot open input file '$ARGV[0]' for reading: $!\n";
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    if ($_ =~ /^LOCUS\s+(\w+)\s+(\d+)/) {
+	$pending = 'LOCUS';	# use 'pending' blocks to catch potential multiline statements
+	$locus = $1;
+	$data{$locus}{LENGTH} = $2;
+    } elsif ($_ =~ /^DEFINITION\s+(.*)/) {
+	($pending, $def) = ('DEFINITION', $1);
+	$data{$locus}{$pending} = $def;
+    } elsif ($_ =~ /^ACCESSION\s+(\S+)/) {
+	$pending = 'ACCESSION';
+	$data{$locus}{$pending} = $1;
+    } elsif ($_ =~ /^VERSION\s+(\S+)\s+(\S+)/) {
+	$pending = 'VERSION';
+	$data{$locus}{$pending} = $1;
+	($data{$locus}{GI} = $2) =~ s/^GI://;
+    } elsif ($_ =~ /^KEYWORDS\s+(.*)/) {
+	$pending = 'KEYWORDS';
+	$data{$locus}{$pending} = $1;
+    } elsif ($_ =~ /^SOURCE\s+(.*)/) {
+	$pending = undef;		# no pending here, else will pick up taxonomy tree on following lines
+	$data{$locus}{SOURCE} = $1;
+    } elsif ($_ =~ /^FEATURES/) {
+	$pending = undef;
+	$features = 1;	# activate feature capture
+    } elsif ($_ =~ /^ORIGIN/) {
+	$pending = 'SEQUENCE';
+	$features = 0;	# stop feature capture
+    } elsif ($_ =~ /^\/\//) {
+	$data{$locus}{SEQUENCE} =~ s/(.*)/\U$1/;
+	$pending = undef;
+    } else {
+	if (defined $pending) {
+	    if ($pending eq 'SEQUENCE') {
+		$_ =~ s/[\d\s]//g;
+		$data{$locus}{$pending} .= $_;
+	    } else {
+		$_ =~ s/^\s+//;
+		$data{$locus}{$pending} .= " $_";
+	    }
+	} elsif ($features == 1) {
+	    if ($_ =~ /\/gene=\"(\w+)\"/) {
+		$data{$locus}{GENE} = $1;
+	    } elsif ($_ =~ /\/db_xref=\"GeneID:(\d+)\"/) {
+		$data{$locus}{GENEID} = $1;
+	    }
+	}
+    }
+}
+close IN;
+
+open OUT, "> $ARGV[0].tsv" or die "$0: Cannot open path '$ARGV[0].tsv' for writing: $!\n";
+print OUT 'LOCUS';
+print OUT "\t$_" foreach @essentials;
+print OUT "\n";
+foreach my $locus (sort keys %data) {
+    print OUT $locus;
+    print OUT "\t$data{$locus}{$_}" foreach @essentials;
+    print OUT "\n";
+}
+close OUT;
+exit;

@@ -1,0 +1,173 @@
+#!/usr/bin/env perl
+
+=pod
+
+=head1 SYNOPSIS
+
+Mode 1: Given N desired windows of length L, returns a list of randomly generated coordinates.
+
+Mode 2: Given a bed file of input coordinates, generates a bed file of random coordinates with the same size distribution and chromosomal frequencies as the inputs.
+
+=head1 OPTIONS
+
+=over
+
+=item B<-N n_output_regions>
+
+Integer >= 1
+
+=item B<-L region_length>
+
+Integer >= 1
+
+=item B<-b bed_file>
+
+Input bed file
+
+=item B<-c chrom_sizes>
+
+REQUIRED. A 2-column file with chromosome name in col 1 and length (bp) in col 2.  Entries in col 1 must match those in bed_file col 1.
+
+=item B<-g gaps_bed>
+
+An optional bed file of unsequenced regions in the genome (i.e., blocks of consecutive 'N's); this enables random coords to avoid these regions.
+
+=item B<-s N_sets>
+
+The number of random sets to generate.  Default 1.
+
+=item B<--avoid>
+
+Require that random coords not overlap each other (if possible).  Off by default.  Only applied within each set.
+
+=item B<-t max_tries>
+
+If using --avoid, maximum number of tries to avoid overlapping with existing random coords (or genome gaps).  Most of the time 1-2 is sufficient, but for small areas with large numbers of coords (like mitochondrion) a very high number might be required.  If max_tries is exceeded, then the next random selection is taken, no matter what it overlaps.  Default 1000.
+
+=item B<--help>
+
+Display command line usage with options.
+
+=item B<--man>
+
+Display complete manual page and exit.
+
+=item B<--version> 
+
+Display the scripts version number and exit.
+
+=back
+
+=head1 RUNNING
+
+=head1 VERSION
+
+$Revision:  1.0$
+
+=head1 AUTHOR
+
+Ariel Paulson (apa@stowers.org)
+
+=head1 DEPENDENCIES
+
+perl
+
+=cut
+
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my $bed;           # bed file to mimic with random coords
+my $gapsbed;       # bed file with genome gaps to avoid
+my $chrsizes;       # chr sizes file (col 1 = name, col 2 = length)
+my $sets = 1;      # number of random sets to generate
+my $avoid;         # 1|0: try to prevent random intervals (within a set) from overlapping?
+my $tries = 1000;  # if $avoid: max number of tries to select a non-overlapping interval, if necessary
+
+my $help;          # show help
+my $man;           # show man page
+my $version;       # show version
+
+GetOptions(
+    "b=s" => \$bed,
+    "g=s" => \$gapsbed,
+    "c=s" => \$chrsizes,
+    "s=i" => \$sets,
+    "t=i" => \$tries,
+    "avoid" => \$avoid,
+
+    "help" => \$help,
+    "man" => \$man,
+    "ver" => \$version
+) or pod2usage(1);
+
+pod2usage(1) if $help;
+pod2usage(-exitstatus => 0, -verbose => 2) if $man;
+
+my (%gaps, %chrlens, %inputs, @chrs, @output);
+
+open my $IN1, '<', $gapsbed or die "$0: Cannot open genome gaps bed file '$gapsbed': $!\n";
+while (<$IN1>) {
+    $_ =~ s/[\n\r]+$//;
+    my ($chr, $coord) = split /\t/, $_, 2;
+    push @{ $gaps{$chr} }, $coord;
+}
+close $IN1;
+
+open my $IN2, '<', $chrsizes or die "$0: Cannot open chromosome sizes file '$chrsizes': $!\n";
+while (<$IN2>) {
+    $_ =~ s/[\n\r]+$//;
+    my ($chr, $length) = split /\t/, $_;
+    $chrlens{$chr} = $length;
+    push @chrs, $chr;   # ordered
+}
+close $IN2;
+
+open my $IN3, '<', $bed or die "$0: Cannot open bed file '$bed': $!\n";
+while (<$IN3>) {
+    $_ =~ s/[\n\r]+$//;
+    my ($chr, $start, $end, $id, @else) = split /\t/, $_;
+    $inputs{$chr}{"$start\t$end"} = $id;
+}
+close $IN3;
+
+my $maxtry;
+foreach my $chr (@chrs) {   # stay in order
+    next unless $inputs{$chr};
+    my @coords = sort {$a <=> $b} keys %{ $inputs{$chr} };
+    my @avoids;
+    if ($avoid) {
+	@avoids = @coords;
+	push @avoids, @{ $gaps{$chr} } if $gaps{$chr};
+    }
+    foreach my $i (0..$#coords) {
+	my ($istart, $iend) = split /\t/, $coords[$i];
+	my $length = $iend - $istart;
+	foreach my $set (1..$sets) {
+            my ($rstart, $rend, $try);
+            {
+                $rstart = int(rand($chrlens{$chr}));
+                $rend = $rstart + $length;
+                redo if $rend > $chrlens{$chr};	  # cannot go past chr end
+                my $overlap;
+		if ($avoid) {
+		    foreach my $acoord (@avoids) {
+			my ($astart, $aend) = split /\t/, $acoord;
+			$overlap = 1 unless ($rend < $astart || $rstart > $aend);  
+		    }
+		}
+                $try++;
+                redo if ($overlap && $try < $tries);  # cannot overlap any original or other random peak coords (unless it tries $tries times and fails -- seq space too constrained)
+            }
+	    print STDERR "$i #$set: $try tries\n" if $try >= 10;
+	    $maxtry = $try if $try > $maxtry;
+            my $id = $inputs{$chr}{$coords[$i]} || "${chr}_${istart}_$iend";
+            push @avoids, "$rstart\t$rend";
+            push @output, "$chr\t$rstart\t$rend\t${id}_set$set\n";
+        }
+    }
+}
+print @output;
+print STDERR "$maxtry max tries\n";
+exit;

@@ -1,0 +1,210 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+# Deps:
+
+## Inputs
+my $vcfA;     # "foreground" VCF
+my $vcfB;     # "background" VCF (to subtract from foreground)
+my $outvcf;   # VCF for presence/absence filtered variants
+my $subvcf;   # VCF for subset variants (otherwise, will not try to distinguish subset relationships from different variant calls)
+my ($help, $man, $version);
+
+GetOptions(
+    "a=s" => \$vcfA,
+    "b=s" => \$vcfB,
+    "o=s" => \$outvcf,
+    "s=s" => \$subvcf,
+    "help" => \$help,
+    "man" => \$man,
+    "version" => \$version
+);
+
+## Globals
+my %Bvars;  # VCF-B variants
+my %pwise;  # positionwise stats
+my %vwise;  # variantwise stats
+my %histo;  # calls-per-position histogram
+my @subout; # subset-VCF data
+my $has_subsets;  # AcB / BcA subset relationships detected
+
+## Paths and Files
+my $logfile = "$outvcf.log";  # Filtering stats logfile
+
+
+## Main
+
+## store 'B' vars for later comparison to 'A'
+print "Reading B-VCF '$vcfB': ",`date`;
+open my $INB, '<', $vcfB or die "$0: Cannot read 'B' VCF '$vcfB': $!\n";
+while (my $line = <$INB>) {
+    next if $line =~ /^#/;
+    my ($chr, $pos, $id, $ref, $alt, $else) = split /\t/, $line, 6;
+    my $refL = length($ref);
+    my @alts = split /,/, $alt;
+    $histo{ scalar @alts }{B}++;
+    foreach my $alt1 (@alts) {
+	my $type = &type_var($refL, length($alt1), \$line);
+	$Bvars{$chr}{$pos}{$type}{$alt1} = $ref;
+    }
+}
+close $INB;
+
+## VCF output(s)
+open my $OUTF, '>', $outvcf or die "$0: Cannot write filtered VCF '$outvcf': $!\n";
+my $OUTS;
+if ($subvcf) {
+    open $OUTS, '>', $subvcf or die "$0: Cannot write subset VCF '$subvcf': $!\n";
+}
+
+## read 'A' VCF and filter on the fly
+print "Reading A-VCF '$vcfA': ",`date`;
+open my $INA, '<', $vcfA or die "$0: Cannot read 'A' VCF '$vcfA': $!\n";
+while (my $line = <$INA>) {
+    if ($line =~ /^#/) {
+	print $OUTF $line;
+	push @subout, $line;
+	next;
+    }
+    my ($chr, $pos, $id, $ref, $alt, $else) = split /\t/, $line, 6;
+    my $refL = length($ref);
+    my (%Afilt, %Asub, %Aredun);
+    my @alts = split /,/, $alt;
+    $histo{ scalar @alts }{A1}++;
+    foreach my $alt1 (@alts) {
+	my $type = &type_var($refL, length($alt1), \$line);
+	if (! defined $Bvars{$chr}{$pos}) {         # other sample: nothing  ## MUST GO FIRST
+	    $vwise{SOLO}{$type}++;
+	    $Afilt{$type}{$alt1} = 1;
+	} elsif ($type eq 'MNP' && defined $Bvars{$chr}{$pos}{SNP}) {  # SNP-MNP subset opportunity -- super-edge case
+	    my $value = 1;
+	    my $matched;
+	    foreach my $altB (keys %{ $Bvars{$chr}{$pos}{SNP} }) {
+		if ($alt1 =~ /$altB/) {  # SNP subset of MNP
+		    $vwise{SUBSET}{$type}++;
+		    $value++;
+		    $matched++;
+		}
+		next if $matched;  # if any subset relationship detected, record and move on
+	    }
+	    $Afilt{$type}{$alt1} = $value;
+	    $vwise{TSAME}{$type}++ unless $matched;
+	} elsif ($type eq 'SNP' && defined $Bvars{$chr}{$pos}{MNP}) {  # SNP-MNP subset opportunity -- super-edge case
+	    my $value = 1;
+	    my $matched;
+	    foreach my $altB (keys %{ $Bvars{$chr}{$pos}{MNP} }) {
+		if ($altB =~ /$alt1/) {  # SNP subset of MNP
+		    $vwise{SUBSET}{$type}++;
+		    $value++;
+		    $matched++;
+		}
+		next if $matched;  # if any subset relationship detected, record and move on
+	    }
+	    $Afilt{$type}{$alt1} = $value;
+	    $vwise{TSAME}{$type}++ unless $matched;
+	} elsif (! defined $Bvars{$chr}{$pos}{$type}) {  # other sample: different type only
+	    $vwise{TDIFF}{$type}++;
+	    $Afilt{$type}{$alt1} = 1;
+	} elsif ($Bvars{$chr}{$pos}{$type}{$alt1}) {     # other sample: exact same variant
+	    $vwise{REDUNDANT}{$type}++;
+	    $Aredun{$type}{$alt1} = 1;
+	} else {  # other sample: different variant but same type (not possible for SNP)
+	    my $value = 1;
+	    my $matched;
+	    foreach my $altB (keys %{ $Bvars{$chr}{$pos}{$type} }) {
+		if ($type eq 'INS') {
+		    if ($alt1 =~ /$altB/ || $altB =~ /$alt1/) {  # alt subset
+			$vwise{SUBSET}{$type}++;
+			$value++;
+			$matched++;
+		    }
+		} elsif ($type eq 'DEL') {
+		    if ($ref =~ /$Bvars{$chr}{$pos}{$type}{$altB}/ || $Bvars{$chr}{$pos}{$type}{$altB} =~ /$ref/) {  # ref subset
+			$vwise{SUBSET}{$type}++;
+			$value++;
+			$matched++;
+		    }
+		} elsif ($type eq 'MNP') {
+		    if ($alt1 =~ /$altB/ || $altB =~ /$alt1/) {  # alt subset -- extremely unlikely
+			$vwise{SUBSET}{$type}++;
+			$value++;
+			$matched++;
+		    }
+		}
+		next if $matched;  # if any subset relationship detected, record and move on
+	    }
+	    $Afilt{$type}{$alt1} = $value;
+	    $vwise{TSAME}{$type}++ unless $matched;
+	}
+    }
+    my $ok;        # anything left at this position?
+    $pwise{STACKED}++ if %Afilt && %Asub;
+    $pwise{SPLIT}++ if (%Afilt || %Asub) && %Aredun;
+    $histo{ scalar(keys %Afilt) + scalar(keys %Asub) }{A2}++;
+    if (%Afilt) { 
+	$ok = 1;
+	foreach my $type (keys %Afilt) {
+	    my $newalt = join(',', sort keys %{ $Afilt{$type} });
+	    print $OUTF "$chr\t$pos\t$id\t$ref\t$newalt\t$else";  # $else carries \n
+	    $pwise{NOCHG}++ if $alt eq $newalt;
+	}
+    }
+    if (%Asub && $subvcf) {
+	$ok = $has_subsets = 1;
+	foreach my $type (keys %Asub) {
+	    my $newalt = join(',', sort keys %{ $Asub{$type} });
+	    push @subout, "$chr\t$pos\t$id\t$ref\t$newalt\t$else";  # $else carries \n
+	    $pwise{NOCHG}++ if $alt eq $newalt;
+	}
+    }
+    $pwise{LOST}++ unless $ok;
+}
+close $INA;
+close $OUTF;
+
+if ($subvcf) {
+    print $OUTS, @subout if $has_subsets;  # otherwise, do not print even header -- leave VCF with size 0
+    close $OUTS;
+}
+
+my @VARS = qw/ SNP MNP INS DEL /;
+my @FATES = qw/ NOCHG SPLIT STACKED LOST /;  # %pwise
+my @RELATS = qw/ SOLO TDIFF TSAME SUBSET REDUNDANT /;  # %vwise
+
+foreach my $stat (keys %vwise) {
+    $vwise{$stat}{TOTAL} += $vwise{$stat}{$_} foreach @VARS;
+}
+
+open my $LOG, '>', $logfile;
+print $LOG join("\t", "VARIANT RELATIONS:\nTYPE", @RELATS), "\n";
+foreach my $var (@VARS, 'TOTAL') {
+    print $LOG join("\t", $var, map { $vwise{$_}{$var}||0 } @RELATS), "\n";
+}
+print $LOG "\nPOSITION FATES:\n", join("\t", @FATES), "\n";
+print $LOG join("\t", map { $pwise{$_}||0 } @FATES), "\n";
+print $LOG "\nVARIANTS PER POSITION:\nPOS\@N\tB\tA-PRE\tA-POST\n";
+foreach my $n (sort {$b <=> $a} keys %histo) {
+    next unless $n;  # don't print 0 line
+    print $LOG join("\t", $n, map { $histo{$n}{$_}||0 } qw/ B A1 A2 /), "\n";
+    $histo{TOTAL}{$_} += $histo{$n}{$_} foreach qw/ B A1 A2 /;
+}
+print $LOG join("\t", 'TOTAL', map { $histo{TOTAL}{$_}||0 } qw/ B A1 A2 /), "\n";
+close $LOG;
+
+system "cat $logfile";  # print to screen, basically
+
+print "\nsnpSubtract Complete! ",`date`;
+system "kill $$ 2>/dev/null";
+
+
+
+sub type_var {
+    my ($REFL, $ALTL, $LREF) = @_;
+    my $TYPE = ($REFL == 1 && $REFL == $ALTL) ? 'SNP' : 
+	($REFL > 1 && $REFL == $ALTL) ? 'MNP' : 
+	($REFL > $ALTL) ? 'DEL' : 
+	($REFL < $ALTL) ? 'INS' : die "Untypable variant: $$LREF\n";
+    return $TYPE;
+}

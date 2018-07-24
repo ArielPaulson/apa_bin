@@ -1,0 +1,35 @@
+#!/usr/bin/perl
+
+my $infile = $ARGV[0];
+(my $outfile = $infile) =~ s/\.uxons.bed$/.iintrons.bed/;
+
+open IN, $infile or die;
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    my ($chr, $start, $end, $id, $score, $str) = split /\t/, $_;
+    my ($gene, $else) = split /:/, $id;
+    next unless $gene;  # header lines, etc
+    $strand{$gene} = $str;
+    push @chrorder, $chr unless $geneorder{$chr};
+    push @{ $geneorder{$chr} }, $gene unless $ustarts{$gene};
+    push @{ $ustarts{$gene} }, $start;
+    push @{ $uends{$gene} }, $end;
+}
+close IN;
+
+open OUT, "> $outfile";
+foreach my $chr (@chrorder) {
+    foreach my $gene (@{ $geneorder{$chr} }) {
+	my $str = $strand{$gene};
+	my @starts = @{ $ustarts{$gene} };
+	my @ends = @{ $uends{$gene} };
+	foreach my $i (0..$#starts-1) {
+	    my $j = $i + 1;
+	    my $istart = $ends[$i];
+	    my $iend = $starts[$j];
+	    print OUT "$chr\t$istart\t$iend\t$gene:$j\t1\t$str\n";
+	}
+    }
+}
+close OUT;
+exit;

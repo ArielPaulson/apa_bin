@@ -1,0 +1,440 @@
+#!/usr/bin/env Rscript
+
+## Takes fastas and produces a blast-similarity matrix.
+## Can run on 1 fasta (self-blast) or 2 fastas (fasta 1 sequences = rows, fasta 2 sequences = cols).
+## Can use blast or blat for alignment, with nucleotides or peptides.  If 2-fasta comparison, sequence types must be same.
+## Can use a variety of metrics for matrix values.  Some will produce a symmetric matrix, others asymmetric.  See below.
+## Output directory receives raw and filtered blast outputs, matrix heatmap PNG, session R script and RData object.
+##
+## Below are available metrics, argument names, and definitions:
+## Symmetric metrics for blast/blat:
+## - Joint length percent, "joint-len-pct": 2 * aln len / (query len + subj len).
+## - Joint end-to-end identity percent, "joint-idt-pct": 2 * idents / (query len + subj len).
+## - Joint similarity percent, "joint-sim-pct": product of above 2 percents.
+## Additional symmetric metrics for self-blast:
+## - Blast max score, "score".
+## - Blast e-value, "e-value".
+## - Blast max score as % self-score, "score-pct".
+## Asymmetric metrics for blast/blat:
+## - Query length percent, "query-len-pct": aln len / query len.
+## - Query end-to-end identity percent, "query-idt-pct": idents / query len.
+## - Query similarity percent, "query-sim-pct": product of above 2 percents.
+## - Subject length percent, "subj-len-pct": aln len / subj len.
+## - Subject end-to-end identity percent, "subj-idt-pct": idents / subj len.
+## - Subject similarity percent, "subj-sim-pct": product of above 2 percents.
+
+
+
+##################### FIXME: DIE UNLESS SELF AND METRIC ARE COMPATIBLE !!!!
+
+
+
+#### setup
+
+## libraries
+library(methods)
+library(tools)
+library(getopt)
+
+## custom dependencies
+source("/home/apa/apa_tools.R")
+filterAligns <- "/home/apa/local/bin/filterAligns"
+
+## parse command line args
+spec <- matrix(c(
+    'fasta1',     'a', 1, 'character', 'required fasta file',
+    'fasta2',     'b', 2, 'character', 'optional second fasta file',
+    'seqtype',    's', 1, 'character', 'type of sequence: "DNA" or "AA"',
+    'program',    'p', 1, 'character', 'alignment program type: "blast" or "blat"',
+    'outdir',     'o', 2, 'character', 'output directory (default ".")',
+    'metric',     'm', 1, 'character', 'metrics to use: joint-len-pct, joint-idt-pct, joint-sim-pct, score, e-value, score-pct, query-len-pct, query-idt-pct, query-sim-pct, subj-len-pct, subj-idt-pct, subj-sim-pct',
+    'view',       'v', 0, 'logical',   'view matrix heatmap upon completion? (requires command "gthumb")',
+    'no-balance', 'n', 0, 'logical',   'do not balance symmetric-metric self-blast score matrices? (balancing is default)',
+    'no-warn',    'w', 0, 'logical',   'do not flag names of sequences containing runs of N/X? (warning is default)',
+    'clobber',    'c', 0, 'logical',   'clobber existing output directory? (default no)',
+    'help',       'h', 0, 'character', 'display help'
+), byrow=TRUE, ncol=5)
+
+opt <- getopt(spec)
+if (!is.null(opt$help)) {
+    cat(getopt(spec, usage=TRUE))
+    q(status=1)
+}
+
+## unpack 'opt'
+fasta1 <- file_path_as_absolute(opt[["fasta1"]])
+self <- ifelse(is.null(opt[["fasta2"]]), TRUE, FALSE)
+fasta2 <- ifelse(is.null(opt[["fasta2"]]), fasta1, file_path_as_absolute(opt[["fasta2"]]))
+seqtype <- opt[["seqtype"]]
+program <- opt[["program"]]
+metric <- opt[["metric"]]
+#metric <- unlist(strsplit(opt[["metric"]],","))   # LATER
+outdir <- ifelse(is.null(opt[["outdir"]]), ".", opt[["outdir"]])
+balance <- ifelse(is.null(opt[["no-balance"]]), TRUE, FALSE)
+warn <- ifelse(is.null(opt[["no-warn"]]), TRUE, FALSE)
+view <- ifelse(is.null(opt[["view"]]), FALSE, TRUE)
+clobber <- ifelse(is.null(opt[["clobber"]]), FALSE, TRUE)
+
+if (self) message(paste0("Running in self-",program," mode"))
+
+## 'metric' values check
+metrics <- c("joint-len-pct","joint-idt-pct","joint-sim-pct","score","e-value","score-pct","query-len-pct","query-idt-pct","query-sim-pct","subj-len-pct","subj-idt-pct","subj-sim-pct")
+metrics1 <- paste(metrics, collapse=", ")
+if (!(metric %in% metrics)) stop(paste0("Metric name '",metric,"' not found: must be one of ",metrics1,"\n"))
+#if (!all(metric %in% metrics)) stop(paste0("Metrics must be one of these values: ",metrics1,"\n"))   # LATER
+
+## Convert metric name to 'dat' column name, image title wording, and symmetric T/F
+metric.dat <- switch(
+    metric,
+    "joint-len-pct" = list("JointLenPct", "Joint Length Percent",       TRUE),
+    "joint-idt-pct" = list("JointIdtPct", "Joint Identity Percent",     TRUE),
+    "joint-sim-pct" = list("JointSimPct", "Joint Similarity Percent",   TRUE),
+    "query-len-pct" = list("QueryLenPct", "Query Length Percent",       FALSE),
+    "query-idt-pct" = list("QueryIdtPct", "Query Identity Percent",     FALSE),
+    "query-sim-pct" = list("QuerySimPct", "Query Similarity Percent",   FALSE),
+    "subj-len-pct"  = list("SubjLenPct",  "Subject Length Percent",     FALSE),
+    "subj-idt-pct"  = list("SubjIdtPct",  "Subject Identity Percent",   FALSE),
+    "subj-sim-pct"  = list("SubjSimPct",  "Subject Similarity Percent", FALSE),
+    "score"         = list("Score",       "Score",                      TRUE),
+    "score-pct"     = list("ScorePct",    "Percent Self-Score",         TRUE),
+    "e-value"       = list("nLog10Eval",  "E-Value",                    TRUE)
+)
+names(metric.dat) <- qw(colname, title, symmetric)
+
+## 'program' values check
+programs <- c("blast","blat")
+programs1 <- paste(programs, collapse=", ")
+if (!(program %in% programs)) stop(paste0("Program name '",program,"' not found: must be one of ",programs1,"\n"))
+
+## 'seqtype' values check
+seqtypes <- c("DNA","AA")
+seqtypes1 <- paste(seqtypes, collapse=", ")
+if (!(seqtype %in% seqtypes)) stop(paste0("Seqtype name '",seqtype,"' not found: must be one of ",seqtypes1,"\n"))
+
+## seqtype-specific things
+if (seqtype == "DNA") {
+    NX <- "N"
+    seqby <- 1000
+} else if (seqtype == "AA") {
+    NX <- "X"
+    seqby <- 100
+}
+
+## set up output directory
+if (outdir != ".") {
+    if (dir.exists(outdir)) {
+        if (clobber) {
+            message(paste0("Overwriting directory '",outdir,"'."))
+            system(paste("rm -rf",outdir))
+            system(paste("mkdir -p",outdir))
+            if (!dir.exists(outdir)) stop(paste0("Output directory '",outdir,"' could not be re-created!  Stopping."))
+        } else {
+            stop(paste0("Output directory '",outdir,"' already exists!  Stopping."))
+        }
+    } else {
+        system(paste("mkdir -p",outdir))
+        if (!dir.exists(outdir)) stop(paste0("Output directory '",outdir,"' could not be created!  Stopping."))
+        message(paste0("Writing to output directory '",outdir,"'"))
+    }
+    setwd(outdir)
+}
+
+
+
+
+
+#### main
+
+## process fasta(s)
+message("Processing fastas...")
+Lfasta1 <- basename(fasta1)
+fa1 <- sapply(read.fasta(fasta1), toupper)
+system(paste("ln -sf",fasta1,Lfasta1))  # local copy in output dir
+key1 <- data.frame(NEW=sapply(strsplit(names(fa1), "[[:space:]]+"),"[[",1), OLD=names(fa1))
+names(fa1) <- key1[,1]
+len1 <- nchar(fa1)
+N1 <- length(fa1)
+njunk1 <- sapply(strsplit(fa1,""), function(x) sum(x==NX) )
+pjunk1 <- njunk1/len1
+rjunk1 <- lapply(fa1, function(x){ y=unlist(strsplit(x,"")); y[y!="X"]=" "; y=unlist(strsplit(gsub(" +"," ",paste(y,collapse=""))," ")) })
+rjunk1.max <- sapply(rjunk1, function(x) max(nchar(x)) )
+warn1 <- which(rjunk1.max>1)  # sequences which have runs of N/X
+xmar1 <- 0.5294 * max(nchar(names(fa1))) + 0.99527  # true for cex=1.2
+xpix1 <- max(nchar(names(fa1))) * 5.4 * 2  # true for cex=1.2
+
+yadj <- 0.5
+
+
+Lfasta2 <- Lfasta1
+fa2 <- fa1
+key2 <- key1
+len2 <- len1
+N2 <- N1
+njunk2 <- njunk1
+pjunk2 <- pjunk1
+rjunk2 <- rjunk1
+rjunk2.max <- rjunk1.max
+warn2 <- warn1
+xmar2 <- xmar1
+xpix2 <- xpix1
+save.image("blastMatrix.RData")
+
+## mono,cex=1.2 : 2=2, 4=6, 6=9, 8=13, 10=17, 12=21, 14=25, 16=28.5, 18=32.5, 20=36,
+## plot(c(2,6,9,13,17,21,25,28,32,36), seq(2,20,2))
+## abline(lm(seq(2,20,2) ~ c(2,6,9,13,17,21,25,28,32,36)))
+## mean(c(2,6,9,13,17,21,25,28,32,36)/seq(2,20,2))
+## lm(seq(2,20,2) ~ c(2,6,9,13,17,21,25,28,32,36))
+png(paste0("percent.",NX,"1.png"), 400+xpix1, 100+14*N1); par(mar=c(3,xmar1,4,2), cex=1.2, las=1, yaxs="i", family="mono")
+plot(100*rev(sort(pjunk1)), N1:1, type="l", lwd=2, xlab="", ylab="", yaxt="n", ylim=c(1-yadj,N1+yadj), main=paste0("Fasta Sequence 1 ",NX,"%"), yaxt="n")
+points(100*rev(sort(pjunk1)), N1:1)
+axis(2, N1:1, labels=names(rev(sort(pjunk1))))
+abline(v=seq(0,100,10), lty=3)
+dev.off()
+
+png(paste0("sequence.lengths1.png"), 400+xpix1, 100+14*N1); par(mar=c(3,xmar1,4,2), cex=1.2, las=1, yaxs="i", family="mono")
+plot(rev(sort(len1)), N1:1, type="l", lwd=2, xlab="", ylab="", yaxt="n", xlim=c(0,max(len1)), ylim=c(1-yadj,N1+yadj), main=paste0("Fasta Sequence 1 Lengths"), yaxt="n")
+points(rev(sort(len1)), N1:1)
+axis(2, N1:1, labels=names(rev(sort(len1))))
+abline(v=seq(0,max(len1),seqby), lty=3)
+dev.off()
+
+
+if (!self) {
+    
+    
+    Lfasta2 <- basename(fasta2)
+    fa2 <- sapply(read.fasta(fasta2), toupper)
+    system(paste("cp",fasta2,Lfasta2))  # local copy in output dir
+    key2 <- data.frame(NEW=sapply(strsplit(names(fa2), "[[:space:]]+"),"[[",1), OLD=names(fa2))
+    names(fa2) <- key2[,1]
+    len2 <- sapply(fa2,nchar)
+    N2 <- length(fa2)
+    njunk2 <- sapply(strsplit(fa2,""), function(x) sum(x=="N") )
+    pjunk2 <- njunk2/len2
+    rjunk2 <- lapply(fa2, function(x){ y=unlist(strsplit(x,"")); y[y!="X"]=" "; y=unlist(strsplit(gsub(" +"," ",paste(y,collapse=""))," ")) })
+    rjunk2.max <- sapply(rjunk2, function(x) max(nchar(x)) )
+    warn2 <- which(rjunk2.max>1)  # sequences which have runs of N/X
+    xmar2 <- 0.5294 * max(nchar(names(fa2))) + 0.99527  # true for cex=1.2
+    xpix2 <- max(nchar(names(fa2))) * 5.4  # true for cex=1.2
+    save.image("blastMatrix.RData")
+    
+    png(paste0("percent.",NX,"2.png"), 400+xpix2, 100+14*N2); par(mar=c(3,xmar2,4,2), cex=1.2, las=1, yaxs="i", family="mono")
+    plot(100*rev(sort(pjunk2)), N2:1, type="l", lwd=2, xlab="", ylab="", yaxt="n", ylim=c(1-yadj,N2+yadj), main=paste0("Fasta Sequence 2 ",NX,"%"), yaxt="n")
+    points(100*rev(sort(pjunk2)), N2:1)
+    axis(2, N2:1, labels=names(rev(sort(pjunk2))))
+    abline(v=seq(0,100,10), lty=3)
+    dev.off()
+    
+    png(paste0("sequence.lengths2.png"), 400+xpix2, 100+14*N2); par(mar=c(3,xmar2,4,2), cex=1.2, las=1, yaxs="i", family="mono")
+    plot(rev(sort(len2)), N2:1, type="l", lwd=2, xlab="", ylab="", yaxt="n", xlim=c(0,max(len2)), ylim=c(1-yadj,N2+yadj), main=paste0("Fasta Sequence 2 Lengths"), yaxt="n")
+    points(rev(sort(len2)), N2:1)
+    axis(2, N2:1, labels=names(rev(sort(len2))))
+    abline(v=seq(0,max(len2),seqby), lty=3)
+    dev.off()
+    
+    
+}
+
+## blast/blat fastas; filter; read and standardize
+if (program == "blast") {
+    
+    
+    raw <- "blast.raw.txt"
+    filt <- "blast.pairbest.txt"
+    exp <- "blast.pairbest.scored.txt"
+    log <- "blast.pairbest.scored.log"
+    csm <- "blast.scores.clustered.txt"
+    if (seqtype == "DNA") {
+        call1 <- paste0("formatdb -p F -o F -i ",Lfasta2," -l ",Lfasta2,".log")
+        call2 <- paste("blastall -p blastn -m 8 -i",Lfasta1,"-d",Lfasta2,">",raw)
+    } else if (seqtype == "AA") {
+        call1 <- paste0("formatdb -p T -o F -i ",Lfasta2," -l ",Lfasta2,".log")
+        call2 <- paste("blastall -p blastp -m 8 -i",Lfasta1,"-d",Lfasta2,">",raw)
+    } else {
+        stop(paste("No handlers for seqtype",seqtype))
+    }
+    fcall1 <- paste(filterAligns,"-f",raw,"-q",Lfasta1,"-s",Lfasta2,"-t blast --more --pairbest >",log)
+    fcall2 <- paste0("mv ",raw,".pairbest ",filt)
+    
+    message("Formatting blast database...")
+    message(call1); system(call1)
+    message("Blasting...")
+    message(call2); system(call2)
+    message("Filtering...")
+    message(fcall1); system(fcall1)
+    message(fcall2); system(fcall2)
+    
+    message("Reading filtered dataset...")
+    dat <- read.delim(filt, as.is=TRUE)
+    ## Query Subject IdtPct AlnLen Mismatch Gaps QStart QEnd SStart SEnd Eval Score Strand IdtBp QLen QLenPct AQIdtPct TQIdtPct SLen SLenPct ASIdtPct TSIdtPct
+    
+    message("Calculating scores...")
+    qs <- 1:2  # query, subject name columns
+    qaln <- abs(dat$QEnd-dat$QStart)+1
+    taln <- abs(dat$SEnd-dat$SStart)+1
+    alnmax <- apply(cbind(qaln,taln), 1, max)
+    lentot <- dat$QLen+dat$SLen
+    
+    qsm1 <- match(dat[,qs[1]],names(fa1))
+    qsm2 <- match(dat[,qs[2]],names(fa2))
+    junk.mat <- data.frame(
+        QryNXTot=njunk1[qsm1],
+        QryNXRun=rjunk1.max[qsm1],
+        SubjNXTot=njunk2[qsm2],
+        SubjNXRun=rjunk2.max[qsm2]
+    )
+    colnames(junk.mat) <- sub("NX",NX,colnames(junk.mat))
+    
+    dat <- cbind(
+        dat,
+        JointLenPct=round(200*alnmax/lentot,2),
+        JointIdtPct=round(200*dat$IdtBp/lentot,2),
+        JointSimPct=0,
+        QueryLenPct=round(100*alnmax/dat$QLen,2),
+        QueryIdtPct=round(100*dat$IdtBp/dat$QLen,2),
+        QuerySimPct=0,
+        SubjLenPct=round(100*alnmax/dat$SLen,2),
+        SubjIdtPct=round(100*dat$IdtBp/dat$SLen,2),
+        SubjSimPct=0,
+        ScorePct=NA,
+        nLog10Eval=-log10(dat$Eval),
+        junk.mat
+    )
+    inf <- which(is.infinite(dat$nLog10Eval))
+    if (length(inf)>0) dat$nLog10Eval[inf] <- max(real(dat$nLog10Eval))*2  # "highest possible value" is double the observed finite maximum
+    
+    if (self) {
+        selfmax <- aggregate(dat$Score, list(dat$Query), max)
+#        dat$ScorePct <- round(100 * sapply(1:nrow(dat), function(i) dat$Score[i]/selfmax[selfmax[,1]==dat$Query[i],2]), 2)
+        for (i in 1:nrow(selfmax)) {
+            w <- which(dat$Query==selfmax[i,1])
+            dat$ScorePct[w] <- round(100*dat$Score[w]/selfmax[i,2],2)
+        }
+    }
+    
+    
+} else if (program == "blat") {
+    
+    
+    raw <- "blat.raw.psl"
+    filt <- "blat.pairbest.txt"
+    exp <- "blat.pairbest.scored.txt"
+    log <- "blat.pairbest.scored.log"
+    csm <- "blat.scores.clustered.txt"
+    if (seqtype == "DNA") {
+        call <- paste("blat -extendThroughN",Lfasta2,Lfasta1,raw)
+    } else if (seqtype == "AA") {
+        call <- paste("blat -extendThroughN -q=prot -t=prot",Lfasta2,Lfasta1,raw)
+    } else {
+        stop(paste("No handlers for seqtype",seqtype))
+    }
+    fcall1 <- paste(filterAligns,"-f",raw,"-q",Lfasta1,"-s",Lfasta2,"-t blat --more --pairbest >",log)
+    fcall2 <- paste0("mv ",raw,".pairbest ",filt)
+    
+    message("Blatting...")
+    message(call); system(call)
+    message("Filtering...")
+    message(fcall1); system(fcall1)
+    message(fcall2); system(fcall2)
+    
+    message("Reading filtered dataset...")
+    dat <- read.delim(filt, as.is=TRUE, skip=5, header=FALSE)
+    header <- read.delim(filt, as.is=TRUE, header=FALSE)[1:5,]
+    colnames(dat) <- gsub("['.-]","",gsub(" ","",paste0(header[2,], header[3,])))
+    ## match mismatch repmatch Ns QgapCount QgapBases TgapCount TgapBases strand Qname Qsize Qstart Qend Tname Tsize Tstart Tend blockcount blockSizes qStarts tStarts QLenPct AQIdtPct TQIdtPct SLenPct ASIdtPct TSIdtPct
+    
+    message("Calculating scores...")
+    qs <- c(10,14)  # query, subject name columns
+    qaln <- abs(dat$Qend-dat$Qstart)
+    taln <- abs(dat$Tend-dat$Tstart)
+    alnmax <- apply(cbind(qaln,taln), 1, max)
+    lentot <- dat$Qsize+dat$Tsize
+    jidt <- dat$match+dat$repmatch
+    
+    qsm1 <- match(dat[,qs[1]],names(fa1))
+    qsm2 <- match(dat[,qs[2]],names(fa2))
+    junk.mat <- data.frame(
+        QryNXTot=njunk1[qsm1],
+        QryNXRun=rjunk1.max[qsm1],
+        SubjNXTot=njunk2[qsm2],
+        SubjNXRun=rjunk2.max[qsm2]
+    )
+    colnames(junk.mat) <- sub("NX",NX,colnames(junk.mat))
+    
+    dat <- cbind(
+        dat,
+        JointLenPct=round(200*alnmax/lentot,2),
+        JointIdtPct=round(200*jidt/lentot,2),
+        JointSimPct=0,
+        QueryLenPct=round(100*alnmax/dat$Qsize,2),
+        QueryIdtPct=round(100*jidt/dat$Qsize,2),
+        QuerySimPct=0,
+        SubjLenPct=round(100*alnmax/dat$Tsize,2),
+        SubjIdtPct=round(100*jidt/dat$Tsize,2),
+        SubjSimPct=0,
+        nLog10Eval=NA,
+        junk.mat
+    )
+    
+    
+}
+
+dat$JointSimPct <- round(dat$JointLenPct*dat$JointIdtPct/100,2)
+dat$QuerySimPct <- round(dat$QueryLenPct*dat$QueryIdtPct/100,2)
+dat$SubjSimPct <- round(dat$SubjLenPct*dat$SubjIdtPct/100,2)
+save.image("blastMatrix.RData")
+
+message("Generating score matrix...")
+score.mat <- matrix(0, N1, N2, F, list(key1$OLD,key2$OLD))
+for (i in 1:nrow(dat)) score.mat[ match(dat[i,qs[1]],rownames(score.mat)), match(dat[i,qs[2]],colnames(score.mat)) ] <- dat[i,metric.dat$colname]
+
+if (self & metric.dat$symmetric & balance) {
+    ## Unfortunately, a->b blast may not score same as b->a blast.  Ensure matrix is symmetric w/ highest scores.
+    message("Balancing score matrix...")
+    for (i in 1:N1) {
+        for (j in 1:N2) { 
+            score.mat[i,j] <- ifelse(score.mat[i,j]>score.mat[j,i], score.mat[i,j], score.mat[j,i]) 
+        }
+    }
+}
+
+if (warn) {
+    wrn <- rownames(score.mat) %in% names(fa1)[warn1]
+    wcn <- colnames(score.mat) %in% names(fa2)[warn2]
+    rownames(score.mat)[wrn] <- paste("*",rownames(score.mat)[wrn])
+    colnames(score.mat)[wcn] <- paste("*",colnames(score.mat)[wcn])
+}
+
+message("Clustering score matrix...")
+if (self) {
+    hc <- reorder.hclust2(hclust(dist(score.mat),"average"), score.mat, mean)
+    score.mat <- score.mat[hc$order,hc$order]
+} else {
+    hcr <- reorder.hclust2(hclust(dist(score.mat),"average"), score.mat, mean)
+    hcc <- reorder.hclust2(hclust(dist(t(score.mat)),"average"), t(score.mat), mean)
+    score.mat <- score.mat[hcr$order,hcc$order]
+}
+
+message("Writing clustered score matrix...")
+write.table2(score.mat, csm, row.head="Query")
+
+message("Writing expanded dataset...")
+write.table(dat, exp, quote=FALSE, sep="\t", row.names=FALSE)
+
+pal <- rev(palettizer("ROYGC", 256, interp="spline"))
+imgname <- paste(program,metric,"png",sep=".")
+heat.map(score.mat, aspect=c(1,1,14), main=paste(toTitleCase(program),"Highest",metric.dat$title,"per Pair"), pal=pal, imgname=imgname)
+save.image("blastMatrix.RData")
+if (view) gthumb(imgname)
+
+## an "overview" version if full heatmap is too large.  will bring back, if better planned out.
+##imgdim <- as.numeric(unlist(strsplit(system(paste0("identify png:",imgname," | cut -f3 -d' '"), intern=TRUE),"x")))
+##if (imgdim[1]>1200 | imgdim[2]>1000) {
+##    png(sub("png$","sm.png",imgname), 1200, 1000); par(family="mono")
+##    mipu(score.mat, main=paste(toTitleCase(program),"Highest",metric.dat[2],"per Pair"), pal=pal, cex=1.2)
+##    dev.off()
+##}
+
+
+
+

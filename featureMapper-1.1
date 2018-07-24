@@ -1,0 +1,614 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+no strict 'refs';
+
+
+
+
+### THINGS TO ADD: $minOverlap control, promoter size, 
+
+
+
+
+##########  SETUP  ##########
+
+my ($input, $outdir, $clobber, $intype, $bamreads, $keep);
+my $gbuild;  # e.g. hg19
+my $abuild;  # e.g. Ens_75
+my $promtail = '10000,1000';
+
+GetOptions("i=s"=>\$input, "o=s"=>\$outdir, "oc=s"=>\$clobber, "t=s"=>\$intype, "g=s"=>\$gbuild, "a=s"=>\$abuild, "br=s"=>\$bamreads, "p=s"=>\$promtail, "keep"=>\$keep);
+
+$outdir = $clobber if $clobber;
+die "$0: Output dir '$outdir' already exists!\n" if (-d $outdir && !$clobber);
+system "mkdir -p $outdir";
+die "$0: Failed to create output dir '$outdir'!\n" unless -d $outdir;
+
+my ($prombp, $tailbp) = split /,/, $promtail;
+
+my $bam;
+if ($input =~ /\.bed$/i || $intype =~ /^bed$/i) {
+    # default
+} elsif ($input =~ /\.bam$/i || $intype =~ /^bam$/i) {
+    $bam = 1;
+} else {
+    die "$0: Unknown or unsupported input extension, and input filetype not specified! (must be BED or BAM)\n";
+}
+
+my $flagread;
+my $gb_prefix = "/n/data1/genomes/bowtie-index/$gbuild/$gbuild";
+my $ab_prefix = "/n/data1/genomes/bowtie-index/$gbuild/$abuild/$gbuild.$abuild";
+my $fai = "$gb_prefix.fa.fai";
+my $gtf = "$ab_prefix.cuff.gtf";
+my $iintbed = "$ab_prefix.iintrons.bed";
+my $uxonbed = "$ab_prefix.uxons.bed";
+my $genebed = "$ab_prefix.genes.bed";
+my $itgnbed = "$ab_prefix.intergenes.bed";
+
+my $f = "0.999999";   # since intersectBed with "-f 1" fails, for some hopelessly stupid reason...
+my $tmp = "$outdir/featureMapper.$$.tmp";
+system "mkdir $tmp";
+die "$0: Failed to create temp dir '$tmp'!\n" unless -d $tmp;
+
+my $iint_ALL = "$tmp/hits_to_iintrons.ALL.txt";
+my $itgc_CON = "$tmp/hits_to_intergenes.CONT.txt";
+my $uxon_CON = "$tmp/hits_to_uxons.CONT.txt";
+my $gene_ALL = "$tmp/hits_to_genes.ALL.txt";
+my $bam_splc = "$tmp/hits_to_splicejuncs.txt";
+
+my $pgenebed = "$tmp/genes-plus.bed";
+my $mgenebed = "$tmp/genes-minus.bed";
+my $prombed = "$tmp/promoters.bed";
+my $tailbed = "$tmp/tailregions.bed";
+my $prom_ALL = "$tmp/hits_to_promoters.ALL.txt";
+my $tail_ALL = "$tmp/hits_to_tailregions.ALL.txt";
+
+
+
+##########  CREATE INTERSECTIONS  ##########
+
+my ($readLen, $totAlns, $alnReads, $label);   # $readLen not yet used -- waiting for $minOverlap feature
+my %inputData;  # used for BED input only
+
+if ($bam) {
+    
+    $label = 'reads';
+    
+    &execute("intersectBed -bed -split -wo -abam $input -b $genebed | cut -f2-4,14-16 > $gene_ALL") unless -e $gene_ALL;
+    &execute("intersectBed -bed -split -wo -abam $input -b $iintbed | cut -f2,4,16 > $iint_ALL") unless -e $iint_ALL;
+    &execute("intersectBed -bed -split -wo -f $f -abam $input -b $uxonbed | cut -f2,4,16 > $uxon_CON") unless -e $uxon_CON;
+    &execute("intersectBed -bed -split -wo -f $f -abam $input -b $itgnbed | cut -f2,4,16 > $itgc_CON") unless -e $itgc_CON;
+    &execute("samtools view $input | awk '\$6 ~ \"N\"' | cut -f1,3,4,6 > $bam_splc") unless -e $bam_splc;
+    
+    if ($prombp) {
+	&execute("flankBed -s -l $prombp -r 0 -i $genebed -g $fai | awk '{ if (\$2!=\$3) print \$0 }' > $prombed") unless -e $prombed;
+        &execute("intersectBed -bed -split -wo -abam $input -b $prombed | cut -f2-4,14-16 > $prom_ALL") unless -e $prom_ALL;
+    }
+    if ($tailbp) {
+        &execute("flankBed -s -l 0 -r $tailbp -i $genebed -g $fai | awk '{ if (\$2!=\$3) print \$0 }' > $tailbed") unless -e $tailbed;
+        &execute("intersectBed -bed -split -wo -abam $input -b $tailbed | cut -f2-4,14-16 > $tail_ALL") unless -e $tail_ALL;
+    }
+    unless ($bamreads) {
+        $bamreads = "$outdir/bamreads.txt";
+        &execute("/home/apa/local/bin/bamReads $input > $bamreads");
+    }
+
+    open IN, $bamreads or die;
+    while (<IN>) {
+        next if $. == 1;
+        $_ =~ s/[\n\r]+$//;
+        ($readLen, $totAlns, $alnReads) = (split /\t/, $_)[1,2,6];
+    }
+    close IN;
+    
+} else {
+    
+    $label = 'peaks';  # assuming all bed inputs are peaks...
+    
+    my $maxcol;
+    open IN, $input;
+    while (<IN>) {
+        $_ =~ s/[\n\r]+$//;
+        my @data = split /\t/, $_;
+        my ($start, $end, $id) = @data[1..3];
+        $inputData{$id} = [$end-$start, $_];
+        $maxcol = scalar(@data) if scalar(@data) > $maxcol;
+    }
+    close IN;
+    $totAlns = scalar keys %inputData;
+    
+    my $fstart = my $fend = my $fname = my $over = $maxcol;  # beginning with input bed final column,
+    $fstart += 2;  # 2 columns farther
+    $fend += 3;    # 3 cols
+    $fname += 4;   # 4
+    
+    &execute("intersectBed -bed -split -wo -a $input -b $genebed | cut -f2-4,$fstart-$fname > $gene_ALL") unless -e $gene_ALL;    # start,end,id + start,end,id
+    &execute("intersectBed -bed -split -wo -a $input -b $iintbed | cut -f2,4,$fname > $iint_ALL") unless -e $iint_ALL;
+    &execute("intersectBed -bed -split -wo -f $f -a $input -b $uxonbed | cut -f2,4,$fname > $uxon_CON") unless -e $uxon_CON;
+    &execute("intersectBed -bed -split -wo -f $f -a $input -b $itgnbed | cut -f2,4,$fname > $itgc_CON") unless -e $itgc_CON;
+    
+    if ($prombp) {
+        &execute("flankBed -s -l $prombp -r 0 -i $genebed -g $fai | awk '{ if (\$2!=\$3) print \$0 }' > $prombed") unless -e $prombed;
+        &execute("intersectBed -bed -split -wo -a $input -b $prombed | cut -f2-4,$fstart-$fname > $prom_ALL") unless -e $prom_ALL;
+    }
+    if ($tailbp) {
+        &execute("flankBed -s -l 0 -r $tailbp -i $genebed -g $fai | awk '{ if (\$2!=\$3) print \$0 }' > $tailbed") unless -e $tailbed;
+        &execute("intersectBed -bed -split -wo -a $input -b $tailbed | cut -f2-4,$fstart-$fname > $tail_ALL") unless -e $tail_ALL;
+    }
+    
+}
+
+
+
+##########  PARSE ANNOTATION FILES  ##########
+
+my (%allfeats, %allfeats2, %allitgn, %GTE, %knowntmp, %knownjunc, %genejunc, @kj, $J);
+&logprint("Parsing annot files...\n");
+
+## Chromosomes
+chomp(my @allchrs = split /\n/, `cut -f1 $fai`);
+
+## GTF parsing
+open IN, $gtf or die;
+while (<IN>) {
+    chomp;
+    my ($chr, $src, $type, $start, $end, $score, $strand, $phase, $annot) = split /\t/, $_;
+    next unless $type eq 'exon';
+    my ($gene) = ($annot =~ /gene_id \"(.*?)\"/);
+    my ($trans) = ($annot =~ /transcript_id \"(.*?)\"/);
+    $allfeats2{GENE}{$gene} = [$chr, $start-1, $end, $strand];  # $start-1 to match bed files
+    push @{ $GTE{$gene}{$trans}{S} }, $start;
+    push @{ $GTE{$gene}{$trans}{E} }, $end;
+}
+close IN;
+
+## Transcript coords per gene
+foreach my $gene (keys %GTE) {
+    my $chr = $allfeats2{GENE}{$gene}->[0];
+    foreach my $trans (keys %{ $GTE{$gene} }) {
+        my @starts = sort {$a <=> $b} @{ $GTE{$gene}{$trans}{S} };
+        my @ends = sort {$a <=> $b} @{ $GTE{$gene}{$trans}{E} };
+        foreach my $i (1..$#starts) {
+            my $coord = join "\t", ($ends[$i-1], $starts[$i]-1);
+            $knowntmp{"$chr\t$coord"}{$gene} = 1;
+        }
+    }
+}
+
+## Known-junction coords per gene
+foreach my $jcoord (sort {$a <=> $b} keys %knowntmp) {
+    my ($chr, $start, $end) = split /\t/, $jcoord;
+    $knownjunc{$jcoord}{J} = ++$J;
+    $knownjunc{$jcoord}{L} = $end-$start;
+    foreach my $gene (keys %{ $knowntmp{$jcoord} }) {
+        $knownjunc{$jcoord}{G}{$gene} = 1;
+        $genejunc{$gene}++;
+        $allfeats{$chr}{"$start\t$end"}{KJUN}{"$gene:$genejunc{$gene}"} = '.';
+        $allfeats2{KJUN}{"$gene:$genejunc{$gene}"} = [$chr, $start, $end, '.'];
+    }
+}
+
+## BED parsing
+my @beds = ($uxonbed, $iintbed, $genebed, $itgnbed);
+my @btypes = qw/ UXON IINT GENE ITGC /;
+foreach my $i (0..$#beds) {
+    my $type = $btypes[$i];
+    open IN, $beds[$i] or die;
+    while (<IN>) {
+        chomp;
+        my @data = split /\t/, $_;
+        my ($chr, $start, $end, $id) = @data[0..3];
+        my $strand = $data[5];
+        $allfeats{$chr}{"$start\t$end"}{$type}{$id} = $strand;
+        $allfeats2{$type}{$id} = [$chr, $start, $end, $strand];
+    }
+    close IN;
+}
+
+if ($prombp) {
+    foreach my $gene (keys %{ $allfeats2{GENE} }) {
+        my ($chr, $gstart, $gend, $strand) = @{ $allfeats2{GENE}{$gene} };
+        my ($pstart, $pend) = $strand eq '+' ? ($gstart-$prombp, $gstart-1) : ($gstart-1, $gstart-$prombp);
+        $allfeats{$chr}{"$pstart\t$pend"}{PROM}{$gene} = $strand;
+        $allfeats2{PROM}{$gene} = [$chr, $pstart, $pend, $strand];
+    }
+}
+
+if ($tailbp) {
+    foreach my $gene (keys %{ $allfeats2{GENE} }) {
+        my ($chr, $gstart, $gend, $strand) = @{ $allfeats2{GENE}{$gene} };
+        my ($tstart, $tend) = $strand eq '+' ? ($gend+1, $gend+$tailbp) : ($gend+$tailbp, $gend+1);
+        $allfeats{$chr}{"$tstart\t$tend"}{TAIL}{$gene} = $strand;
+        $allfeats2{TAIL}{$gene} = [$chr, $tstart, $tend, $strand];
+    }
+}
+
+## Terminal uxon identification
+my (%alljunc, $kjhits, $njhits, %juncreads, %noveljunc, %noveltmp, %allCoords, %terminals, %x, %y, %z);
+foreach my $uxon (keys %{ $allfeats2{UXON} }) {
+    my $gene = (split /:/, $uxon)[0];
+    my ($ustart, $uend) = @{ $allfeats2{UXON}{$uxon} }[1,2];
+    my ($gstart, $gend, $gstr) = @{ $allfeats2{GENE}{$gene} }[1..3];
+    if ($ustart == $gstart) {
+        $terminals{$gene}{$_} = $uxon foreach (3,5);
+    } elsif ($ustart == $gstart) {
+        my $side = $gstr eq '+' ? 5 : 3;
+        $terminals{$gene}{$side} = $uxon;
+    } elsif ($uend == $gend) {
+        my $side = $gstr eq '+' ? 3 : 5;
+        $terminals{$gene}{$side} = $uxon;
+    }
+}
+
+## Any genes missing annotated terminal uxons??
+my ($ok, $nok);
+foreach my $gene (keys %{ $allfeats2{GENE} }) {
+    my $nterm = scalar(keys %{ $terminals{$gene} });
+    if (scalar(keys %{ $terminals{$gene} }) < 2) {
+        &logprint("$gene missing terminals! $nterm\n");
+        $nok++;
+    } else {
+        $ok++;
+    }
+}
+&logprint("Terminals: $ok ok, $nok not\n");
+
+
+
+##########  PARSE JUNCTIONS BED  ##########
+
+if ($bam) {
+    
+    open IN, $bam_splc or die;
+    while (<IN>) {
+        chomp;
+        my ($read, $chr, $start, $cigar) = split /\t/, $_;
+        $start--;  # 0-based
+        my ($h1, $gap, $h2) = ($cigar =~ /(.*\D+)(\d+N)(\d+.*)/);
+        my ($bp1, $bp2);
+        $bp1 += $_ foreach (split /\D+/, $h1);
+        $bp2 += $_ foreach (split /\D+/, $h2);
+        my $jstart = $start + $bp1;
+        my $jend = $jstart + $gap;
+        my $jcoord = "$chr\t$jstart\t$jend";
+        if (exists $knownjunc{$jcoord}) {
+            foreach my $gene (keys %{ $knownjunc{$jcoord}{G} }) {
+                my ($id) = grep($gene, keys %{ $allfeats{$chr}{"$jstart\t$jend"}{KJUN} });
+                $allCoords{$read}{KJUN}{$gene}{$id}{$start} = 1;
+                $x{KJUN}++;
+            }
+            $kjhits++;
+        } else {
+            $noveltmp{$chr}{"$jstart\t$jend"}{$read}{$start} = 1;
+            $x{NJUN}++;
+            $njhits++;
+        }
+    }
+    close IN;
+    &logprint("$kjhits, $njhits\n");
+    
+    my $nj;
+    foreach my $chr (@allchrs) {
+        foreach my $coord (sort {$a <=> $b} keys %{ $noveltmp{$chr} }) {
+            $nj++;
+            my $id = "NOVEL:$nj";
+            $allfeats{$chr}{$coord}{NJUN}{$id} = '.';
+            $allfeats2{NJUN}{$id} = [$chr, split("\t",$coord), '.'];
+            foreach my $read (keys %{ $noveltmp{$chr}{$coord} }) {
+                $allCoords{$read}{NJUN}{$id}{$id}{$_} = 1 foreach keys %{ $noveltmp{$chr}{$coord}{$read} };
+            }
+        }
+    }
+    
+}
+
+
+##########  PARSE INTERSECTIONS  ##########
+
+open IN, $uxon_CON or die;
+while (<IN>) {
+    chomp;
+    my ($start, $item, $uxon) = split /\t/, $_;
+    my $gene = (split /:/, $uxon)[0];
+    $allCoords{$item}{UXON}{$gene}{$uxon}{$start} = 1;
+    $x{UXON}++;
+}
+close IN;
+
+open IN, $iint_ALL or die;
+while (<IN>) {
+    chomp;
+    my ($start, $item, $iint) = split /\t/, $_;
+    next if $allCoords{$item}{UXON};
+    next if $bam && $allCoords{$item}{KJUN};   # first condition should prevent {KJUN} autovivification
+    my $gene = (split /:/, $iint)[0];
+    $allCoords{$item}{IINT}{$gene}{$iint}{$start} = 1;
+    $x{IINT}++;
+}
+close IN;
+
+my $genelost;
+open IN, $gene_ALL or die;
+while (<IN>) {
+    chomp;
+    my ($start, $end, $item, $gstart, $gend, $gene) = split /\t/, $_;
+    my $str = $allfeats2{GENE}{$gene}->[3];
+    my $side;
+    if ($start < $gstart) {
+        $side = $str eq '+' ? 5 : 3;
+    } elsif ($end > $gend) {
+        $side = $str eq '+' ? 5 : 3;
+    } else {
+        $genelost++ unless $allCoords{$item};
+        next;  # ONLY looking for novel-UTR reads (which get assigned to terminal uxons...)
+    }
+    $x{UXON}++;
+    my $uxon = $terminals{$gene}{$side};
+    $allCoords{$item}{UXON}{$gene}{$uxon}{$start} = 1;
+}
+close IN;
+&logprint("$genelost genelost\n") if $genelost;
+
+if ($prombp) {
+    open IN, $prom_ALL or die;
+    while (<IN>) {
+        chomp;
+        my ($start, $end, $item, $pstart, $pend, $gene) = split /\t/, $_;
+        next if exists $juncreads{$item};
+        if ($start >= $pstart && $end <= $pend) {   # contained by promoter space
+            $allCoords{$item}{PROM}{$gene}{$gene} = 1;
+            $x{PROM}++;
+        } else {
+            ## ignore -- NUTR or other stuff already assigned
+        }
+    }
+    &logprint("promoters: $.\n");
+    close IN;
+}
+
+if ($tailbp) {
+    open IN, $tail_ALL or die;
+    while (<IN>) {
+        chomp;
+        my ($start, $end, $item, $tstart, $tend, $gene) = split /\t/, $_;
+        next if exists $juncreads{$item};
+        if ($start >= $tstart && $end <= $tend) {   # contained by promoter space
+            $allCoords{$item}{TAIL}{$gene}{$gene} = 1;
+            $x{TAIL}++;
+        } else {
+            ## ignore -- NUTR or other stuff already assigned
+        }
+    }
+    &logprint("tail regions: $.\n");
+    close IN;
+}
+
+open IN, $itgc_CON or die;
+while (<IN>) {
+    chomp;
+    my ($start, $item, $itgn) = split /\t/, $_;
+    #    next if $allCoords{$item}{UXON};
+    #    next if $allCoords{$item}{IINT};
+    #    next if $allCoords{$item}{PROM};
+    #    next if $allCoords{$item}{TAIL};
+    $allCoords{$item}{ITGC}{$itgn}{$itgn}{$start} = 1;
+    $x{ITGC}++;
+}
+close IN;
+
+
+
+##########  RANK ASSIGNMENTS AND SELECT BEST FOR EACH INPUT COORD  ##########
+
+my (%fullhits, %genehits, %coordhits, $fail, $multi, $mono, $lost, $juncpass2, $xSum, $ySum, $zSum, $cSum, $multisum, @itemFail);
+my @ranked = $bam ? qw/ KJUN NJUN UXON IINT PROM TAIL ITGC / : qw/ UXON IINT PROM TAIL ITGC /;   # feature types in order of precedence
+my ($a1, $a2, $a3);
+foreach my $item (keys %allCoords) {
+    my ($best, $assign);
+    # select highest-ranked feature for read
+    foreach (@ranked) {
+        next if $best;
+        $best = $_ if exists $allCoords{$item}{$_};
+    }
+    $a1++;
+    # tally feature hits per gene, and per actual feature(s) which were the best matches
+    foreach my $gene (keys %{ $allCoords{$item}{$best} }) {
+        $a2++;
+        foreach my $component (keys %{ $allCoords{$item}{$best}{$gene} }) {
+            $z{$best}++;
+            $genehits{$best}{$gene}++;
+            $fullhits{$best}{$component}++;
+            $coordhits{$item}{$best}{$component}++ unless $bam;   # too much data to store, if $bam
+            $assign = 1;
+            $a3++;
+        }
+    }
+    # successfully assigned? (basically, did any features match the ostensible 'best 'feature this read was supposed to have?)
+    if ($assign) {
+        $y{$best}++;
+    } else {
+        push @itemFail, $item;
+    }
+}
+
+
+
+##########  REPORTING  ##########
+
+if (@itemFail) {
+    open OUT, "> $outdir/featureMapper.unassigned.$label.txt";
+    print OUT "$_\n" foreach @itemFail;
+    close OUT;
+}
+&logprint("A: $a1, $a2, $a3\n");
+
+my (%ccounti, %ccountf);
+&logprint("\tCOMPONENTS\tASSIGNMENTS\t\n");
+&logprint("TYPE\tTOTAL\tASSND\tINITL\tFINAL\tRDS\n");
+foreach (@ranked) {
+    $ccounti{$_} = scalar(keys %{ $allfeats2{$_} });
+    $ccountf{$_} = scalar(keys %{ $fullhits{$_} });
+    &logprint("$_\t$ccounti{$_}\t$ccountf{$_}\t$x{$_}\t$z{$_}\t$y{$_}\n");
+    $xSum += $x{$_};
+    $ySum += $y{$_};
+    $zSum += $z{$_};
+}
+
+my $obsCoords = scalar keys %allCoords;
+$cSum += $allCoords{$_} foreach keys %allCoords;
+
+if ($bam) {
+    &logprint("TOTAL RAW ASSIGNMENTS: $xSum\n");
+    &logprint("READS OBSERVED: $obsCoords, vs bamreads $alnReads (diff ",($obsCoords-$alnReads),")\n");
+    &logprint("READS ASSIGNED: $ySum (lost ",($obsCoords-$ySum),")\n");
+    &logprint("TOTAL ASSIGNMENTS: $zSum, vs bamreads $totAlns (diff ",($zSum-$totAlns),")\n");
+} else {
+    &logprint("TOTAL RAW ASSIGNMENTS: $xSum\n");
+    &logprint("COORDS OBSERVED: $obsCoords, vs input $totAlns (diff ",($obsCoords-$totAlns),")\n");
+    &logprint("COORDS ASSIGNED: $ySum (lost ",($obsCoords-$ySum),")\n");
+    &logprint("TOTAL ASSIGNMENTS: $zSum, vs input $totAlns (diff ",($zSum-$totAlns),")\n");
+}
+
+
+
+##########  SUMMARIZE AND WRITE OUTPUTS  ##########
+
+my %summ;
+foreach my $gene (keys %{ $allfeats2{GENE} }) {
+    my ($chr, $start, $end, $strand) = @{ $allfeats2{GENE}{$gene} };
+    my $coord = "$start\t$end\t$strand";
+    push @{ $summ{G}{$chr}{$coord} }, join("\t",($gene,$chr,$coord, map { $genehits{$_}{$gene} } @ranked)),"\n";
+}
+foreach my $itgn (keys %{ $allfeats2{ITGC} }) {
+    my ($chr, $start, $end, $strand) = @{ $allfeats2{ITGC}{$itgn} };
+    my $coord = "$start\t$end\t$strand";
+    push @{ $summ{I}{$chr}{$coord} }, join("\t",($itgn,$chr,$coord, map { $genehits{$_}{$itgn} } @ranked)),"\n";
+}
+foreach my $junc (keys %{ $allfeats2{NJUN} }) {
+    my ($chr, $start, $end, $strand) = @{ $allfeats2{NJUN}{$junc} };
+    my $coord = "$start\t$end\t$strand";
+    push @{ $summ{N}{$chr}{$coord} }, join("\t",($junc,$chr,$coord, map { $genehits{$_}{$junc} } @ranked)),"\n";
+}
+
+open OUT, "> $outdir/featureMapper.summary.txt";
+print OUT join("\t", ("OBJECT\tCHR\tSTART\tEND\tSTRAND",@ranked)), "\n";
+foreach my $GIN (qw/ G I N /) {
+    foreach my $chr (@allchrs) {
+        print OUT @{ $summ{$GIN}{$chr}{$_} } foreach sort {$a <=> $b} keys %{ $summ{$GIN}{$chr} };
+    }
+}
+close OUT;
+
+my %ignored = map {($_=>1)} qw/ GENE TJUN /;
+my %ignorable = map {($_=>1)} qw/ UIBO NUTR NJUN /;
+open OUT, "> $outdir/featureMapper.full.txt";
+print OUT "CHR\tSTART\tEND\tSTRAND\tTYPE\tID\tREADS\tGENE(S)\n";
+foreach my $chr (@allchrs) {
+    foreach my $coord (sort {$a <=> $b} keys %{ $allfeats{$chr} }) {
+        foreach my $type (sort keys %{ $allfeats{$chr}{$coord} }) {
+            next if $ignored{$type};
+            foreach my $id (sort keys %{ $allfeats{$chr}{$coord}{$type} }) {
+                my $strand = $allfeats{$chr}{$coord}{$type}{$id};
+                my $N = $fullhits{$type}{$id} || '0';  # guarantee printable
+                next if ($N == 0 && $ignorable{$type});
+                print OUT "$chr\t$coord\t$strand\t$type\t$id\t$N\n";
+            }
+        }
+    }
+}
+close OUT;
+
+unless ($bam) {
+    open OUT, "> $outdir/featureMapper.coord.txt";
+    foreach my $id (keys %inputData) {
+        my $best = (keys %{ $coordhits{$id} })[0];
+        my $components = join ';', sort keys %{ $coordhits{$id}{$best} };
+        my $N = scalar keys %{ $coordhits{$id}{$best} };
+        print OUT $inputData{$id}->[1]."\t$N\t$best\t$components\n";
+    }
+    close OUT;
+}
+
+
+
+##########  FINISH  ##########
+
+system "rm -Rf $tmp" unless $keep;
+&test;
+my $msg = "featureMapper $outdir $gbuild $abuild complete!";
+$msg .= " ($tmp)" if $keep;
+&logprint("$msg\n");
+$| = 1;
+kill $$;
+
+
+
+
+
+
+
+
+#######################################################################  SUBROUTINES  #######################################################################
+#######################################################################  SUBROUTINES  #######################################################################
+#######################################################################  SUBROUTINES  #######################################################################
+#######################################################################  SUBROUTINES  #######################################################################
+#######################################################################  SUBROUTINES  #######################################################################
+
+
+
+
+
+
+
+
+sub logprint {
+    my $msg = join '', @_;
+    print LOG $msg;
+    print $msg;
+}
+
+
+sub execute {
+    &logprint("$_[0]\n"); system $_[0];
+}
+
+
+sub test {
+    
+    my ($totalA, $totalB, %statA, %byfeat);
+    #my $cmd = 'for i in {6..10}; do /home/apa/local/bin/colStats -f '.$outdir.'/featureMapper.summary.txt -c $i --sum --nz; done | '."grep '.'";
+    my $cmd = 'for i in {6..10}; do /home/apa/local/bin/colStats -f '.$outdir.'/featureMapper.summary.txt -c $i --sum --nz; done';
+    print "Running: $cmd\n";
+    foreach (split /\n/, `bash -c '$cmd'`) {
+        next unless $_;
+        if ($_ =~ /^Sum: (\d+)$/) {
+            push @{ $statA{sum} }, $1;
+            $totalA += $1;
+        } elsif ($_ =~ /^Nonzero: (\d+)$/) {
+            push @{ $statA{nz} }, $1;
+        } else {
+            print "Line fail A: $_\n";
+        }
+    }
+    foreach my $i (0..$#ranked) {
+        $byfeat{ $ranked[$i] }{SUMM}{sum} += $statA{sum}->[$i];
+        $byfeat{ $ranked[$i] }{SUMM}{nz} += $statA{nz}->[$i];
+    }
+    
+    my %convB = ('N','n', 'Sum','sum', 'Nonzero','nz');
+    my $cmd = '/home/apa/local/bin/colStats -f '.$outdir.'/featureMapper.full.txt -c 7 -g 5 --sum --nz --N';
+    print "Running: $cmd\n";
+    foreach (split /\n/, `$cmd`) {
+        next unless $_;
+        if ($_ =~ /^(\S+): (\S+): (\d+)$/) {
+            $byfeat{$1}{FULL}{ $convB{$2} } += $3;
+            $byfeat{$1}{FULL}{ $convB{$2} } += $3;
+            $totalB += $3 if $2 eq 'Sum';
+        } else {
+            print "Line fail B: $_\n";
+        }
+    }
+    print "Summary: $totalA, Full: $totalB\n";
+}

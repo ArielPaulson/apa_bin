@@ -1,0 +1,84 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use strict;
+no strict 'refs';
+
+my %kformats = ('EXPORT',1, 'SAM',1, 'BAM',1);
+my ($infile, $format, $outname, $passonly);
+my $ends = 1;
+my $tmp = "convert2sequence.$$.tmp";
+
+GetOptions( "i=s" => \$infile, "f=s" => \$format, "o=s" => \$outname, "e=i" => \$ends, "p" => \$passonly );
+
+$format =~ s/(.*)/\U$1/;
+die "Unsupported format '$format'!  Must be 'EXPORT', 'SAM', or 'BAM'!\n" unless $kformats{$format};
+
+$ends = 1 if $format eq 'EXPORT';
+die "Ends value must be 1 or 2 if specified!\n" unless ($ends == 1 || $ends == 2);
+
+$outname = $infile unless $outname;
+
+if ($format eq 'BAM') {
+    print "Converting BAM to temp file...\n";
+    system "samtools view $infile | cut -f1,2,10,11 > $tmp";
+} elsif ($format eq 'SAM') {
+    print "Converting SAM to temp file...\n";
+    system "cut -f1,2,10,11 $infile > $tmp";
+} elsif ($format eq 'EXPORT') {
+    print "Converting export to temp file...\n";
+    system "cut -f1-10,22 $infile > $tmp";
+} else {
+    print "Unknown format '$format'!  Exiting.\n";
+}
+
+if ($ends == 1) {
+    open OUT1, "> $outname.fastq";
+} elsif ($ends == 2) {
+    open OUT1, "> ${outname}_1.fastq";
+    open OUT2, "> ${outname}_2.fastq";
+}
+
+my %already;
+
+print "Converting temp file to fastq...\n";
+open IN, $tmp;
+my $line;
+while (<IN>) {
+    chomp;
+    $line++;
+    my ($header, $seq, $qual, $flag, $filt);
+    my $FH = 'OUT1';		# default filehandle
+    if ($format eq 'SAM' || $format eq 'BAM') {
+	($header, $flag, $seq, $qual) = split /\t/, $_;
+	if ($flag & 1) {		# paired-end
+	    if ($flag & 64) {
+		$header .= "/1";	# end 1
+	    } elsif ($flag & 128) {
+		$header .= "/2";	# end 2
+		$FH = 'OUT2';		# CHANGE FILEHANDLE!!
+	    } else {
+		print "Improper end flags on line $line!  Getting 1 by default...\n";
+		$header .= "/1";	# end 1
+	    }
+	} else {
+	    $header .= "/1";	# end 1 by default
+	}
+	next if ($passonly && ($flag & 512));
+    } elsif ($format eq 'EXPORT') {
+	my @data = split /\t/, $_;
+	$header = join ':', @data[0..5];
+	$header .= "\#$data[6]/$data[7]";
+	($seq, $qual, $filt) = @data[8..10];
+	next if ($passonly && $filt eq 'N');
+    }
+    next if $already{$header};
+    $already{$header} = 1;
+    print $FH "\@$header\n$seq\n+\n$qual\n";
+}
+close IN;
+close OUT1;
+close OUT2 if $ends == 2;
+unlink $tmp;
+exit;
+
+

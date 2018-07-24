@@ -1,0 +1,61 @@
+#!/bin/bash
+
+## 'rm' wrapper which deletes only files of zero size
+## basically allows "rm *" but only empty files will be removed
+
+
+rm_args=""     # args to be passed through to 'rm'
+rm_fileN=0     # N files to be deleted
+rm_files=""    # file list to be deleted
+rm_files2=""   # printable version (\n separated for visibility)
+test=0         # test mode: only show deletable files, do not actually delete
+interactive=1  # force -i for this script (unless -f provided)
+
+
+## separate arguments into 'rm' args versus files
+for arg in $@
+do
+    if [[ "$arg" == "--test" ]]; then
+        ## custom arg '--test', which only shows deletable files and does NOT actually delete them.
+        test=1
+    elif [ "$arg" == "-f" ]; then
+        ## explicit control of '-i' param, since it is not always default for 'rm' -- this makes it default for this rm0
+	interactive=0
+    elif [[ "$arg" =~ ^"-" ]]; then
+        ## other args passed to 'rm'
+	rm_args="$rm_args $arg"
+    else
+        ## not an obvious 'rm' arg, see if it is a file
+	if [ -e "$arg" ]; then
+            ## it is a file
+	    if [ ! -s "$arg" ]; then
+		## it is a file with zero size; add to delete list
+		rm_files="$rm_files $arg"
+		rm_files2="$rm_files2\n$arg"
+		((rm_fileN=$rm_fileN+1))
+	    fi
+	else
+            ## problem?
+	    echo "Argument '$arg' not a file or an obvious 'rm' argument!  Ignoring."
+	    #exit 1
+	fi
+    fi
+done
+
+
+if [ $interactive -eq 1 ]; then rm_args="$rm_args -i"; fi
+
+
+if [ $rm_fileN -eq 0 ]; then
+    echo "No eligible files to delete!"
+else
+    ## show list of targets
+    echo -e "Removing: $rm_files2"
+    if [ $test -eq 0 ]; then
+	rm $rm_args $rm_files
+    fi
+fi
+
+
+exit
+

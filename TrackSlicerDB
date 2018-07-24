@@ -1,0 +1,205 @@
+#!/usr/bin/env perl
+
+#$Id$
+
+# Copyright © 2005, Stowers Institute for Medical Research.  All
+# rights reserved.
+
+# c.f. attached LICENSE
+
+
+=pod
+
+=head1 SYNOPSIS
+
+TrackSlicerDB [region file] [sample ids file]
+
+This script extracts specified coordinates of .wig files from the JBZ3 database on mysql-dev.
+
+=head1 OPTIONS
+
+=over
+
+=item B<--help>
+
+Display command line usage with options.
+
+=item B<--man>
+
+Display complete manual page and exit.
+
+=item B<--verbose>
+
+Provides a trace of processing on STDERR.
+
+=item B<--version> 
+
+Display the scripts version number and exit.
+
+=back
+
+=head1 DESCRIPTION
+
+TrackSlicer is designed to take sets of sample ids (short) and export specific regions into a tab-delimited 
+output file, where rows correspond to probes/bp in the region and columns to samples.
+
+=over
+
+=item [region file]: regions are given as a list file, it must have 3 tab-delimited columns, no header:
+
+=item Chr	Start	End
+
+=item ...
+
+=item Any columns after 3 will be treated as annotation.
+
+=item S< >                                                                                       
+
+=item [sample ids] is a file containing multiple short ids, see Qiye's spreadsheet.  Duplicates have suffixes of _b, _c, etc.
+
+=back
+
+=head1 VERSION
+
+$Revision:  1.00$
+
+=head1 AUTHOR
+
+Ariel Paulson (apa@stowers-institute.org)
+
+=head1 DEPENDENCIES
+
+=over
+
+=item perl
+
+=item DBI
+
+=item Getopt::Long
+
+=item Pod::Usage
+
+=item FindBin
+
+=back
+
+=head1 AVAILABILITY
+
+Email the author for sources.
+
+=cut
+
+#use warnings;
+use strict;
+use DBI;
+use Cwd;
+#use vars qw($VERSION $VC_DATE);
+
+#BEGIN {
+our $VERSION =  qw$Revision: 0.01 $[-1];
+our $VC_DATE =  qw$Date: $[-2];
+#}
+
+use Getopt::Long;
+use Pod::Usage;
+use FindBin;
+#use UNIVERSAL::require;
+
+my $man = 0;
+my $help = 0;
+my $verbose;
+my $version;
+
+#use File::Spec; ... other modules
+
+GetOptions('help|?'        => \$help,
+	   'man!'           => \$man,
+	   'verbose!'       => \$verbose,
+           'version!'       => \$version,
+) or pod2usage(2);
+
+pod2usage(1) if $help;
+pod2usage(-exitstatus => 0, -verbose => 2) if $man;
+if ($version) {print "$FindBin::Script: $VERSION\n"; exit(0)};
+
+###########################################################  ACTUAL CODE
+###########################################################  ACTUAL CODE
+###########################################################  ACTUAL CODE
+
+die "Bad arguments!  Use TrackSlicerDB -m for help\n" if (scalar @ARGV != 2);
+
+my ($coordfile, $samplefile) = @ARGV;
+my ($coordfilename, $samplefilename);
+my $dbh = DBI->connect("DBI:mysql:database=JBZ3:host=mysql-dev",'anonymous','guy#fawkes',{RaiseError=>1}) or die "Cannot connect to JBZ3 on mysql-dev! $DBI::err() $DBI::errstr()\n";
+($coordfile =~ /\/([^\/]+)$/) ? ($coordfilename = $1) : ($coordfilename = $coordfile);
+($samplefile =~ /\/([^\/]+)$/) ? ($samplefilename = $1) : ($samplefilename = $samplefile);
+
+my (%alpha, %numeric, %tempregions, %samples, @coords);
+open IN1, $coordfile;
+while (<IN1>) {
+	$_ =~ s/[\n\r]//g;
+	my @fields = split /\t/, $_;
+	my ($chr, $start, $end, $else);
+	if (scalar @fields == 3) {
+		($chr, $start, $end) = @fields;
+		$else = '';
+	} elsif (scalar @fields > 3) {
+		($chr, $start, $end) = @fields[0..2];
+		$else = join "\t", @fields[3..$#fields];
+	} else {
+		die "Bad coordinate description! minimum 3 tab-delimited fields: Chr, Start, End.  Other fields for optional annotation\n";
+	}
+	$chr =~ s/^chr//;	# just in case
+	die "Bad coordinate description! Chr: $chr | Start: $start | End: $end\n" unless ($chr && $start && $end);
+#	print "$chr, $start, $end, $else\n";
+	push @coords, [$chr, $start, $end, $else];
+}
+close IN1;
+
+open IN2, $samplefile;
+while (<IN2>) {
+	$_ =~ s/[\n\r]//g;
+	my @fields = split /_/, $_;
+	if (scalar @fields == 4) {
+		my ($org, $ip, $set, $rlen) = @fields;
+		die "Bad sample description! Org: $org | IP: $ip | Set: $set | Length: $rlen\n" unless ($org && $ip && $set && $rlen);
+		push @{ $samples{$org} }, "${ip}_${set}_$rlen";
+	} elsif (scalar @fields == 5) {
+		my ($org, $ip, $set, $rep, $rlen) = @fields;
+		die "Bad sample description! Org: $org | IP: $ip | Set: $set | Rep: $rep | Length: $rlen\n" unless ($org && $ip && $set && $rep && $rlen);
+		push @{ $samples{$org} }, "${ip}_${set}_${rep}_$rlen";
+	} else {
+		die "Bad sample description! 4 or 5 '_'-delimited fields only: Organism, IP, Set, Replicate (optional), Read Length\n";
+	}
+}
+close IN2;
+
+my $wdir = cwd();
+print "\nWrite directory: $wdir\n";
+
+foreach my $org (keys %samples) {
+	my @output;
+	my $cols = join ', ', @{ $samples{$org} };
+	my $header = join "\t", ('Chrom','Pos',@{ $samples{$org} });
+	my $sth = $dbh->prepare("SELECT chrom, position, $cols FROM $org WHERE chrom = ? AND position >= ? AND position <= ?");
+	foreach my $coord (@coords) {
+		my ($chr, $start, $end, $else) = @$coord;
+		print "Extracting $chr:$start-$end\n";
+		push @output, "REGION: $chr:$start-$end\t$else\n$header\n";
+		$sth->bind_param(1,$chr);
+		$sth->bind_param(2,$start);
+		$sth->bind_param(3,$end);
+		$sth->execute();
+		while ( my @data = $sth->fetchrow_array() ) {
+			my $string = join "\t", @data;
+			push @output, "$string\n";
+		}
+		warn "Error retrieving slice '$chr:$start-$end' for '$cols': $sth->errstr()" if $sth->err();
+		push @output, "\n";
+	}
+	my $filename = "TrackSlicerDB_Results_${coordfilename}_${samplefilename}_$org.txt";
+	open OUT, "> $wdir/$filename" or die "Cannot create output $filename: $!";
+	print OUT @output;
+	close OUT;
+}
+exit;

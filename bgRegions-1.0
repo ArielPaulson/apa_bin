@@ -1,0 +1,117 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use strict;
+
+## Uses a bed file to extract regions from a bedGraph file.
+## May input either the bedGraph or just a BAM file; will autodetect format and convert BAM->BG.
+## Redirect output to some file.
+## Output is either:
+##  1. Default: bedgraph with an extra prepended column, that being the line # of the bed file for the extracted region.
+##  2. Matrix: rows = N bed entries (in order) and cols = positions per entry (values = depths @ positions); this requires all bed entries have same width.
+## Use '--matrix' to toggle matrix output.  Fails if bed entries do not all have same width.
+
+my ($bed, $file, $matrix) = @ARGV;
+my $rmdup = 1;
+my $tmp = "bgRegions.$$.tmp";
+$matrix = $matrix eq '--matrix' ? 1 : 0;
+
+my (%regions, %lengths, $i);
+open IN, $bed or die "Could not open bed file '$bed': $!\n";
+while (<IN>) {
+    next if ($_ =~ /^#/ || $_ =~ /^track/);
+    $_ =~ s/[\n\r]+$//;
+    $regions{++$i} = [split /\t/, $_];
+    my $len = $regions{$i}->[2]-$regions{$i}->[1];
+    push @{ $regions{$i} }, $len;
+    $lengths{$len}++;
+}
+close IN;
+my $Nregions = $i;  # region count
+
+my $cols;
+if (scalar (keys %lengths) > 1) {
+    die "Not all BED entries had same length: cannot use '--matrix'!\n";
+} else {
+    $cols = (keys %lengths)[0];
+}
+
+my $test;
+open IN, $file or die "Could not open '$file': $!\n";
+while (<IN>) {
+    $test = $_;
+    last;   # first line only
+}
+close IN;
+
+my $type;
+if ($test =~ /^(\S+)\t(\d+)\t([\d.-]+)$/) {  # bedgraph, allowing for non-integer values
+    $type = 'BG';
+} else {
+    my $test = `samtools view $file | head -1`;
+    if ($test =~ /^\[bam_header_read\]/) {   # not bam, either
+	die "File '$file' is not a bedGraph or BAM file!\n";
+    } elsif (scalar (split /\t/, $test) >= 11) {  # has minimum N fields -- must be bam?
+	$type = 'BAM';
+    } else {
+	die "File '$file' is not a bedGraph or BAM file!\n";
+    }
+}
+
+my (%data, $unassigned);
+if ($type eq 'BG') {
+    &parse($file);
+} elsif ($type eq 'BAM') {
+    (my $rdbam = $file) =~ s/bam$/rmdup.bam/i;
+    my $target = $file;
+    if ($rmdup) {
+	system "samtools rmdup $file $rdbam";
+	$target = $rdbam;
+    }
+    system "samtools depth -b $bed $target > $tmp";
+    &parse($tmp);
+    system "rm -f $tmp";
+}
+
+warn "$unassigned positions were unassigned!\n" if $unassigned;
+
+if ($matrix) {
+    foreach my $i (1..$Nregions) {
+	print join("\t", map { $data{$i}{$_}->[1] || 0 } (1..$cols)), "\n";
+    }
+} else {
+    foreach my $i (1..$Nregions) {
+	print "$i\t$regions{$i}->[0]\t$data{$i}{$_}\n" foreach (1..$regions{$i}->[-1]);
+    }
+}
+exit;
+
+
+
+
+sub parse {
+    
+    my $i = 1;
+    my ($rchr, $rstart, $rend) = @{ $regions{$i} };
+
+    open IN, $_[0] or die "Could not open '$_[0]': $!\n";
+    while (<IN>) {
+	$_ =~ s/[\n\r]+$//;
+	my ($chr, $pos, $depth) = split /\t/, $_;
+	{
+	    if ($i > $Nregions) {
+		$i = 1;
+		$unassigned++;
+	    } else {
+		my ($rchr, $rstart, $rend) = @{ $regions{$i} };
+		if ($chr eq $rchr && $pos >= $rstart && $pos <= $rend) {  # contained in region $i
+		    my $relative = $pos - $rstart;
+		    $data{$i}{$relative} = [$pos, $depth];
+		} else {
+		    $i++;  # increase $i
+		    redo;  # keep going until region $i overlaps bedgraph entry
+		}
+	    }
+	}
+    }
+    close IN;
+}

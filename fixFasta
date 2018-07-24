@@ -1,0 +1,44 @@
+#!/usr/bin/env perl
+require '/home/apa/local/bin/apa_routines.pm';  # &blockify
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+# For a fasta file, uppercases all sequence, standardized line length, converts all header [^\w.] chars to underscores, removes blank lines
+
+my ($infasta, $outfasta, $overwrite, $stdio);
+GetOptions("f=s"=>\$infasta, "o=s"=>\$outfasta, "overwrite"=>\$overwrite, ""=>\$stdio);
+
+my ($header, @headers, %seq, $IN, $OUT);
+
+if ($stdio) {
+    open $IN, '<-' or die "$0: Cannot read STDIN: $!\n";
+} else {
+    open $IN, '<', $infasta or die "$0: Cannot read fasta file '$infasta': $!\n";
+}
+
+while (<$IN>) {
+    s/[\n\r]+$//;
+    if (/^>(.*)/) {
+	$header = $1;
+	push @headers, $header;
+    } else {
+	$seq{$header} .= uc($_);
+    }
+}
+close $IN;
+
+if ($overwrite) {
+    open $OUT, '>', $infasta or die "$0: Cannot write fasta file '$infasta': $!\n";
+} elsif ($outfasta) {
+    open $OUT, '>', $outfasta or die "$0: Cannot write fasta file '$outfasta': $!\n";
+} else {
+    open $OUT, '>-' or die "$0: Cannot write STDOUT: $!\n";
+}
+
+foreach my $header (@headers) {
+    (my $header2 = $header) =~ s/[^\w.]+/_/g;
+    print $OUT ">$header2\n".${ &blockify($seq{$header}) }."\n";
+}
+exit;
+

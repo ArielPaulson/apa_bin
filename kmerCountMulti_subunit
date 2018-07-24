@@ -1,0 +1,405 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Storable qw/ nstore retrieve /;
+use FileHandle;
+use strict;
+
+
+
+### Batch processing subunit for /home/apa/local/bin/kmerCountMulti; intended to be qsubbed.
+
+
+
+### Dependencies
+
+my $bin = '/home/apa/local/bin';
+my $sortBedCoord = "$bin/sortBedCoord";
+my $intersectBed = 'intersectBed';
+
+
+
+### Inputs (from parent script kmerCountMulti)
+
+my ($batch, $batchdat) = @ARGV;
+die "No batch number specified!\n" unless defined $batch;
+die "Batch data object '$batchdat' unspecified or nonexistent!\n" unless -e $batchdat;
+my $stall = 1+($batch-1)*10;
+#sleep $stall;  # stall, so $batchdat doesn't get hit all at once
+
+
+
+## Unpack batch data
+
+chomp(my $now = `date`);
+my $unpack = "Batch $batch: unpacking data: $now";
+my %batchdata = %{ retrieve($batchdat) };
+
+my $outdir = $batchdata{outdir};
+my $tmpdir = $batchdata{tmpdir};
+my $basedir = $batchdata{basedir};
+chdir $basedir;   ###############  SWITCHING ACTIVE DIRECTORY
+
+my $k = $batchdata{k};
+my $minN = $batchdata{minN};
+my $maxN = $batchdata{maxN};
+my $keep_N = $batchdata{keep_N};
+my $genesbed = $batchdata{genesbed};
+my $exonsbed = $batchdata{exonsbed};
+my $repeatsbed = $batchdata{repeatsbed};
+my $genedata = $batchdata{genedata};
+my $nk = $batchdata{nk};
+my $nbatches = $batchdata{nbatches};
+my $annotate = $batchdata{annotate};
+
+my $ki = $batchdata{perbatch}{$batch}{ki};
+my $kf = $batchdata{perbatch}{$batch}{kf};
+my $log = $batchdata{perbatch}{$batch}{log};
+my $outdat = $batchdata{perbatch}{$batch}{outdat};
+my $gint = $batchdata{perbatch}{$batch}{gint};
+my $xint = $batchdata{perbatch}{$batch}{xint};
+my $rint = $batchdata{perbatch}{$batch}{rint};
+my $ksum = $batchdata{perbatch}{$batch}{ksum};
+my $kdet = $batchdata{perbatch}{$batch}{kdet};
+my $kbed = $batchdata{perbatch}{$batch}{kbed};
+
+my $ktmpdir = &validate('dir', $batchdata{perbatch}{$batch}{ktmpdir}, "Batch $batch output directory", 1);
+
+my @kmer_table = @{ $batchdata{perbatch}{$batch}{kmer_table} };
+my @headers = @{ $batchdata{headers} };
+my %seq = %{ $batchdata{seq} };
+
+
+
+### Filehandles
+
+my $LOG = &open2('W', $log, 'Batch $batch Log');
+#$LOG->autoflush(1);  # keep hot
+my $BED = &open2('W', $kbed, 'Batch $batch Kmer locations BED');
+my $SUM = &open2('W', $ksum, 'Batch $batch Kmer summary table');
+my $DET = &open2('W', $kdet, 'Batch $batch Kmer detail table');
+
+
+
+### Other Globals
+
+my $all_thresh = 95;   # min feature-type-cooccurrence percent for a kmer to be classified as "all" type (see uses below)
+my $most_thresh = 50;  # min feature-type-cooccurrence percent for a kmer to be classified as "mostly" type (see uses below)
+my %kmers;    # Kmer data
+my %stats;    # run statistics
+my %gdata;    # annotation data
+my %fdata;    # feature data
+my %bychr;    # per-chrom summary
+my %byfeat;   # per-feature summary
+
+
+
+### Read in kmer tables; locate genomic instances
+
+my $batch_nk = $kf - $ki + 1;
+my $this_k;
+chomp(my $now = `date`);
+print $LOG "$unpack\nBatch $batch: Locating kmers: $now\n";
+foreach my $entry (@kmer_table) {
+    my ($kmer_id, $kmer_i, $N, $pal, $kmer, $rc) = @$entry;
+    $kmers{$kmer_id}{I} = $kmer_i;
+    $kmers{$kmer_id}{N} = $N;
+    $kmers{$kmer_id}{P} = $pal;  # palindrome
+    $kmers{$kmer_id}{S} = [$kmer, $rc];
+    $this_k++;
+    
+    my $sumGC;
+    $sumGC++ while $kmer =~ /[GC]/g;
+    $kmers{$kmer_id}{G} = sprintf("%0.1f", 100*$sumGC/$k);
+    
+    my ($n, @output);
+    foreach my $header (@headers) {
+	next if $seq{$header}{L} < $k;
+	my $chrseq = $seq{$header}{S};	
+	my %ktemp;
+	
+	while ($chrseq =~ m/$kmer/g) {
+	    my $start = pos($chrseq)-$k;
+	    $ktemp{$start} = '+';
+	    $kmers{$kmer_id}{D1}{"$header +"}++;
+	    $bychr{$header}{"+"}{$kmer_id}++;
+	}
+	next if $kmers{$kmer_id}{P};  # palindrome; no need to double-annotate each matched position...
+	while ($chrseq =~ m/$rc/g) {
+	    my $start = pos($chrseq)-$k;
+	    $ktemp{$start} = '-';
+	    $kmers{$kmer_id}{D1}{"$header -"}++;
+	    $bychr{$header}{"-"}{$kmer_id}++;
+	}
+	
+	if (%ktemp) {  # at least one kmer instance found on this chromosome
+	    foreach my $start (keys %ktemp) {
+		my $str = $ktemp{$start};
+		my $kmer_inst = "$kmer_id.".++$n;
+		$kmers{$kmer_id}{L}{$n} = [$header,$start,$start+$k,$kmer_inst,1,$str];
+		push @output, join("\t", @{ $kmers{$kmer_id}{L}{$n} });
+	    }
+	}
+    }
+    
+    my $distrib;
+    my (%nchr, $nt);
+    $nt += $kmers{$kmer_id}{D1}{$_} foreach keys %{ $kmers{$kmer_id}{D1} };
+    foreach my $chrstr (keys %{ $kmers{$kmer_id}{D1} }) {
+	my ($chr, $str) = split / /, $chrstr;
+	$nchr{$chr} = 1;
+	my $sitepct = sprintf("%0.0f", 100*$kmers{$kmer_id}{D1}{$chrstr}/$nt);
+	if ($sitepct >= $all_thresh) {
+	    $distrib = 'SEGDUP';  # almost all instances are segmental-duplicate
+	} elsif ($sitepct >= $most_thresh) {
+	    $distrib = 'MOST_SEGDUP';  # majority of instances are segmental-duplicate
+	}
+	if ($distrib) {
+	    $kmers{$kmer_id}{D} = "$chrstr $sitepct%";
+	    last;
+	}
+    }
+    unless ($kmers{$kmer_id}{D}) {
+	$kmers{$kmer_id}{D} = 'Multi (' . scalar(keys %nchr) . ' chr)';
+	$distrib = 'GENOMIC';   # multi-chromosome distribution
+    }
+    $stats{D}{$distrib}++;
+    $kmers{$kmer_id}{DTYPE} = $distrib;  # more succinct than the report-friendly {D}; used during feature matching below
+    
+    my $msg = " kmer $kmer_i ($this_k/$batch_nk): $N copies:";
+    my $found = scalar @output;
+    if ($found == $N) {
+	$msg .= " All found!";
+    } else {
+	my $lost = $N-$found;
+	$msg .= " $found found | $lost lost!";
+	$kmers{$kmer_id}{X} = $lost;
+    }
+    $msg .= "  Distribution: $kmers{$kmer_id}{D}\n";
+    print $LOG $msg;
+    print $BED "$_\n" foreach @output;
+}
+close $BED;
+%seq = undef;
+
+system "$sortBedCoord -i $kbed --overwrite";
+
+
+
+### Write Kmer BED file / classify kmers, if either was called for
+
+if ($annotate) {
+    
+    if ($genedata) {
+	
+	## Read annotations (just looking for symbols/names)
+	my $GD = &open2('R', $genedata, 'Gene data table');
+	my $namecol;
+	while (<$GD>) {
+	    chomp;
+	    my @data = split /\t/, $_;
+	    if ($. == 1) {
+		foreach my $i (0..$#data) {
+		    if ($data[$i] =~ /^gene[_ ]name$/i) {
+			$namecol = $i;
+			last;
+		    } elsif ($data[$i] =~ /^symbol$/i) {
+			$namecol = $i;
+			last;
+		    } elsif ($data[$i] =~ /^name$/i) {
+			$namecol = $i;
+			last;
+		    }
+		}
+		if ($namecol == 0) {
+		    my $msg = "Gene name column '$data[$namecol]' was column 1, instead of gene ID: bad gene data file format!  Gene names will be unavailable.\n";
+		    print STDERR $msg;
+		    print $LOG $msg;
+		    last;
+		} elsif (! defined $namecol) {
+		    my $msg = "Failed to find a column name like 'gene_name', 'gene name', 'name', or 'symbol' in the gene data file!  Gene names will be unavailable.\n";
+		    print STDERR $msg;
+		    print $LOG $msg;
+		    last;
+		}
+	    }
+	    $gdata{ $data[0] }{NAME} = $data[$namecol];
+	}
+	close $GD;
+    }
+    
+    ## Intersect kmers BED with gtf fraction BEDs
+    chomp(my $now = `date`);
+    print $LOG "Batch $batch: Calculating overlaps: $now\n";
+    my $isrep = '.';
+    
+    if ($exonsbed) {
+	
+	## Exon intersections ** DO FIRST **
+	system "$intersectBed -wo -a $kbed -b $exonsbed > $xint";
+	chomp(my $nxi = `cat $xint | wc -l`);
+	chomp(my $now = `date`);
+	print $LOG "Batch $batch: Analyzing $nxi exon overlaps: $now\n";
+	my $XI = &open2('R', $xint, 'Batch $batch exons intersection file');
+	while (<$XI>) {
+	    chomp;
+	    my ($kchr, $kstart, $kend, $kmer_inst, $kscore, $kstr, $fchr, $fstart, $fend, $featid, $fscore, $fstr, $overlap) = split /\t/, $_;
+	    my ($kmer_id, $n) = split /\./, $kmer_inst, 2;
+	    my ($gene, $exon) = split /:/, $featid;
+	    my $oltype = $overlap == $k ? 'EXON' : 'EXINT';
+	    if (exists $kmers{$kmer_id}{A}{$n}) {   # annotation (overlap) already exists
+		my ($oldoltype, $oldolbp, $oldid, $oldname, $oldstr, $isrep) = @{ $kmers{$kmer_id}{A}{$n} };
+		if ($overlap > $oldolbp) {   # larger overlap with this feature -- replace existing
+		    print $LOG "  Replacing kmer $kmer_id feature at site $n: $overlap ($oltype) > $oldolbp ($oldoltype)\n";
+		    $kmers{$kmer_id}{A}{$n} = [$oltype, $overlap, $gene, $gdata{$gene}{NAME}, $fstr, $isrep];
+		}
+	    } else {
+		$kmers{$kmer_id}{A}{$n} = [$oltype, $overlap, $gene, $gdata{$gene}{NAME}, $fstr, $isrep];
+	    }
+	}
+	close $XI;
+    }
+    
+    if ($genesbed) {
+	
+	## Gene intersections ** DO SECOND **
+	system "$intersectBed -wo -a $kbed -b $genesbed > $gint";
+	chomp(my $ngi = `cat $gint | wc -l`);
+	chomp(my $now = `date`);
+	print $LOG "Batch $batch: Analyzing $ngi gene overlaps: $now\n";
+	my $GI = &open2('R', $gint, 'Batch $batch genes intersection file');
+	while (<$GI>) {
+	    chomp;
+	    my ($kchr, $kstart, $kend, $kmer_inst, $kscore, $kstr, $fchr, $fstart, $fend, $gene, $fscore, $fstr, $overlap) = split /\t/, $_;
+	    my ($kmer_id, $n) = split /\./, $kmer_inst, 2;
+	    $fdata{G}{$gene} = [$fchr, $fstart, $fend, $fstr];
+	    my $oltype = $overlap == $k ? 'INTRON' : 'NOVUTR';
+	    if (exists $kmers{$kmer_id}{A}{$n}) {  # already some kind of exonic overlap
+		my ($oldoltype, $oldolbp, $oldid, $oldname, $oldstr, $isrep) = @{ $kmers{$kmer_id}{A}{$n} };
+		if ($oldoltype eq 'EXINT' && $overlap < $k) {
+		    ## not exon-intron overlap -- actually novel-UTR overlap -- replace entry, if $overlap if same (same entry) or better (another entry??)
+		    $kmers{$kmer_id}{A}{$n} = [$oltype, $overlap, $gene, $gdata{$gene}{NAME}, $fstr, $isrep] if $overlap >= $oldolbp;
+		}
+	    } else {  # no exonic overlap
+		$kmers{$kmer_id}{A}{$n} = [$oltype, $overlap, $gene, $gdata{$gene}{NAME}, $fstr, $isrep];
+	    }
+	}
+	close $GI;
+    }
+    
+    if ($repeatsbed) {
+	
+	## Repeat intersections ** DO THIRD **
+	$isrep = 1;
+	system "$intersectBed -wo -a $kbed -b $repeatsbed > $rint";
+	chomp(my $nri = `cat $rint | wc -l`);
+	chomp(my $now = `date`);
+	print $LOG "Batch $batch: Analyzing $nri repeat overlaps: $now\n";
+	my $RI = &open2('R', $rint, 'Batch $batch repeats intersection file');
+	while (<$RI>) {
+	    chomp;
+	    my ($kchr, $kstart, $kend, $kmer_inst, $kscore, $kstr, $fchr, $fstart, $fend, $featid, $fscore, $fstr, $overlap) = split /\t/, $_;
+	    my ($kmer_id, $n) = split /\./, $kmer_inst, 2;
+	    my $featname = (split /:/, $featid)[0];
+	    $fdata{R}{$featname} = [$fchr, $fstart, $fend, $fstr];
+	    my $oltype = $overlap == $k ? 'REPT-C' : 'REPT-O';
+	    if (exists $kmers{$kmer_id}{A}{$n}) {  # already some kind of feature overlap
+		my ($oldoltype, $oldolbp, $oldid, $oldname, $oldstr, $oldisrep) = @{ $kmers{$kmer_id}{A}{$n} };
+		$kmers{$kmer_id}{A}{$n} = [$oltype, $overlap, $featid, $featname, $fstr, $isrep] if $overlap >= $oldolbp;
+	    } else {  # no feature overlap
+		$kmers{$kmer_id}{A}{$n} = [$oltype, $overlap, $featid, $featname, $fstr, $isrep];
+	    }
+	}
+	close $RI;
+    }
+    
+    ## Record stats for annotations
+    foreach my $kmer_id (keys %kmers) {
+	my %oltypes;
+	if (exists $kmers{$kmer_id}{A}) {
+	    foreach my $n (keys %{ $kmers{$kmer_id}{A} }) {  # for each feature overlap
+		my ($oltype, $overlap, $featid, $featname, $fstr, $isrep) = @{ $kmers{$kmer_id}{A}{$n} };
+		$byfeat{$featid}{$kmer_id}++;
+		$oltypes{$oltype}++;
+		if ($isrep == 1) {
+		    $kmers{$kmer_id}{UR}{$featid}++;
+		} else {
+		    $kmers{$kmer_id}{UG}{$featid}++;
+		}
+	    }
+	} else {
+	    $oltypes{ITGC}++;
+	}
+	foreach my $oltype (keys %oltypes) {
+	    $stats{DO}{ $kmers{$kmer_id}{DTYPE} }{$oltype} += $oltypes{$oltype};
+	    $stats{A}{$oltype} += $oltypes{$oltype};
+	}
+    }
+    
+}
+
+
+
+### Tabulate and write kmer data, and BED if called for
+
+chomp(my $now = `date`);
+print $LOG "Batch $batch: Writing outputs: $now\n";
+print $SUM "KmerN\tLength\tGC%\tPalindrome\tInstances\tDistType\tDistribution\tAssocType\tNGenes\tNRepeats\tExon\tEx-Int\tIntron\tNovUTR\tReptCont\tReptOlap\tItgc\tLost\tExon%\tEx-Int%\tIntron%\tNovUTR%\tReptCont%\tReptOlap%\tItgc%\tLost%\tSequence\tRevComp\n";
+print $DET "KmerN\tChr\tStart\tEnd\tKmerInst\tLength\tStrand\tOverlapType\tOverlapBp\tFeatID\tFeatName\tFeatStr\tRepeat\n";
+foreach my $kmer_id (sort {$a <=> $b} keys %kmers) {
+    print "$kmer_id: $kmers{$kmer_id}{N}\n";
+    my $kmer = $kmers{$kmer_id}{S}->[0];
+    my $pal = $kmers{$kmer_id}{P} ? 'Yes' : 'No';
+    my $ngenes = scalar keys %{ $kmers{$kmer_id}{UG} };
+    my $nreps = scalar keys %{ $kmers{$kmer_id}{UR} };
+#    my %olfeat;
+#    foreach my $gene (keys %{ $kmers{$kmer_id}{UG} }) {
+#	## add to some featurewise report?
+#    }
+#    foreach my $repeat (keys %{ $kmers{$kmer_id}{UR} }) {
+#	## add to some featurewise report?
+#    }
+    my %olcount;
+    foreach my $n (keys %{ $kmers{$kmer_id}{L} }) {
+	$kmers{$kmer_id}{A}{$n} = ['ITGC', $k, '.', '.', '.', '.'] unless exists $kmers{$kmer_id}{A}{$n};
+	my $oltype = $kmers{$kmer_id}{A}{$n}->[0];
+	$olcount{$oltype}++;
+	$kmers{$kmer_id}{L}{$n}->[4] = $k;  # 'score' was '1' for BED file; now make kmer length
+	print $DET join("\t", $kmers{$kmer_id}{I}, @{ $kmers{$kmer_id}{L}{$n} }, @{ $kmers{$kmer_id}{A}{$n} }),"\n";
+    }
+    my %olct = map {( $_=>($olcount{$_}||0) )} qw/ EXON EXINT INTRON NOVUTR REPT-C REPT-O ITGC /;
+    my %olpct = map {( $_=>sprintf("%0.2f",100*$olct{$_}/$kmers{$kmer_id}{N}) )} qw/ EXON EXINT INTRON NOVUTR REPT-C REPT-O ITGC /;
+    $olct{LOST} = $kmers{$kmer_id}{X}||0;
+    $olpct{LOST} = sprintf("%0.2f",100*$olct{LOST}/$kmers{$kmer_id}{N});
+    
+    $kmers{$kmer_id}{ATYPE} = $olpct{LOST} >= $most_thresh ? 'LOST' :
+	$olpct{ITGC} >= $all_thresh ? 'ITGC' :
+	$olpct{EXON}+$olpct{EXINT} >= $all_thresh ? 'EXONIC' :
+	$olpct{EXON}+$olpct{EXINT}+$olpct{INTRON}+$olpct{NOVUTR} >= $all_thresh ? 'GENIC' :
+	$olpct{'REPT-O'}+$olpct{'REPT-C'} >= $all_thresh ? 'REPEAT' :
+	$olpct{EXON}+$olpct{EXINT}+$olpct{INTRON}+$olpct{NOVUTR} >= $most_thresh & $olpct{'REPT-O'}+$olpct{'REPT-C'} == 0 ? 'GENE-ASSOC' :
+	$olpct{EXON}+$olpct{EXINT}+$olpct{INTRON}+$olpct{NOVUTR} == 0 & $olpct{'REPT-O'}+$olpct{'REPT-C'} >= $most_thresh ? 'REPT-ASSOC' : 
+	'MIXED';
+    
+    $stats{DA}{ $kmers{$kmer_id}{DTYPE} }{ $kmers{$kmer_id}{ATYPE} }++;
+    
+    print $SUM join("\t", $kmers{$kmer_id}{I}, $k, $kmers{$kmer_id}{G}, $pal, $kmers{$kmer_id}{N}, $kmers{$kmer_id}{DTYPE}, $kmers{$kmer_id}{D}, $kmers{$kmer_id}{ATYPE}, $ngenes, $nreps);
+    print $SUM "\t$olct{$_}" foreach qw/ EXON EXINT INTRON NOVUTR REPT-C REPT-O ITGC LOST /;
+    print $SUM "\t$olpct{$_}" foreach qw/ EXON EXINT INTRON NOVUTR REPT-C REPT-O ITGC LOST /;
+    print $SUM "\t", join("\t", @{ $kmers{$kmer_id}{S} }), "\n";
+    
+}
+close $SUM;
+close $DET;
+
+
+
+
+## Cleanup & Exit
+#my %batchdata_out = ('stats'=>{%stats}, 'bychr'=>{%bychr}, 'byfeat'=>{%byfeat}, 'kmers'=>\{%kmers});
+my %batchdata_out = ('stats'=>{%stats}, 'bychr'=>{%bychr}, 'byfeat'=>{%byfeat});
+nstore(\%batchdata_out, $outdat);
+chomp(my $now = `date`);
+print $LOG "kmerCountMulti_subunit batch $batch complete: $now\n";
+close $LOG;
+system "kill $$";  # so much faster than exit
+

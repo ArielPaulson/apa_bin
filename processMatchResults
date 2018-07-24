@@ -1,0 +1,263 @@
+#!/usr/bin/env perl
+
+#$Id$
+
+# Copyright © 2010, Stowers Institute for Medical Research.  All rights reserved.
+
+# c.f. attached LICENSE
+
+=pod
+
+=head1 SYNOPSIS
+
+This script gives some processing options for output from Transfac's Match software.
+
+=head1 OPTIONS
+
+=over
+
+=item S<INPUT SWITCHES:>
+
+=over
+
+=item B<-f file>
+
+The Transfac Match output file.
+
+=item B<-pw promoterWidth>
+
+If your input sequences were promoters of fixed width, enter the size here.  This will convert position-in-sequence to distance-from-TSS.  Otherwise, positions will not be converted.
+
+=item B<-md matrix.dat>
+
+The matrix.dat file used in the Match call.  Provides gene names for each matrix.
+
+=item B<-mc minCoreScore>
+
+Hits with core-matrix match score below this are discarded [Default: 0] (hits with core score > 1 are erroneous, and automatically discarded).
+
+=item B<-mf minFullScore>
+
+Hits with full-matrix match score below this are discarded [Default: 0] (hits with full score > 1 are erroneous, and automatically discarded).
+
+=back
+
+=item S<OUTPUT SWITCHES:>
+
+=over
+
+=item B<--seqSplit>
+
+Tabularize output and split into one file per input sequence.  Outputs will be <fileName>.<seqName>.txt.
+
+=item B<--tabulate>
+
+Tally hits per matrix and input sequence; report a 3-col file (Gene, Matrix, N).  Output will be <fileName>.tabulated.txt.
+
+=item B<--bed>
+
+Converts all entries to a bed file.  Score column is full-matrix match score.  Ignores the -pw switch.  Output will be <fileName>.bed.
+
+=item B<--seqPssm>
+
+Generate one PSSM per matrix and input sequence.  Output will be <fileName>.seqPSSM.txt.
+
+=item B<--allPssm>
+
+Generate one PSSM per matrix (all input sequences).  Output will be <fileName>.allPSSM.txt.
+
+=item B<[nothing]>
+
+By default, if no outputs are specified, the file will simply be stripped of erroneous hits (and filtered by -mc, -mf).  Output will be <fileName>.filtered.txt.
+
+=back
+
+=back
+
+=item B<--help>
+
+Display command line usage with options.
+
+=item B<--man>
+
+Display complete manual page and exit.
+
+=item B<--version> 
+
+Display the scripts version number and exit.
+
+=head1 VERSION
+
+$Revision:  1.0$
+
+=head1 AUTHOR
+
+Ariel Paulson (apa@stowers-institute.org)
+
+=head1 DEPENDENCIES
+
+perl
+
+=head1 AVAILABILITY
+
+Download at will.
+
+=cut
+
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my ($file, $minCore, $minFull, $promoterWidth, $matrixDat, $tabulate, $bed, $seqSplit, $seqPssm, $allPssm);   # PSSM mode not yet ready
+GetOptions("f=s" => \$file, "mc=f" => \$minCore, "mf=f" => \$minFull, "pw=i" => \$promoterWidth, "md=s" => \$matrixDat, "tabulate" => \$tabulate, "bed" => \$bed, "seqSplit" => \$seqSplit, "seqPssm" => \$seqPssm, "allPssm" => \$allPssm) or pod2usage(1);
+
+my $null = $seqSplit || $tabulate || $bed || $seqPssm || $allPssm ? 0 : 1;  # $null = 1 means that NO output switches were toggled.
+my $posType = $promoterWidth ? 'dist2TSS' : 'Pos';
+
+my (%seqCounts, %allCounts, %matDat, %BED, $seqName, $junk);
+if ($matrixDat) {
+    my ($ac, $id, $na);
+    if (open IN, $matrixDat) {
+	while (<IN>) {
+	    $_ =~ s/[\n\r]+$//;
+	    if ($_ =~ /^\/\//) {
+		$ac = $id = $na = undef;
+	    } elsif ($_ =~ /^AC\s+(.*)/) {
+		$ac = $1;
+	    } elsif ($_ =~ /^ID\s+(.*)/) {
+		$id = $1;
+	    } elsif ($_ =~ /^NA\s+(.*)/) {
+		$na = $1;
+		$matDat{$id} = [$ac, $na];
+	    }
+	}
+	close IN;
+    } else {
+	print "Failed to open Transfac matrix.dat file '$matrixDat': $!\n Matrix names will be unavailable\n";
+    }
+}
+
+open IN, $file or die "Cannot open file '$file': $!\n";
+open OUT, "> $file.filtered.txt" if $null;
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    if ($_ =~ /Inspecting sequence ID\s+(\S+)/) {
+	$seqName = $1;
+	if ($seqSplit) {
+	    open OUT, "> $file.$seqName.txt";  # replace prior genes FH, if any
+	    print OUT "matrixID\tGene\t$posType\tstrand\tlength\tcoreScore\tfullScore\tmatchSequence\n";
+	}
+	if ($null) {
+	    print OUT "$_\n";
+	}
+    } elsif ($_ =~ /^Total sequences length/) {
+	## footer -- ignore
+    } elsif ($_ =~ /^Total number of found sites/) {
+	## footer -- ignore
+    } elsif ($_ =~ /^Frequency of sites per nucleotide/) {
+	## footer -- ignore
+    } elsif ($_ =~ /\S/) {
+	next unless $seqName;   # skip headers
+	my @fields = split /\|/, $_;
+	$_ =~ s/^\s*// foreach @fields;
+	$_ =~ s/\s*$// foreach @fields;
+	my ($matrix, $pos_strand, $core, $full, $word) = @fields;
+	my ($pos, $strand) = ($pos_strand =~ /^(\d+) \(([+-])\)$/);
+	if ($core > 1 || $full > 1) {
+	    $junk++;
+	    next;
+	}
+	next if (defined $minCore && $core < $minCore);
+	next if (defined $minFull && $full < $minFull);
+
+	my ($name) = ($matrix =~ /\$_?([^_]+)/);
+	my $length = length($word);
+	my $end = $pos+$length-1;
+	my $dist = $promoterWidth ? $promoterWidth-$end : $pos;
+
+	if ($null) {
+	    print OUT "$_\n";
+	}
+	if ($bed) {
+	    push @{ $BED{$seqName}{$pos} }, "$end\t$matrix\t$full\t$strand" if $seqName;
+	}
+	if ($seqSplit) {
+	    print OUT (join "\t", ($matrix, $matDat{$matrix}->[1], $dist, $strand, $length, $core, $full, $word)), "\n";
+	}
+	if ($tabulate || $seqPssm) {
+	    $seqCounts{$seqName}{$matrix}{N}++;
+	}
+	if ($seqPssm) {
+	    my @bases = split //, "\U$word";
+	    $seqCounts{$seqName}{$matrix}{P}{$_}{$bases[$_]}++ foreach 0..$#bases;
+	}
+	if ($allPssm) {
+	    $allCounts{$matrix}{N}++;
+	    my @bases = split //, "\U$word";
+	    $allCounts{$matrix}{P}{$_}{$bases[$_]}++ foreach 0..$#bases;
+	}
+    } elsif ($null) {  # blank lines still print if $null
+	print OUT "$_\n";
+    }	
+}
+close IN;
+close OUT if $null;
+print "Discarded $junk junk matches\n";
+
+if ($bed) {
+    open BED, "> $file.bed";
+    foreach my $seqName (sort keys %BED) {
+	foreach my $pos (sort {$a <=> $b} keys %{ $BED{$seqName} }) {
+	    print BED "$seqName\t$pos\t$_\n" foreach sort {$b <=> $a} @{ $BED{$seqName}{$pos} };   # LONGEST FIRST
+	}
+    }
+    close BED;
+}
+
+if ($tabulate) {
+    open OUT, "> $file.tabulated.txt";
+    print OUT "Gene\tMatrix\tCount\n";
+    foreach my $seqName (sort keys %seqCounts) {
+	next unless $seqName;   # null values getting in?
+	foreach my $matrix (sort keys %{ $seqCounts{$seqName} }) {
+	    print OUT "$seqName\t$matrix\t$seqCounts{$seqName}{$matrix}{N}\n";
+	}
+    }
+    close OUT;
+}
+
+if ($seqPssm) {
+    open OUT, "> $file.seqPSSM.txt";
+    foreach my $seqName (sort keys %seqCounts) {
+	next unless $seqName;   # null values getting in?
+	foreach my $matrix (sort keys %{ $seqCounts{$seqName} }) {
+	    my ($acc, $name);
+	    ($acc, $name) = @{ $matDat{$matrix} } if $matDat{$matrix};
+	    print OUT "SEQ=$seqName\tMAT=$matrix\tACC=$acc\tFAC=$name\tN=$seqCounts{$seqName}{$matrix}{N}\n";
+	    foreach my $i (sort {$a <=> $b} keys %{ $seqCounts{$seqName}{$matrix}{P} }) {
+		my ($A, $C, $G, $T) = map { $seqCounts{$seqName}{$matrix}{P}{$i}{$_} } qw/ A C G T /;
+		my $N = $A+$C+$G+$T;  # not using $seqCounts{$seqName}{$matrix}{N}, to hedge against non-ACGT letters
+		printf OUT "%0i\t%0.6f\t%0.6f\t%0.6f\t%0.6f\n", $i+1, $A/$N, $C/$N, $G/$N, $T/$N;
+	    }
+	}
+    }
+    close OUT;
+}
+
+if ($allPssm) {
+    open OUT, "> $file.allPSSM.txt";
+    foreach my $matrix (sort keys %allCounts) {
+	next unless $matrix;   # null values getting in?
+	my ($acc, $name);
+	($acc, $name) = @{ $matDat{$matrix} } if $matDat{$matrix};
+	print OUT "MAT=$matrix\tACC=$acc\tFAC=$name\tN=$allCounts{$matrix}{N}\n";
+	foreach my $i (sort {$a <=> $b} keys %{ $allCounts{$matrix}{P} }) {
+	    my ($A, $C, $G, $T) = map { $allCounts{$matrix}{P}{$i}{$_} } qw/ A C G T /;
+	    my $N = $A+$C+$G+$T;  # not using $allCounts{$matrix}{N}, to hedge against non-ACGT letters
+	    printf OUT "%0i\t%0.6f\t%0.6f\t%0.6f\t%0.6f\n", $i+1, $A/$N, $C/$N, $G/$N, $T/$N;
+	}
+    }
+    close OUT;
+}
+
+exit;

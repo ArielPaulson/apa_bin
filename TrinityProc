@@ -1,0 +1,57 @@
+#!/usr/bin/env perl
+use strict;
+
+
+# takes a Trinity "Trinity.fasta" as input
+# outputs a tabular version of the header data
+# outputs a truncated-header contig fasta
+# outputs a kmer abundance-of-abundances file, for transcriptome complexity calculations
+
+
+my $dir = $ARGV[0];    # a Trinity output directory, including Trinity.fasta and meryl.kmers.min1.fa
+die "$0: '$dir' not a directory, or directory not specified!\n" unless -d $dir;
+
+my $fasta = "$dir/Trinity.fasta";         # input
+my $meryl = "$dir/meryl.kmers.min1.fa";   # input
+
+my $newfasta = "$dir/Trinity.fa";              # output
+my $outfile1 = "$dir/Trinity.fasta.data.txt";  # output
+my $outfile2 = "$dir/Trinity.kmercounts.txt";  # output
+
+die "$0: Cannot find contig fasta '$fasta'!\n" unless -e $fasta;
+die "$0: Cannot find kmers fasta '$meryl'!\n" unless -e $meryl;
+
+my (@headers, @output, %tally);
+
+open FASTA, $fasta or die "Cannot read '$fasta': $!\n";
+while (<IN1>) {
+    if ($_ =~ /^>/) {   #>comp50976_c1_seq2 len=111 ~FPKM=7 path=[0:0-19 20:20-29 30:30-53 141:54-110]
+	my ($contig, $len, $fpkm, $path) = ($_ =~ /^>(\S+) len=(\d+) ~FPKM=([\d.]+) path=\[(.*?)\]/);
+	print "Failed to parse line: '$_'\n" unless $contig;
+	push @headers, "$contig\t$len\t$fpkm\t$path\n";
+	push @output, ">$contig";
+    } else {
+	push @output, $_;
+    }
+}
+close FASTA;
+
+open FA, "> $newfasta" or die "$0: Cannot write contig fasta '$newfasta': $!\n";
+print FA @output;
+close FA;
+
+open KMER, "meryl.kmers.min1.fa";
+while (<IN2>) {
+    $tally{$1}++ if $_ =~ /^>(\d+)/;
+}
+close KMER;
+
+open OUT1, "> $outfile1" or die "$0: Cannot write header data file '$outfile1': $!\n";
+print OUT1 "Contig\tLength\tFPKM\tPath\n", @headers;
+close OUT1;
+
+open OUT2, "> $outfile2" or die "$0: Cannot write abundances file '$outfile2': $!\n"; 
+print OUT2 "$_\t$tally{$_}\n" foreach sort {$a <=> $b} keys %tally;
+close OUT2;
+
+exit;

@@ -1,0 +1,126 @@
+#!/usr/bin/env perl
+use Pod::Usage;
+use strict;
+
+die "$0: No inputs specified!\n" unless @ARGV;
+
+## Inputs
+my @files;
+my ($PE, $verbose);
+
+foreach (@ARGV) {   # list of STDERR captures from successful bowtie runs
+    if ($_ eq '--PE') {
+	$PE = 1;
+    } elsif ($_ eq '--verbose') {
+	$verbose = 1;
+    } else {
+	push @files, $_;
+    }
+}
+
+## Globals
+my %output;  # parsed bowtie data
+my @fields = $PE ? qw/ PAIRS MONO_PAIR MULTI_PAIR DISC_PAIR UNAL_PAIR ALIGN_PAIR MONO_END MULTI_END UNAL_END ALIGN_END ALL_ENDS_ALIGNED / : qw/ MONO_ALIGN MULTI_ALIGN ALL_ALIGN UNALIGNED /;  # field names
+
+foreach my $file (@files) {
+    if (open my $IN, '<', $file) {
+	
+	if ($PE) {  # paired bowtie2 run
+	    
+	    while (<$IN>) {
+		if ($_ =~ /^(\d+) reads/) {
+		    $output{$file}{READ} = $1;
+		    print STDERR "READ: $1\n" if $verbose;
+		} elsif ($_ =~ /^\s+(\d+) \(([\d.]+)%\) were paired/) {
+		    $output{$file}{PAIRS} = [$1, $2];
+		    print STDERR "PAIRS: $1, $2\n" if $verbose;
+		} elsif ($_ =~ /^\s+(\d+) \(([\d.]+)%\) aligned concordantly 0 times/) {
+#		    $output{$file}{NOCON_PAIR} = [$1, $2];
+#		    print STDERR "NOCON_PAIR: \n" if $verbose;
+		} elsif ($_ =~ /^\s+(\d+) \(([\d.]+)%\) aligned concordantly exactly 1 time/) {
+		    $output{$file}{MONO_PAIR} = [$1, $2];
+		    $output{$file}{ALIGN_PAIR} += $1;
+		    print STDERR "ALIGN_PAIR: $1, $2\n" if $verbose;
+		} elsif ($_ =~ /^\s+(\d+) \(([\d.]+)%\) aligned concordantly >1 times/) {
+		    $output{$file}{MULTI_PAIR} = [$1, $2];
+		    $output{$file}{ALIGN_PAIR} += $1;
+		    print STDERR "MULTI_PAIR: $1, $2\n" if $verbose;
+		} elsif ($_ =~ /^\s+(\d+) \(([\d.]+)%\) aligned discordantly 1 time/) {
+		    $output{$file}{DISC_PAIR} = [$1, sprintf("%0.2f",100*$1/$output{$file}{PAIRS}->[0])];  # not using $2 -- that is relative to non-concordant pairs, not total pairs
+		    $output{$file}{ALIGN_PAIR} += $1;
+		    print STDERR "DISC_PAIR: $1, $2\n" if $verbose;
+		    
+		} elsif ($_ =~ /^\s+(\d+) pairs aligned 0 times/) {
+		    $output{$file}{UNAL_PAIR} = [$1, sprintf("%0.2f",100*$1/$output{$file}{PAIRS}->[0])];
+		    print STDERR "UNAL_PAIR: $1\n" if $verbose;
+		} elsif ($_ =~ /^\s+(\d+) mates make up/) {
+#		    $output{$file}{ALL_END} = [$1, sprintf("%0.2f",100*$1/(2*$output{$file}{UNAL_PAIR}->[0]))];
+#		    print STDERR "ALL_END: 41\n" if $verbose;
+		} elsif ($_ =~ /^\s+(\d+) \(([\d.]+)%\) aligned 0 times/) {
+		    $output{$file}{UNAL_END} = [$1, $2];
+		    print STDERR "UNAL_END: $1, $2\n" if $verbose;
+		} elsif ($_ =~ /^\s+(\d+) \(([\d.]+)%\) aligned exactly 1 time/) {
+		    $output{$file}{MONO_END} = [$1, $2];
+		    $output{$file}{ALIGN_END} += $1;
+		    print STDERR "MONO_END: $1, $2\n" if $verbose;
+		} elsif ($_ =~ /^\s+(\d+) \(([\d.]+)%\) aligned >1 times/) {
+		    $output{$file}{MULTI_END} = [$1, $2];
+		    $output{$file}{ALIGN_END} += $1;
+		    print STDERR "MULTI_END: $1, $2\n" if $verbose;
+		} elsif ($_ =~ /^([\d.]+)% overall alignment rate/) {
+		    $output{$file}{ALL_ENDS_ALIGNED} = [2*$output{$file}{ALIGN_PAIR}+$output{$file}{ALIGN_END}, $1];   # $1 == sprintf("%0.2f", 100*$output{$file}{ALL_ALIGN}->[0]/(2*$output{$file}{READ});
+		    $output{$file}{ALIGN_PAIR} = [$output{$file}{ALIGN_PAIR}, sprintf("%0.2f",100*$output{$file}{ALIGN_PAIR}/$output{$file}{PAIRS}->[0])];
+		    $output{$file}{ALIGN_END} = [$output{$file}{ALIGN_END}, sprintf("%0.2f",100*$output{$file}{ALIGN_END}/(2*$output{$file}{UNAL_PAIR}->[0]))];
+		    print STDERR "OVERALL: $1\n" if $verbose;
+		}		
+	    }
+	    
+	    $output{$file}{READS} *= 2;
+	    
+	} else {  # unpaired bowtie2 run
+	    
+	    while (<$IN>) {
+		if ($_ =~ /^(\d+) reads/) {
+		    $output{$file}{READ} = $1;
+		    print STDERR "READ: $1\n" if $verbose;
+		} elsif ($_ =~ /^\s+(\d+) \(([\d.]+)%\) were unpaired/) {
+		    $output{$file}{UNPAIRED} = [$1, $2];
+		    print STDERR "UNPAIRED: $1, $2\n" if $verbose;
+		} elsif ($_ =~ /^\s+(\d+) \(([\d.]+)%\) aligned 0/) {
+		    $output{$file}{UNALIGNED} = [$1, $2];
+		    print STDERR "UNALIGNED: $1, $2\n" if $verbose;
+		} elsif ($_ =~ /^\s+(\d+) \(([\d.]+)%\) aligned exactly/) {
+		    $output{$file}{MONO_ALIGN} = [$1, $2];
+		    print STDERR "MONO_ALIGN: $1, $2\n" if $verbose;
+		} elsif ($_ =~ /^\s+(\d+) \(([\d.]+)%\) aligned >1/) {
+		    $output{$file}{MULTI_ALIGN} = [$1, $2];
+		    print STDERR "MULTI_ALIGN: $1, $2\n" if $verbose;
+		} elsif ($_ =~ /^([\d.]+)% overall alignment rate/) {
+		    $output{$file}{ALL_ALIGN} = [$output{$file}{MONO_ALIGN}->[0]+$output{$file}{MULTI_ALIGN}->[0], $1];
+		    print STDERR "ALL_ALIGN: $1\n" if $verbose;
+		}
+	    }
+	    
+	}
+	close $IN;
+    } else {
+	print STDERR "$0: Failed to open file '$file': $!\n";
+	$output{$file}{$_} = '' foreach @fields;
+    }
+}
+print STDERR "FIELDS: @fields\n" if $verbose;
+
+
+print "FILE\tREADS";
+my ($header1, $header2);
+$header1 .= "\t$_" foreach @fields;
+$header1 .= "\t${_}_PCT" foreach @fields;
+print "$header1$header2\n";  # first for counts, second for percents
+foreach my $file (@files) {
+    next unless $output{$file}{READ};
+    print "$file\t$output{$file}{READ}";
+    print join("\t", ('', map { (defined $output{$file}{$_}->[0]) ? $output{$file}{$_}->[0] : '.' } @fields));
+    print join("\t", ('', map { (defined $output{$file}{$_}->[1]) ? $output{$file}{$_}->[1] : '.' } @fields));
+    print "\n";
+}
+exit;

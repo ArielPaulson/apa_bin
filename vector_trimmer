@@ -1,0 +1,334 @@
+#!/usr/bin/env perl
+
+#$Id$
+
+# Copyright © 2005, Stowers Institute for Medical Research.  All
+# rights reserved.
+
+# c.f. attached LICENSE
+
+
+=pod
+
+=head1 SYNOPSIS
+
+vector_trimmer -v <vector file> -N <N tolerance> -e <extension>
+
+=head1 OPTIONS
+
+=over
+
+=item B<-v>
+
+MANDATORY: A fasta file containing vector sequence(s) to be removed.
+
+=item B<-N>
+
+An integer tolerance threshold for the maximum number of Ns in a 10-bp window.  Some sequences lack identifiable vector due to Ns near the ends, 
+so N-trimming is automatic.  Scanning starts at the middle of the sequence and proceeds outwards.  Once the first 10-bp window containing 
+the threshold number of Ns is found, the sequence beyond (including the window itself) is trimmed away.  Default is 4.
+
+=item B<-e>
+
+Sequence files trimmed by default are *.fasta, *.fsta, *.fas, and *.fa.  If you have another extension in mind, add it here.
+
+=item B<--help>
+
+Display command line usage with options.
+
+=item B<--man>
+
+Display complete manual page and exit.
+
+=item B<--version> 
+
+Display the scripts version number and exit.
+
+=back
+
+=head1 RUNNING
+
+=over
+
+=item vector_trimmer uses the cross_match software to identify and remove specified vector sequences from raw molbio sequencing output.  
+Additionally, sequence flanks which are rich in Ns will be removed.
+
+=item S< >
+
+=item Keep the files to be trimmed separate from any other files!!  This script is a directory crawler.
+
+=item S< >
+
+=item vector_trimmer can be run either inside a directory with sequence files, or in a directory with folders of sequence files.  
+Either way it will scan the run directory and all first-level subfolders for files with recognized extensions.  
+It is expected that each input file contains only one sequence.  All sequences found will be trimmed, if possible.  
+
+=back
+
+=head1 OUTPUTS
+
+=over
+
+=item B<trimmed_sequences.fasta>
+
+All trimmed (vector-containing) sequences.
+
+=item B<untrimmable_sequences.fasta>
+
+All untrimmable (non-vector-containing) sequences; however these are still trimmed for Ns.
+
+=item B<trimming_comparison.txt>
+
+Side-by-side display of all inputs, screens, and outputs, for verification of correct trimming.  In the C<OUTPUT> blocks, hyphens indicate regions that were
+trimmed due to vector, and periods indicate regions that were trimmed due to Ns.
+
+=item B<screening_log.txt>
+
+The output from cross_match, which was also printed to screen.
+
+=back
+
+=head1 EXAMPLES
+
+=over
+
+=item C< vector_trimmer --man >
+
+print a manpage
+
+=back
+
+=head1 VERSION
+
+$Revision:  1.0$
+
+=head1 AUTHOR
+
+Ariel Paulson (apa@stowers-institute.org)
+
+=head1 DEPENDENCIES
+
+perl
+
+=head1 AVAILABILITY
+
+Download at will.
+
+=head1 TO DO
+
+=over
+
+=item In a later version, all sequencing vectors we use at SIMR will be built-in, and -v will be required only if using nonstandard vectors.
+
+=cut
+
+#use warnings;
+use strict;
+#use vars qw($VERSION $VC_DATE);
+
+#BEGIN {
+our $VERSION =  qw$Revision: 1.0 $[-1];
+our $VC_DATE =  qw$Date: $[-2];
+#}
+
+use Getopt::Long;
+use Pod::Usage;
+use FindBin;
+#use UNIVERSAL::require;
+
+my $man = my $help = 0;
+my ($verbose, $version, $vector, $ext);
+my $tolerance = 4;	# default value
+
+#use File::Spec; ... other modules
+
+GetOptions('help|?'	=> \$help,
+	   'man!'	=> \$man,
+	   'verbose!'	=> \$verbose,
+           'version!'	=> \$version,
+           'v=s'	=> \$vector,
+           'e=s'	=> \$ext,
+           'N=i'	=> \$tolerance
+) or pod2usage(2);
+
+pod2usage(1) if $help;
+pod2usage(-exitstatus => 0, -verbose => 2) if $man;
+if ($version) {print "$FindBin::Script: $VERSION\n"; exit(0)};
+
+
+######################################################################  ACTUAL CODE  ######################################################################
+######################################################################  ACTUAL CODE  ######################################################################
+######################################################################  ACTUAL CODE  ######################################################################
+
+
+die "No vector fasta specified, or otherwise unable to locate file '$vector!'" unless -e $vector;
+
+my $width = 100;	# fasta line width
+my $trimfile = 'trimmed_sequences.fasta';
+my $untrimfile = 'untrimmable_sequences.fasta';
+
+my @extensions = qw/ fasta fsta fas fa /;	# various fasta extensions
+push @extensions, $ext if $ext;			# add custom extension
+
+my (@files, @headers, %inputs, %screens, %finals, %outputs);
+
+## Get subdirectory files
+foreach my $entry (glob "*") {
+	if (-d $entry) {
+		push @files, (glob "$entry/*.$_") foreach @extensions;
+	}
+}
+
+## Add current directory files
+push @files, (glob "*.$_") foreach @extensions;
+
+open OUT, "> screening_log.txt";	# overwrite existing
+close OUT;
+
+foreach my $file (@files) {
+
+	next if ($file eq $trimfile || $file eq $untrimfile || $file eq $vector);	# ignore own output, and vector file
+	
+	## parse raw sequence
+	my ($header, $seq);
+	open IN, $file or die;
+	while (<IN>) {
+		$_ =~ s/[\n\r]//g;
+		if ($_ =~ /^>/) {
+			$inputs{$header} = &blockify($seq) if $seq;
+			($header, $seq) = ($_, '');
+			push @headers, $header;
+		} else {
+			$seq .= $_;
+		}
+	}
+	close IN;
+	$inputs{$header} = &blockify($seq);
+	
+	## screen vector(s)
+	system "cross_match $file $vector -minmatch 10 -minscore 20 -screen >>& screening_log.txt";	# blows up if non-fasta file
+	system "echo \"\\n\\n\\n\" >> screening_log.txt";
+	
+	## parse screened sequence
+	my ($header2, $seq2);
+	open IN, "$file.screen" or warn "No .screen file produced!";
+	while (<IN>) {
+		$_ =~ s/[\n\r]//g;
+		if ($_ =~ /^>/) {
+			if ($seq2) {
+				$screens{$header2} = &blockify($seq2);
+				&finalize($header2, $seq2);
+			}
+			($header2, $seq2) = ($_, '');
+			$header2 =~ s/\s+$//;	# has a trailing whitespace problem
+		} else {
+			$seq2 .= $_;
+		}
+	}
+	close IN;
+	$screens{$header2} = &blockify($seq2);
+	&finalize($header2, $seq2);
+	
+	## delete cross_match outputs
+	unlink "$file.screen";
+	unlink "$file.log";
+}
+
+my $total = my $trimmed = my $untrimmed = 0;
+open COMP, "> trimming_comparison.txt";
+open OUT, "> $trimfile";
+open NOT, "> $untrimfile";
+foreach my $header (@headers) {
+	$total++;
+	print COMP "$header\n*** INPUT\n$inputs{$header}*** SCREENED";
+	if ($screens{$header} eq $inputs{$header}) {
+		print NOT "$header\n$outputs{$header}";
+		$untrimmed++;
+		print COMP " (NO VECTOR)";
+	} else {
+		print OUT "$header\n$outputs{$header}";
+		$trimmed++;
+	}
+	print COMP "\n$screens{$header}*** OUTPUT\n$finals{$header}\n\n\n";
+}
+close COMP;
+close OUT;
+close NOT;
+print "$total sequences | $trimmed trimmed | $untrimmed not trimmed\n";
+exit;
+
+
+sub blockify {	# add line breaks to raw string
+	my $SEQ = shift;
+	my $BLOCK;
+	my $loops = int( length($SEQ) / $width ) + 1;
+	foreach my $i (1..$loops) {
+		my $start = ($i - 1) * $width;
+		my $line = substr($SEQ, $start, $width);
+		$BLOCK .= "$line\n" if $line;
+	}
+	return $BLOCK;
+}
+
+sub finalize {
+	my ($HEAD2, $SEQ2) = @_;
+
+	## Find largest fragment post screening
+	my @fragments = split /X+/, $SEQ2;
+	my $largest;
+	foreach (@fragments) {
+		$largest = $_ if (length($_) > length($largest));	# gets first fragment, if multiple largest fragments
+	}
+	my $len = length($largest);
+	my $offset1 = index($SEQ2, $largest);
+	my $remainder1 = length($SEQ2) - $len - $offset1;
+	my $spacer1 = '-'x$offset1;
+	my $trailer1 = '-'x$remainder1;
+	
+	my $mid = int( length($largest)/2 );
+	my $half1 = reverse substr($largest, 0, $mid);		# REVERSED first half of $largest sequence
+	my @halfbases = split //, $half1;			# REVERSED array
+	my @bases = split //, $largest;
+	
+	## Detect start of reliable sequence (post-Ns)
+	my ($start, $headcut, $headcutR) = (-1, 0, 0);
+	{
+		$start++;
+		$headcutR = index($half1, 'N', $start);		# we are searching FROM THE MIDDLE BACKWARDS
+		my $sum;
+		foreach my $i ($headcutR..$headcutR+9) {	# scan 10bp ahead
+			$sum++ if $halfbases[$i] eq 'N';	# $sum is count of Ns, now
+		}
+		redo if ($headcutR != -1 && $sum < $tolerance);	# not reached start, but not enough Ns to trigger halt
+	}
+	$headcut = $mid - $headcutR unless ($headcutR == -1);
+
+	## Detect end of reliable sequence (pre-Ns)
+	my ($start2, $tailcut) = ($headcut, 0);			# pick up where we left off
+	{
+		$start2++;
+		$tailcut = index($largest, 'N', $start2);	# search from middle forwards
+		my $sum;
+		foreach my $i ($tailcut..$tailcut+9) {		# scan 10bp ahead
+			$sum++ if $bases[$i] eq 'N';		# $sum is count of Ns, now
+		}
+		redo if ($tailcut != -1 && $sum < $tolerance);	# not reached end, but not enough Ns to trigger halt
+	}
+	$tailcut = $len if $tailcut == -1;			# set to end if nothing found
+
+	## Trim sequence to reliable boundaries (no excessive Ns)
+	my $length = $tailcut - $headcut;
+	my $trimmed = substr($largest, $headcut, $length);
+	$trimmed =~ s/^N+//;	# algorithm may call breaks immediately before or after regions of
+	$trimmed =~ s/N+$//;	#   additional Ns, so we want to make sure these are removed too...
+	my $tlen = length($trimmed);
+	my $offset2 = index($largest, $trimmed);
+	my $remainder2 = length($largest) - $tlen - $offset2;
+	my $spacer2 = '.'x$offset2;
+	my $trailer2 = '.'x$remainder2;
+	
+	## Record remaining sequence
+	$finals{$HEAD2} = &blockify("$spacer1$spacer2$trimmed$trailer2$trailer1");
+	$outputs{$HEAD2} = &blockify($trimmed);
+}
+

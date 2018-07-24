@@ -1,0 +1,26 @@
+#!/usr/bin/env perl
+require '/home/apa/local/bin/apa_routines.pm';  # &blockify
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my $fasta = $ARGV[0];
+
+my ($header, @headers, %sequence);
+open IN, $fasta or die "$0: Cannot open '$fasta' for reading: $!\n";
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//g;
+    if ($_ =~ /^>(.*)/) {
+	$header = $1;
+	push @headers, $header;
+    } else {
+	$sequence{$header} .= $_;
+    }
+}
+close IN;
+
+$sequence{$_} = ${ &blockify(\$sequence{$_}) } foreach @headers;
+
+print ">$_\n$sequence{$_}\n" foreach @headers;
+
+exit;

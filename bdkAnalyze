@@ -1,0 +1,88 @@
+#!/usr/bin/env perl
+use Net::SSH qw/ ssh /;
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+use Cwd;
+
+
+## Inputs
+my $name;       # run name
+my $genome;     # a bowtie-index genome build name (e.g. mm9, sacCer3)
+my $annot;      # a bowtie-index annotation build for $genome (e.g. Ens_67)
+my $cores = 24; # number of cores to use when running meme on cluster
+my @beds;       # input beds
+
+## Globals
+my $wdir;       # run working directory
+my $bin = '/home/apa/local/bin';  # directory for my scripts
+my $bdk14 = '/n/core/Genomics/CWS/Krumlauf/bony_dekumar/bdk14/apa_analysis/redo_from_scratch';  # Bony analysis root
+my $TFM = '/n/data1/biobase/transfac/current/meme/transfac.meme';  # transfac database
+my $BDKW = "$bdk14/bdk.words.meme";  # Bony's K-mers MEME file
+my $genfile = "/n/data1/genomes/bowtie-index/$genome/$genome";  # genome datafile prefix
+my $annfile = "/n/data1/genomes/bowtie-index/$genome/$annot/$genome.$annot";  # annotation datafile prefix
+my $KEGG = "/n/core/Bioinformatics/analysis/LinhengLi/aparna_venkatraman/hsc_rnaseq/apa_analysis/gene_data/KMT1.txt";  # FatiClone KEGG annotations
+my $GoIdConv = "$bdk14/new_data/Ens67_to_MGI.txt";  # input ID -> GO DB ID converter file (col 1 = input IDs, col 2 = GO DB IDs";
+
+GetOptions("n=s" => \$name, "g=s" => \$genome, "a=s" => \$annots, "c=i" => \$cores);
+@beds = @ARGV;
+
+system "mkdir $name";
+chdir $name;
+$wdir = cwd();
+foreach (@beds) {
+    $_ = "../$_" unless $_ =~ /^\//;  # now all input beds must be called from parent dir, unless given as fully rooted paths
+}
+
+if ($#beds == 0) {
+    system "cp $beds[0] $name.bed" unless -e "$name.bed";
+} else {
+    system "$bin/mergePeaks -o $name.bed --all --split @beds" unless -e "$name.bed";
+    system "mkdir -p mergePeaks/mergeSets";
+    system "mv $name.bed.*.txt mergePeaks/";
+    system "mv $name.P*.bed mergePeaks/mergeSets/";
+}
+
+system "$bin/getRandomCoords -b $name.bed -c $genfile.chrom.sizes -n $genfile.N-blocks.bed -s 10 --avoid > $name.random.bed" unless -e "$name.random.bed";
+system "$bin/flankPeakMidpoint $name.bed $name.1k.bed 1000" unless -e "$name.1k.bed";
+system "$bin/bed2fasta-2.0 -r $bwti/mm9.fa $name.*.bed" unless -e "$name.fa";  # only testing one of the resulting fastas...
+
+foreach my $ver ('', '.random') {
+    my $name2 = "$name$ver";
+    my $fmdir = "featureMapper$ver";
+    system "$bin/featureMapper-1.1 -i $name2.bed -o $fmdir" unless -e "$fmdir/featureMapper.summary.txt";  # only one of the outputs
+    my $ngdir = "neighborGenes$ver";
+    system "mkdir $ngdir";
+    system "$bin/neighborsBed -a $name2.bed -b $annfile.genes.bed -g $genfile.chrom.sizes > $ngdir/neighbor_genes.txt" unless -e "$ngdir/neighbor_genes.txt";
+    system "$bin/neighborFunction -i $ngdir/neighbor_genes.txt -o $ngdir/neighborFunction -K $KEGG -x 10090 -id $GoIdConv --no-under --flag-sig-parents" unless -e "$ngdir/neighborFunction/GO_all/FatiClone_Fishers_OVER_significant_terms.txt";  # only one of many outputs...
+}
+
+my $tmp = "/n/projects/apa/lepus/bdkAnalyze.$name.tmp";  # temp cluster MEME output dir
+system "rm -Rf $tmp";  # just in case??
+system "mkdir -p $tmp";
+system "cp $name.fa $tmp/$name.fa";
+
+chomp(my $me = `whoami`);
+my $cmd = "qsub -sync y -v LD_LIBRARY_PATH -pe mpich $cores -N $me.meme.$cores.mpi -q all.q -now yes -M $me@stowers.org -m beas -cwd -j yes -b y mpiexec meme_p -p $cores -nmotifs 20 -dna -revcomp -mod anr -maxsize 1000000 -minw 6 -maxw 14 -oc $tmp/meme $tmp/$name.fa";
+my $results = ssh('lepus', $cmd);
+print "LEPUS Head Node says: $results\n";
+
+if (-e "$tmp/meme/meme.html") {
+    mkdir 'meme';
+    system "cp $tmp/meme/* meme/";
+} else {
+    die "MEME run failed!\n";
+}
+
+system "tomtom -o tomtom -thresh 0.1 -min-overlap 4 $name.meme $TFM";
+system "$bin/fimoPlus-2.0 -f $name.fa -b $name.random.fa -o fimoPlus.meme -p 0.0001 -p2 0.000001 -m meme/meme.txt -t tomtom/tomtom.txt -td $TFM --more";
+system "$bin/fimoPlus-2.0 -f $name.fa -b $name.random.fa -o fimoPlus.TF -p 0.0001 -p2 0.0000001 -m $TFM --more";
+system "$bin/fimoPlus-2.0 -f $name.fa -b $name.random.fa -o fimoPlus.KM -m $BDKW --grep --more";
+
+
+## ADD COMBINATORIAL ANALYSIS HERE...
+
+# Break out peaks by runs merged
+# Separate featureMapper, MEME/tomtom, TF/Kmer enrichments, neighbor-genes analysis
+# Full cross-FIMO on all peak sets
+# Differential enrichment analysis on enriched motifs, MEME patterns, feature hit frequencies, and neighbor-genes GO terms

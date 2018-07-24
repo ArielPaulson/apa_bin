@@ -1,0 +1,117 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+# merges peaks across a set of bed files (or macs .xls files) 
+# outputs 1..N beds with merged regions containing peaks from 1..N peak sets
+
+my @files = @ARGV;
+my $outdir = shift @ARGV;
+die "Output dir '$outdir' is an existing file: did you forget to specify the output dir?\n" if (-e $outdir && !-d $outdir);
+die "Output dir '$outdir' already exists!\n" if -d $outdir;
+system "mkdir $outdir";
+die "Output dir '$outdir' could not be created!\n" unless -d $outdir;
+
+my (%exts, $xls, $xlsheader);
+foreach (@ARGV) {
+    $exts{"\L$1"}++ if $_ =~ /\.(bed|xls)$/i;
+}
+
+my $Next = scalar keys %exts;
+if ($Next == 0) {
+    die "No files with extension 'bed' or 'xls'!\n";
+} elsif ($Next == 1) {
+    $xls = (keys %exts)[0] eq 'xls' ? 1 : 0;
+} elsif ($Next == 2) {
+    die "All files must have same extension (i.e. have same format)!\n";   
+}
+
+my (%orig, %master, %filter, %subsets, %merged);
+my $N = scalar @ARGV;
+
+my $name = $xls ? 9 : 3;
+print "Reading...\n";
+open OUT, "> $outdir/premerge.bed";
+foreach my $n (1..$N) {
+    my $i;
+    open IN, $ARGV[$n-1] or die "Could not open input file '$ARGV[$n-1]': $!\n";
+    while (<IN>) {
+	if ($xls) {
+	    if ($. < 26) {
+		next;   # skip MACS2 header
+	    } elsif ($. == 26) {
+		$xlsheader = $_;
+		next;
+	    }
+	}
+	$i++;
+	$_ =~ s/[\n\r]+$//;
+	my @data = split /\t/, $_;
+	push @{ $orig{$n} }, \@data;
+	$master{"$n.$i"} = \@data;
+	print OUT join("\t",(@data[0..2],"$n.$i\n"));
+    }
+    close IN;
+}
+close OUT;
+
+foreach my $n (1..$N) {
+    $filter{$n}{$_} = 9E9 foreach qw/ NW HT PV FC /;  # initialize impossibly high: NW=min width; HT=height; PV=pval; FC=fold change
+}
+
+print "Merging...\n";
+system "/home/apa/local/bin/sortBedCoord -i $outdir/premerge.bed --overwrite";
+system "mergeBed -nms -i $outdir/premerge.bed > $outdir/postmerge.txt";
+
+open IN, "$outdir/postmerge.txt" or die "Failed to open post-merge file: $!\n";
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    chomp;
+    my ($chr, $start, $end, $merges) = split /\t/, $_;
+    my @merges = split /;/, $merges;
+    my $m = scalar @merges;
+    push @{ $merged{$m} }, "$chr\t$start\t$end\n";
+    foreach my $id (@merges) {
+	my ($n, $i) = split /\./, $id;
+	push @{ $subsets{$m}{$n} }, join("\t",@{$master{$id}}),"\n"; 
+	if ($xls) {
+	    my @data = split /\t/, $_;
+	    $filter{$m}{NW} = $master{$id}->[3] if $master{$id}->[3] < $filter{$m}{NW};  # min width
+	    $filter{$m}{XW} = $master{$id}->[3] if $master{$id}->[3] > $filter{$m}{XW};  # max width
+	    $filter{$m}{HT} = $master{$id}->[5] if $master{$id}->[5] < $filter{$m}{HT};  # height
+	    $filter{$m}{PV} = $master{$id}->[6] if $master{$id}->[6] < $filter{$m}{PV};  # p-value
+	    $filter{$m}{FC} = $master{$id}->[7] if $master{$id}->[7] < $filter{$m}{FC};  # fold-change
+	}
+    }
+}
+close IN;
+
+system "rm -f $outdir/*";   # remove temp files
+
+print "Writing...\n";
+foreach my $m (1..$N) {   # overlap degree
+    open OUT, "> $outdir/final.$m.bed";
+    print OUT @{ $merged{$m} } if $merged{$m};
+    close OUT;
+    foreach my $n (1..$N) {   # file number
+	open OUT, "> $outdir/$ARGV[$n-1].$m.txt";
+	print OUT $xlsheader if $xls;
+	print OUT @{ $subsets{$m}{$n} } if $subsets{$m}{$n};
+	close OUT;
+	
+	if ($xls) {
+	    open OUT, "> $outdir/$ARGV[$n-1].$m-filter.txt";
+	    print OUT $xlsheader;
+	    foreach my $line (@{ $orig{$n} }) {
+		next if $$line[3] < $filter{$m}{NW} || $$line[3] > $filter{$m}{XW};  # width filter
+		next if $$line[5] < $filter{$m}{HT};  # height filter
+		next if $$line[6] < $filter{$m}{PV};  # p-value filter
+		next if $$line[7] < $filter{$m}{FC};  # fold-change filter
+		print OUT join("\t",@$line), "\n";
+	    }
+	    close OUT;
+	}
+    }
+}
+exit;

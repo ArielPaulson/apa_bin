@@ -1,0 +1,76 @@
+#!/usr/bin/env perl
+use Spreadsheet::ParseExcel;
+use Spreadsheet::XLSX;
+use strict;
+
+## Reads xls/x and re-writes each tab as txt, tab-separated.
+
+my ($input, $outpref) = @ARGV;  # input XLS/X
+die "$0: Cannot find input excel file '$input'!\n" unless -e $input;
+$outpref = $input unless $outpref;
+my $xlsx = $input =~ /xlsx$/i;
+
+my ($inbook, @insheets);
+if ($xlsx) {
+    {
+        local $SIG{__WARN__} = \&no_warnings;  # Spreadsheet::XLSX, a poorly written module with tons of useless warnings
+        $inbook = Spreadsheet::XLSX->new($input);
+    }
+    @insheets = @{ $inbook->{Worksheet} };
+} else {
+    $inbook = Spreadsheet::ParseExcel->new()->parse($input);
+    @insheets = $inbook->worksheets();
+}
+
+foreach my $i (0..$#insheets) {
+    
+    my $sheet = @insheets[$i];
+    my $sheetname = $xlsx ? $sheet->{Name} : $sheet->get_name();
+    $sheetname = "Sheet".$i+1 unless $sheetname;
+    (my $sheetname2 = $sheetname) =~ s/ /_/g;
+    
+    ## Import cell data and formats
+    my (@rowrange, @colrange);
+    if ($xlsx) {
+        $sheet->{MaxRow} ||= $sheet->{MinRow};
+        $sheet->{MaxCol} ||= $sheet->{MinCol};
+        @rowrange = ($sheet->{MinRow}, $sheet->{MaxRow});
+        @colrange = ($sheet->{MinCol}, $sheet->{MaxCol});
+    } else {
+        @rowrange = $sheet->row_range();
+        @colrange = $sheet->col_range();
+    }
+
+    my $outfile = "$outpref.".($i+1).".$sheetname2.txt";
+    print "Converting sheet: $sheetname | rows $rowrange[0]-$rowrange[1] | cols $colrange[0]-$colrange[1] | to: $outfile\n";
+    
+    open my $OUT, '>', $outfile;
+    foreach my $row (0..$rowrange[1]) {
+        my @row;
+        foreach my $col (0..$colrange[1]) {
+            my $value;
+            if ($xlsx) {
+                my $cell = $sheet->{Cells}[$row][$col];
+                $value = defined $cell ? $cell->{Val} : '';
+            } else {
+                my $cell = $sheet->get_cell($row, $col);
+                $value = defined $cell ? $cell->value() : '';
+            }
+            push @row, $value;
+        }
+        print $OUT join("\t", @row), "\n";
+    }
+    close $OUT;
+}
+
+print "$0 complete!\n";
+exit;
+
+
+
+sub no_warnings {
+    ## See: http://www.perlmonks.org/?node_id=1062996
+    my ($message) = @_;
+#    if ($message =~ /^Use of uninitialized value/) { return; }
+#    warn $message;         # <-------- Is this correct ?
+}

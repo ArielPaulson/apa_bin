@@ -1,0 +1,26 @@
+#!/bin/bash
+
+alias=$1
+
+echo $alias
+
+ERCC=/n/data1/genomes/bowtie-index/ERCC
+gtf=$ERCC/ERCC92.gtf
+fai=$ERCC/ERCC92.fa.fai
+ALER=$alias/$alias.ERCC92
+ALUN=$alias/$alias.unmapped
+
+/home/apa/lbin/convert2fastq -i $ALUN.bam -f BAM -o $ALUN
+
+bowtie2 --very-fast --un-gz $ALUN.fq.gz -x $ERCC/ERCC92 -U $ALUN.fastq -S $ALER.sam 2> $ALER.bowtie2.err 
+samtools view -bS $ALER.sam > $ALER.bam  
+samtools sort $ALER.bam $ALER.sorted
+mv $ALER.sorted.bam $ALER.bam
+samtools index $ALER.bam
+samtools idxstats $ALER.bam > $ALER.idxstats.txt
+#genomeCoverageBed -split -bg -ibam $ALER.bam -g $fai > $ALER.bg
+mv $alias/$alias.covVecs $alias/$alias.covVecs.txt
+
+#rm -f $ALUN.fastq
+rm -f $ALER.sam 
+rm -f $alias/$alias.unmapped.bam

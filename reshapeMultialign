@@ -1,0 +1,87 @@
+#!/usr/bin/env perl
+require '/home/apa/local/bin/apa_routines.pm';
+use Getopt::Long;
+use strict;
+
+my ($input, $width, $type, $flat, $fasta, $trans);
+GetOptions("i=s"=>\$input, "w=i"=>\$width, "t=s" => \$type, "flat"=>\$flat, "transpose"=>\$trans);
+$type = 'fasta' unless $type;
+
+my (%seq, $header, @headers, $maxhw, $consensus);
+open IN, $input or die "$0: Cannot read input file '$input': $!\n";
+if ($type eq 'fasta') {
+    while (<IN>) {
+	$_ =~ s/[\n\r]+$//;
+	if ($_ =~ /^>(.*)/) {
+	    $header = $1;
+	    push @headers, $header;
+	    $maxhw = length($header) if length($header) > $maxhw;
+	} else {
+	    $seq{$header} .= $_;
+	}
+    }
+} elsif ($type eq 'clustalw') {
+    my ($align, $cons, $offset, $linelen);
+    $maxhw = 9;  # length of 'CONSENSUS'
+    while (<IN>) {
+	next if $. < 4;
+	$_ =~ s/[\n\r]+$//;
+	if ($_ =~ /^(\S+)(\s+)(\S+)/) {
+	    ($align, $cons) = (1, 0);
+	    $header = $1;
+	    push @headers, $header unless $seq{$header};
+	    $maxhw = length($header) if length($header) > $maxhw;
+	    $seq{$header} .= $3;
+	    $offset = length("$1$2");
+	    $linelen = length($_)-$offset;
+	} elsif ($align) {
+	    ($align, $cons) = (0, 1);
+	    $consensus .= substr($_, $offset-1, $linelen);
+	} else {
+	    # spacer line; ignore
+	}
+    }
+    ## for some reason, $consensus always has one extra space in front
+    $consensus = substr($consensus, 1, length($consensus)-1) if defined $consensus;
+} elsif ($type eq 'flat') {
+    while (<IN>) {
+	$_ =~ s/[\n\r]+$//;
+	my ($header, $line) = split /\t/, $_;
+	next unless $header;
+	next if $header eq 'CONSENSUS';
+	push @headers, $header unless exists $seq{$header};
+	$seq{$header} .= $line;
+    }
+}
+close IN;
+
+if ($flat) {
+    printf "%-${maxhw}s\t$seq{$_}\n", $_ foreach @headers;
+    printf "%-${maxhw}s\t$consensus\n", 'CONSENSUS' if defined $consensus;
+} elsif ($trans) {
+    my $L = length($seq{ $headers[0] });
+    my @out = (join("\tPOS\t",@headers));
+    my %hpos = map {($_=>0)} @headers;
+    $out[0] .= "\tCONSENSUS" if defined $consensus;
+    foreach my $i (1..$L) {
+	my @row;
+	foreach my $header (@headers) {
+	    my $res = substr($seq{$header}, $i-1, 1);
+	    my $pos = $res eq '-' ? '' : ++$hpos{$header};
+	    push @row, "$res\t$pos";
+	}
+	push @row, substr($consensus, $i-1, 1) if defined $consensus;
+	push @out, join("\t",@row);
+    }
+    print "$_\n" foreach @out;
+} elsif ($width) {
+    foreach my $header (@headers) {
+	my $block = ${ blockify($seq{$header}, $width) };
+	print ">$header\n$block\n";
+    }
+} else {
+    foreach my $header (@headers) {
+	my $block = ${ blockify($seq{$header}) };
+	print ">$header\n$block\n";
+    }
+}

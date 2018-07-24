@@ -1,0 +1,181 @@
+#!/usr/bin/env perl
+use strict;
+
+my ($gtf1, $gtf2) = @ARGV;
+die "GTF 1 '$gtf1' does not exist!\n" unless -e $gtf1;
+unless ($gtf2) {
+    $gtf2 = $gtf1;
+    $self = 1;
+}
+die "GTF 2 '$gtf2' does not exist!\n" unless -e $gtf2;
+
+my $tmp = "compareModels.$$.tmp";
+die "Tempdir '$tmp' already exists!\n" if -d $tmp;
+system "mkdir $tmp";
+die "Failed to create tempdir '$tmp'!\n" unless -d $tmp;
+
+my $bed1 = "compareModels.$$.tmp/1.bed";
+my $bed1m = "compareModels.$$.tmp/1.merged";
+my $bed2 = "compareModels.$$.tmp/2.bed";
+my $bed2m = "compareModels.$$.tmp/2.merged";
+my $int = "compareModels.$$.tmp/3.txt";
+
+print "Processing GTF 1...\n";
+system "/home/apa/local/bin/gtf2exons $gtf1 > $bed1";
+system "/home/apa/local/bin/sortBedCoord -i $bed1 --overwrite";
+system "/home/apa/local/bin/exons2uxons $bed1 bed > $bed1m";
+
+print "Processing GTF 2...\n";
+system "/home/apa/local/bin/gtf2exons $gtf2 > $bed2";
+system "/home/apa/local/bin/sortBedCoord -i $bed2 --overwrite";
+system "/home/apa/local/bin/exons2uxons $bed2 bed > $bed2m";
+
+print "Intersecting...\n";
+system "intersectBed -wao -a $bed1m -b $bed2m > $int";
+
+my (%gdat, %N);
+
+open IN, $bed1m or die "Failed to open file '$bed1m': $!\n";
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    my @data = split /\t/, $_;
+    my ($gene, $num) = split /:/, $data[3];
+    my $len = $data[2]-$data[1];
+    $gdat{1}{$gene}{N}++;
+    $gdat{1}{$gene}{L} += $len;
+
+
+##?
+    $genes{1}{$id} = $gene;
+    $gdat{1}{$gene}->[0] += $end-$start;   # this should be proper BED format, 0-based
+    $gdat{1}{$gene}->[1]++;
+    $gdat{1}{$gene}->[2] = $strand;
+}
+close IN;
+
+if ($self) {
+    $gdat{2} = $gdat{1};
+    $genes{2} = $genes{1};
+} else {
+    open IN, $bed2m or die "Failed to open file '$bed2m': $!\n";
+    while (<IN>) {
+	$_ =~ s/[\n\r]+$//;
+	my @data = split /\t/, $_;
+	my ($gene, $num) = split /:/, $data[3];
+	my $len = $data[2]-$data[1];
+	$gdat{2}{$gene}{N}++;
+	$gdat{2}{$gene}{L} += $len;
+
+##?
+	$genes{2}{$id} = $gene;
+	$gdat{2}{$gene}->[0] += $end-$start;   # this should be proper BED format, 0-based
+	$gdat{2}{$gene}->[1]++;
+	$gdat{2}{$gene}->[2] = $strand;
+    }
+    close IN;
+}
+
+my (%overlap, %uxons);
+open IN, $int or die "Failed to open intersection file '$int': $!\n";
+while (<IN>) {
+    chomp;
+    my @data = split /\t/, $_;
+    next if $data[6] eq '.';  # no match
+    my @fields1 = @data[0..5];
+    my @fields2 = @data[6..11];
+    my ($gene1) = (split /:/, $fields1[3])[0];
+    my ($gene2) = (split /:/, $fields2[3])[0];
+    $overlap{$gene1}{$gene2} += $data[12];
+    $uxons{1}{$gene1}{$fields1[3]}++;
+    $uxons{2}{$gene2}{$fields2[3]}++;
+
+
+##?
+    my ($chr1, $start1, $end1, $id1, $score1, $strand1, $chr2, $start2, $end2, $id2, $score2, $strand2, $bp) = split /\t/, $_;
+    next if $id2 eq '.';
+    if ($self) {
+	next if $id1 eq $id2;
+	next if exists $overlaps{ $genes{2}{$id2} }{ $genes{1}{$id1} };  # keep only one record per unique pair
+    }
+    $overlaps{ $genes{1}{$id1} }{ $genes{2}{$id2} }{BP} += $bp;
+    $overlaps{ $genes{1}{$id1} }{ $genes{2}{$id2} }{NU}++;
+    $overYes{1}{ $genes{1}{$id1} } = 1;
+    $overYes{2}{ $genes{2}{$id2} } = 1;
+}
+close IN;
+
+
+##?
+print "Calculating...\n";
+foreach my $gene1 (keys %{ $gdat{1} }) {
+    $overNo{1}{$gene1} = 1 unless $overYes{1}{$gene1};
+}
+unless ($self) {
+    foreach my $gene2 (keys %{ $gdat{2} }) {
+	$overNo{2}{$gene2} = 1 unless $overYes{2}{$gene2};
+    }
+}
+
+
+
+
+
+
+
+my %output;
+foreach my $gene1 (keys %overlap) {
+    foreach my $gene2 (keys %{ $overlap{$gene1} }) {
+	my $over = $overlap{$gene1}{$gene2};
+	my $N1 = scalar keys %{ $uxons{1}{$gene1} };
+	my $N2 = scalar keys %{ $uxons{2}{$gene2} };
+	my $maxN = $N1 > $N2 ? $N1 : $N2;
+	my ($len1, $len2) = ($gdat{1}{$gene1}{L}, $gdat{2}{$gene2}{L});
+	my ($uxons1, $uxons2) = ($gdat{1}{$gene1}{N}, $gdat{2}{$gene2}{N});
+	my $bpp1 = sprintf("%0.2f", 100*$over/$len1);
+	my $bpp2 = sprintf("%0.2f", 100*$over/$len2);
+	my $uxp1 = sprintf("%0.2f", 100*$N1/$uxons1);
+	my $uxp2 = sprintf("%0.2f", 100*$N2/$uxons2);
+	push @{ $output{$over}{$maxN} }, "$gene1\t$gene2\t$over\t$len1\t$len2\t$bpp1\t$bpp2\t$uxons1\t$N1\t$uxp1\t$uxons2\t$N2\t$uxp2\n";
+    }
+}
+
+system "rm -Rf compareModels.$$.tmp";
+
+open OUT, "> compareModels.txt";
+print OUT "Gene1\tGene2\tUxonicBpOverlap\tUxonBp1\tUxonBp2\tBpPct1\tBpPct2\tTotUxons1\tAffUxons1\tAffPct1\tTotUxons2\tAffUxons2\tAffPct2\n";
+foreach my $over (sort {$b <=> $a} keys %output) {
+    foreach my $maxN (sort {$b <=> $a} keys %{ $output{$over} }) {
+	print OUT sort @{ $output{$over}{$maxN} };
+    }
+}
+close OUT;
+
+
+
+## ?
+open OUT, "> $outfile";
+print OUT "Gene1\tLength1\tUxons1\tStrand1\tGene2\tLength2\tUxons2\tStrand2\tOlapBp\tOlapBp%1\tOlapBp%2\tOlapUx\tOlapUx%1\tOlapUx%2\n";
+foreach my $gene1 (keys %overlaps) {
+    my ($glen1, $gnux1, $gstr1) = @{ $gdat{1}{$gene1} };
+    foreach my $gene2 (keys %{ $overlaps{$gene1} }) {
+	my ($glen2, $gnux2, $gstr2) = @{ $gdat{2}{$gene2} };
+	my ($olbp, $olnu) = ($overlaps{$gene1}{$gene2}{BP}, $overlaps{$gene1}{$gene2}{NU});
+	my ($olbpp1, $olnup1) = (sprintf("%0.4f",100*$olbp/$glen1), sprintf("%0.4f",100*$olnu/$gnux1));
+	my ($olbpp2, $olnup2) = (sprintf("%0.4f",100*$olbp/$glen2), sprintf("%0.4f",100*$olnu/$gnux2));
+	print OUT "$gene1\t$glen1\t$gnux1\t$gstr1\t$gene2\t$glen2\t$gnux2\t$gstr2\t$olbp\t$olbpp1\t$olbpp2\t$olnu\t$olnup1\t$olnup2\n";
+    }
+}
+foreach my $gene1 (keys %{ $overNo{1} }) {
+    my ($glen1, $gnux1, $gstr1) = @{ $gdat{1}{$gene1} };
+    print OUT "$gene1\t$glen1\t$gnux1\t$gstr1\t.\t.\t.\t.\t.\t.\t.\t.\t.\t.\n";
+}
+unless ($self) {
+    foreach my $gene2 (keys %{ $overNo{2} }) {
+	my ($glen2, $gnux2, $gstr2) = @{ $gdat{2}{$gene2} };
+	print OUT ".\t.\t.\t.\t$gene2\t$glen2\t$gnux2\t$gstr2\t.\t.\t.\t.\t.\t.\n";
+    }
+}
+close OUT;
+
+print "deOverlapGTF Complete!\n";
+exit;

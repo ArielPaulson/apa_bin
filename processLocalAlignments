@@ -1,0 +1,96 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## Inputs
+my $input;     # input alignment file (psl or sam/bam)
+my $format;    # input alignment format, if not discernable from extension
+my $output;    # output PREFIX ("$input", by default)
+
+## Globals
+my %master;    # master alignment data object (per read)
+my $outbed;    # output BED12 file
+my $outstats;  # output stats file
+
+GetOptions("i=s" => \$input, "o=s" => \$output, "f=s" => \$format);
+
+unless ($format) {
+    ($format) = ($input =~ /\.psl\.(best|filtered)$/i) ? ('psl.filtered') : ($input =~ /([^.]+)$/);
+}
+$format = "\L$format";
+
+$output = $input unless $output;
+$outbed = "$input.bed12";
+$outstats = "$input.stats";
+
+if ($format eq 'psl') {
+    open IN, $input or die "$0: Cannot open psl file '$input': $!\n";
+    while (my $line = <IN>) {
+	next if $. < 6;
+	$_ =~ s/[\n\r]+$//;
+	my @fields = split /\t/, $line;
+    }
+    close IN;
+} elsif ($format eq 'psl.filtered') {
+    open IN, $input or die "$0: Cannot open filtered psl file '$input': $!\n";
+    while (my $line = <IN>) {
+	next if $. < 6;
+	$line =~ s/[\n\r]+$//;
+	my @fields = split /\t/, $line;
+	my ($matches, $strand, $qName, $qSize, $qStart, $qEnd, $tName, $tSize, $tStart, $tEnd, $nBlocks, $blockSizes, $qStarts, $tStarts) = @fields[0,8..20];
+	my ($qLenPct, $aQIdtPct) = @fields[21,22];  # only exist if filterAligns called with '--more' arg
+	my $qALen = $qEnd-$qStart;
+	unless ($qLenPct) {  # if not supplied, calc from scratch
+	    $qLenPct = sprintf("%0.2f", 100*$qALen/$qSize);
+	    $aQIdtPct = sprintf("%0.2f", 100*$matches/$qALen);
+	}
+	my $qGap3 = $qSize-$qEnd;  # gap from alignment end to read 3' end
+	my $globalStart = $strand eq '+' ? $tStart-$qStart : $tEnd+$qGap3;  # genomic start of entire read, if the entire read had aligned
+	my $globalEnd = $strand eq '+' ? $tEnd+$qGap3 : $tStart-$qStart;    # genomic end of entire read, if the entire read had aligned
+	$master{$qName}{$.}{ALIGN} = [$tName,$globalStart,$globalEnd,"",0,$strand,$tStart,$tEnd,"",$nBlocks,$blockSizes,$tStarts];  # fields 4,5,9 left blank
+	my $terminality = $qStart==0 ? 5 : $qGap3==0 ? 3 : 0;
+	$master{$qName}{$.}{STATS} = [$qSize,$qALen,$tName,$terminality,$aQIdtPct,$qLenPct,$matches];
+    }
+    close IN;
+} elsif ($format eq 'sam') {
+    open IN, $input or die "$0: Cannot open sam file '$input': $!\n";
+    while (my $line = <IN>) {
+	$line =~ s/[\n\r]+$//;
+	my @fields = split /\t/, $line;
+    }
+    close IN;
+} elsif ($format eq 'bam') {
+    my $tmp = "localAlignToBed12.$$.tmp";
+    die "$0: bam file '$input' does not exist!\n" unless -e $input;
+    system "samtools view $input > $tmp";
+    open IN, $tmp or die "$0: Cannot open temp sam file '$tmp': $!\n";
+    while (my $line = <IN>) {
+	$line =~ s/[\n\r]+$//;
+	my @fields = split /\t/, $line;
+    }
+    close IN;
+    system "rm -f $tmp";
+} else {
+    die "$0: Unknown alignment format '$format': must be psl, psl.best, sam, or bam!\n";
+}
+
+open STAT, "> $outstats" or die "$0: Cannot open output stats file '$outstats' for writing: $!\n";
+print STAT "READ\tLENGTH\tALIGNED\tMATCHES\tTERMINAL\tCHROM\n";
+open BED, "> $outbed" or die "$0: Cannot open output BED12 file '$outbed' for writing: $!\n";
+print BED "track name=\"$input\" visibility=pack itemRgb=\"On\"\n";
+foreach my $qName (keys %master) {  # reads
+    my $nAligns = scalar keys %{ $master{$qName} };
+    foreach my $i (keys %{ $master{$qName} }) {  # alignments
+	my ($qSize, $qALen, $tName, $terminality, $aQIdtPct, $qLenPct, $matches) = @{ $master{$qName}{$i}{STATS} };
+	my @fields = @{ $master{$qName}{$i}{ALIGN} };  # name, score, itemRgb are blank
+	$fields[3] = "$qName:$nAligns:$qLenPct:$aQIdtPct";  # full name
+	$fields[4] = sprintf("%0.0f",1000/$nAligns);  # "score" = read uniqueness
+	$fields[8] = 0;  # itemRgb left alone for the moment
+	print BED join("\t",@fields),"\n";
+	print STAT join("\t",($qName,$qSize,$qALen,$matches,$terminality,$tName)),"\n";
+    }
+}
+close BED;
+close STAT;
+exit;

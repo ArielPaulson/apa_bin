@@ -1,0 +1,41 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my $cmd = 'cuffcompare';
+my $outdir;
+my $procs;
+my $intxt;
+my $ref;
+my $prefix;
+my @gtfs;
+
+GetOptions("o=s"=>\$outdir, "p=i"=>\$procs, "i=s"=>\$intxt, "r=s"=>\$ref, "x=s"=>\$prefix, "cmd=s"=>\$cmd);
+@gtfs = @ARGV;
+
+#system "rm -rf $outdir" if -d $outdir;
+
+$cmd .= " -o $outdir";
+$cmd .= " -p $procs" if $procs;
+$cmd .= " -r $ref" if $ref;
+if ($intxt) {
+    $cmd .= " -i $intxt";
+} else {
+    $cmd .= " @gtfs";
+}
+print "$cmd\n";
+system $cmd;
+
+#system "mv -f $outdir $outdir.log";
+system "mkdir $outdir";
+system "mv -f $outdir.* $outdir/";
+system "rename $outdir. '' $outdir/*";
+system "perl -i -pe 's/(XLOC|TCONS)/${prefix}_\$1/g' novel_cuffmerge/merged.gtf" if $prefix;
+system "/home/apa/local/bin/gtf2beds $outdir/combined.gtf";
+chomp(my $lines = `cat $outdir/combined.gtf | wc -l`);
+chomp(my $trans = `cat $outdir/combined.gtf | grep -oP "transcript_id \\S+" | sort -u | wc -l`);
+chomp(my $genes = `cat $outdir/combined.gtf | grep -oP "gene_id \\S+" | sort -u | wc -l`);
+print "LINES: $lines\nTRANS: $trans\nGENES: $genes\n$0 complete!\n";
+exit;
+

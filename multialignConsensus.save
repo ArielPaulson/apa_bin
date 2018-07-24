@@ -1,0 +1,82 @@
+
+ccccc#!/usr/bin/env perl
+require '/home/apa/local/bin/apa_routines.pm';
+use Getopt::Long;
+use strict;
+
+my ($mfa, $subtract);
+my $gapmode = 'allow';
+GetOptions("f=s"=>\$mfa, "g=s"=>\$gapmode, "subtract"=>\$subtract);
+
+my %gapmodes = map {($_=>1)} qw/ allow ignore force drop /;  # allow a gap to be the consensus, ignore existence of gaps, force consensus to be gap (if any gaps at that position)
+die "Gapmode '$gapmode' not allowed: must be 'allow', 'ignore', or 'force'.\n" unless $gapmodes{$gapmode};
+
+my (%seq, $header, @headers, %freq, $cons);
+my $maxhw = 9;  # at least as wide as 'CONSENSUS'
+
+open IN, $mfa or die "$0: Cannot read '$mfa': $!\n";
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    if ($_ =~ /^>(.*)/) {
+		$header = $1;
+		push @headers, $header;
+		$maxhw = length($header) if length($header) > $maxhw;
+    } else {
+		$seq{$header} .= $_;
+    }
+}
+close IN;
+my $H = scalar @headers;
+my $W = length($seq{$headers[0]});
+
+foreach my $i (0..$H) {
+    my @base = split //, $seq{$headers[$i]};
+    $freq{$_}{$base[$_]}++ foreach (0..$W);
+}
+
+foreach my $i (0..$W) {
+    my $pos;
+    my $path;
+    delete $freq{$i}{''};
+    my @rep = sort { $freq{$i}{$b} <=> $freq{$i}{$a} } keys %{ $freq{$i} };
+#    print STDERR "$i: @rep: $rep[0], $rep[1], $rep[2]\n";
+    if ($gapmode eq 'force' && exists $freq{$i}{'-'}) {
+		$pos = '-';
+		$path = 1;
+    } elsif ($rep[0] eq '-') {
+		if ($gapmode eq 'allow') {
+			$pos = $rep[0];
+			$path = 2;
+		} else {
+			$pos = ($freq{$i}{$rep[1]}/$H < 0.5) ? "\L$rep[1]" : "\U$rep[1]";  # next-best, if gaps disallowed
+			$path = 3;
+		}
+    } else {
+		$pos = ($freq{$i}{$rep[0]}/$H < 0.5) ? "\L$rep[0]" : "\U$rep[0]";
+		$path = 4;
+    }
+#    print STDERR "$i: $pos ($path)\n";
+    $cons .= $pos;
+}
+
+my @cons = split //, $cons;
+foreach my $i (0..$H) {
+    my $out;
+    if ($subtract) {
+		my @seq = split //, $seq{$headers[$i]};
+		foreach my $j (0..$W) {
+			if ("\U$seq[$j]" eq "\U$cons[$j]") {
+				$out .= '.';
+			} else {
+				$out .= $seq[$j];
+			}
+		}
+    } else {
+		$out = $seq{$headers[$i]};
+    }
+    printf "%-${maxhw}s\t$out\n", $headers[$i];
+}
+
+printf "%-${maxhw}s\t$cons\n", 'CONSENSUS';
+exit;
+

@@ -1,0 +1,190 @@
+#!/usr/bin/perl
+use Data::Dumper;
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## Written 08/04/2012 by Ariel Paulson (apa@stowers.org)
+##
+## Returns flanking genes (from -b bed) for each gene in -a bed, along with distances.
+## For each gene in -a bed, the original bed entry is returned, plus 5 columns: 1 = gene hits | 2 = 5' neighbor | 3 = 5' neighbor distance | 4 = 3' neighbor | 5 = 3' neighbor distance
+## By default, only the nearest neighbor(s) are returned.  Neighbors (and gene hits, if any) will be ordered, semicolon-delimited strings of values, if > 1 exist.
+## If -x (expanded) is used, then ONE LINE PER NEIGHBOR IS RETURNED:
+## Each line starts with the original bed entry, then 3 columns: 1 = entry type | 2 = gene | 3 = distance.  "Entry type" may be "G" for gene hit, "5" for 5'-neighbor, "3" for 3'-neighbor.
+## Using -o will return ALL overlapping neighbors, i.e., if the neighbor gene overlaps other genes, even though they may not be the closest, they will be reported too.
+## Using -s restricts neighbors to same strand as query gene.
+## For any genes in -a bed which overlap any genes in -b bed, only the gene hits will be returned, and no other neighbors.
+##
+## DEPENDENCIES: bedtools, perl Getopt::Long module, /home/apa/local/bin/getIntergenes, /home/apa/local/bin/fixBed
+
+my ($CHROM_START, $CHROM_END) = qw/ CHROM_START CHROM_END /;  # chr start and end labels from intergenes bed file.  MUST MATCH!!!!!!!!!
+
+my ($bedA, $bedB, $genome, $stranded, $expanded, $overlaps);
+GetOptions("a=s" => \$bedA, "b=s" => \$bedB, "g=s" => \$genome, "s" => \$stranded, "x" => \$expanded, "o" => \$overlaps);
+$bedB = $bedA unless $bedB;
+
+my ($maxcolA, %chrmax, %genesA, %genesB, %intergenes);
+
+open my $IN1, '<', $bedA or die "$0: Cannot open -a bed '$bedA': $!\n";
+while (<$IN1>) {
+    next if ($_ =~ /^track/ || $_ =~ /^#/);
+    $_ =~ s/[\n\r]+$//;
+    my @data = split /\t/, $_;
+    $maxcolA = $#data unless %genesA;  # so, on first row only
+    $genesA{$.} = \@data;  # ranked
+}
+close $IN1;
+
+open my $IN2, '<', $bedB or die "$0: Cannot open -b bed '$bedB': $!\n";
+while (<$IN2>) {
+    next if ($_ =~ /^track/ || $_ =~ /^#/);
+    $_ =~ s/[\n\r]+$//;
+    my @data = split /\t/, $_;
+    $genesB{$data[3]} = \@data;
+}
+close $IN2;
+
+open my $IN3, '<', $genome or die "$0: Cannot read genome file '$genome': $!\n";
+while (<$IN3>) {
+    $_ =~ s/[\n\r]+$//;
+    my @data = split /\t/, $_;
+    $chrmax{$data[0]} = $data[1];
+}
+close $IN3;
+
+my $TEMP = "neighborBed.$$.tmp";
+system "mkdir -p $TEMP";
+die "$0: Failed to create temp directory '$TEMP'\n" unless -d $TEMP;
+my $bedb_inter = "$TEMP/intergenes";
+my $gene_hits = "$TEMP/gene.hits";
+my $itgc_hits = "$TEMP/itgc.hits";
+
+if ($stranded) {
+    system "/home/apa/local/bin/getIntergenes -g $bedB -c $genome -s > $bedb_inter";
+    system "intersectBed -wo -s -a $bedA -b $bedB > $gene_hits";
+    system "intersectBed -wo -s -a $bedA -b $bedb_inter > $itgc_hits";
+} else {
+    system "/home/apa/local/bin/getIntergenes -g $bedB -c $genome > $bedb_inter";
+    system "/home/apa/local/bin/fixBed -i $bedb_inter --overwrite";
+    system "intersectBed -wo -a $bedA -b $bedB > $gene_hits";
+    system "intersectBed -wo -a $bedA -b $bedb_inter > $itgc_hits";
+}
+   
+my %genehits;
+open my $IN4, '<', $gene_hits;
+while (<$IN4>) {
+    $_ =~ s/[\n\r]+$//;
+    my @data = split /\t/, $_;
+    my @geneA = @data[0..$maxcolA];
+    my @geneB = @data[$maxcolA+1..$#data];
+    my $nn = "$geneB[3]($geneB[5])";
+    $genehits{$geneA[3]}{$nn} = 1;
+}
+close $IN4;
+
+my %chrlabs;
+my %itghits;
+open my $IN5, '<', $itgc_hits;
+while (<$IN5>) {
+    $_ =~ s/[\n\r]+$//;
+    my @data = split /\t/, $_;   # lines like: chrX	22364196	22382557	5:-:FBgn0069973|3:-:FBgn0016976,FBgn0016975
+    my @gene = @data[0..$maxcolA];
+    my @intergene = @data[$maxcolA+1..$#data];
+    my ($start, $end) = @gene[1,2];
+    my (%fields, %flanks);
+    foreach (split /\|/, $intergene[3]) {
+	my ($end, $strand, $tgenes) = split /:/, $_;
+	$end = 0 unless $end;
+	$fields{$end}{$strand} = $tgenes;
+    }
+    if (scalar(keys %fields) != 2) {
+	warn "$0: Failed to parse intergene identifier '$intergene[3]': should have format like '5:strand:gene1[,gene2,...]|3:strand:gene1[,gene2,...]'\n";
+    } else {
+	foreach my $nnstr (keys %{ $fields{5} }) {
+	    foreach my $nngene (split /,/, $fields{5}{$nnstr}) {
+		my $neighbor = "$nngene($nnstr)";
+		my $end2 = $nngene eq $CHROM_START ? 0 : $genesB{$nngene}->[2];
+		$flanks{G2D}{5}{$neighbor} = $start-$end2;
+		$flanks{D2G}{5}{$start-$end2}{$neighbor} = 1;
+	    }
+	}
+	foreach my $nnstr (keys %{ $fields{3} }) {
+	    foreach my $nngene (split /,/, $fields{3}{$nnstr}) {
+		my $neighbor = "$nngene($nnstr)";
+		my $start2 = $nngene eq $CHROM_END ? $chrmax{$gene[0]} : $genesB{$nngene}->[1];
+		$flanks{G2D}{3}{$neighbor} = $start2-$end;
+		$flanks{D2G}{3}{$start2-$end}{$neighbor} = 1;
+	    }
+	}
+	if ($expanded) {
+	    my (@f5, @f3);
+	    my @d5 = sort { $a <=> $b } keys %{ $flanks{D2G}{5} };
+	    my @d3 = sort { $a <=> $b } keys %{ $flanks{D2G}{3} };
+	    if ($overlaps) {
+		@f5 = sort { $flanks{G2D}{5}{$a} <=> $flanks{G2D}{5}{$b} } keys %{ $flanks{G2D}{5} };
+		@f3 = sort { $flanks{G2D}{3}{$a} <=> $flanks{G2D}{3}{$b} } keys %{ $flanks{G2D}{3} };
+	    } else {
+		@f5 = sort keys %{ $flanks{D2G}{5}{$d5[0]} };
+		@f3 = sort keys %{ $flanks{D2G}{3}{$d3[0]} };
+	    }
+	    push @{ $itghits{$gene[3]} }, "5\t$f5[$_]\t$d5[$_]" foreach (0..$#f5);
+	    push @{ $itghits{$gene[3]} }, "3\t$f3[$_]\t$d3[$_]" foreach (0..$#f3);
+	} else {
+	    my ($f5, $f3, $d5, $d3);
+	    if ($overlaps) {
+		$f5 = join ';', sort { $flanks{G2D}{5}{$a} <=> $flanks{G2D}{5}{$b} } keys %{ $flanks{G2D}{5} };
+		$f3 = join ';', sort { $flanks{G2D}{3}{$a} <=> $flanks{G2D}{3}{$b} } keys %{ $flanks{G2D}{3} };
+		$d5 = join ';', sort { $a <=> $b } keys %{ $flanks{D2G}{5} };
+		$d3 = join ';', sort { $a <=> $b } keys %{ $flanks{D2G}{3} };
+	    } else {
+		$d5 = (sort { $a <=> $b } keys %{ $flanks{D2G}{5} })[0];
+		$d3 = (sort { $a <=> $b } keys %{ $flanks{D2G}{3} })[0];
+		$f5 = join ';', sort keys %{ $flanks{D2G}{5}{$d5} };
+		$f3 = join ';', sort keys %{ $flanks{D2G}{3}{$d3} };
+	    }
+	    push @{ $itghits{$gene[3]} }, join("\t", ($f5, $d5, $f3, $d3));
+	}
+    }
+}
+close $IN5;
+
+system "rm -Rf $TEMP";
+
+print join("\t", qw/ Chrom Start End Peak Score Strand GeneHit Neighbor5 Dist5 Neighbor3 Dist3 /), "\n";
+foreach my $i (sort {$a <=> $b} keys %genesA) {
+    my @gene = @{ $genesA{$i} };
+    if ($genehits{$gene[3]}) {
+	if ($expanded) {
+	    print (join "\t", (@gene, 'G', $_, "0\n")) foreach sort keys %{ $genehits{$gene[3]} };
+	} else {
+	    my $hits = join ';', sort keys %{ $genehits{$gene[3]} };
+	    print (join "\t", (@gene, $hits, "\t\t\t\n"));
+	}
+    } else {
+	if ($expanded) {
+	    print (join "\t", (@gene, "$_\n")) foreach @{ $itghits{$gene[3]} };
+	} else {
+	    my $hits = $itghits{$gene[3]}->[0];
+	    print (join "\t", (@gene, '', "$hits\n"));
+	}
+    }
+}
+exit;
+
+
+#source("~/uapa/R/apa_tools.R")
+#A <- read.delim("$bedA", as.is=T, header=F)
+#B <- read.delim("$bedB", as.is=T, header=F)
+#G <- read.delim("$gdat", as.is=T)
+#N <- nearest.neighbors(A,B,format="tabular",zero=TRUE)
+#GA <- if (all(A[,4] %in% G[,1])) { G[match(A[N[,1],4],G[,1]),] } else { A[N[,1],] }
+#GB <- G[match(B[N[,2],4],G[,1]),]
+#NT <- translate(sign(N[,3]),-1:1,c(5,0,3))
+#NF <- cbind(GA,NT,DIST=N[,3],GB)
+#write.table(NF, "$output", sep="\t", quote=F, row.names=F)
+#TAB <- as.matrix(table(NF[,8]))[,c(1,1,1)]
+#TAB[,2:3] <- 0
+#colnames(TAB) <- qw(ALL,DIRECT,DISTAL)
+#x <- table(NF[NF[,6]==0,8]); TAB[match(names(x),rownames(TAB)),2] <- x
+#x <- table(NF[NF[,6]!=0,8]); TAB[match(names(x),rownames(TAB)),3] <- x
+#write.table(TAB, "neighbor.table.txt", sep="\t", quote=F, row.names=T)

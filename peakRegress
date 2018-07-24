@@ -1,0 +1,162 @@
+#!/usr/bin/env Rscript
+
+## Inputs
+# input;   # input file; either fasta or motif-hit bed (see $mode)
+# mode;    # run mode: "kmer" for full kmer decomposition (input = fasta) or "motif" for set of given motif hits (input = bed; motif hits)
+# scores;  # peak scores; a 2-col file with col 1 = peak ID (matches input) and col 2 = peak score (to regress)
+# ms;      # if mode = "motif": minimum score for a motif instance; instances below this score are ignored.
+
+## Inputs with Defaults
+# prefix = 'peakRegress';  # prefix for output files
+# k1 = 4;  # if mode = "kmer": minimum k
+# k2 = 8;  # if mode = "kmer": maximum k
+# mk = 10; # if mode = "kmer": minimum kmer rate: a kmer must be present >= mk times in at least one peak; otherwise ignored.
+
+## Globals
+# fasta;   # fasta sequences
+# motifs;  # motif bed data
+# kmers;   # kmer frequencies
+# regress; # regression data
+
+
+#################
+##### SETUP #####
+#################
+
+
+suppressPackageStartupMessages(library(optparse))
+source("/n/projects/apa/R/apa_tools.R")
+options(stringsAsFactors=FALSE)
+
+#library(getopt)
+#arg.mat <- cbind(
+#    LONG=qw(input,prefix,scores,k1,k2,min-k,min-score,motif),
+#    SHORT=qw(i,p,s,k1,k2,mk,ms,motif),
+#    IN.TYPE=qw(character,character,character,integer,integer,integer,character,logical),
+#    OUT.TYPE=qw(character,character,character,integer,integer,integer,character,logical)
+#)
+#cmd.args <- getopt(arg.mat)
+
+
+option_list <- list(
+    make_option(c("-i", "--input"),      type="character", dest="input",                                                     help="input file; either fasta (default) or motif-instances bed file if using '--motif'"),
+    make_option(c("-p", "--prefix"),     type="character", dest="prefix",        default="peakRegress",                      help="output prefix for results files, default \"%default\".[kmer|motif] depending on run mode"),
+    make_option(c("-s", "--scores"),     type="character", dest="peakScores",                                                help="2-col file with peak name and peak height/score/pvalue or other regressable value"),
+    make_option(c("-ms", "--min-score"), type="character", dest="minMotifScore", default=NA,                                 help="a minimum score threshold for motif instances, or 2-col file with motif name and min score"),
+    make_option(c("-mk", "--min-k"),     type="integer",   dest="minKFreq",      default=10,                                 help="minimum kmer count in any peak to consider kmer, [default %default]"),
+    make_option(c("-1", "--k1"),         type="integer",   dest="k1",            default=4,                                  help="minimum kmer size, [default %default]"),
+    make_option(c("-2", "--k2"),         type="integer",   dest="k2",            default=8,                                  help="maximum kmer size, [default %default]"),
+    make_option("--motif",               type="logical",   dest="motif",         default=FALSE,         action="store_true", help="regress on motifs, [default %default]"),
+    make_option("--verbose",             type="logical",   dest="verbose",       default=FALSE,         action="store_true", help="verbose processing, [default %default]")
+)
+opt <- parse_args2(OptionParser(option_list=option_list))
+
+
+## RUN MODE AND INPUT DATA
+kmers <- FALSE
+if (opt$motif) {  # motif mode
+    motifs <- read.delim(opt$input, as.is=TRUE, header=FALSE)   # BED FILE; NO HEADER
+} else {
+    fasta <- read.fasta(opt$input)
+    kmers <- TRUE
+}
+
+## PEAK SCORES
+peakScores <- read.delim(opt$peakScores, as.is=TRUE, header=FALSE)   # EXPECTS NO HEADER
+
+## PREFIX AND KMER CONSTRAINTS (have defaults)
+if (opt$prefix == "peakRegress") opt$prefix <- paste(opt$prefix, ifelse(kmers,'kmer','motif'), sep=".")
+k1 <- opt$k1
+k2 <- opt$k2
+krange <- k1:k2
+
+## MIN SCORE(S)
+if (!is.na(opt$minMotifScore)) {
+    facc <- file.access(opt$minMotifScore,4)
+    if (facc == 0) {
+	motif.scores <- read.delim(opt$minMotifScore, as.is=TRUE)   # EXPECTS HEADER
+	minScore <- NA
+    } else {
+	minScore <- as.numeric(opt$minMotifScore)
+    }
+    if (fa == -1 && is.na(minScore)) stop("minScore is non-numeric and not a readable file!\n")
+}
+
+
+
+################
+##### MAIN #####
+################
+
+
+if (kmers) {
+
+    ## prepare peak scores
+    peakScores <- peakScores[real.only(match(names(fasta), peakScores[,1])),]
+    if (length(fasta) != nrow(peakScores)) stop(paste(length(fasta),nrow(peakScores),"Some sequence names are missing from the peak scores file!\n"))
+    ## kmers per sequence
+    k.each <- lapply(fasta, function(x){ lapply(krange, function(i){ count.kmers(x,i) }) })
+    ## all usable kmers
+    all.kmers <- unlist(lapply(krange, function(i){ sort(unique(unlist(lapply(k.each, function(x){ j=(i-k1+1); x[[j]][x[[j]][,2]>=opt$minKFreq,1] })))) }))
+    ## flatten all kmers into kmer/revcomp pairs
+    kmer.rc <- nameless(cbind(FINAL=all.kmers,ORIG=all.kmers,REVCOMP=sapply(all.kmers,rev.comp)))
+    for (i in 1:nrow(kmer.rc)) {
+        w <- intersect((i+1):nrow(kmer.rc), which(kmer.rc[,2]==kmer.rc[i,3]))
+        kmer.rc[w,1] <- ""
+    }
+    final.kmers <- real.only(kmer.rc[,1])
+    final.rcs <- kmer.rc[match(final.kmers,kmer.rc[,2]),3]
+    final.elems <- paste(final.kmers,final.rcs,sep="/")
+    ## hits-per-sequence matrix for all kmers
+    master <- matrix(0, length(final.kmers), length(fasta), FALSE, list(final.elems,names(fasta)))
+    for (i in 1:nrow(master)) {
+        k <- nchar(final.kmers[i])-k1+1
+        for (j in 1:ncol(master)) {
+            w <- union(which(k.each[[j]][[k]][,1]==final.kmers[i]), which(k.each[[j]][[k]][,1]==final.rcs[i]))
+            master[i,j] <- ifelse(length(w)==0, 0, sum(k.each[[j]][[k]][w,2]))
+        }
+    }
+    table.colnames <- c("Kmer/RevComp\tAdj.R.Sq","P.Order")
+    
+} else {
+
+    ## all sequences
+    seq <- sort(unique(motifs[,1]))
+    ## prepare peak scores
+    peakScores <- peakScores[real.only(match(seq, peakScores[,1])),]
+    if (length(seq) != nrow(peakScores)) stop(paste(length(seq),nrow(peakScores),"Some sequence names are missing from the peak scores file!\n"))
+    ## pass-filter motifs
+    if (is.na(minScore)) {
+        rowScores <- motif.scores[match(motifs[,4],motif.scores[,1]),2]
+        motifs[motifs[i,5]<=rowScores,4] <- NA  # zap motif names with sub-par scores
+    } else {
+        motifs[motifs[i,5]<=minScore,4] <- NA  # zap motif names with sub-par scores
+    }
+    motifs <- motifs[!is.na(motifs[,4]),]
+    ## all usable motifs
+    final.elems <- sort(unique(motifs[,4]))
+    ## hits-per-sequence matrix for all kmers
+    master <- matrix(0, length(final.elems), length(seq), FALSE, list(final.elems,seq))
+    for (i in 1:nrow(master)) {
+        for (j in 1:ncol(master)) {
+            master[i,j] <- sum(motifs[,1]==seq[j] & motifs[,4]==final.elems[i])
+        }
+    }
+    table.colnames <- c("Motif\tAdj.R.Sq","P.Order")
+}
+
+## regress each row to peak scores
+regression <- apply(master, 1, function(x){ summary(lm(peakScores[,2] ~ x)) })
+
+## regression stats matrix
+regression.stats <- matrix( c(
+  sapply(regression, function(x){ x$adj.r.squared }),
+  sapply(regression, function(x){ -log10(x$coefficients[2,4]) })
+), length(final.elems), 2, F, list(final.elems,qw(Adj.R.Sq,P.Order)))
+
+## write matrix
+write.table(regression.stats[order(regression.stats[,1],decreasing=T),], paste(opt$prefix,"regression.stats.txt",sep="."), sep="\t", quote=F, col.names=table.colnames)
+
+save.image(paste(opt$prefix,"RData",sep="."))
+quit()
+

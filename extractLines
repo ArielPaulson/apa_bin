@@ -1,0 +1,41 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+# given a set of line numbers ($lines), extract these lines from file $file.
+
+## Inputs
+my $input;     # input file
+my $output;    # output file
+my $lines;     # file with lines numbers to sample
+my $skip = 0;  # number of "header" lines to skip in $input before starting filter (i.e., this number will be added to everything in $lines, and lines 1-$skip will be included in output)
+
+## Globals
+my %filter;    # line number hash
+my $filtermax; # maximum line number in filter -- compare to max line number in input file.
+
+GetOptions("i=s" => \$input, "o=s" => \$output, "l=s" => \$lines, "s=i" => \$skip);
+
+%filter = map {($_=>1)} (1..$skip) if $skip;  # preload %filter with header lines, if any
+
+my $new;
+open IN, $lines or die "$0: Cannot open lines file '$lines' for reading: $!\n";
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    $new = $_+$skip;  # add offset, if any
+    $filter{$new} = 1;
+    $filtermax = $new if $new > $filtermax;
+}
+close IN;
+
+open IN, $input or die "$0: Cannot open input file '$input' for reading: $!\n";
+open OUT, "> $output" or die "$0: Cannot open output file '$output' for writing: $!\n";
+while (<IN>) {
+    print OUT $_ if $filter{$.};
+}
+close OUT;
+print "$0: Input lines = $. but max filter index = $filtermax!\n" if $. < $filtermax;
+close IN;
+exit;
+

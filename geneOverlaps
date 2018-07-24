@@ -1,0 +1,107 @@
+#!/usr/bin/perl
+use strict;
+
+## Takes an uxons bed file and returns gene-gene overlap statistics BASED ON EXONIC OVERLAP ONLY
+## assumes coorect 6-column BED format, i.e. with score and strand and 0-based coords
+
+my (%genes, %gdat, %overlaps, %overYes, %overNo, $self);
+my ($uxbed1, $outfile, $uxbed2) = @ARGV;
+
+unless ($uxbed2) {
+    $uxbed2 = $uxbed1;
+    $self = 1;
+}
+my $inter = "geneOverlaps.$$.tmp";
+
+my $beds = $self ? 'bed' : 'beds';
+print "Reading uxon $beds...\n";
+
+open IN, $uxbed1 or die "Cannot read uxons bed file '$uxbed1': $!\n";
+while (<IN>) {
+    next if $. == 1;
+    $_ =~ s/[\n\r]+$//;
+    my ($chr, $start, $end, $id, $score, $strand) = split /\t/, $_;
+    my $gene = (split /:/, $id)[0];
+    $genes{1}{$id} = $gene;
+    $gdat{1}{$gene}->[0] += $end-$start;   # this should be proper BED format, 0-based
+    $gdat{1}{$gene}->[1]++;
+    $gdat{1}{$gene}->[2] = $strand;
+}
+close IN;
+
+if ($self) {
+    $gdat{2} = $gdat{1};
+    $genes{2} = $genes{1};
+} else {
+    open IN, $uxbed2 or die "Cannot read uxons bed file '$uxbed2': $!\n";
+    while (<IN>) {
+	next if $. == 1;
+	$_ =~ s/[\n\r]+$//;
+	my ($chr, $start, $end, $id, $score, $strand) = split /\t/, $_;
+	my $gene = (split /:/, $id)[0];
+	$genes{2}{$id} = $gene;
+	$gdat{2}{$gene}->[0] += $end-$start;   # this should be proper BED format, 0-based
+	$gdat{2}{$gene}->[1]++;
+	$gdat{2}{$gene}->[2] = $strand;
+    }
+    close IN;
+}
+
+print "Intersecting...\n";
+system "intersectBed -wao -a $uxbed1 -b $uxbed2 > $inter";
+
+print "Reading intersections...\n";
+open INT, $inter or die "Cannot read merge file '$inter': $!\n";
+while (<INT>) {
+    $_ =~ s/[\n\r]+$//;
+    my ($chr1, $start1, $end1, $id1, $score1, $strand1, $chr2, $start2, $end2, $id2, $score2, $strand2, $bp) = split /\t/, $_;
+    next if $id2 eq '.';
+    if ($self) {
+	next if $id1 eq $id2;
+	next if exists $overlaps{ $genes{2}{$id2} }{ $genes{1}{$id1} };  # keep only one record per unique pair
+    }
+    $overlaps{ $genes{1}{$id1} }{ $genes{2}{$id2} }{BP} += $bp;
+    $overlaps{ $genes{1}{$id1} }{ $genes{2}{$id2} }{NU}++;
+    $overYes{1}{ $genes{1}{$id1} } = 1;
+    $overYes{2}{ $genes{2}{$id2} } = 1;
+}
+close INT;
+
+print "Calculating...\n";
+foreach my $gene1 (keys %{ $gdat{1} }) {
+    $overNo{1}{$gene1} = 1 unless $overYes{1}{$gene1};
+}
+unless ($self) {
+    foreach my $gene2 (keys %{ $gdat{2} }) {
+	$overNo{2}{$gene2} = 1 unless $overYes{2}{$gene2};
+    }
+}
+
+open OUT, "> $outfile";
+print OUT "Gene1\tLength1\tUxons1\tStrand1\tGene2\tLength2\tUxons2\tStrand2\tOlapBp\tOlapBp%1\tOlapBp%2\tOlapUx\tOlapUx%1\tOlapUx%2\n";
+foreach my $gene1 (keys %overlaps) {
+    my ($glen1, $gnux1, $gstr1) = @{ $gdat{1}{$gene1} };
+    foreach my $gene2 (keys %{ $overlaps{$gene1} }) {
+	my ($glen2, $gnux2, $gstr2) = @{ $gdat{2}{$gene2} };
+	my ($olbp, $olnu) = ($overlaps{$gene1}{$gene2}{BP}, $overlaps{$gene1}{$gene2}{NU});
+	my ($olbpp1, $olnup1) = (sprintf("%0.4f",100*$olbp/$glen1), sprintf("%0.4f",100*$olnu/$gnux1));
+	my ($olbpp2, $olnup2) = (sprintf("%0.4f",100*$olbp/$glen2), sprintf("%0.4f",100*$olnu/$gnux2));
+	print OUT "$gene1\t$glen1\t$gnux1\t$gstr1\t$gene2\t$glen2\t$gnux2\t$gstr2\t$olbp\t$olbpp1\t$olbpp2\t$olnu\t$olnup1\t$olnup2\n";
+    }
+}
+foreach my $gene1 (keys %{ $overNo{1} }) {
+    my ($glen1, $gnux1, $gstr1) = @{ $gdat{1}{$gene1} };
+    print OUT "$gene1\t$glen1\t$gnux1\t$gstr1\t.\t.\t.\t.\t.\t.\t.\t.\t.\t.\n";
+}
+unless ($self) {
+    foreach my $gene2 (keys %{ $overNo{2} }) {
+	my ($glen2, $gnux2, $gstr2) = @{ $gdat{2}{$gene2} };
+	print OUT ".\t.\t.\t.\t$gene2\t$glen2\t$gnux2\t$gstr2\t.\t.\t.\t.\t.\t.\n";
+    }
+}
+close OUT;
+
+unlink $inter;
+print "Complete!\n";
+exit;
+

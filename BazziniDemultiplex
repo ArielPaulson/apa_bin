@@ -1,0 +1,759 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Storable qw/ nstore retrieve /;
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+## Demultiplexes multi-species mixed-library fastqs for Bazzini lab, using standard barcodes.
+
+
+## TO DO:
+## FIX OR FLAG SHORT-FRAG PAIRS WHICH CUT UNEVENLY !!!!!
+## Test barcode matches for ATG-end (5') and (TAA|TGA|TAG)-start (3') 
+## smaller blat seed (or replace w/ blast?), to avoid losing 2-internal-mismatch barcodes
+
+my $watch;
+#$watch = 'M01285:59:000000000-AV70C:1:1107:13570:13781';  # header to watch operations for
+
+my $fqprefix;  # fastq pair must be: ${fqprefix}_[12].fastq.gz
+my $outdir;    # output directory
+my $bctable;   # Table of barcodes to search for: txt output of BazziniFindBarcodes (may be manually corrected)
+my $skip;      # dev option only -- skip intermediate file creation, just re-analyze
+
+GetOptions("f=s"=>\$fqprefix, "o=s"=>\$outdir, "b=s"=>\$bctable, "skip"=>\$skip);
+
+die "$0: barcode table '$bctable' does not exist!\n" unless -e $bctable;
+die "$0: End-1 fastq '${fqprefix}_1.fastq.gz' does not exist!\n" unless -e "${fqprefix}_1.fastq.gz";
+die "$0: End-2 fastq '${fqprefix}_2.fastq.gz' does not exist!\n" unless -e "${fqprefix}_2.fastq.gz";
+
+(my $prefix = $fqprefix) =~ s/.*\///;
+$outdir = '.' unless $outdir;
+my $demdir = "$outdir/demultiplex";
+system "mkdir $demdir";
+my $demprefix = "$demdir/$prefix";
+my $tmp = "$outdir/temp";
+system "mkdir -p $tmp";
+
+my @versions = qw/ 5S 5A 3S 3A /;
+my @patterns = qw/ 00-00 10-01 10-00 00-01 11-11 11-10 11-01 11-00 10-11 10-10 01-11 01-10 01-01 01-00 00-11 00-10 /;
+my @ORFpatterns = qw/ 52-32 52-31 52-30 51-32 51-31 51-30 50-32 50-31 50-30 /;
+my %pr = ( 1=>"$tmp/${prefix}_1", 2=>"$tmp/${prefix}_2" );
+my %fq = ( 1=>"$pr{1}.fastq.gz",  2=>"$pr{2}.fastq.gz"  );
+my %tb = ( 1=>"$pr{1}.fastq.tab", 2=>"$pr{2}.fastq.tab" );
+my %fa = ( 1=>"$pr{1}.fa",        2=>"$pr{2}.fa"        );
+my %bcf = map {($_=>"$tmp/barcodes_$_.fa")} @versions;
+my $npfile = "$tmp/$prefix.npairs";
+my (%psl, %datfile);
+foreach my $i (1,2) {
+    $datfile{$i} = "$pr{$i}.dat";
+    $psl{$i}{$_} = "$pr{$i}.$_.psl" foreach @versions;
+}
+
+
+my @gzips;
+my $log = "$demprefix.log";
+my $LOG = &open2('W', $log, 'log file');
+&logreport("$0 initialized: ".`date`, 1, $LOG);
+
+my (%barcodes, %bcname2num, @sortbc, $maxbcn);
+my $BC = &open2('R', $bctable, 'detected barcodes table');
+open OUT5S, "> $bcf{'5S'}";
+open OUT5A, "> $bcf{'5A'}";
+open OUT3S, "> $bcf{'3S'}";
+open OUT3A, "> $bcf{'3A'}";
+while (<$BC>) {
+    next if $. == 1;
+    chomp;
+    my ($bc, $bcname, $count, $percent, $p5, $p3) = split /\t/, $_;
+    push @sortbc, $bc;
+    $maxbcn = length($bcname) if length($bcname) > $maxbcn;
+    $bcname2num{$bcname} = $bc;
+    $barcodes{$bc}{N} = $bcname;
+    $barcodes{$bc}{S} = [$count, $percent];
+    $barcodes{$bc}{5}{S} = $p5;
+    $barcodes{$bc}{5}{A} = ${ &revcomp($p5) };
+    $barcodes{$bc}{5}{L} = length($p5);
+    $barcodes{$bc}{5}{E} = substr($p5, length($p5)-5, 5);
+    $barcodes{$bc}{3}{S} = $p3;                 # incoming $p3 is already canonicalized
+    $barcodes{$bc}{3}{A} = ${ &revcomp($p3) };  # revcomp $p3 back to "original" sequence greppable from reads
+    $barcodes{$bc}{3}{L} = length($p3);
+    $barcodes{$bc}{3}{B} = substr($p3, 0, 5);
+    print OUT5S ">$bc:$bcname:5S\n$barcodes{$bc}{5}{S}\n";
+    print OUT5A ">$bc:$bcname:5A\n$barcodes{$bc}{5}{A}\n";
+    print OUT3S ">$bc:$bcname:3S\n$barcodes{$bc}{3}{S}\n";
+    print OUT3A ">$bc:$bcname:3A\n$barcodes{$bc}{3}{A}\n";
+}
+close $BC;
+close $_ foreach qw/ OUT5S OUT5A OUT3S OUT3A /;
+my @sortbc2 = (@sortbc, 'MULTI', 'NONE');
+
+my %blat = (
+    # [ blat_cmd, exp_e1_aln_str, exp_e2_aln_str, exp_aln_side, preferred, label ]
+    '5S' => [ "blat -tileSize=6 -minScore=2 $bcf{'5S'}",  '+',  '-',  5,  1,  "5' barcodes, fwd" ],
+    '5A' => [ "blat -tileSize=6 -minScore=2 $bcf{'5A'}",  '-',  '+',  5,  0,  "5' barcodes, rev" ],
+    '3S' => [ "blat -tileSize=6 -minScore=2 $bcf{'3S'}",  '+',  '-',  3,  0,  "3' barcodes, fwd" ],
+    '3A' => [ "blat -tileSize=6 -minScore=2 $bcf{'3A'}",  '-',  '+',  3,  1,  "3' barcodes, rev" ]
+);
+my $report = 0;
+
+my (@headers, %newpsl, %xstats, %data, $npairs, %newstats);
+foreach my $i (1, 2) {
+    unless (-e $datfile{$i}) {
+        &logreport("Reading end $i...", 1, $LOG);
+        &execute("zcat ${fqprefix}_$i.fastq.gz | /home/apa/local/bin/fastq2tab | perl -pe 's/ \\S+//' > $tb{$i}", 1, $LOG, 2) unless $skip;
+        &execute("gzip $tb{$i}", 1, $LOG, 2) unless $skip;
+        $tb{$i} .= '.gz';
+        my $FQ = &open2('R', $tb{$i}, "end $i fastq.tab");
+        while (<$FQ>) {
+            chomp;
+            my ($header, $seq, $qual) = split /\t/, $_;
+            $data{$header}{$i}{R} = [$seq, $qual];
+            $data{$header}{$i}{OK}{$_} = [0,0] foreach @sortbc2;
+            $data{$header}{$i}{S}{$_} = 0 foreach @sortbc;
+            push @headers, $header if $i == 1;
+        }
+        close $FQ;
+    }
+}
+if (@headers) {  # i.e., no datfiles
+    $npairs = scalar @headers;
+    open NP, "> $npfile";
+    print NP $npairs;
+    close NP;
+} else {
+    chomp($npairs = `cat $npfile`);
+}
+
+## Some alignment-reporting prep
+my $lnp = length($npairs) + 1;  # +1 because we expect redundant totals to sometimes be larger than $npairs
+$lnp = 4 if $lnp < 4;
+my $maxbcn2 = $maxbcn > 7 ? $maxbcn : 7;
+my $hblock = '%'.$lnp.'s %'.$lnp.'s %'.$lnp.'s %'.$lnp.'s';
+my $nblock = '%'.$lnp.'i %'.$lnp.'i %'.$lnp.'i %'.$lnp.'i';
+## Play-by-play formats
+my $hfmt = '%3s %-'.$maxbcn.'s %4s '.$hblock." MSCORE\n";
+my $nfmt = '%3s %-'.$maxbcn.'s %4s '.$nblock.' %0.1f'."\n";
+my $sumhead = sprintf($hfmt, qw/ END BARCODE VERS GOOD DUP BAD NONE /);
+## Final-report formats
+my $hfmt2 = '%-'.$maxbcn.'s %4s '."$hblock $hblock\n";
+my $nfmt2 = '%-'.$maxbcn.'s %4s '."$nblock $nblock\n";
+my $sumhead2 = sprintf($hfmt2, qw/ BARCODE VERS GOOD.1 GOOD.2 DUP.1 DUP.2 BAD.1 BAD.2 NONE.1 NONE.2 AVSC.1 AVSC.2 /);
+
+
+foreach my $i (1, 2) {
+    my $xside = $i==1 ? 5 : 3;  # $xside is the side of the barcode we EXPECT to align to; $side is the side that the barcode belongs to.  Ideally they will be the same...
+    my @xfields = $i==1 ? (0,2,4,6,8) : (1,3,5,7,9);
+    if (-e $datfile{$i}) {
+        print "Loading E$i DAT file...\n";
+        my %X = %{retrieve($datfile{$i})};
+        %xstats = %{ $X{xstats} };
+        %newstats = %{ $X{newstats} };
+        %psl = %{ $X{psl} };
+        %data = %{ $X{data} };
+        @headers = @{ $X{headers} };
+        %X = ();
+        ## Stats messages
+        foreach my $ver (@versions) {
+            my $msg;
+            foreach my $bc (@sortbc) {
+                my ($good, $dup, $bad, $none, $avgscore) = @{ $xstats{TABLE}{$bc}{$ver} }[@xfields];
+                $msg .= sprintf($nfmt, $i, $barcodes{$bc}{N}, $ver, $good, $dup, $bad, $none, $avgscore);
+            }
+            my ($good, $dup, $bad, $none, $avgscore) = @{ $xstats{TABLE}{ALL}{$ver} }[@xfields];
+            $msg .= sprintf($nfmt, $i, 'ALL', $ver, $good, $dup, $bad, $none, '');
+            &logreport("$sumhead$msg", 1, $LOG);
+        }
+    } else {
+        unless ($skip) {
+            &logreport("Aligning barcodes to end $i...", 1, $LOG);
+            &execute("zcat $tb{$i} | cut -f1,2 | /home/apa/local/bin/tab2fasta > $fa{$i}", 1, $LOG, 2);
+        }
+        foreach my $ver (@versions) {
+            my %tmpstats;
+            my ($cmd, $xstr1, $xstr2, $side, $prefer, $label) = @{ $blat{$ver} };
+            my $xstr = $blat{$ver}->[$i];  # set up arrays this way!
+            my $SAS = $ver =~ /R$/ ? 'A' : 'S';
+            unless ($skip) {
+                &logreport("\nBlat: end $i, $label: ".`date`, 1, $LOG);
+                &execute("$cmd $fa{$i} $psl{$i}{$ver}", 1, $LOG, 2);
+                &execute("gzip $psl{$i}{$ver}", 1, $LOG, 2);
+            }
+            &logreport("Processing end $i $ver blat results...", 1, $LOG);
+            $psl{$i}{$ver} .= '.gz';
+            my $PSL = &open2('R', $psl{$i}{$ver}, "end-$i $ver barcode PSL");
+            while (<$PSL>) {
+                next if $. < 6;
+                my @fields = split /\t/, $_;
+                my ($matches, $str, $header, $rlen, $rstart, $rend, $bcid, $blen, $bstart, $bend, $blocks) = @fields[0,8..17];
+                my ($bc, $bcname, $ver2) = split /:/, $bcid;
+                ## rank "correctness" of blat hit based on end, direction, start pos, matches, etc.
+                my $aln_score = ($str ne $xstr) ? 1 : ($side==$xside && $prefer) ? 4 : ($side==$xside) ? 3 : 2;
+                my $idt_score = ($matches==$blen) ? 4 : ($matches+1==$blen) ? 3 : ($matches+2==$blen) ? 2 : 1;
+                my ($pos_score, $pos_score2);  # $pos_score for expected adapter at start of read, $pos_score2 for other adapter elsewhere in read
+                if ($side==$xside) {
+                    $pos_score = ($bstart==$rstart && $rstart==0) ? 4 : ($rstart<2 && $bstart<2) ? 3 : ($bstart==$rstart) ? 2 : 1;
+                    $pos_score2 = 0;
+                } else {
+                    $pos_score = 0; 
+                    $pos_score2 = $rstart > 3*$rlen/4 ? 4 : $rstart > $rlen/2 ? 3 : $rstart > $rlen/4 ? 2 : 1;
+                }
+                my $dup = exists $xstats{DUP2}{$bc}{$header}{$i}{$ver} ? 1 : 0;
+                my $score = $aln_score + $idt_score + $pos_score + $pos_score2;
+                $tmpstats{ALL}{$header} = 1;
+                push @{ $newpsl{$bc}{$header}{$i} }, join("\t", $i, $bcname, $ver, $xside, $xstr, $side, $str, $prefer, $dup, $aln_score, $idt_score, $pos_score, $pos_score2, $score, ':', @fields);  # @fields carries newline
+                ## ignore if not the first alignment of barcode $bc, orientation $ver, to read $header/$i: almost certainly junk
+                if ($dup) {
+                    $xstats{DUP}{$bc}{$i}{$ver}++;
+                    $xstats{DUP2}{$bc}{$header}{$i}{$ver}++;
+                    $tmpstats{DUP}{$header} = 1;
+                    next;
+                }
+                ## further, only "good enough" alignments used for mapping purposes
+                ## no alignments where adapter was backwards in molecule, or had > 2 mismatches/non-matches
+                unless ($aln_score > 1 && $idt_score > 1) {
+                    print "$xstr, $str | $xside, $side | $prefer\n" if $i == 2 && $report;
+                    $xstats{BAD}{$bc}{$i}{$ver}++;
+                    $tmpstats{BAD}{$header} = 1;
+                    next;
+                }
+                $xstats{GOOD}{$bc}{$i}{$ver}++;
+                $tmpstats{GOOD}{$header} = 1;
+                $tmpstats{S}{$bc} += $score;
+                $tmpstats{N}{$bc}++;
+                $data{$header}{$i}{S}{$bc} = $score if $score > $data{$header}{$i}{S}{$bc};
+                if (exists $data{$header}{$i}{M}{$bc}) {
+                    if ($side==5) {
+                        $data{$header}{$i}{M}{$bc}->[0] = $rstart if $rstart < $data{$header}{$i}{M}{$bc}->[0];
+                        $data{$header}{$i}{M}{$bc}->[1] = $rend if $rend > $data{$header}{$i}{M}{$bc}->[1];
+                    } elsif ($side==3) {
+                        $data{$header}{$i}{M}{$bc}->[2] = $rstart if $rstart < $data{$header}{$i}{M}{$bc}->[2];
+                        $data{$header}{$i}{M}{$bc}->[3] = $rend if $rend > $data{$header}{$i}{M}{$bc}->[3];
+                    }
+                } elsif ($side==5) {
+                    $data{$header}{$i}{M}{$bc} = [$rstart,$rend, 9E9,0];  # 5' adap start, end; 3' adap start, end;
+                } elsif ($side==3) {
+                    $data{$header}{$i}{M}{$bc} = [9E9,0, $rstart,$rend];  # 5' adap start, end; 3' adap start, end;
+                }
+                $data{$header}{$i}{OK}{$bc}->[0] = 1 if $side == 5;
+                $data{$header}{$i}{OK}{$bc}->[1] = 1 if $side == 3;
+            }
+            close $PSL;
+            ## Finish loading %xstats
+            foreach my $bc (@sortbc) {
+                my $none = $npairs - $xstats{GOOD}{$bc}{$i}{$ver} - $xstats{DUP}{$bc}{$i}{$ver} - $xstats{BAD}{$bc}{$i}{$ver};
+                my $avgscore = $tmpstats{S}{$bc}/($tmpstats{N}{$bc}||1);
+                @{ $xstats{TABLE}{$bc}{$ver} }[@xfields] = ($xstats{GOOD}{$bc}{$i}{$ver}, $xstats{DUP}{$bc}{$i}{$ver}, $xstats{BAD}{$bc}{$i}{$ver}, $none, $avgscore);  # for tabular report below
+            }
+            $xstats{GOOD}{ALL}{$i}{$ver} = scalar keys %{ $tmpstats{GOOD} };
+            $xstats{DUP}{ALL}{$i}{$ver} = scalar keys %{ $tmpstats{DUP} }; 
+            $xstats{BAD}{ALL}{$i}{$ver} = scalar keys %{ $tmpstats{BAD} };
+            $xstats{NONE}{ALL}{$i}{$ver} = $npairs - scalar keys %{ $tmpstats{ALL} };
+            @{ $xstats{TABLE}{ALL}{$ver} }[@xfields] = ($xstats{GOOD}{ALL}{$i}{$ver}, $xstats{DUP}{ALL}{$i}{$ver}, $xstats{BAD}{ALL}{$i}{$ver}, $xstats{NONE}{ALL}{$i}{$ver}, '');  # for tabular report below
+            ## Stats message
+            my $msg;
+            foreach my $bc (@sortbc) {
+                my ($good, $dup, $bad, $none, $avgscore) = @{ $xstats{TABLE}{$bc}{$ver} }[@xfields];
+                $msg .= sprintf($nfmt, $i, $barcodes{$bc}{N}, $ver, $good, $dup, $bad, $none, $avgscore);
+            }
+            my ($good, $dup, $bad, $none, $avgscore) = @{ $xstats{TABLE}{ALL}{$ver} }[@xfields];
+            $msg .= sprintf($nfmt, $i, 'ALL', $ver, $good, $dup, $bad, $none, '');
+            &logreport("$sumhead$msg", 1, $LOG);
+        }
+        ## Write DAT file
+        print "Saving DAT file...\n";
+        my %X;
+        $X{xstats} = \%xstats;
+        $X{newstats} = \%newstats;
+        $X{psl} = \%psl;
+        $X{data} = \%data;
+        $X{headers} = \@headers;
+        nstore(\%X, $datfile{$i});
+        %X = ();
+        ## Compress fastas
+        unless ($skip) {
+            &execute("gzip $fa{$i}", 1, $LOG, 2);
+            $fa{$i} .= '.gz';
+        }
+    }
+}
+
+my $TAB = &open2('W', "$demprefix.alignment_counts.txt", 'alignment counts table');
+print $TAB $sumhead2;
+foreach my $bc (@sortbc) {
+    foreach my $ver (@versions) {
+        print $TAB sprintf($nfmt2, $barcodes{$bc}{N}, $ver, @{ $xstats{TABLE}{$bc}{$ver} });
+    }
+}
+foreach my $ver (@versions) {
+    print $TAB sprintf($nfmt2, 'ALL', $ver, @{ $xstats{TABLE}{ALL}{$ver} });
+}
+close $TAB;
+
+
+my (%assignments, %astats);
+&logreport("\nAssigning pairs to barcodes: ".`date`, 1, $LOG);
+my $OUT = &open2('W', "$demprefix.read_scores.txt", "read-barcode scores table");
+push @gzips, "$demprefix.read_scores.txt";
+print $OUT "Header\tBest\tN.Best\tAssigned";
+print $OUT "\tEnd1.$_" foreach @sortbc;
+print $OUT "\tEnd2.$_" foreach @sortbc;
+print $OUT "\tPair.$_" foreach @sortbc;
+print $OUT "\n";
+foreach my $header (@headers) {
+    my (%scores, $line, $assigned);
+    $line .= "\t$data{$header}{1}{S}{$_}" foreach @sortbc;
+    $line .= "\t$data{$header}{2}{S}{$_}" foreach @sortbc;
+    foreach my $bc (@sortbc) {
+        my $pairscore = ($data{$header}{1}{S}{$bc} + $data{$header}{2}{S}{$bc}) / 2;
+        $scores{$pairscore}{$bc} = 1;
+        $line .= "\t$pairscore" foreach @sortbc;
+    }
+    my @sortscores = (sort {$b <=> $a} keys %scores);
+    my ($topscore, $nextscore) = @sortscores[0,1];
+    if ($topscore==0) {
+        $assigned = 'NONE';
+    } else {
+        my @topbc = sort keys %{ $scores{$topscore} };
+        my $ntop = scalar @topbc;
+        my $assign = join(',', @topbc);
+        print $OUT join("\t", $header, $topscore, $ntop, $assign, $line), "\n";
+        if ($ntop>1) {
+            ## ambiguous assignment
+            ## do not assign to barcode
+            $assigned = 'MULTI';
+        } else {
+            ## solitary assignment
+            $assigned = $topbc[0];
+        }
+    }
+    
+    $assignments{$assigned}{$header} = [$topscore, $nextscore];
+    $astats{$assigned}{N}++;
+}
+close $OUT;
+
+my $ahfmt = '%-'.$maxbcn.'s %'.$lnp.'s %7s %'.$lnp.'s %7s'."\n";
+my $anfmt = '%-'.$maxbcn.'s %'.$lnp.'i %7.1f %'.$lnp.'i %7.1f'."\n";
+my $msg = sprintf($ahfmt, qw/ Barcode N % Assigns Percent /);
+foreach my $bc (@sortbc, 'MULTI', 'NONE') {
+    my ($bcname, $bcn, $bcp) = $bc=~/(MULTI|NONE)/ ? ($bc, 'NA', 'NA') : ($barcodes{$bc}{N}, @{ $barcodes{$bc}{S} });
+    $msg .= sprintf($anfmt, $bcname, $bcn, $bcp, $astats{$bc}{N}, 100*$astats{$bc}{N}/$npairs);
+}
+&logreport("$msg\n", 1, $LOG);
+$msg =~ s/ +/\t/g;
+my $ASN = &open2('W', "$demprefix.assignments.txt", 'assignments summary table');
+print $ASN $msg;
+close $ASN;
+
+
+my (%pstats, %mstats, %ostats);  # pattern-stats, mapping-stats, ORF(start,end)-stats
+foreach my $pattern (@patterns) {
+    foreach my $i (1,2) {
+        $mstats{$pattern}{F}{$i} = [0,0,0];
+        foreach my $e (5,3) {
+            $mstats{$pattern}{M}{$i}{$e} = [0,0,0,0,0,0];
+        }
+    }
+}
+
+my $lnp2 = $lnp < 7 ? 7 : $lnp;
+my $plnp2s = '%'.$lnp2.'s';
+my $pattern_err_fmt = '%-6s';
+$pattern_err_fmt .= " $plnp2s" foreach (1..33);
+my $pattern_err = sprintf("$pattern_err_fmt\n", qw/ Pattern TOTAL DIMER MULTI D1<0 D1=0 D1>0 D2<0 D2=0 D2>0 E1B5S<R E1B5S=R E1B5S>R E1B5E<R E1B5E=R E1B5E>R E1B3S<R E1B3S=R E1B3S>R E1B3E<R E1B3E=R E1B3E>R E2B5S<R E2B5S=R E2B5S>R E2B5E<R E2B5E=R E2B5E>R E2B3S<R E2B3S=R E2B3S>R E2B3E<R E2B3E=R E2B3E>R /);
+(my $pattern_err_fmt2 = $pattern_err_fmt) =~ s/s/i/g;
+$pattern_err_fmt2 =~ s/i/s/;  # revert only the first
+
+my $orfpatt_msg_fmt  = '%-'.$maxbcn.'s %7s %'.$lnp.'s'."\n";
+my $orfpatt_msg_fmt2 = '%-'.$maxbcn.'s %7s %'.$lnp.'i'."\n";
+my $orfpatt_msg = sprintf($orfpatt_msg_fmt, qw/ Barcode ORFpatt Count /);
+    
+my $pattern_msg = sprintf('%-'.$maxbcn.'s %6s %6s %'.$lnp.'s %8s %8s'."\n", qw/ Barcode Assign Pattern Counts PctTotal AvgScore /);
+my $pattern_msg_fmt2 = '%-'.$maxbcn.'s %6s %6s %'.$lnp.'i %7.1f %7.1f'."\n";  # BarcodeName Pattern Counts PctTotal AvgScore
+
+system "mkdir -p $outdir/$_" foreach @sortbc;
+
+foreach my $bc (@sortbc, 'MULTI', 'NONE') {
+    my ($bcname, $bcok);
+    if ($bc=~/(MULTI|NONE)/) {
+        ($bcname, $bcok) = ($bc, 0);
+    } else {
+        ($bcname, $bcok) = ($barcodes{$bc}{N}, 1);
+    }
+    my $bcdir = "$outdir/$bcname";  # MAY NOT EXIST
+    my $bcprefix = $bc eq 'MULTI' || $bc eq 'NONE' ? "$demdir/$prefix" : "$bcdir/$prefix";
+    my ($B5L, $B3L) = ( length($barcodes{$bc}{5}{S}), length($barcodes{$bc}{3}{S}) );
+    &logreport(sprintf('Fractionating %-'.$maxbcn.'s reads: %s', $bcname, `date`), 1, $LOG);
+    my $OUT = &open2('W', "$bcprefix.$bcname.read_fractions.txt", "$bcname read fractions file");
+    push @gzips, "$bcprefix.$bcname.read_fractions.txt";
+    print $OUT "Header\tFrMpErr\tPattern\tORFpatt\tTopScore\tNextScore";
+    print $OUT "\tE1.B5.Start\tE1.B5.End\tE1.B3.Start\tE1.B3.End\tE1.Pre-B5\tE1.B5\tE1.Read\tE1.B3\tE1.Post-B3\tE1.Qual";
+    print $OUT "\tE2.B3.Start\tE2.B3.End\tE2.B5.Start\tE2.B5.End\tE2.Pre-B5\tE2.B5\tE2.Read\tE2.B3\tE2.Post-B3\tE2.Qual";
+    print $OUT "\n";
+    my $FQ1 = &open2('W', "$bcprefix.${bcname}_1.fastq.gz", "$bcname end-1 fastq");
+    my $FQ2 = &open2('W', "$bcprefix.${bcname}_2.fastq.gz", "$bcname end-2 fastq");
+    foreach my $header (@headers) {
+        my (%fqReads, %fqQuals, %maps, %short, %fractions, $assigned, $topscore, $nextscore);
+        my $pattern = join('', @{ $data{$header}{1}{OK}{$bc} }, '-', @{ $data{$header}{2}{OK}{$bc} });
+        if (exists $assignments{$bc}{$header}) {
+            ($assigned, $topscore, $nextscore) = (1, @{ $assignments{$bc}{$header} });
+            
+            ## Compile read maps for each end
+            foreach my $i (1, 2) {
+                my @ord = $i==1 ? (0,1,2,3) : (2,3,0,1);
+                my ($b1s, $b1e, $b2s, $b2e) = exists $data{$header}{$i}{M}{$bc} ? @{ $data{$header}{$i}{M}{$bc} }[@ord] : (9E9, 0, 9E9, 0);
+                my $nbc;
+                if ($b1s == 9E9) {  # no barcode alignment
+                    push @{ $maps{$i} }, ('NA', 'NA');
+                } else {
+                    push @{ $maps{$i} }, ($b1s, $b1e);  # 0-based coords
+                    $nbc++;
+                }
+                if ($b2s == 9E9) {  # no barcode alignment
+                    push @{ $maps{$i} }, ('NA', 'NA');
+                } else {
+                    push @{ $maps{$i} }, ($b2s, $b2e);  # 0-based coords
+                    $nbc++;
+                }
+                $short{$i} = 1 if $nbc == 2;  # short fragments match both barcodes
+            }
+            
+            ## Repair patterns with errors.
+            ## All patterns are 1|0 encoding hits for: E1B5 E1B3 - E2B5 E2B3  (ALWAYS ordered 5,3 regardless of end)
+            ## Only 11-11, 10-01, and 00-00 are "complete" patterns -- all others imply errors.
+            ## Always assuming 1s are correct (and thus 0s are fails), and ignoring possibility that 1s are bogus matches.
+            ## All but the last 2 patterns repair to 11-11; the last two repair to 10-01.
+            ## NOTE: only original patterns are shown in output; pattern repairs below are made ONLY for read fractionation.
+            ## For each pattern below, ops MUST be executed in the given order in order for repair to succeed.
+            ## For E1, map array is (B5S, B5E, B3S, B3E) -- 5 THEN 3
+            ## For E2, map array is (B3S, B3E, B5S, B5E) -- 3 THEN 5
+            if ($pattern eq '11-01') {
+                %maps = %{ &repair_E2B5(\%maps,$B5L) };
+            } elsif ($pattern eq '11-10') {
+                %maps = %{ &repair_E2B3(\%maps,$B3L) };
+            } elsif ($pattern eq '01-11') {
+                %maps = %{ &repair_E1B5(\%maps,$B5L) };
+            } elsif ($pattern eq '10-11') {
+                %maps = %{ &repair_E1B3(\%maps,$B3L) };
+            } elsif ($pattern eq '11-00') {
+                %maps = %{ &replace_E2B3(\%maps,$B3L) };
+                %maps = %{ &repair_E2B5(\%maps,$B5L) };
+            } elsif ($pattern eq '00-11') {
+                %maps = %{ &replace_E1B5(\%maps,$B5L) };
+                %maps = %{ &repair_E1B3(\%maps,$B3L) };
+            } elsif ($pattern eq '01-10') {
+                %maps = %{ &replace_E1B5(\%maps,$B5L) };
+                %maps = %{ &replace_E2B3(\%maps,$B3L) };
+            } elsif ($pattern eq '10-10') {
+                %maps = %{ &replace_E2B3(\%maps,$B3L) };
+                %maps = %{ &repair_E1B3(\%maps,$B3L) };
+            } elsif ($pattern eq '01-01') {
+                %maps = %{ &replace_E1B5(\%maps,$B5L) };
+                %maps = %{ &repair_E2B5(\%maps,$B5L) };
+            } elsif ($pattern eq '01-00') {
+                %maps = %{ &replace_E1B5(\%maps,$B5L) };
+                %maps = %{ &replace_E2B3(\%maps,$B3L) };
+                %maps = %{ &repair_E1B3(\%maps,$B3L) };
+            } elsif ($pattern eq '00-10') {
+                %maps = %{ &replace_E2B3(\%maps,$B3L) };
+                %maps = %{ &replace_E1B5(\%maps,$B5L) };
+                %maps = %{ &repair_E1B3(\%maps,$B3L) };
+            } elsif ($pattern eq '10-00') {
+                %maps = %{ &replace_E2B3(\%maps,$B3L) };  # repairs to 10-01
+            } elsif ($pattern eq '00-01') {
+                %maps = %{ &replace_E1B5(\%maps,$B5L) };  # repairs to 10-01
+            }
+            
+            ## Adapter-dimer detection
+            my ($b1s1, $b1e1, $b2s1, $b2e1) = @{ $maps{1} };
+            my ($b1s2, $b1e2, $b2s2, $b2e2) = @{ $maps{2} };
+            my (@fragmaperr, $ORFpatt);
+            my $dimer = ( ($b2s1 ne 'NA' && $b1e1 ne 'NA' && $b2s1<=$b1e1) || ($b2s2 ne 'NA' && $b1e2 ne 'NA' && $b2s2<=$b1e2) ) ? 1 : 0;
+            
+            ## Fractionate reads
+            @fragmaperr = (0, 0);  # errors with mapping (0|1), errors with fragmentation (0|1)
+            foreach my $i (1, 2) {
+                my $b1t = $i == 1 ? 5 : 3;
+                my $b2t = $i == 1 ? 3 : 5;
+                my ($seq, $qual) = @{ $data{$header}{$i}{R} };
+                my $seqlen = length($seq);
+                my ($b1s, $b1e, $b2s, $b2e) = @{ $maps{$i} };
+                @{ $fractions{$i} } = (' ', ' ', ' ', ' ', ' ');   # SPACES NOT EMPTIES: when viewing in Excel, these will terminate display of strings in previous columns
+                my ($okstart, $okend);
+                if ($b1s eq 'NA') {  # no alignment
+                    $okstart = 1;
+                } else {
+                    my $b1l = $barcodes{$bc}{$b1t}{L};
+                    if ($b1e-$b1s >= 2*$b1l) {
+                        $mstats{$pattern}{D2}++;  # "the other dimer"
+                        $mstats{$pattern}{T}++;
+                        $fragmaperr[0] = 2;   # multiple adapters on one end -- library construction problem
+                        $b1s = $b1e - $b1l;   # taking only the 3'-most adapter match
+                    } elsif ($b1s < 0) {
+                        $mstats{$pattern}{M}{$i}{$b1t}->[0]++;  # too low
+                        $mstats{$pattern}{T}++;
+                        $fragmaperr[0] = 1;
+                        $b1s = 0;
+                    } elsif ($b1s > $seqlen) {
+                        $mstats{$pattern}{M}{$i}{$b1t}->[2]++;  # too high
+                        $mstats{$pattern}{T}++;
+                        $fragmaperr[0] = 1;
+                        $b1s = $seqlen;
+                    } else {
+                        $mstats{$pattern}{M}{$i}{$b1t}->[1]++;  # ok range
+                    }
+                    if ($b1e < 0) {
+                        $mstats{$pattern}{M}{$i}{$b1t}->[3]++;  # too low
+                        $mstats{$pattern}{T}++;
+                        $fragmaperr[0] = 1;
+                        $b1e = 0;
+                    } elsif ($b1e > $seqlen) {
+                        $mstats{$pattern}{M}{$i}{$b1t}->[5]++;  # too high
+                        $mstats{$pattern}{T}++;
+                        $fragmaperr[0] = 1;
+                        $b1e = $seqlen;
+                    } else {
+                        $mstats{$pattern}{M}{$i}{$b1t}->[4]++;  # ok range
+                    }
+                    $fractions{$i}->[0] = substr($seq, 0, $b1s) if $b1s > 0;
+                    $fractions{$i}->[1] = substr($seq, $b1s, $b1e-$b1s);
+                    $okstart = $b1e;
+                }
+                if ($b2s eq 'NA') {  # no alignment
+                    $okend = $seqlen+1;
+                } else {
+                    my $b2l = $barcodes{$bc}{$b2t}{L};
+                    if ($b2e-$b2s >= 2*$b2l) {
+                        $mstats{$pattern}{D2}++;  # "the other dimer"
+                        $mstats{$pattern}{T}++;
+                        $fragmaperr[0] = 2;   # multiple adapters on one end -- library construction problem
+                        $b2s = $b2s + $b2l;   # taking only the 5'-most adapter match
+                    } elsif ($b2s < 0) {
+                        $mstats{$pattern}{M}{$i}{$b2t}->[0]++;  # too low
+                        $mstats{$pattern}{T}++;
+                        $fragmaperr[0] = 1;
+                        $b2s = 0;
+                    } elsif ($b2s > $seqlen) {
+                        $mstats{$pattern}{M}{$i}{$b2t}->[2]++;  # too high
+                        $mstats{$pattern}{T}++;
+                        $fragmaperr[0] = 1;
+                        $b2s = $seqlen;
+                    } else {
+                        $mstats{$pattern}{M}{$i}{$b2t}->[1]++;  # ok range
+                    }
+                    if ($b2e < 0) {
+                        $mstats{$pattern}{M}{$i}{$b2t}->[3]++;  # too low
+                        $mstats{$pattern}{T}++;
+                        $fragmaperr[0] = 1;
+                        $b2e = 0;
+                    } elsif ($b2e > $seqlen) {
+                        $mstats{$pattern}{M}{$i}{$b2t}->[5]++;  # too high
+                        $mstats{$pattern}{T}++;
+                        $fragmaperr[0] = 1;
+                        $b2e = $seqlen;
+                    } else {
+                        $mstats{$pattern}{M}{$i}{$b2t}->[4]++;  # ok range
+                    }
+                    $fractions{$i}->[3] = substr($seq, $b2s, $b2e-$b2s);
+                    $fractions{$i}->[4] = substr($seq, $b2e, $seqlen) if $b2e < $seqlen;
+                    $okend = $b2s;
+                }
+                $fqReads{$i} = substr($seq, $okstart, $okend-$okstart);
+                $fqQuals{$i} = substr($qual, $okstart, $okend-$okstart);
+                $fractions{$i}->[2] = $fqReads{$i};
+                if ($i==2) {
+                    $fractions{$i}->[$_] = ${ &revcomp($fractions{$i}->[$_]) } foreach (0..3);  # DO NOT revcomp post-B5 sequence: expected to be sequencing adapter; want this sequence as-is
+                    @{ $fractions{$i} } = reverse @{ $fractions{$i} };
+                }
+                $fractions{$i}->[5] = $i==1 ? $fqQuals{$i} : reverse($fqQuals{$i});  # quality goes last, no matter which end (so do this AFTER reversing the end-2 array)
+                ## Mapping and fragmenting QC
+                my $fraglen;
+                foreach (0..4) {
+                    $fraglen += length($fractions{$i}->[$_]) if $fractions{$i}->[$_] =~ /\S/;
+                }
+                if ($fraglen-$seqlen == 0) {
+                    $mstats{$pattern}{F}{$i}->[1]++;  # expected
+                } elsif ($fraglen-$seqlen > 0) {
+                    $mstats{$pattern}{F}{$i}->[2]++;  # over-cut fragments (too many total bp)
+                    $mstats{$pattern}{T}++;
+                    $fragmaperr[1] = 1;
+                } elsif ($fraglen-$seqlen < 0) {
+                    $mstats{$pattern}{F}{$i}->[0]++;  # under-cut fragments (too few total bp)
+                    $mstats{$pattern}{T}++;
+                    $fragmaperr[1] = 1;
+                } else {
+                    print STDERR "WARNING: Cannot reconcile fragment length to read length! $bcname $header $i ($fraglen) ($seqlen)\n";
+                }
+                ## ORF start, end QC
+                $data{$header}{$i}{ORF_OK}{$bc}->[0] = $fractions{$i}->[1] =~ /$barcodes{$bc}{5}{E}$/ ? 1 : 0;  # 5' barcode end (5bp) matches correctly?
+                $data{$header}{$i}{ORF_OK}{$bc}->[1] = $fractions{$i}->[3] =~ /^$barcodes{$bc}{3}{B}/ ? 1 : 0;  # 3' barcode start (5bp) matches correctly?
+                if ($header eq $watch) {
+                    print "FRAGLEN $i: $fraglen (@fragmaperr)\n";
+                    foreach (0..4) {
+                        my $fs = $fractions{$i}->[$_];
+                        my $fl = $fs =~ /\S/ ? length($fs) : 0;
+                        print "LEN $i $_: $fl\n" ;
+                    }
+                }
+            }
+            
+            ## Write out final data + fastq records
+            $maps{1}->[0]++ if $maps{1}->[0] ne 'NA';  # write out 1-based coords
+            $maps{1}->[2]++ if $maps{1}->[2] ne 'NA';  # write out 1-based coords
+            $maps{2}->[0]++ if $maps{2}->[0] ne 'NA';  # write out 1-based coords
+            $maps{2}->[2]++ if $maps{2}->[2] ne 'NA';  # write out 1-based coords
+            if ($dimer) {
+                $mstats{$pattern}{D}++;  # only once per header (not per end)
+                @fragmaperr = (3, 3);    # special adapter dimer pattern
+                $ORFpatt = 'NA-NA';      # "
+                $fractions{1}->[2] = $fractions{2}->[2] = '';
+            } else {
+                $ORFpatt = '5' . ($data{$header}{1}{ORF_OK}{$bc}->[0]+$data{$header}{2}{ORF_OK}{$bc}->[0]) . '-3' . ($data{$header}{1}{ORF_OK}{$bc}->[1]+$data{$header}{2}{ORF_OK}{$bc}->[1]);
+            }
+            $ostats{$bc}{$ORFpatt}++;
+            print $OUT join("\t", $header, join('.',@fragmaperr), $pattern, $ORFpatt, $topscore, $nextscore, @{ $maps{1} }, @{ $fractions{1} }, @{ $maps{2} }, @{ $fractions{2} }), "\n";
+            unless ($dimer) {
+                print $FQ1 '@'."$header\n$fqReads{1}\n+\n$fqQuals{1}\n";
+                print $FQ2 '@'."$header\n$fqReads{2}\n+\n$fqQuals{2}\n";
+            }
+        }
+        
+        $pstats{$bc}{$assigned}{$pattern}{S} += $topscore/2;  ############### FIXME?  /2?
+        $pstats{$bc}{$assigned}{$pattern}{N}++;
+        $pstats{$bc}{$assigned}{ALL}++;
+    }
+    close $OUT;
+    close $FQ1;
+    close $FQ2;
+    
+    $orfpatt_msg .= sprintf($orfpatt_msg_fmt2, $bcname, $_, $ostats{$bc}{$_}||0) foreach @ORFpatterns;
+    foreach my $assigned (1,0) {
+        my $label = $assigned ? 'ASSIGN' : 'UNASSN';
+        foreach my $pattern (sort { $pstats{$bc}{$assigned}{$b}{N} <=> $pstats{$bc}{$assigned}{$a}{N} } @patterns) {
+            $pattern_msg .= sprintf($pattern_msg_fmt2, $bcname, $label, $pattern, $pstats{$bc}{$assigned}{$pattern}{N}, 100*$pstats{$bc}{$assigned}{$pattern}{N}/$npairs, $pstats{$bc}{$assigned}{$pattern}{S}/($pstats{$bc}{$assigned}{$pattern}{N}||1)) if $pstats{$bc}{$assigned}{$pattern};
+        }
+    }
+}
+
+foreach my $pattern (@patterns) {
+    $pattern_err .= sprintf("$pattern_err_fmt2\n", $pattern, $mstats{$pattern}{T}, $mstats{$pattern}{D}, $mstats{$pattern}{D2}, @{ $mstats{$pattern}{F}{1} }, @{ $mstats{$pattern}{F}{2} }, @{ $mstats{$pattern}{M}{1}{5} }, @{ $mstats{$pattern}{M}{1}{3} }, @{ $mstats{$pattern}{M}{2}{5} }, @{ $mstats{$pattern}{M}{2}{3} });
+}
+
+&logreport("\nWriting patterns tables...", 1, $LOG);
+my $ERR = &open2('W', "$demprefix.pattern-errors.txt", 'pattern errors table');
+print $ERR $pattern_err;
+close $ERR;
+my $TAB = &open2('W', "$demprefix.patterns.txt", 'barcode patterns table');
+print $TAB $pattern_msg;
+close $TAB;
+my $ORF = &open2('W', "$demprefix.ORF-patterns.txt", 'barcode ORF-patterns table');
+print $ORF $orfpatt_msg;
+close $ORF;
+print "$pattern_err\n$orfpatt_msg\n$pattern_msg";
+
+
+&logreport("\n", 1, $LOG);
+foreach my $bc (sort keys %newpsl) {
+    my $bcname = $barcodes{$bc}{N};
+    &logreport("Writing barcode $bcname extended blat datasets...", 1, $LOG);
+    my $OUT = &open2('W', "$bcprefix.blat_assigned_$bcname.txt", "$bcname-assigned extended blat dataset: $bc");
+    push @gzips, "$bcprefix.blat_assigned_$bcname.txt";
+    print $OUT join("\t", qw/ Assigned End Barcode Version ExpSide ExpStr ObsSide ObsStr Preferred DupAln AlnScore IdtScore PosScore PosScore2 Score : Matches Mismatches RepMatches Ns QGapN QGapBp TGapN TGapBp Strand Query QLen QStart QEnd Target TLen TStart TEnd Blocks BlockSizes QStarts TStarts /), "\n";
+    foreach my $header (@headers) {
+        next unless $assignments{$bc}{$header};
+        if (exists $newpsl{$bc}{$header}{1}) {
+            print $OUT "1\t$_" foreach @{ $newpsl{$bc}{$header}{1} };
+        }
+        if (exists $newpsl{$bc}{$header}{2}) {
+            print $OUT "1\t$_" foreach @{ $newpsl{$bc}{$header}{2} };
+        }
+    }
+    close $OUT;
+    my $OUT = &open2('W', "$bcprefix.blat_unassigned_$bcname.txt", "$bcname-unassigned extended blat dataset: $bc");
+    push @gzips, "$bcprefix.blat_unassigned_$bcname.txt";
+    print $OUT join("\t", qw/ Assigned End Barcode Version ExpSide ExpStr ObsSide ObsStr Preferred DupAln AlnScore IdtScore PosScore PosScore2 Score Matches Mismatches RepMatches Ns QGapN QGapBp TGapN TGapBp Strand Query QLen QStart QEnd Target TLen TStart TEnd Blocks BlockSizes QStarts TStarts /), "\n";
+    foreach my $header (@headers) {
+        next if $assignments{$bc}{$header};
+        if (exists $newpsl{$bc}{$header}{1}) {
+            print $OUT "0\t$_" foreach @{ $newpsl{$bc}{$header}{1} };
+        }
+        if (exists $newpsl{$bc}{$header}{2}) {
+            print $OUT "0\t$_" foreach @{ $newpsl{$bc}{$header}{2} };
+        }
+    }
+    close $OUT;
+}
+
+unless ($skip) {
+    &execute("gzip -f $_", 1, $LOG, 2) foreach @gzips;
+}
+#&execute("rm -rf $tmp", 1, $LOG, 2);
+&logreport("$0 complete: ".`date`, 1, $LOG);
+system "kill $$";  # rapid exit
+
+
+
+
+
+
+sub replace_E1B5 {
+    my %MAPS = %{$_[0]};
+    my $B5L = $_[1];
+    @{ $MAPS{1} }[0,1] = (0, $B5L);  # E1 B5 assumed coords
+    return \%MAPS;
+}
+
+sub replace_E2B3 {
+    my %MAPS = %{$_[0]};
+    my $B3L = $_[1];
+    @{ $MAPS{2} }[0,1] = (0, $B3L);  # E2 B3 assumed coords
+    return \%MAPS;
+}
+
+sub repair_E1B5 {
+    my %MAPS = %{$_[0]};
+    my ($E1B5S, $E1B5E, $E1B3S, $E1B3E) = @{ $MAPS{1} };
+    my ($E2B3S, $E2B3E, $E2B5S, $E2B5E) = @{ $MAPS{2} };
+    my $B5L = $_[1];
+    my $RL = $E2B5S-$E2B3E;           # read length (region between barcodes)
+    $MAPS{1}->[0] = $E1B3S-$RL-$B5L;  # E1 B5 start, based on end and barcode length
+    $MAPS{1}->[1] = $E1B3S-$RL;       # E1 B5 end, based on E1 B3 start and read length
+    return \%MAPS;
+}
+
+sub repair_E1B3 {
+    my %MAPS = %{$_[0]};
+    my ($E1B5S, $E1B5E, $E1B3S, $E1B3E) = @{ $MAPS{1} };
+    my ($E2B3S, $E2B3E, $E2B5S, $E2B5E) = @{ $MAPS{2} };
+    my $B3L = $_[1];
+    my $RL = $E2B5S-$E2B3E;           # read length (region between barcodes)
+    $MAPS{1}->[2] = $E1B5E+$RL;       # E1 B3 start, based on E1 B5 end and read length
+    $MAPS{1}->[3] = $E1B5E+$RL+$B3L;  # E1 B3 end, based on end and barcode length
+    return \%MAPS;
+}
+
+sub repair_E2B5 {
+    my %MAPS = %{$_[0]};
+    my ($E1B5S, $E1B5E, $E1B3S, $E1B3E) = @{ $MAPS{1} };
+    my ($E2B3S, $E2B3E, $E2B5S, $E2B5E) = @{ $MAPS{2} };
+    my $B5L = $_[1];
+    my $RL = $E1B3S-$E1B5E;           # read length (region between barcodes)
+    $MAPS{2}->[2] = $E2B3E+$RL;       # E2 B5 start, based on end and barcode length
+    $MAPS{2}->[3] = $E2B3E+$RL+$B5L;  # E2 B5 end, based on E2 B3 start and read length
+    return \%MAPS;
+}
+
+sub repair_E2B3 {
+    my %MAPS = %{$_[0]};
+    my ($E1B5S, $E1B5E, $E1B3S, $E1B3E) = @{ $MAPS{1} };
+    my ($E2B3S, $E2B3E, $E2B5S, $E2B5E) = @{ $MAPS{2} };
+    my $B3L = $_[1];
+    my $RL = $E1B3S-$E1B5E;           # read length (region between barcodes)
+    $MAPS{2}->[0] = $E2B5E-$RL-$B3L;  # E2 B3 start, based on E2 B5 end and read length
+    $MAPS{2}->[1] = $E2B5E-$RL;       # E2 B3 end, based on end and barcode length
+    return \%MAPS;
+}
+
+

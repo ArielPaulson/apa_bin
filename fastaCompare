@@ -1,0 +1,254 @@
+#!/usr/bin/env perl
+use Data::Dumper;
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+## Under construction.
+## Compares fasta sequences in two files.
+## BOTH FASTAS MUST HAVE SAME HEADERS.
+die;
+
+
+## Inputs
+my $fa1;   # fasta 1
+my $fa2;   # fasta 2 
+my $fast;  # perform rapid similarity scan (binary yes/no for diffs; no bp diff details): e.g. on mm10, fast = 2 min, regular = 1 hr.
+
+
+
+## Get/test arguments
+my @args = @ARGV;
+GetOptions("g=s"=>\$genome, "o=s"=>\$outlog, "p1=s"=>\$p1string, "p2=s"=>\$p2string, "fast"=>\$fast);
+
+my $root = '/n/projects/apa/stuff/bowtie_building';
+my $aliasfile = "$root/chrom.aliases/$genome.chrom_aliases.txt";
+die "$0: Failed to resolve chromosome aliases file '$aliasfile'!\n" unless -e $aliasfile;
+my ($prov1, $fasta1) = split /=/, $p1string;
+my ($prov2, $fasta2) = split /=/, $p2string;
+
+
+
+## Other globals
+my %aliases;  # chromosome aliases
+my %fafiles;  # fasta files
+my %fanames;  # fasta seq names
+my %faseqs;   # fasta sequences
+my %stats;    # comparison results
+my %stats2;   # comparison results, summarized
+my $f1file;   # fasta 1 file
+my $f2file;   # fasta 2 file;
+
+
+
+## Read aliases
+open my $CA, $aliasfile or die "$0: Failed to read '$aliasfile': $!\n";
+my (@anames, $prov1N, $prov2N);
+while (<$CA>) {
+    my @fields = split /\t/, $_;
+    $fields[$#fields] =~ s/[\n\r]+$//;
+    if ($. == 1) {
+	@anames = @fields;
+	foreach my $i (0..$#anames) {
+	    if ($anames[$i] eq $prov1) {
+		if ($prov1N) {
+		    die "More than one ID column of type '$prov1' found in alias file '$aliasfile'.\n" if defined $prov1N;
+		} else {
+		    $prov1N = $i;  # 0-BASED
+		}
+	    } elsif ($anames[$i] eq $prov2) {
+		if ($prov2N) {
+		    die "More than one ID column of type '$prov2' found in alias file '$aliasfile'.\n" if defined $prov2N;
+		} else {
+		    $prov2N = $i;  # 0-BASED
+		}
+	    }
+	}
+	die "Could not find 'from' ID type '$prov1' in alias file '$aliasfile'.\n" unless defined $prov1N;
+	die "Could not find 'to' ID type '$prov2' in alias file '$aliasfile'.\n" unless defined $prov2N;
+    } else {
+	$stats2{ALIASES}{1}++ if $fields[$prov1N];
+	$stats2{ALIASES}{2}++ if $fields[$prov2N];
+	die "Malformed line $. in alias file '$aliasfile': expecting ",scalar(@anames)," fields, got ",scalar(@fields),".\n" if $#fields != $#anames;
+	if (defined $aliases{1}{$fields[$prov1N]}) {
+	    die "Malformed alias file '$aliasfile': $prov1 chromosome '$fields[$prov1N]' exists on multiple lines!\n";
+	} elsif (defined $aliases{2}{$fields[$prov2N]}) {
+	    die "Malformed alias file '$aliasfile': $prov2 chromosome '$fields[$prov2N]' exists on multiple lines!\n";
+	} elsif ($fields[$prov1N] && $fields[$prov2N]) {
+	    ## will not record blank aliases, i.e. blank entries for aliases missing from the other provider
+	    $aliases{1}{$fields[$prov1N]} = $fields[$prov2N];
+	    $aliases{2}{$fields[$prov2N]} = $fields[$prov1N];
+	} else {
+	    ## one of these chroms has no equivalent; ignore
+	}
+    }
+    
+}
+close $CA;
+
+
+
+## Test files first
+if ($fasta1 !~ /^(ht|f)tp:/) {
+    die "$0: Cannot locate provider 1 fasta '$fasta1'!\n" unless -e $fasta1;
+    $fafiles{1} = $fasta1;
+}
+if ($fasta2 !~ /^(ht|f)tp:/) {
+    die "$0: Cannot locate provider 2 fasta '$fasta2'!\n" unless -e $fasta2;
+    $fafiles{2} = $fasta2;
+}
+
+
+
+## Test write handle
+my $LOG;
+if ($outlog) {
+    open $LOG, '>', $outlog or die "$0: Failed to open output log '$outlog' for writing: $!\n";
+} else {
+    $LOG = *STDOUT;
+}
+print $LOG "Function call: $0 @args\nDate: ".`date`;
+
+
+
+## Then downloads, if any
+if ($fasta1 =~ /^(ht|f)tp:/) {
+    ($fafiles{1} = $fasta1) =~ s!^.*/!!;
+    $fafiles{1} = "$root/fastas/$fafiles{1}";
+    unless (-e $fafiles{1}) {
+	print STDERR "Downloading '$fasta1' to '$fafiles{1}': ",`date`;
+	system "wget -O $fafiles{1} $fasta1";
+    }
+}
+if ($fasta2 =~ /^(ht|f)tp:/) {
+    ($fafiles{2} = $fasta2) =~ s!^.*/!!;
+    $fafiles{2} = "$root/fastas/$fafiles{2}";
+    unless (-e $fafiles{2}) {
+	print STDERR "Downloading '$fasta2' to '$fafiles{2}': ",`date`;
+	system "wget -O $fafiles{2} $fasta2";
+    }
+}
+
+
+
+## Read fastas
+my ($IN, $header);
+foreach my $i (1,2) {
+    print STDERR "Reading fasta $i: ",`date`;
+    if ($fafiles{$i} =~ /\.gz$/) {
+	open $IN, '-|', "gunzip -c $fafiles{$i}" or die "$0: Failed to read fasta $i file '$fafiles{$i}': $!\n";
+    } else {
+	open $IN, '<', $fafiles{$i} or die "$0: Failed to read fasta $i file '$fafiles{$i}': $!\n";
+    }
+    while (<$IN>) {
+	$_ =~ s/[\n\r]+$//;
+	if ($_ =~ /^>(\S+)/) {
+	    $header = $1;
+	    print STDERR " $header";
+	    push @{ $fanames{$i} }, $header;
+	    $stats2{SEQUENCES}{$i}++;
+	} else {
+	    $faseqs{$i}{$header} .= "\U$_";
+	}   
+    }
+    close $IN;
+    print STDERR "\n";
+}
+
+
+
+## Check aliases vs fasta names
+foreach my $i (1,2) {
+    my $j = $i == 1 ? 2 : 1;
+    foreach my $header (keys %{ $aliases{$i} }) {
+	unless (exists $faseqs{$i}{$header}) {
+	    ## In alias file, but not fasta
+	    $stats{LOST_IN_FA}{$i}{$header} = 1;
+	    $stats2{LOST_IN_FA}{$i}++;
+	}
+	if (exists $aliases{$j}{ $aliases{$i}{$header} }) {
+	    $stats2{COMPARABLE}{$i}++;
+	} else {
+	    ## No matching sequence from other provider was found in aliases file
+	    $stats{INCOMPARABLE}{$i}{$header} = 1;
+	    $stats2{INCOMPARABLE}{$i}++;
+	}
+    }
+    foreach my $header (@{ $fanames{$i} }) {
+	unless (exists $aliases{$i}{$header}) {
+	    ## In fasta, but not alias file
+	    $stats{LOST_IN_AL}{$i}{$header} = 1;
+	    $stats2{LOST_IN_AL}{$i}++;
+	}
+    }
+}
+
+
+
+## Compare fastas
+print STDERR "Comparing sequences...\n";
+foreach my $header1 (sort keys %{ $aliases{1} }) {
+    if ($fast) {
+	print STDERR " $header1";
+    } else {
+	print STDERR " $header1: ",`date`;
+    }
+    my $header2 = $aliases{1}{$header1};
+    if (exists $faseqs{1}{$header1} && exists $faseqs{2}{$header2}) {
+	$stats2{COMPARED}++;
+	my $len1 = length($faseqs{1}{$header1});
+	my $len2 = length($faseqs{2}{$header2});
+	if ( ($len1 != $len2) || ($faseqs{1}{$header1} ne $faseqs{2}{$header2}) ) {
+	    $stats{COMP}{$header1} = [$header2, $len1, $len2, 'FALSE'];
+	    $stats2{SAME}{FALSE}++;
+	} else {
+	    $stats{COMP}{$header1} = [$header2, $len1, $len2, 'TRUE'];
+	    $stats2{SAME}{TRUE}++;
+	}
+	if (!$fast && $len1 == $len2) {
+	    my @seq1 = split //, $faseqs{1}{$header1};
+	    my @seq2 = split //, $faseqs{2}{$header2};
+	    my (%bp, %xo);
+	    for (my $i = 0; $i <= $#seq1; $i++) {
+		$bp{$seq1[$i]} = 1;
+		$bp{$seq2[$i]} = 1;
+		$xo{$seq1[$i]}{$seq2[$i]}++;
+	    }
+	    my @bases = sort keys %bp;
+	    my @matrix = map { [map {0} @bases] } @bases;  # symmetric matrix as array-of-arrays
+	    my $printmat;
+	    foreach my $i (0..$#bases) {
+		foreach my $j (0..$#bases) {
+		    $matrix[$i][$j] = $xo{$bases[$i]}{$bases[$j]}||0;
+		}
+		$printmat .= join("\t", "\t", $bases[$i], @{ $matrix[$i] })."\n";
+	    }
+	    push @{ $stats{COMP}{$header1} }, join("\t",'',@bases)."\n$printmat";
+	}
+    }
+}
+
+
+
+## Print results
+print $LOG "\nAliases not in Fastas:\n",Dumper(\%{ $stats{LOST_IN_FA} }),"\n";
+print $LOG "\nFastas not in Aliases:\n",Dumper(\%{ $stats{LOST_IN_AL} }),"\n";
+print $LOG "\nIncomparable Aliases:\n",Dumper(\%{ $stats{INCOMPARABLE} }),"\n\n";
+foreach (sort keys %{ $stats{COMP} }) {
+    print $LOG join("\t",$_,@{ $stats{COMP}{$_} }[0..3]),"\n";
+    print $LOG $stats{COMP}{$_}->[4] unless $fast;
+}
+my $maxn = (sort {$b <=> $a} ($stats2{ALIASES}{1}, $stats2{ALIASES}{2}, $stats2{SEQUENCES}{1}, $stats2{SEQUENCES}{2}))[0];
+my $maxnw = length($maxn);
+my $provw = length($prov1);
+$provw = length($prov2) if length($prov2) > $provw;
+printf $LOG "\nTOTAL ALIASES:                        %-${provw}s %${maxnw}d; %-${provw}s %${maxnw}d\n", $prov1, $stats2{ALIASES}{1}||0, $prov2, $stats2{ALIASES}{2}||0;
+printf $LOG "TOTAL SEQUENCES:                      %-${provw}s %${maxnw}d; %-${provw}s %${maxnw}d\n", $prov1, $stats2{SEQUENCES}{1}||0, $prov2, $stats2{SEQUENCES}{2}||0;
+printf $LOG "EXPECTED ALIASES MISSING FROM FASTAS: %-${provw}s %${maxnw}d; %-${provw}s %${maxnw}d\n", $prov1, $stats2{LOST_IN_FA}{1}||0, $prov2, $stats2{LOST_IN_FA}{2}||0;
+printf $LOG "FASTA SEQUENCES MISSING FROM ALIASES: %-${provw}s %${maxnw}d; %-${provw}s %${maxnw}d\n", $prov1, $stats2{LOST_IN_AL}{1}||0, $prov2, $stats2{LOST_IN_AL}{2}||0;
+printf $LOG "SEQUENCES FROM ONE PROVIDER ONLY:     %-${provw}s %${maxnw}d; %-${provw}s %${maxnw}d\n", $prov1, $stats2{INCOMPARABLE}{1}||0, $prov2, $stats2{INCOMPARABLE}{2}||0;
+printf $LOG "COMPARABLE SEQUENCES WERE IDENTICAL:  %-${provw}s %${maxnw}d; %-${provw}s %${maxnw}d; COMPARED %${maxnw}d\n", 'Yes', $stats2{SAME}{TRUE}||0, 'No', $stats2{SAME}{FALSE}||0, $stats2{COMPARED}||0;
+print STDERR "\ncompareFastas complete: ",`date`;
+system "kill $$" if !$fast;
+exit;

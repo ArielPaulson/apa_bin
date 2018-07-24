@@ -1,0 +1,125 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+###### WARNING: DO NOT USE ON GENOTYPED OR EFFECT-PREDICTED VCFS
+
+
+## Does a number of things:
+## 1. Removes junk-alt records, e.g. ".", "X", "-", etc, or containing Ns.
+## 2. Removes junk-ref records, e.g. "( 1020bp deletion )", etc, or containing Ns.
+## 2. Removes records where alt == ref.
+## 3. Converts degenerate-base alts to multiple real-base alts.
+## 4. Splits multi-alt and/or multi-ref positions into separate single-alt / single-ref records, if desired.
+## 5. Removes records with depth below some threshold, if desired.
+## 
+## Junk is removed first; depth is tested afterwards
+
+
+## Inputs
+my $invcf;
+my $outvcf;
+my $mindepth;
+my $split;
+
+GetOptions("i=s"=>\$invcf, "o=s"=>\$outvcf, "d=i"=>\$mindepth, "split"=>\$split);
+
+
+my $degens = '[WKSMRYBVDH]';  # NOT N
+my %ACGT = ( "N"=>["A","C","G","T"], "H"=>["A","C","T"], "V"=>["A","C","G"], "D"=>["A","G","T"], "B"=>["C","G","T"], "M"=>["A","C"], "W"=>["A","T"], "K"=>["G","T"], "S"=>["C","G"], "Y"=>["C","T"], "R"=>["A","G"], "A"=>["A"], "C"=>["C"], "G"=>["G"], "T"=>["T"] );
+
+my %stats;
+(my $dropvcf = $outvcf) =~ s/\.vcf/.vcfCleaner-removed.vcf/;
+my $IN = &open2('R', $invcf, 'input vcf');
+my $OUT = &open2('W', $outvcf, 'output vcf');
+my $DROP = &open2('W', $dropvcf, 'dropped-records vcf');
+while (<$IN>) {
+    if (/^#/) {
+        if (/^##/) {
+            print $OUT $_;
+            print $DROP $_;
+        } else {
+            print $OUT $_;
+            s/^#//;
+            print $DROP "#REASON\t$_";
+        }
+        $stats{HEADER}++;
+    } else {
+        $stats{INPUT}++;
+        my ($chr, $pos, $id, $ref, $alt, $filt, $etc) = split /\t/, $_, 7;
+        my @refs = $split ? (split /,/, $ref) : ($ref);
+        my @alts = $split ? (split /,/, $alt) : ($alt);
+        $stats{MULTREF}++ if $#refs > 0;
+        $stats{MULTALT}++ if $#alts > 0;
+        my @out;
+        foreach my $alt2 (@alts) {
+            if ($ref =~ /[.X -]/) {
+                print $DROP join("\t", 'REFJUNK', $chr, $pos, $id, $ref, $alt2, $filt, $etc);
+                $stats{REFJUNK}++;
+            } elsif ($alt2 =~ /[.X -]/) {
+                print $DROP join("\t", 'ALTJUNK', $chr, $pos, $id, $ref, $alt2, $filt, $etc);
+                $stats{ALTJUNK}++;
+            } elsif ($alt eq $ref) {
+                print $DROP join("\t", 'EQREF', $chr, $pos, $id, $ref, $alt2, $filt, $etc);
+                $stats{EQREF}++;
+            } elsif ($ref =~ /N/) {
+                print $DROP join("\t", 'REF_N', $chr, $pos, $id, $ref, $alt2, $filt, $etc);
+                $stats{REF_N}++;
+            } elsif ($alt =~ /N/) {
+                print $DROP join("\t", 'ALT_N', $chr, $pos, $id, $ref, $alt2, $filt, $etc);
+                $stats{ALT_N}++;
+            } elsif ($alt =~ /$degens/) {
+                if (length($alt2)==1) {
+                    ## single degen SNP
+                    if ($split) {
+                        foreach my $true (@{ $ACGT{$alt2} }) {
+                            push @out, join("\t", $chr, $pos, $id, $_, $true, $filt, $etc) foreach @refs;
+                        }
+                    } else {
+                        push @out, join("\t", $chr, $pos, $id, $ref, join(',',@{ $ACGT{$alt2} }), $filt, $etc);
+                    }
+                    $stats{DEG_OK}++;
+                 } elsif ($alt2 =~ /,/ && !$split) {
+                    ## Multi-variant site w/ degens, but not splitting: drop it
+                    print $DROP join("\t", 'EQREF', $chr, $pos, $id, $ref, $alt2, $filt, $etc);
+                    $stats{DEG_NOK}++;
+                } else {
+                    ## MNP with degen(s) -- NOT going to do kmer expansion; please create a VCF that does not suck.
+                    print $DROP join("\t", 'EQREF', $chr, $pos, $id, $ref, $alt2, $filt, $etc);
+                    $stats{DEG_MNP}++;
+                }
+                $stats{DEGEN}++;
+            } else {
+                if ($split) {
+                    push @out, join("\t", $chr, $pos, $id, $_, $alt2, $filt, $etc) foreach @refs;
+                } else {
+                    push @out, join("\t", $chr, $pos, $id, $ref, $alt2, $filt, $etc);
+                }
+            }
+        }
+        next unless @out;
+        if ($mindepth) {
+            my $dp = ($etc =~ /DP=(\d+)/) ? $1 : -1;  # if no detectable depth, then ensure position will NOT be filtered
+            if ($dp > -1 && $dp < $mindepth) {
+                print $DROP "LOWCOV\t$_" foreach @out;
+                $stats{LOWCOV}++;
+            } else {
+                print $OUT @out;
+                $stats{NORMAL}++;
+                $stats{OUTPUT} += scalar @out;
+            }
+        } else {
+            print $OUT @out;
+            $stats{NORMAL}++;
+            $stats{OUTPUT} += scalar @out;
+        }
+    }
+}
+close $_ foreach ($IN, $OUT, $DROP);
+
+print "$_\t",($stats{$_}||0),"\n" foreach qw/ HEADER OUTPUT INPUT NORMAL MULTREF MULTALT LOWCOV DEGEN DEG_OK DEG_NOK DEG_MNP REF_N ALT_N EQREF REFJUNK ALTJUNK /;
+print "$0 $invcf complete!\n";
+exit;

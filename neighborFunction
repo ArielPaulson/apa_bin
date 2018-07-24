@@ -1,0 +1,158 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+no strict 'refs';
+
+## General Inputs
+my $input;      # input file (output from neighborsBed call)
+my $outdir;     # write directory
+my $showdbs;    # show current GO databases (script will do this then quit)
+my $showtaxa;   # show major NCBI taxon IDs (script will do this then quit)
+my $DSonly;     # consider only downstream genes as "neighbors"
+my $nnDist = '1000-10000';     # gene distance range to be considered a "neighbor".  If > max, ignored.  If < min, taken as a "direct hit" to gene.
+
+## Globals
+my $inpname;    # $input filename only
+my @minmax;     # parsed $nnDist object
+my %IDconv;     # ID conversion hash, e.g. Ensembl -> MGI
+
+## FatiClone parameters
+my $bin = '/home/apa/local/bin';
+my $taxon;      # NCBI taxon ID for organism in question
+my $GO_db;      # GO database version, if not most-current
+my $KEGG;       # KEGG annotations file; otherwise will not test KEGG
+my $noUnder;    # remove under-enriched terms from results
+my $noSigPar;   # remove "significant parent" terms from results
+my $flagSigPar; # flag "significant parent" terms in results
+my $GoIdConv;   # input ID -> GO DB ID converter file (col 1 = input IDs, col 2 = GO DB IDs";
+
+
+GetOptions("i=s" => \$input, "o=s" => \$outdir, "G=s" => \$GO_db, "K=s" => \$KEGG, "x=s" => \$taxon, "nnd=i" => \$nnDist, "id=s" => \$GoIdConv, "dso" => \$DSonly, "no-sig-parents" => \$noSigPar, "flag-sig-parents" => \$flagSigPar, "no-under" => \$noUnder, "showdbs" => \$showdbs, "showtaxa" => \$showtaxa);
+
+die "$0: No input!\n" unless $input;
+$outdir = 'neighborFunction' unless $outdir;
+
+if ($nnDist) {
+    @minmax = split /-/, $nnDist;
+    $minmax[0] = 0 unless defined $minmax[0];
+    $minmax[1] = 9E9 unless defined $minmax[1];
+} else {
+    @minmax = (0,9E9);  # practical upper distance limit...
+}
+print "minmax: $minmax[0], $minmax[1]\n";
+
+if ($showtaxa) {
+    system "$bin/GO_Tools --showtaxa";
+    exit;
+} elsif ($showdbs) {
+    system "$bin/GO_Tools --showdbs";
+    exit;
+}
+
+
+
+## parse $input into $fcfile
+
+mkdir $outdir unless -d $outdir;
+($inpname) = ($input =~ /([^\/]+)$/);
+my $GOfile1 = "$outdir/$inpname.direct.hits.to.FatiClone.GO";      # FatiClone GO input file: direct-hit genes
+my $GOfile2 = "$outdir/$inpname.all.hits.to.FatiClone.GO";         # FatiClone GO input file: direct-hit and filtered-neighbor genes
+my $KEGGfile1 = "$outdir/$inpname.direct.hits.to.FatiClone.KEGG";  # FatiClone KEGG input file: direct-hit genes
+my $KEGGfile2 = "$outdir/$inpname.all.hits.to.FatiClone.KEGG";     # FatiClone KEGG input file: direct-hit and filtered-neighbor genes
+
+if ($GoIdConv) {
+    open ID, $GoIdConv or die "$0: Cannot open ID conversion file '$GoIdConv' for reading: $!\n";
+    while (<ID>) {
+	$_ =~ s/[\n\r]+$//;
+	my @data = split /\t/, $_;
+	$IDconv{$data[0]} = $data[1];
+    }
+    close ID;
+}
+
+open IN, $input or die "$0: Cannot open input '$input' for reading: $!\n";
+open GO1, "> $GOfile1";
+open GO2, "> $GOfile2";
+open KEGG1, "> $KEGGfile1";
+open KEGG2, "> $KEGGfile2";
+print $_ "GENE\n" foreach qw/ GO1 GO2 KEGG1 KEGG2 /;
+my $outputGeneN;
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    my %genes;
+    my @data = split /\t/, $_;
+    my @coord = @data[0..-6];  # no guarantee on number of columns, but there had better be at least 4
+    my ($hits, $nns5, $dist5, $nns3, $dist3) = @data[-5..-1];
+    if ($hits) {  # direct hit
+	foreach my $neighbor (split /;/, $hits) {
+	    my ($nnGene, $strand) = ($neighbor =~ /^([^\(]+)\(([+-])\)$/);
+	    $genes{$nnGene} = 1 unless $nnGene =~ /^CHR\./;
+	}
+    } else {
+	if ($dist5 <= $minmax[0]) {   # treat as direct hit
+	    foreach my $neighbor (split /;/, $nns5) {
+		my ($nnGene, $strand) = ($neighbor =~ /^([^\(]+)\(([+-])\)$/);
+		$genes{$nnGene} = 1 unless $nnGene =~ /^CHR\./;
+	    }
+	} elsif ($dist5 > $minmax[1]) {  # ignore
+	} else {
+	    foreach my $neighbor (split /;/, $nns5) {
+		my ($nnGene, $strand) = ($neighbor =~ /^([^\(]+)\(([+-])\)$/);
+		next if $nnGene =~ /^CHR\./;
+		next if exists $genes{$nnGene};  # don't re-associate with 'neighbor' status
+		my $dir = $strand eq '+' ? 'DN' : 'UP';  # is the coordinate transcriptionally upstream of downstream of the gene
+		$genes{$nnGene} = 2 unless $DSonly && $dir eq 'UP';
+	    }
+	}
+	if ($dist3 <= $minmax[0]) {   # treat as direct hit
+	    foreach my $neighbor (split /;/, $nns3) {
+		my ($nnGene, $strand) = ($neighbor =~ /^([^\(]+)\(([+-])\)$/);
+		$genes{$nnGene} = 1 unless $nnGene =~ /^CHR\./;
+	    }
+	} elsif ($dist3 > $minmax[1]) {  # ignore
+	} else {
+	    foreach my $neighbor (split /;/, $nns3) {
+		my ($nnGene, $strand) = ($neighbor =~ /^([^\(]+)\(([+-])\)$/);
+		next if $nnGene =~ /^CHR\./;
+		next if exists $genes{$nnGene};  # don't re-associate with 'neighbor' status
+		my $dir = $strand eq '+' ? 'UP' : 'DN';  # is the coordinate transcriptionally upstream of downstream of the gene
+		$genes{$nnGene} = 2 unless $DSonly && $dir eq 'UP';
+	    }
+	}
+    }
+    foreach my $nnGene (keys %genes) {
+	if ($nnGene) {
+	    print KEGG2 "$nnGene\n";
+	    print KEGG1 "$nnGene\n" if $genes{$nnGene} == 1;
+	}
+	if ($IDconv{$nnGene}) {
+	    print GO2 "$IDconv{$nnGene}\n";
+	    print GO1 "$IDconv{$nnGene}\n" if $genes{$nnGene} == 1;
+	}
+    }
+    $outputGeneN += scalar keys %genes;
+}
+close $_ foreach qw/ GO1 GO2 KEGG1 KEGG2 IN /;
+
+
+die "$0: No direct-hit or nearest-neighbor genes found with minmax=$nnDist!  ($input)\n" unless $outputGeneN;
+
+
+## run FatiClone
+
+chomp($GO_db = (split /\n/, `$bin/GO_Tools --showdbs`)[3]) unless $GO_db;
+
+my $flags;
+$flags .= '--nounder ' if $noUnder;
+$flags .= '--no_sig_parents ' if $noSigPar;
+$flags .= '--flag_sig_parents ' if $flagSigPar;
+print "$bin/FatiClone -f $GOfile1 -b genome -d $GO_db -x $taxon -t 1 -w $outdir/GO_direct $flags\n";
+system "$bin/FatiClone -f $GOfile1 -b genome -d $GO_db -x $taxon -t 1 -w $outdir/GO_direct $flags";
+system "$bin/FatiClone -f $GOfile2 -b genome -d $GO_db -x $taxon -t 1 -w $outdir/GO_all $flags";
+if ($KEGG) {
+    system "$bin/FatiClone -f $KEGGfile1 -b genome -o $KEGG -u KEGG -t 1 -w $outdir/KEGG_direct $flags";
+    system "$bin/FatiClone -f $KEGGfile2 -b genome -o $KEGG -u KEGG -t 1 -w $outdir/KEGG_all $flags";
+}
+exit;
+

@@ -1,0 +1,50 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use strict;
+
+## ASSUMES NO REDUNDANT ALIGNMENTS -- I.E. ONLY ONE ALIGNMENT EXISTS FOR ANY QUERY-WINDOW / TARGET-WINDOW PAIR.
+## ASSUMES NO PROTEIN-GENOME ALIGNMENTS -- I.E. STRANDS ARE {+,-} NOT {++,+-,-+,--}
+
+my ($psl, $chain) = @ARGV;
+
+my (%preChain, $chainN);
+
+my $IN = &open2('R', $psl, 'Input PSL');
+while (<$IN>) {
+    s/[\n\r]+$//;
+    if ($. > 5) {
+	## FLIP TARGET AND QUERY -- CHAINS TREAT THEM BACKWARDS
+	my ($ident, $mismatch, $reps, $Ns, $qgaps, $qgapbp, $tgaps, $tgapbp, $strand, $target, $tlen, $tstart, $tend, $query, $qlen, $qstart, $qend, $blocks, $blocksizes, $tstarts, $qstarts) = split /\t/, $_;
+	my @tmp = ("chain $ident $target $tlen + $tstart $tend $query $qlen $strand $qstart $qend ".++$chainN);
+	$blocksizes =~ s/,$//;
+	$qstarts =~ s/,$//;
+	$tstarts =~ s/,$//;
+	my @blocksizes = split /,/, $blocksizes;
+	my @qstarts = split /,/, $qstarts;
+	my @tstarts = split /,/, $tstarts;
+	for (my $i = 0; $i < $#blocksizes; $i++) {
+	    push @tmp, join("\t",$blocksizes[$i],$tstarts[$i+1]-$tstarts[$i]-$blocksizes[$i],$qstarts[$i+1]-$qstarts[$i]-$blocksizes[$i]);
+	}
+	push @tmp, $blocksizes[-1];
+	$preChain{$target}{$tstart}{$tend}{$query}{$qstart}{$qend} = join("\n",@tmp);
+    }
+}
+close $IN;
+
+my $OUT = &open2('W', $chain, 'Output chain');
+foreach my $target (sort keys %preChain) {
+    foreach my $tstart (sort {$a <=> $b} keys %{ $preChain{$target} }) {
+	foreach my $tend (sort {$a <=> $b} keys %{ $preChain{$target}{$tstart} }) {
+	    foreach my $query (sort keys %{ $preChain{$target}{$tstart}{$tend} }) {
+		foreach my $qstart (sort {$a <=> $b} keys %{ $preChain{$target}{$tstart}{$tend}{$query} }) {
+		    foreach my $qend (sort {$a <=> $b} keys %{ $preChain{$target}{$tstart}{$tend}{$query}{$qstart} }) {
+			print $OUT "$preChain{$target}{$tstart}{$tend}{$query}{$qstart}{$qend}\n\n";
+		    }
+		}
+	    }
+	}
+    }
+}
+close $OUT;
+exit;
+

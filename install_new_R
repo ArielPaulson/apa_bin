@@ -1,0 +1,73 @@
+#!/usr/bin/env perl
+use IO::CaptureOutput qw / capture_exec /;
+
+## written by apa 2011/04/19 based on code at wiki/research/R/MaintenanceNotes
+
+my $I = `whoami`;
+die "Must be logged on as 'bioinfo'!\n" unless $I eq 'bioinfo';
+
+my $version = $ARGV[0];
+die "Invalid R version format: must be \"\d+.\d+.[01]\"\n" unless $version =~ /^\d+\.\d+\.[01]$/;
+my $Rversion = "R-$version";
+
+
+################  TEMP DIRS?  CLEANUP?
+
+
+# prep
+my $url = "http://cran.r-project.org/src/base/R-2/$Rversion.tar.gz";
+my $idir = "/n/site/inst/Linux-x86_64/bioinfo/R/$version";
+my $ldir = "$idir/logs";
+my $wdir = "/n/site/src/bioinfo/R/Linux-x86_64";
+
+execute("mkdir -p $idir");
+die "Unable to create install directory!\n" unless -d $idir;
+system "mkdir -p $ldir";
+
+my $LOG = "$ldir/install_new_$Rversion.log";
+open OUT, "> $LOG";  # overwrite old log
+close OUT;
+
+die unless -d $wdir;
+chdir $wdir;
+print "\nWorking in $wdir\n";
+
+execute("wget $url");
+die "Unable to download $url!\n" unless -s "$Rversion.tar.gz";  # wget failed
+execute("tar xzf $Rversion.tar.gz");
+
+# compile
+chdir $Rversion;
+execute("./configure --prefix=$idir --enable-R-shlib --enable-memory-profiling");
+execute("make -j 3");
+execute("make check");
+
+# install
+execute("make install");
+
+# check capabilities
+execute("echo 'capabilities()' | R --vanilla > capabilities.txt");
+
+exit;
+
+
+sub execute {
+    my $COM = shift;
+	print "$COM\n";
+    $! = undef;
+#    my ($success, $messages) = capture_exec($COM);	# capture any STDOUT/STDERR from command and report this also
+    my ($stdout, $stderr, $success, $exit_code) = capture_exec($COM);	# capture any STDOUT/STDERR from command and report this also
+	if ($messages) {
+		print $messages;
+		open OUT, ">> $LOG";	# write to log but not screen (i.e. cufflinks output)
+		print OUT "$messages\n";
+		close OUT;
+    } elsif (!$success) {
+		my $failwarn = "\nPERL WARNING: command '$COM' failed: $!\n\n";
+		print $failwarn;
+		open OUT, ">> $LOG";	# write to log but not screen (i.e. cufflinks output)
+		print OUT $failwarn;
+		close OUT;
+	}
+}
+

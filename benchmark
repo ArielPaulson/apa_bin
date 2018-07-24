@@ -1,0 +1,44 @@
+#!/bin/bash
+
+## Runs a command and checks RAM usage every 5 seconds.  Reports final time & RAM, etc (time reported is also to the nearest 5-second interval)
+
+date=$(date)
+host=$(hostname)
+user=$(whoami)
+
+cmd=$*
+$cmd &
+pid=$!
+SECONDS=0
+
+continue=1
+RAM=0
+while [ $continue == 1 ]
+do
+    top=$(top -p $pid -b -n 1 | grep -P "^\s*$pid")
+    ram=$(echo $top | awk '{ print $10 }')
+#    echo "TOP: $top"
+#    echo "RAM: $ram"
+    if [ -z $ram ]; then
+	continue=0
+    elif [ $(echo "$ram > $RAM" | bc) -eq 1 ]; then
+	RAM=$ram
+    fi
+    sleep 5
+done
+
+duration=$SECONDS
+echo "SEC: $duration"
+mins=$(($duration / 60))
+secs=$(($duration % 60))
+
+echo -e "TIME\t${mins}m${secs}s\nRAM%\t$RAM" 1>&2
+
+if [ -e /proc/meminfo ]; then
+    kb=$(cat /proc/meminfo | grep ^MemTotal | awk '{ print $2 }')
+    RAMb=$(echo "scale=0; 10*$kb*$RAM" | bc)
+    RAMb=${RAMb%.0}
+    echo -e "RAMb\t$RAMb" 1>&2
+fi    
+
+echo -e "HOST\t$host\nUSER\t$user\nDATE\t$date\nCALL\t$cmd" 1>&2

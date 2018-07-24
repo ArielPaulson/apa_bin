@@ -1,0 +1,397 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Data::Dumper;
+use Getopt::Long;
+use strict;
+
+
+## Runs Picard CRSM + unstranded htseq-count on a bam and returns R object with results ready for compilation and multisample comparison
+
+
+## Dependencies
+my $bin = '/home/apa/local/bin';
+my $readCount = "$bin/readCount";
+my $samtools = 'samtools';  # REQUIRES SAMTOOLS >= 1.3.1
+my $java = 'java';
+my $picard = '/n/apps/CentOS7/bin/picard.jar';
+my $htseq_count = 'htseq-count';
+
+
+## Inputs
+my $bam;         # 
+my $outdir;      # 
+my $geno;        # genome build label
+my $anno;        # annot build label (optional)
+my $outdir;      # output path
+my $clobber;     # output path, if clobbering
+my $fastq1;      # end 1 fastq
+my $fastq2;      # end 2 fastq, if any
+my $aligner;     # which aligner to use   ## CURRENTLY: tophat, shortstack   ## FUTURE: bowtie1, bowtie2, star, bwa
+my $params;      # quoted string containing non-default args to pass to aligner  *** PARAMS MUST BE COMPLETE -- ONLY THESE PARAMS WILL BE USED ***
+my $cuffparams;  # quoted string containing non-default args to pass to cufflinks, if running cufflinks  *** PARAMS MUST BE COMPLETE -- ONLY THESE PARAMS WILL BE USED ***
+my $cores = 1;   # N cores
+my $mem = '1G';  # memory for 'samtools sort'
+my $M;           # alternate M for RPKM; will get N input reads if not specified
+my $runfqr;      # 1|0 generate fastqReads file for inputs?
+my $quantitate;  # 1|0 quantitate gene models?
+my $multi_quantitate; # 1|0 force htseq-count to quantitate multireads?
+my $transcriptome;    # 1|0 align to transcriptome only?
+my $unique;      # 1|0 produce a multiread-free bam version?
+my $stranded;    # 1|0 are reads stranded?  If so, will also generate stranded counts and bigWigs
+my $smallRNA;    # 1|0 are reads from a smallRNA prep? (alters default alignment params)
+my $runrqc;      # 1|0 run RChipQC.R on final bam file?
+my $runrsm;      # 1|0 run Picard's CollectRnaSeqMetrics on bam? (HOW TO INDICATE 'PLUS'?)
+my $runcuff;     # 1|0 run Cufflinks? (HOW TO PASS CUSTOM ARGUMENTS?)
+my $bw;          # 1|0 generate bigWigs?
+my $tdf;         # 1|0 generate TDFs? (bigWig for IGV)
+my $rlsplit;     # 1|0 generate a read-length read-grouped bam and split into individual read-length bams? (in separate folder)
+
+############## FIXME: should these be $params?
+my $htseq_python = '2.7.5';  # python version where desired htseq version is installed
+my $alnmax = 100;     # maximum allowed alignments before a read is ignored; default 100
+my $ranmax = int($alnmax/10);  # ShortStack --ranmax argument; default int($alnmax/10)
+$alnmax = 100 unless $alnmax;   # default maximum alignments per read (before read is ignored)
+$ranmax = int($alnmax/10) unless $ranmax;  # ShortStack --ranmax param
+
+## ALTERNATE RUN MODE
+my $requant;     # if this valued, then ONLY run quantitation loop on the included bam.  $M *should* also be specified.
+my $PE;          # 1|0 required for $requant if run was paired-end
+## NOTE: to run $requant, value is not just a BAM file, like other members of this script family
+##                  
+
+## MUST MAKE PRIMARY BAM CREATION DEPENDENT ON ALIGNER/CUSTOM-ARG-GREP RESULTS
+
+## Get, test options
+GetOptions(
+    "g=s"=>\$geno, "a=s"=>\$anno, "o=s"=>\$outdir, "oc=s"=>\$clobber, "c=i"=>\$cores, "m=s"=>\$mem, 
+    "fq1=s"=>\$fastq1, "fq2=s"=>\$fastq2, "Mval=i"=>\$M, "aln=s"=>\$aligner, "params=s"=>\$params, 
+    "transcriptome"=>\$transcriptome, "quant"=>\$quantitate, "quant-multi"=>\$multi_quantitate, 
+    "unique"=>\$unique, "stranded"=>\$stranded, "smallRNA"=>\$smallRNA, "bw"=>\$bw, "tdf"=>\$tdf, 
+    "fqr"=>\$runfqr, "rqc"=>\$runrqc, "rsm"=>\$runrsm, "cufflinks"=>\$runcuff, "cuff-params=s"=>\$cuffparams, 
+    "requant=s"=>\$requant, "PE"=>\$PE, "rl-split"=>\$rlsplit
+);
+
+$aligner = lc($aligner);
+my $STAR_len;
+if ($aligner =~ /^star[-_](\d+)/) {
+    $STAR_len = $1;
+    $aligner = 'star';
+}
+my $Gdir = "/n/data1/genomes/indexes/$geno";
+my $Gpref = "$Gdir/$geno";
+my $Adir = "$Gdir/$anno";
+my $Apref = "$Adir/$geno.$anno";
+my $gtf = "$Apref.cuff.gtf";
+my $gtfi = "$gtf.index/$geno.$anno.cuff";
+my $Sdir = $anno ? "$Adir/STAR_${STAR_len}bp" : "$Gdir/STAR_${STAR_len}bp";
+die "$0: Expected dataset path '$Gdir' does not exist!\n" unless -d $Gdir;   # must exist
+die "$0: Expected dataset path '$Adir' does not exist!\n" if $anno && ! -d $Adir;  # must exist if $anno specified
+die "$0: Expected STAR index '$Sdir' does not exist!\n" if $aligner eq 'star' && ! -d $Sdir;
+
+unless ($requant) {
+    die "$0: fastq1 '$fastq1' does not exist!\n" unless -e $fastq1;  # must exist
+    die "$0: fastq2 '$fastq2' does not exist!\n" if $fastq2 && ! -e $fastq2;  # must exist if specified
+    die "$0: cannot make tracks when aligning to transcriptome only!\n" if $transcriptome && ($bw || $tdf);
+}
+
+## Globals
+my %quant;  # quantitation data
+my %files;  # filename control
+my $nreads; # N input reads (reads not pairs)
+my $ndec = 6;  # decimal accuracy for percents and RPKMs
+my $noUna;  # specified aligner does not write unaligned-read files
+my $allbam; # final all-reads bam post-alignment
+my $pribam; # final primary-reads bam (may be same as $allbam)
+my $LOG;
+my $PEflag = $fastq2 ? ' --PE' : '';
+
+
+if ($requant) {
+    
+    ## Requantitate modified bam from earlier run
+    
+    print "Re-quantitating: ".`date`;
+    
+    ## Determine aligned, unaligned read counts
+    (my $rqpref = $requant) =~ s/\.bam$//i;
+    system "samtools index $requant" unless -e "$requant.bai";
+    system "samtools idxstats $requant > $rqpref.idxstats.txt" unless -e "$rqpref.idxstats.txt";
+    chomp($nreads = `bash -c 'paste -s -d+ <(cut -f3 $rqpref.idxstats.txt) | bc'`);
+    $quant{READS}{Aligned} = $nreads;
+    $quant{READS}{Total} = $quant{READS}{Aligned};
+    $quant{READS}{Unaligned} = 0;
+    $M = $quant{READS}{Total} unless $M;  # also M for RPKM
+    
+    # gtf, PE, geno, anno, stranded, smallRNA, transcriptome, htseq_python
+    &quantitate($requant, $gtf, $PE, $rqpref), 
+    
+} else {
+    
+    ## NEW RUN ##
+    
+    ## Output location
+    chomp(my $pwd = `pwd`);
+    $outdir = "$pwd/alignToGenome" unless $outdir;
+    if ($clobber) {
+        $outdir = $clobber;
+        system "rm -rf $outdir";
+    } elsif (-d $outdir) {
+        die "$0: output dir '$outdir' already exists!\n";
+    }
+    system "mkdir -p $outdir";
+    die "$0: failed to create output dir '$outdir'!\n" unless -d $outdir;
+    
+    
+    ## Log file
+    my $outpref = "$outdir/alignToGenome";
+    my $logfile = "$outpref.log";
+    $LOG = &open2('W', $logfile, 'log file');
+    &logreport("Initialized: ".`date`, 1, $LOG);
+    
+    
+    ## Alignments
+    my $alndir = "$outdir/alignToGenome.align.$$.tmp";
+    
+    if ($aligner eq 'shortstack') {
+        
+        
+        my $SSname = 'shortstack';
+        my $SSpref = "$outdir/$SSname";
+        my $SSfqin = "$SSpref-input.fastq.gz";
+        my $noUna = 0;
+        if ($fastq2) {
+            &execute("$collapseFastqPair $fastq1 $fastq2 $SSfqin", 1, $LOG, 2);
+        } else {
+            &execute("ln -sf \$(readlink -f $fastq1) $SSfqin", 1, $LOG, 2, 1);  ## REQUIRES BASH
+        }
+        my $ref_fa = $transcriptome ? "$gtfi.fa" : "$Gpref.fa";
+        unless ($params) {
+            $params .= " --align_only --nostitch --nohp --mismatches 2 --mmap u --bowtie_m $alnmax --ranmax $ranmax";
+        }
+        &execute("$shortstack $params --genomefile $ref_fa --bowtie_cores $cores --sort_mem $mem --readfile $SSfqin --bowtie_un $SSpref.unal.fastq --outprefix $SSname --outdir $alndir", 1, $LOG, 2);
+        if ($fastq2) {
+            &execute("$uncollapseFastqPair $SSpref.unal.fastq $outpref.unaligned", 1, $LOG, 2);  # outputs gzipped
+        } else {
+            &execute("mv -f $SSpref.unal.fastq $outpref.unaligned.fastq", 1, $LOG, 2);
+            &execute("gzip -f $outpref.unaligned.fastq", 1, $LOG, 2) if -e "$outpref.unaligned.fastq";
+        }
+        &execute("mv $alndir/* $outdir/", 1, $LOG, 2);
+        &execute("rm -rf $alndir", 1, $LOG, 2);
+        &execute("rm -f $SSfqin", 1, $LOG, 2);
+        
+        &execute("samtools view -h -F 4 $SSpref.bam | samtools view -bS - > $outpref.bam", 1, $LOG, 2);
+        &execute("rm -f $SSpref.bam", 1, $LOG, 2);
+        &execute("$samtools index $outpref.bam", 1, $LOG, 2);
+        &execute("$samtools idxstats $outpref.bam > $outpref.idxstats.txt", 1, $LOG, 2);
+        &execute("ln -sf \$(readlink -f $outpref.bam) $outpref.primary.bam", 1, $LOG, 2); 
+        &execute("ln -sf \$(readlink -f $outpref.bam.bai) $outpref.primary.bam.bai", 1, $LOG, 2); 
+        &execute("ln -sf \$(readlink -f $outpref.idxstats.txt) $outpref.primary.idxstats.txt", 1, $LOG, 2); 
+        &execute("$mergeAlignSummary -o $outpref.align_summary.txt -a shortstack --nodirname $SSpref.Log.txt", 1, $LOG, 2);
+        chomp(my $nreads = `head -2 $outpref.align_summary.txt | tail -1 | cut -f2`);
+        
+        
+    } elsif ($aligner eq 'tophat') {
+        
+        
+        my $THpref = "$outdir/tophat";
+        unless ($params) {
+            if ($smallRNA) {
+                $params = "-g 1 -x 1 -N 2 --bowtie1 --segment-length 10 --no-novel-juncs --no-coverage-search --library-type fr-firststrand";    ### FIXME: DOES THIS REQUIRE FR-FIRSTSTRAND TOO ?
+            } else {
+                $params = "--no-novel-juncs --no-coverage-search";
+            }
+            $params .= " --library-type fr-firststrand" if $stranded;   ### FIXME: SHOULD THIS LINE BE IN THIS LOCATION?
+        }
+        $params .= " --transcriptome-index $gtfi" if $anno && !$transcriptome;
+        my $index = $transcriptome ? $gtfi : $Gpref;
+        $noUna = 0;
+        &execute("$tophat $params -p $cores -o $alndir $index $fastq1 $fastq2", 1, $LOG, 2);  # $fastq2 need not exist
+        &execute("mv -f $alndir/accepted_hits.bam $outpref.bam", 1, $LOG, 2);
+        &execute("samtools index $outpref.bam", 1, $LOG, 2);
+        &execute("samtools idxstats $outpref.bam > $outpref.idxstats.txt", 1, $LOG, 2);
+        &execute("$bam2fq $alndir/unmapped.bam $outpref.unaligned", 1, $LOG, 3);
+        &execute("mv $alndir/$_ $THpref.$_", 1, $LOG, 2) foreach qw/ deletions.bed insertions.bed junctions.bed prep_reads.info align_summary.txt logs /;  # expected Tophat outputs
+        &execute("rm -rf $alndir/", 1, $LOG, 2);    # remove unmapped.bam along with it
+        &execute("$samtools view -h -F 256 $outpref.bam | $samtools view -h -bS - > $outpref.primary.bam", 1, $LOG, 2);
+        &execute("$samtools index $outpref.primary.bam", 1, $LOG, 2);
+        &execute("$samtools idxstats $outpref.primary.bam > $outpref.primary.idxstats.txt", 1, $LOG, 2);
+        &execute("$mergeAlignSummary -o $outpref.align_summary.txt -a tophat --nodirname$PEflag $THpref.align_summary.txt", 1, $LOG, 2);
+        chomp(my $nreads = `head -2 $outpref.align_summary.txt | tail -1 | cut -f2`);
+        #    &execute("$stripMultireads --mode2 --tophat --index $outpref.bam", 1, $LOG, 2);
+        #    &execute("rename stripMultireads unique $outpref.stripmultireads.*", 1, $LOG, 2);
+        #    &execute("samtools idxstats $outpref.unique.bam > $outpref.unique.idxstats.txt", 1, $LOG, 2);
+        
+        
+    } elsif ($aligner eq 'star') {
+        
+        
+        my $STpref = "$outdir/star";
+        unless ($params) {
+            $params = "--outReadsUnmapped Fastx" unless $fastq2;
+        }
+        $noUna = $fastq2 ? 1 : 0;
+        &execute("STAR --outFileNamePrefix $STpref. --genomeDir $Sdir --readFilesIn $fastq1 $fastq2 --readFilesCommand zcat --runThreadN $cores --outSAMtype BAM Unsorted", 1, $LOG, 2);
+        &execute("$samtools sort -@ $cores -m $mem -o $outpref.bam $STpref.Aligned.out.bam", 1, $LOG, 2);
+        &execute("rm -f $STpref.Aligned.out.bam", 1, $LOG, 2);
+        &execute("$samtools index $outpref.bam", 1, $LOG, 2);
+        &execute("$samtools idxstats $outpref.bam > $outpref.idxstats.txt", 1, $LOG, 2);
+        &execute("$samtools view -h -F 256 $outpref.bam | $samtools view -h -bS - > $outpref.primary.bam", 1, $LOG, 2);
+        &execute("$samtools index $outpref.primary.bam", 1, $LOG, 2);
+        &execute("$samtools idxstats $outpref.primary.bam > $outpref.primary.idxstats.txt", 1, $LOG, 2);
+        &execute("mv -f $STpref.Unmapped.out.mate1 $outpref.unaligned.fastq", 1, $LOG, 2) unless $fastq2;
+        &execute("gzip -f $outpref.unaligned.fastq", 1, $LOG, 2) if -e "$outpref.unaligned.fastq";
+        &execute("$mergeAlignSummary -o $outpref.align_summary.txt -a star --nodirname$PEflag $STpref.Log.final.txt", 1, $LOG, 2);
+        chomp(my $nreads = `head -2 $outpref.align_summary.txt | tail -1 | cut -f2`);
+        
+        
+    } elsif ($aligner eq 'bowtie1') {
+        
+        
+        die "$0: Aligner '$aligner' not available!\n";
+        
+        
+    } elsif ($aligner eq 'bowtie2') {
+        
+        
+        my $BTpref = "$outdir/bowtie2";
+        my $BTtmp = "$outdir/bowtie2.tmp";
+        my $infq = $fastq2 ? "-1 $fastq1 -2 $fastq2" : "-U $fastq1";
+        $noUna = $fastq2 ? 1 : 0;
+        unless ($params) {
+            $params = "--un-gz $outpref.unaligned.fastq.gz" unless $fastq2;  # PE has separate unaligned-read extraction approach
+        }
+        my $idx = $transcriptome ? $gtfi : $Gpref;
+        &execute("$bowtie2 $params -p $cores -x $idx $infq -S $BTtmp.sam 2> $BTpref.align_summary.txt", 1, $LOG, 1);
+        &execute("samtools view -h -F 4 $BTtmp.sam > $BTtmp.bam", 1, $LOG, 2);
+        &execute("$samtools sort -@ $cores -m $mem -o $outpref.bam $BTtmp.bam", 1, $LOG, 2);
+        &execute("$samtools index $outpref.bam", 1, $LOG, 2);
+        &execute("$samtools idxstats $outpref.bam > $outpref.idxstats.txt", 1, $LOG, 2);
+        #### FIXME: TEST $PARAMS FOR MULTIALIGN-INDUCING PARAMS
+        &execute("ln -sf $outpref.bam $outpref.primary.bam", 1, $LOG, 2);
+        &execute("ln -sf $outpref.bam.bai $outpref.primary.bam.bai", 1, $LOG, 2);
+        &execute("ln -sf $outpref.idxstats.txt $outpref.primary.idxstats.txt", 1, $LOG, 2);
+        &execute("rm -f $BTtmp.*", 1, $LOG, 2);
+#        &execute("$mergeAlignSummary -o $outpref.align_summary.txt -a tophat --nodirname$PEflag $BTpref.align_summary.txt", 1, $LOG, 2);  ############# NOT: PE bowtie2 not enabled here
+        chomp(my $nreads = `head -1 $BTpref.align_summary.txt | cut -f1 -d' '`);
+        
+        
+    } elsif ($aligner eq 'bwa') {
+        
+        
+        $noUna = 1;
+        die "$0: Aligner '$aligner' not available!\n";
+        
+        
+    } else {
+        
+        
+        die "$0: Aligner '$aligner' not available!\n";
+        
+        
+    }
+    
+    ($allbam, $pribam) = ("$outpref.bam", "$outpref.primary.bam");
+    &logreport("Aligment complete: ".`date`, 1, $LOG);
+
+
+    ## Post-alignment
+    &logreport("Running post-alignment:", 1, $LOG);
+
+    #~/lbin/CollectRnaSeqMetricsPlus -g $geno -a $anno -b $pri.bam -m $mem -o $outdir/RnaSeqMetrics.txt --old
+    #~/lbin/CollectRnaSeqMetricsPlus -g $geno -a $anno -b $pri.bam -m $mem -o $outdir/RnaSeqMetrics.txt --old -s samtools-sorted
+
+    #cufflinks -p 4 -u -G $annots.cuff.gtf -o $outdir $all.bam --max-bundle-frags 1000000
+
+    if ($bw || $tdf) {
+        my $cmd = "$bam2track -t $cores -r $mem -b ";
+        $cmd .= $pribam ? $pribam : $allbam;
+        $cmd .= " --primary" unless $pribam;
+        $cmd .= " -g $geno -n APM";
+        $cmd .= " -M $M" if $M;
+        $cmd .= " --PE" if $fastq2;
+        $cmd .= " --stranded --switch" if $stranded;  # assuming all stranded is TruSeq
+        $cmd .= " --BW" if $bw;
+        $cmd .= " --TDF" if $tdf;
+        &execute($cmd, 1, $LOG, 2);
+    }
+
+    &execute("$readCount --uhisto $fastq1 $fastq2 > $outdir/fqReads.txt", 1, $LOG, 2) if $runfqr;  # $fastq2 need not exist
+
+
+    ## Extract final unaligned read sets
+    if ($noUna) {
+        &logreport("Extracting unaligned reads: ".`date`, 1, $LOG);
+        if ($fastq2) {
+            &execute("$fastqUnaligned -fq1 $fastq1 -fq2 $fastq2 -p $outpref.unaligned $outpref.bam", 1, $LOG, 2);
+        } else {
+            &execute("$fastqUnaligned -fq1 $fastq1 -p $outpref.unaligned $outpref.bam", 1, $LOG, 2);
+        }	
+    }
+    
+    if ($rlsplit) {
+        &execute("$readGroupByLength $outpref.bam $outpref.RGL.bam $outpref.RGL", 1, $LOG, 2);
+        &execute("mv -f $outpref.RGL.bam $outpref.bam", 1, $LOG, 2);
+        &execute("samtools index $outpref.bam", 1, $LOG, 2);
+        &execute("samtools idxstats $outpref.bam > $outpref.idxstats.txt", 1, $LOG, 2);
+    }
+    
+    if ($quantitate || $multi_quantitate) {
+        
+        ### Quantitate regions
+        &logreport("Quantitating: ".`date`, 1, $LOG);
+        
+        ## Determine aligned, unaligned read counts
+        #    $quant{READS}{Total} = $nreads;
+        #    chomp($quant{READS}{Aligned} = `bash -c 'paste -s -d+ <(cut -f3 $outpref.idxstats.txt) | bc'`);     #### FIXME: IDXSTATS IS NOT $OUTPREF
+        #    $quant{READS}{Unaligned} = $quant{READS}{Total} - $quant{READS}{Aligned};
+        #    $M = $quant{READS}{Total} unless $M;  # also M for RPKM                                             #### FIXME: NO RPKM CALC, ADD TO EXTERNAL QUANTITATORS?
+        
+        #&quantitate($allbam, $gtf, $PE, $outpref), 
+        
+    }
+}
+
+
+## Exit
+if ($requant) {
+    print "Complete: ".`date`;
+} else {
+    &logreport("Complete: ".`date`, 1, $LOG);
+    close $LOG;
+}
+exit;
+
+
+
+
+
+sub quantitate {
+    
+    my ($BAM, $GTF, $ISPE, $OUTPREF)  = @_;
+    my $PEflag = $ISPE ? '--PE' : '';
+    
+    if ($transcriptome) {
+        &execute("$transcriptBamQuantitate -b $BAM -o $OUTPREF.idxstats_counts.all.txt -g $geno -a $anno $PEflag", 1, $LOG, 2);
+    } elsif ($htseq_count) {
+        my $cmd = "$samtools view $BAM";  ## MUST BE $allbam: critical if counting multireads, no impact on output otherwise
+        $cmd .= " | perl -pe 's/\\s+NH:i:\\d+//'" if $multi_quantitate;  # only affects Tophat results, BUT, that is the only aligner for which HTSeq can detect multiread-ness
+        $cmd .= " | $htseq_count -s SVALUE -a 0 -m intersection-nonempty - $GTF > $OUTPREF.htseq_counts.FNAME.txt";
+        if ($stranded || $smallRNA) {
+            (my $cmdS = $cmd) =~ s/SVALUE/yes/;
+            $cmdS =~ s/FNAME/sense/;
+            (my $cmdA = $cmd) =~ s/SVALUE/reverse/;
+            $cmdA =~ s/FNAME/anti/;
+            &execute("export PYENV_VERSION=$htseq_python && $cmdS", 1, $LOG, 2, 1);  ## REQUIRES BASH
+            &execute("export PYENV_VERSION=$htseq_python && $cmdA", 1, $LOG, 2, 1);  ## REQUIRES BASH
+            &execute("(echo -e \"Gene\\tUnstr\\tSense\\tAnti\" && paste $OUTPREF.htseq_counts.sense.txt $OUTPREF.htseq_counts.anti.txt | awk -F\"\\t\" 'BEGIN { OFS=\"\\t\" } { print \$1,\$2+\$4,\$2,\$4 }') > $OUTPREF.htseq_counts.all.txt", 1, $LOG, 2, 1);  ## REQUIRES BASH
+            &execute("rm -f $OUTPREF.htseq_counts.sense.txt $OUTPREF.htseq_counts.anti.txt", 1, $LOG, 2);
+        } else {
+            (my $cmdU = $cmd) =~ s/SVALUE/no/;
+            $cmdU =~ s/FNAME/unstr/;
+            &execute("export PYENV_VERSION=$htseq_python && $cmdU", 1, $LOG, 2, 1);  ## REQUIRES BASH
+        }
+    }
+
+}
+
+

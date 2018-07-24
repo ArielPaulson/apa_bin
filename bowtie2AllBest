@@ -1,0 +1,124 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my $inbam;   # input SAM/BAM
+my $outbam;  # output BAM
+my $clobber; # overwrite pre-existing output?
+my $topchr;  # if a best alignment occurrs on this chromosome, ignore all other best alignments on other chromosomes
+my $maxcol;  # IF null/0: do not color reads by alignment state.
+             # IF > 0: cap at $maxcol+1 unique colors, where black means 1 alignment, blue->red gradient means [2,$maxcol] alignments, and grey means alignments > $maxcol.
+             # E.g. if $maxcol = 4, alignment-coloration scheme becomes: black(1), blue(2), purple(3), red(4), grey(5+)
+
+GetOptions("i=s" => \$inbam, "o=s" => \$outbam, "m=i" => \$maxcol, "clobber" => \$clobber, "top-chr=s" => \$topchr);
+
+(my $name = $inbam) =~ s/\.bam$//;
+$outbam = "$name.AllBest.bam" unless $outbam;
+if ($clobber) {
+    system "rm -f $outbam";
+} else {
+    die "Output file '$outbam' already exists!\n" if -e $outbam;
+}
+$outbam =~ s/\.bam$//;
+
+my $max1 = $maxcol+1;
+my $max_1 = $maxcol-1;
+my %palette;
+&assign_colors if $maxcol;
+
+print "\n";
+my $tmp = "bowtie2AllBest.$$.tmp";
+my $cmd = "samtools sort -n -o $tmp.bam $inbam";
+print "$cmd\n"; system $cmd;
+
+my %histo;
+print "Filtering for best alignments per read: ".`date`;
+open my $IN, "samtools view -h $tmp.bam |";
+open my $OUT, "> $tmp.sam";
+my ($header, $in, $out, $idx, $prev_idx, %aligns);
+while (my $line = <$IN>) {
+    if ($_ =~ /^\@/) {
+	print $OUT $line;
+	$header++;
+    } else {
+	chomp($line);
+	$in++;
+	my ($idx, $chr, $score) = (split /\t/, $line)[0,2,11];
+	$score =~ s/^AS:i://;
+	&process_aligns if ($in > 1 && $idx ne $prev_idx);  # also empties %aligns
+        push @{ $aligns{$score}{$chr} }, $line;
+	$prev_idx = $idx;
+    }
+}
+close $IN;
+close $OUT;
+print "Filtering complete: ".`date`."$in in | $out out | $header header\n";
+
+my $cmd = "samtools view -bS $tmp.sam > $tmp.bam";
+print "$cmd\n"; system $cmd;
+my $cmd = "samtools sort $tmp.bam $outbam";
+print "$cmd\n"; system $cmd;
+my $cmd = "samtools index $outbam.bam";
+print "$cmd\n"; system $cmd;
+system "rm -f $tmp.*";
+
+open my $HIST, '>', "$outbam.alignHisto.txt";
+print $HIST "NAligns\tReadsWithNAligns\n";
+print $HIST "$_\t$histo{$_}\n" foreach sort {$a <=> $b} keys %histo;
+close $HIST;
+print "bowtie2AllBest complete!\n";
+exit;
+
+
+sub process_aligns {
+    my $topscore = (sort {$b <=> $a} keys %aligns)[0];
+    unless ($topscore) {
+	print STDERR "WARNING: Line $. topscore = '$topscore', ", scalar(keys %aligns), " aligns\n";
+    }
+    if ($topchr && $aligns{$topscore}{$topchr}) {
+	foreach my $chr (keys %{ $aligns{$topscore} }) {
+	    delete $aligns{$topscore}{$chr} if $chr ne $topchr;
+	}
+    }
+    my $Ntop;
+    $Ntop += scalar @{ $aligns{$topscore}{$_} } foreach keys %{ $aligns{$topscore} };
+    $histo{$Ntop}++;
+    $out += $Ntop;
+    my $tag;
+    if ($maxcol) {
+	$tag = "\tAL:i:$Ntop";
+	my $colN = $Ntop > $maxcol ? $max1 : $Ntop;
+	$tag .= "\tYC:Z:$palette{$colN}";
+    }
+    foreach my $chr (keys %{ $aligns{$topscore} }) {
+	print $OUT "$_$tag\n" foreach @{ $aligns{$topscore}{$chr} };
+    }
+    %aligns = ();
+}
+
+
+sub assign_colors {
+    
+##    my $cmd = "bash -c 'Rscript <(echo \"t(col2rgb(colorRampPalette(c(4,2))($max_1)))\")'";
+    my $cmd = "/home/apa/local/bin/scriptutils/linear-exp.gradient.R $max1 FALSE";
+    
+    open my $PAL, '-|', $cmd;
+    while (<$PAL>) {
+	chomp;
+##	next if $_ =~ /^\s+red/;  # header line
+##	my ($null, $i, $R, $G, $B) = split /\s+/, $_;
+##	$i =~ s/[\[\],]//g;
+##	$palette{$i+1} = "$R,$G,$B";  # reads from 2-maxcol alignments grade from blue to red
+	my ($i, $R, $G, $B) = split / /, $_;
+	next if $i < 3;
+	$palette{$i-1} = "$R,$G,$B";  # reads from 2-maxcol alignments grade from blue to red
+    }
+    close $PAL;
+    
+    $palette{1} = "0,0,0";  # unique reads always black
+    $palette{$max1} = "180,180,180";  # overmax reads always grey
+    
+    print "PALETTE:\n";
+    print "Aligns = $_: $palette{$_}\n" foreach (1..$max1);
+}

@@ -1,0 +1,38 @@
+#!/usr/bin/env perl
+
+if (@ARGV) {
+	$file = $ARGV[0];
+} else {
+	print "Enter a mysql \\T file to tidy:\n";
+	chomp($file = <STDIN>);
+}
+
+open IN, $file or die "Cannot read file '$file': $!";
+open OUT, "> tidy_$file" or die "Cannot write file 'tidy_$file': $!";
+while (<IN>) {
+	$count++;
+	next if ($_ =~ /^mysql/ || $_ =~ /\s+->/ || $_ =~ /^\+/);	# skip header rows
+	last unless ($_ =~ /^\| /);	# skip final non-data rows
+	chomp;
+	$_ =~ s/^\s*\|\s+//;		# clip leading "| .."
+	$_ =~ s/\s+\|\s*$//;		# clip trailing ".. | "
+	my @data = split /\s+\|\s+/, $_;	# DO NOT split on '|' only -- fields may have that character
+#	print scalar @data, "\n";
+	my (@newdata);
+	foreach $i (0..$#data) {	# dropping 1st and last because eq ""
+#		$data[$i] =~ s/^\s+//;
+#		$data[$i] =~ s/\s+$//;
+#		$data[$i] =~ s/\s//g;			# WATCH THIS
+#		$data[$i] = '\N' if ($data[$i] eq "NULL");
+		$data[$i] = '' if ($data[$i] eq "NULL");
+		push @newdata, $data[$i];
+#		push @newdata, $data[$i] unless ($data[$i] eq "");
+	}
+	my $line = join "\t", @newdata;
+	print OUT "$line\n";
+	print "$count\n" if ($count % 100000 == 0);
+}
+close IN;
+close OUT;
+
+exit;

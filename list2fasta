@@ -1,0 +1,8 @@
+#!/usr/bin/env perl
+use Pod::Usage;
+use strict;
+
+open my $IN, '<', $ARGV[0] or die "Cannot read '$ARGV[0]': $!\n";
+print ">$.\n$_" while (<$IN>);
+close $IN;
+exit;

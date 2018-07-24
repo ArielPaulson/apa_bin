@@ -1,0 +1,38 @@
+#!/usr/bin/env perl
+use strict;
+
+my $Rscript = $ARGV[0];
+
+my $apa_code = '/home/apa/local/git/apa_tools/code';
+
+chomp(my @apa_func = split /\n/, `ls $apa_code/*/* | sed 's/.R\$//' | sed 's/.*\\///'`);
+chomp(my @apa_alias = split /\n/, `grep -P "^\\S+ <- \\S+" $apa_code/*/* | grep -vP "(function|~)" | sed 's/.*\\///' | sed 's/ .*//' | sed 's/.R:/ /'`);
+chomp(my @local_func = split /\n/, `grep -oP "[\\w.]+\\s*(=|<?<-)\\s*function\s*\\(" $Rscript | sed 's/[ =<].*//' | sort -u`);
+chomp(my @all_func = split /\n/, `grep -oP "[\\w.]+\\(" $Rscript | sed 's/(//' | sort -u`);
+
+my %local_func = map {($_=>1)} @local_func;
+my %apa_func = map {($_=>'')} @apa_func;
+foreach (@apa_alias) {
+    my ($real, $alias) = split;
+    $apa_func{$alias} = "($real)";
+}
+
+my ($fw, %out);
+foreach my $func (@all_func) {
+    $fw = length($func) if length($func) > $fw;
+    next unless $func =~ /[A-Z]/i;  # no '.', '_', etc 
+    if (exists $apa_func{$func}) {
+        push @{ $out{APA} }, [$func,'APA_TOOLS',$apa_func{$func}];
+    } elsif (exists $local_func{$func}) {
+        push @{ $out{LOC} }, [$func,'LOCAL',''];
+    } else {
+        push @{ $out{NON} }, [$func,'',''];
+    }
+}
+
+my $fmt = "%-${fw}s  %s  %s\n";
+printf($fmt, $_->[0], $_->[1], $_->[2]) foreach @{ $out{NON} };
+printf($fmt, $_->[0], $_->[1], $_->[2]) foreach @{ $out{LOC} };
+printf($fmt, $_->[0], $_->[1], $_->[2]) foreach @{ $out{APA} };
+exit;
+

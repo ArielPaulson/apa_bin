@@ -1,0 +1,254 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';  # open2
+use Getopt::Long;
+use Pod::Usage;
+#use strict;
+
+
+
+### Inputs
+my $filter;    # filter headers list file (can be a SAM/BAM file)
+my $fastq1;    # end-1 fastq to be filtered
+my $fastq2;    # end-2 fastq to be filtered
+my $prefix;    # output fastq prefix
+my $gzip;      # gzip output?
+my $byend;     # apply filter by end? (PE only; if filter included end 1, but not end 2, then end 1 becomes an orphan)
+my $endflag;   # if $byend, is end info a BAM bitflag field? (otherwise, expects '1' or '2')  ## If $filter is SAM/BAM, turns on automatically
+my $noorphans; # do not write orphans fastqs? (PE only; basically, only write full pairs)
+my $nolost;    # ignore unmatched filter items
+my $stdio;     # read $filter from stdin?
+my $exclude;   # filter to exclude? (default: include)
+
+
+### Get inputs
+GetOptions("f=s"=>\$filter, "fq1=s"=>\$fastq1, "fq2=s"=>\$fastq2, "p=s"=>\$prefix, "gzip"=>\$gzip, "by-end"=>\$byend, "end-flag"=>\$endflag, "no-orphans"=>\$noorphans, "no-lost"=>\$nolost, ""=>\$stdio, "exclude"=>\$exclude);
+$byend = $endflag = $noorphans = undef unless $fastq2;
+$prefix = $filter unless $prefix;
+
+
+### Globals
+my %filter;  # filter list
+my %data;    # filtered fastq records
+my %orphans; # holding for orphan reads, if any
+my %lost;    # unmatched headers
+my %stats;   # stats for log
+my %endfq = (1=>$fastq1, 2=>$fastq2);
+
+
+### Get filter list
+my ($FILT, $isbam);
+if ($stdio) {
+    open $FILT, '-';
+} elsif ($filter =~ /\.[bs]am$/) {
+    $isbam = 1;
+    $endflag = 1 if $byend;
+    my $read_cmd = "samtools view $filter | cut -f1";
+    $read_cmd .= ",2" if $byend;
+    print "READ_CMD: $read_cmd\n";
+    open $FILT, '-|', $read_cmd;
+} else {
+    $FILT = &open2('R', $filter, 'Filter headers list');
+}
+if ($byend) {
+    ## assuming filter is 2-column: header and end
+    while (<$FILT>) {
+	chomp;
+	my ($header, $end) = split /\t/, $_;
+	if ($endflag) {
+	    $end = $end & 64 ? 1 : 2;
+	}
+	$filter{$header}{$end} = 1;
+	$stats{LINES}{$end}++;
+    }
+} else {
+    ## assuming filter is NOT 2-column: header only (but ensuring that 2-column data will be handled properly anyway)
+    while (<$FILT>) {
+	chomp;
+	my $header = (split /\t/, $_)[0];
+	$filter{$header}{1} = 1;
+	$filter{$header}{2} = 1;  # automatically storing in end 2 filter if not $byend -- if single-end; this gets ignored anyway
+	$stats{TFILT}{1}++;
+	$stats{TFILT}{2}++;
+    }
+}
+print "$. filter lines read\n";
+close $FILT;
+
+$stats{LINES}{0} = $stats{LINES}{1} + $stats{LINES}{2};
+$stats{TFILT}{0} = scalar keys %filter;
+foreach my $header (keys %filter) {
+    if (exists $filter{$header}{1} && exists $filter{$header}{2}) {
+	$stats{TFILT}{1}++;
+	$stats{TFILT}{2}++;
+	$stats{UFILT}{1}++;
+	$stats{UFILT}{2}++;
+    } elsif (exists $filter{$header}{1}) {
+	$stats{TFILT}{1}++;
+	$stats{UFILT}{1}++;
+    } elsif (exists $filter{$header}{2}) {
+	$stats{TFILT}{2}++;
+	$stats{UFILT}{2}++;
+    }
+}
+
+
+
+### Process fastqs
+foreach my $end (1, 2) {
+    next if $end == 2 & !$fastq2;
+    my $IN = &open2('R', $endfq{$end}, "End-$end input fastq");
+    my ($i, $rec, $header);
+    while (<$IN>) {
+	$i++;
+	$rec .= $_;
+	chomp;
+	if ($i == 1) {
+	    ($header = (split /\s+/, $_)[0]) =~ s/^@//;
+	} elsif ($i == 4) {
+	    if (exists $filter{$header}) {
+		$stats{MATCH}{$end}++ if exists $filter{$header}{$end};
+		$data{$header}{$end} = $rec unless $exclude;
+	    } else {
+		$data{$header}{$end} = $rec if $exclude;
+	    }
+	    $rec = undef;
+	    $i = 0;
+	}
+    }
+    my $nrecs = $. / 4; #/
+    print "End $end: $nrecs records read\n";
+    close $IN;
+}
+
+
+
+### Write paired fastqs
+my $outfq1 = "${prefix}_1.fastq";
+$outfq1 .= '.gz' if $gzip;
+my $OUT1 = &open2('W', $outfq1, 'End-1 output fastq');
+my $OUT2;
+if ($fastq2) {
+    my $outfq2 = "${prefix}_2.fastq";
+    $outfq2 .= '.gz' if $gzip;
+    $OUT2 = &open2('W', $outfq2, 'End-2 output fastq');
+}
+
+my @outheaders = $exclude ? (keys %data) : (keys %filter);
+
+foreach my $header (@outheaders) {
+    
+    if ($fastq2) {
+	
+	my $d1ok = exists $data{$header}{1} ? 1 : 0;
+	my $d2ok = exists $data{$header}{2} ? 1 : 0;
+	
+	if ($d1ok && $d2ok) {
+	    ## Filtered and found in both ends
+	    print $OUT1 $data{$header}{1};
+	    print $OUT2 $data{$header}{2};
+	    $stats{PAIRED}++;
+	} elsif ($d1ok) {
+	    ## Found in end 1 only
+	    if (exists $filter{$header}{2}) {
+		## Expected end 2 match was not found
+		$stats{LOST}{2}++;
+		push @{ $lost{2} }, $header;
+		$stats{ORPH}{1}++;
+		push @{ $orphans{1} }, $header;
+	    } else {
+		## Why are we filtering to retain only one end of a pair??
+		print STDERR "FILTER FAILURE: $header was only requested for end 1!\n";
+	    }
+	} elsif ($d2ok) {
+	    ## Found in end 2 only
+	    if (exists $filter{$header}{1}) {
+		## Expected end 1 match was not found
+		$stats{LOST}{1}++;
+		push @{ $lost{1} }, $header;
+		$stats{ORPH}{2}++;
+		push @{ $orphans{2} }, $header;
+	    } else {
+		## Why are we filtering to retain only one end of a pair??
+		print STDERR "FILTER FAILURE: $header was only requested for end 2!\n";
+	    }
+	} else {
+	    ## In filter, but not in either fastq
+	    $stats{LOST}{0}++;
+	    push @{ $lost{0} }, $header;
+	}
+	
+    } else {
+	
+	if (exists $data{$header}{1}) {
+	    print $OUT1 $data{$header}{1};
+	    $stats{PAIRED}++;
+	} else {
+	    $stats{LOST}{1}++;
+	    push @{ $lost{1} }, $header;
+	}
+	
+    }
+}
+close $OUT1;
+close $OUT2 if $fastq2;
+
+
+
+### Write orphans, if any
+if (exists $stats{ORPH} && !$noorphans) {
+    my $orphfq1 = "${prefix}_1.orphans.fastq";
+    $orphfq1 .= '.gz' if $gzip;
+    my $ORPH1 = &open2('W', $orphfq1, 'End-1 orphans fastq');
+    print $ORPH1 $data{$_}{1} foreach @{ $orphans{1} };
+    close $ORPH1;
+    
+    if ($fastq2) {
+	my $orphfq2 = "${prefix}_2.orphans.fastq";
+	$orphfq2 .= '.gz' if $gzip;
+	my $ORPH2 = &open2('W', $orphfq2, 'End-2 orphans fastq');
+	print $ORPH2 $data{$_}{2} foreach @{ $orphans{2} };
+	close $ORPH2;
+    }
+}
+
+
+
+### Write lost list, if any
+if (exists $stats{LOST} && !$nolost) {
+    my $LOST = &open2('W', "${prefix}_lost.txt", "Unmatched filter headers list");
+    print $LOST "Header\tLost From\n";
+    foreach my $end (0, 1, 2) {
+	my $endname = $end ? "END_$end" : "BOTH_ENDS";
+	print $LOST "$_\t$endname\n" foreach @{ $lost{$end} };
+    }
+    close $LOST;
+}
+
+
+
+### Write stats and exit
+if ($fastq2) {
+    foreach my $i (1, 2) {
+	print "End-$i input fastq:     $endfq{$i}\n";
+	print "End-$i total lines:     $stats{LINES}{$i}\n";
+	print "End-$i total filters:   $stats{TFILT}{$i}\n";
+	print "End-$i unique filters:  $stats{UFILT}{$i}\n";
+	print "End-$i matched filters: $stats{MATCH}{$i}\n";
+	print "End-$i orphan filters:  $stats{ORPH}{$i}\n";
+	print "End-$i lost filters:    $stats{LOST}{$i}\n";
+    }
+    print "Total lines:                $stats{LINES}{0}\n";
+    print "Total filters:              $stats{TFILT}{0}\n";
+    print "Pair-matched filters:       $stats{PAIRED}\n";
+    print "Pair-lost filters:          $stats{LOST}{0}\n";
+} else {
+    print "Input fastq:     $endfq{1}\n";
+    print "Total lines:     $stats{LINES}{1}\n";
+    print "Total filters:   $stats{TFILT}{1}\n";
+    print "Unique filters:  $stats{UFILT}{1}\n";
+    print "Matched filters: $stats{MATCH}{1}\n";
+    print "Lost filters:    $stats{LOST}{1}\n";
+}
+
+print "$0 complete!\n";
+system "kill $$";  # required if file may have massive hashes

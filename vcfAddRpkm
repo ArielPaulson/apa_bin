@@ -1,0 +1,211 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+## Adds gene and/or transcript RPKM fields to the VCF INFO column.
+
+
+## Inputs
+my $invcf;   # input VCF
+my $outvcf;  # output VCF
+my $grpkms;  # gene-level rpkm/fpkm file               (col 1 = gene ID,  cols 2-N = rpkms, 1 header row)
+my $trpkms;  # transcript-level rpkm/fpkm file         (col 1 = trans ID, cols 2-N = rpkms, 1 header row)
+my $gtr;     # OPTIONAL gene-transcript relations file (col 1 = gene ID,  col 2 = trans ID, 1 header row), ONLY REQUIRED IF using gene rpkms AND have old 'EFF'-type snpEff fields.
+
+
+## Get args
+GetOptions( "i=s"=>\$invcf, "o=s"=>\$outvcf, "g=s"=>\$grpkms, "t=s"=>\$trpkms, "r=s"=>\$gtr );
+
+
+## Test args
+die "$0: input VCF '$invcf' not found!\n" unless -e $invcf;
+die "$0: must have at least one RPKM file!\n" if !$grpkms && !$trpkms;
+
+
+## Globals
+my @VCF;      # VCF data
+my %RPKM;     # RPKM data
+my %GTR;      # gene-transcript relations data
+my %idmatch;  # ID match tracking
+my @lines;
+my $do_gene;
+my $do_trans;
+my $gene_no_gtr;
+
+
+## Get Transcript RPKMs
+if ($trpkms) {
+    $do_trans = 1;
+    my @samples;
+    my $TR = &open2('R', $trpkms, 'transcript RPKMs file');
+    while (<$TR>) {
+        s/[\n\r]+$//;
+        my ($tid, @rpkms) = split /\t/, $_;
+        if ($. == 1) {
+            @samples = @rpkms;
+        } else {
+            $RPKM{T}{$tid} = "T|$tid";
+            $RPKM{T}{$tid} .= "|$samples[$_]:$rpkms[$_]" foreach (0..$#rpkms);
+        }
+    }
+    close $TR;
+}
+
+
+## Get Gene RPKMs
+if ($grpkms) {
+    $do_gene = 1;
+    my @samples;
+    my $GR = &open2('R', $grpkms, 'gene RPKMs file');
+    while (<$GR>) {
+        s/[\n\r]+$//;
+        my ($gid, @rpkms) = split /\t/, $_;
+        if ($. == 1) {
+            @samples = @rpkms;
+        } else {
+            $RPKM{G}{$gid} = "G|$gid";
+            $RPKM{G}{$gid} .= "|$samples[$_]:$rpkms[$_]" foreach (0..$#rpkms);
+        }
+    }
+    close $GR;
+}
+
+
+## Get Gene->Transcript Relations
+if ($gtr) {
+    my $G2T = &open2('R', $gtr, 'gene-transcript relations file');
+    while (<$G2T>) {
+        s/[\n\r]+$//;
+        my ($gid, $tid) = split /\t/, $_;
+        $GTR{$tid} = $gid;
+    }
+    close $G2T;
+} else {
+    $gene_no_gtr = 1 if $do_gene;
+}
+
+
+## Read VCF
+my $IN = &open2('R', $invcf, 'input vcf');
+while (<$IN>) {
+    s/[\n\r]+$//;
+    
+    if (/^#/) {
+        
+        ## Headers
+        push @VCF, "$_\n";
+        
+    } else {
+        
+        ## Records
+        $lines[0]++;
+        my @fields = split /\t/, $_;
+        my %gt;       # genes, transcripts identified on this line
+        my @rpkmstr;  # data array to add to INFO
+        
+        ## Look for snpEff data in INFO field
+        foreach my $item (split /;/, $fields[7]) {
+            my @keyval = split /=/, $item;
+            if ($keyval[0] eq 'EFF') {
+                ## Old snpEff effects
+                die "$0: gene-transcript relations are required for older EFF-type snpEff annotations!\n" if $gene_no_gtr;
+                foreach my $entry (split /,/, $keyval[1]) {
+                    my $tid = (split /\|/, $entry)[9];
+                    my $gid = $GTR{$tid};
+                    #next if $eff =~ /^intergenic/i;
+                    $gt{G}{$gid} = 1;
+                    $gt{T}{$tid} = 1;
+                }
+            } elsif ($keyval[0] eq 'ANN') {
+                ## New snpEff effects
+                foreach my $entry (split /,/, $keyval[1]) {
+                    my ($eff, $gid, $tid) = (split /\|/, $entry)[1,4,6];
+                    next if $eff =~ /^intergenic/i;
+                    $gt{G}{$gid} = 1;
+                    $gt{T}{$tid} = 1;
+                }
+            }
+        }
+        
+        ## Get unique genes/transcripts referred to
+        if (%gt) {
+            $lines[1]++;
+            my $success;
+            
+            ## Add gene RPKM tag(s)
+            if ($do_gene) {
+                foreach my $gid (keys %{ $gt{G} }) {
+                    if (exists $RPKM{G}{$gid}) {
+                        $idmatch{1}{GI}{$gid} = 1;
+                        $idmatch{1}{GT}++;
+                        push @rpkmstr, $RPKM{G}{$gid};
+                        $success = 1;
+                    } else {
+                        $idmatch{0}{GI}{$gid} = 1;
+                        $idmatch{0}{GT}++;
+                        print "WARNING: gene '$gid' does not have an RPKM value!\n";
+                    }
+                }
+            }
+            
+            ## Add transcript RPKM tag(s)
+            if ($do_trans) {
+                foreach my $tid (keys %{ $gt{T} }) {
+                    if (exists $RPKM{T}{$tid}) {
+                        $idmatch{1}{TI}{$tid} = 1;
+                        $idmatch{1}{TT}++;
+                        push @rpkmstr, $RPKM{T}{$tid};
+                        $success = 1;
+                    } else {
+                        (my $tid2 = $tid) =~ s/\.\d+$//;   # crop transcript version number
+                        if (exists $RPKM{T}{$tid2}) {
+                            $idmatch{1}{TI}{$tid2} = 1;
+                            $idmatch{1}{TT}++;
+                            push @rpkmstr, $RPKM{T}{$tid2};
+                            $success = 1;
+                        } else {
+                            $idmatch{0}{TI}{$tid} = 1;
+                            $idmatch{0}{TT}++;
+                            print "WARNING: transcript '$tid' does not have an RPKM value!";
+                            if ($tid ne $tid2) {
+                                print "  (neither does '$tid2')\n";
+                            } else {
+                                print "\n";
+                            }
+                        }
+                    }
+                }
+            }
+            $lines[2]++ if $success;
+            $fields[7] .= ";RPKM=".join(',', @rpkmstr);
+            
+        }
+        
+        push @VCF, join("\t", @fields)."\n";
+        
+    }
+}
+close $IN;
+
+
+## Write VCF
+my $OUT = &open2('W', $outvcf, 'output VCF');
+print $OUT @VCF;
+close $OUT;
+
+
+## Reporting and exit
+print "$lines[0] records total.\n";
+print "$lines[1] records with gene or transcript events.\n";
+print "$lines[2] records had RPKMs added to the INFO field.\n";
+print scalar(keys %{ $idmatch{1}{TI} }), " transcript IDs were matched $idmatch{1}{TT} times.\n";
+print scalar(keys %{ $idmatch{0}{TI} }), " transcript IDs were UN-matched $idmatch{0}{TT} times.\n";
+print scalar(keys %{ $idmatch{1}{GI} }), " gene IDs were matched $idmatch{1}{GT} times.\n";
+print scalar(keys %{ $idmatch{0}{GI} }), " gene IDs were UN-matched $idmatch{0}{GT} times.\n";
+print "$0 $invcf complete!\n";
+exit;
+
+

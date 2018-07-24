@@ -1,0 +1,22 @@
+#!/usr/bin/env perl
+require '/home/apa/local/bin/apa_routines.pm';  # &blockify
+use Getopt::Long;
+use strict; 
+
+# converts a fasta in tab-delim format (col 1 = header, col 2 = seq) back to regular fasta
+# streaming only
+
+my ($linelen, $stdio);
+GetOptions("l=i"=>\$linelen, ""=>\$stdio);
+
+open my $IN, '-';
+while (<$IN>) {
+    s/[\n\r]+$//;
+    my ($header, $SEQ) = (split /\t/, $_)[0,1];  # may have other columns, but only taking first two
+    if (length($SEQ) > $linelen) {
+	print ">$header\n",${ &blockify(\$SEQ, $linelen) },"\n";
+    } else {
+	print ">$header\n$SEQ\n";
+    }
+}
+exit;

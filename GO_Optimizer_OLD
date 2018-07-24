@@ -1,0 +1,1862 @@
+#!/usr/bin/env perl
+
+
+
+my ($noK, $noF, $noP) = (0,0,0);	# testing purposes only -- leave all 0
+my $HS_uniprot_trim = 1;		# trim "-\d" suffixes from Uniprot IDs for human xref entries?
+
+
+
+#$Id$
+
+# Copyright © 2009, Stowers Institute for Medical Research.  All rights reserved.
+
+# c.f. attached LICENSE
+
+
+=pod
+
+=head1 SYNOPSIS
+
+Briefly, GO_Optimizer takes a gene expression matrix, k-means clusters it for a range of k, identifies significant GO terms per cluster, 
+and reports which value of k maximizes the number of significant GO terms (also returns GO and cluster stability analyses for each k).  
+Alternatively, if a cluster mapping already exists, GO_Optimizer can skip the clustering and proceed directly to GO analysis.
+
+=head1 OPTIONS
+
+=item S<MANDATORY PARAMETERS>
+
+=over
+
+=item B<-f     --file>
+
+The input file
+
+=item B<-x     --taxon>
+
+The ncbi taxa id for the desired organism (use --showtaxa for a listing of the most common model organisms).
+
+=item B<-d     --db>
+
+The GO database to use (use --showdbs to get a listing of all canonically-named GO databases on the given mysql host).
+
+=back
+
+=item S<OPTIONAL PARAMETERS>
+
+=over
+
+=item B<-m     --mode>
+
+Run mode.  Use "k" to start from the beginning (default; do k-means clustering) or "F" to start with the Fisher's exact testing.
+
+NOTE: The input files are different for each mode.  Mode "k" takes a gene expression matrix (columns are measurements), 
+while mode "F" takes a clustering matrix (columns are cluster assignments; one column per k).  Mode 'F' also works perfectly well for 
+'flagged' lists, where column 1 is the gene identifier(s) and column 2 is a single integer indicating group membership.
+
+=item B<-h     --host>
+
+The mysql host where the GO database lives (default: mysql-dev).
+
+=item B<-b     --bkg>
+
+Background type for each cluster being analyzed.  Use "complement" for all other clusters, "genome" for the rest of the genome, or "opposite" for opposing 
+list pairs ("opposite" is only available for mode = F, see below).  If using "opposite", cluster values in each mapping column of the cluster matrix must
+comprise a set of signed pairs, e.g. 1/-1, 2/-2, 3/-3, where the unsigned value is the set number and the signs indicate the opposing pair.  This indicates 
+which gene sets are "opposites" to be compared.  Thus, all genes in cluster 1 will be compared to all genes in cluster -1, likewise for 2 and -2, etc.
+
+=item B<-l     --levels>
+
+The GO 'tree' levels to search for significant terms in (FatiGO-style), given as 'min-max'; default 3-9.
+
+=item B<-n     --slim>
+
+Use a slim list (-n slimfile) instead of searching all terms and levels.  The slim list must consist only of GO accessions.
+
+=item B<-a     --alpha>
+
+Fisher's Exact Test parameter: post-adjustment significance cutoff value; default is 0.05.
+
+=item B<-t     --Ftails>
+
+Fisher's Exact Test parameter: number of tails for the test; default is 2.  Informs R parameter "alternative" for function "fisher.test".  Choices:
+
+=over
+
+=item B<2 = two-tailed test>
+
+=item B<1 = 1-tailed; cluster > background>
+
+=item B<-1 = 1-tailed; cluster < background>
+
+=back
+
+=item B<-v     --Fclev>
+
+Fisher's Exact Test parameter: confidence interval for test; default 0.95.  Becomes R parameter "conf.level" for function "fisher.test".
+
+=item B<-j     --padj>
+
+Fisher's Exact Test parameter: method for p-value adjustment; default is "BH".  Informs R parameter "method" for function "p.adjust".  Choices:
+
+=over
+
+=item B<BF = Bonferroni>
+
+=item B<BH = Benjamini-Hochberg>
+
+=item B<BY = Benjamini-Young>
+
+=item B<F = FDR>
+
+=item B<H = Holm>
+
+=item B<HB = Hochberg>
+
+=item B<HM = Hommel>
+
+=item B<NA = none>
+
+=back
+
+=item S<MANDATORY PARAMETERS IF MODE = K>
+
+=over
+
+=item B<-r     --krange>
+
+K-Means parameter: range of k values to evaluate, given as 'min-max', e.g. 3-10.  Informs R parameter "centers" for function "kmeans".
+
+=back
+
+=item S<OPTIONAL PARAMETERS IF MODE = K>
+
+=over
+
+=item B<-i     --kiter>
+
+K-Means parameter: number of iterations for each k-means execution; default is 200.  Becomes R parameter "iter.max" for function "kmeans".
+
+=item B<-p     --kreps>
+
+K-Means parameter: number of times to re-cluster each k (for cluster stability testing); default is 10.
+
+=item B<-s     --kstart>
+
+K-Means parameter: initial cluster number; default is 1.  Becomes R parameter "nstart" for function "kmeans".
+
+=item B<-g     --kalg>
+
+K-Means parameter: algorithm specification; default is "HW".  Informs R parameter "algorithm" for function "kmeans".  Choices:
+
+=over
+
+=item B<HW = Hartigan-Wong>
+
+=item B<L = Lloyd>
+
+=item B<F = Forgy>
+
+=item B<M = MacQueen>
+
+=back
+
+=item B<-p     --kreps>
+
+K-Means parameter:  number of reinitializations to use in testing cluster stability (since kmeans algorithms are randomly initialized), default 10.  
+
+=back
+
+=item S<OTHER FLAGS>
+
+=over
+
+=item B<--showdbs>
+
+Show a list of canonically-named GO databases (go_yyyymm) on the specified host (be sure to specify -h if not using mysql-dev).
+
+=item B<--showtaxa>
+
+Show a list of the NCBI taxa ids for the most common model organisms.
+
+=item B<--help>
+
+Display command line usage with options.
+
+=item B<--man>
+
+Display complete manual page and exit.
+
+=item B<--version> 
+
+Display the scripts version number and exit.
+
+=back
+
+=back
+
+=head1 RUNNING
+
+
+
+
+=head1 OUTPUTS
+
+=over
+
+=item B<GO_Optimizer_Final_Report_<krange>.txt>
+
+
+
+=item B<GO_Optimizer_kmeans.Rout>
+
+R session output, k-means script
+
+=item B<GO_Optimizer_kmeans_cluster_map_<krange>.txt>
+
+
+
+=item B<GO_Optimizer_Consensus_Cluster_Profiles_k<k>.png>
+
+
+
+=item B<GO_Optimizer_kmeans_<krange>_Cluster_Stats.png>
+
+
+
+=item B<GO_Optimizer_kmeans_<krange>_log_R.txt>
+
+
+
+=item B<GO_Optimizer_Fisher's.Rout>
+
+R session output, Fisher's exact test script
+
+=item B<GO_Optimizer_Fisher's_GO_Report_k<k>.png>
+
+
+
+=item B<>
+
+
+
+=back
+
+=head1 EXAMPLES
+
+=over
+
+=item C< GO_Optimizer --man >
+
+print a manpage.
+
+=item C< GO_Optimizer --showtaxa >
+
+show the NCBI taxa numbers for the most common model organisms.
+
+=item C< GO_Optimizer --getGOstats Bacillus.subtilis -d go_201001>
+
+show all NCBI taxa numbers associated with Bacillus subtilis* from database 'go_201001', and their associated DB statistics.
+
+=item C< GO_Optimizer --showdbs -h rho >
+
+show any GO databases (with name format go_yyyymm) on host rho.
+
+=item C< GO_Optimizer -m k -f expmatrix.txt -x 9606 -b complement -d go_201001 -r 3-10 -i 200 -p 30 -t 1 -a 0.01 >
+
+Run GO_Optimizer on file expmatrix.txt (thus, mode=k), species = human, bkg = other clusters, GO db = go_201001 (on mysql-dev), k range from 3 to 10, 200 iterations, repeat 30 times, and use a 1-sided Fisher's test (for over-enrichment in cluster) with alpha = 0.01.
+
+=item C< GO_Optimizer -m F -f clustmatrix.txt -x 9606 -b complement -d go_201001 -t 1 -a 0.01 >
+
+The same call as above, but starting at the Fisher's test (thus, mode=F, kmeans is skipped, and input file is a cluster matrix equivalent to GO_Optimizer_kmeans_cluster_map_<krange>.txt).
+
+
+
+
+
+=back
+
+=head1 VERSION
+
+$Revision:  1.0$
+
+=head1 AUTHOR
+
+Ariel Paulson (apa@stowers-institute.org)
+
+=head1 DEPENDENCIES
+
+perl
+
+=head1 AVAILABILITY
+
+Download at will.
+
+=cut
+
+use DBI;
+use Cwd;
+use Storable (qw/ nstore retrieve /);
+use File::Path;
+use Data::Dumper;
+use Getopt::Long;
+use Pod::Usage;
+use FindBin;
+use strict;
+
+#use vars qw($VERSION $VC_DATE);
+
+#BEGIN {
+our $VERSION =  qw$Revision: 1.0 $[-1];
+our $VC_DATE =  qw$Date: $[-2];
+#}
+
+
+
+######################################################################  ACTUAL CODE  ######################################################################
+######################################################################  ACTUAL CODE  ######################################################################
+######################################################################  ACTUAL CODE  ######################################################################
+######################################################################  ACTUAL CODE  ######################################################################
+######################################################################  ACTUAL CODE  ######################################################################
+
+
+
+### Setup
+
+my %taxon_ids = (
+	3702 => 'Arabidopsis thaliana',
+	6500 => 'Aplysia californica',
+	7739 => 'Branchistoma floridae',
+	6239 => 'Caenorhabditis elegans',
+	7955 => 'Danio rerio',
+	7227 => 'Drosophila melanogaster',
+	9031 => 'Gallus gallus',
+	9606 => 'Homo sapiens',
+	10090 => 'Mus musculus',
+	45351 => 'Nematostella vectensis',
+	46514 => 'Patiria (Asterina) miniata',
+	10116 => 'Rattus norvegicus',
+	4932 => 'Saccharomyces cerevisiae',
+	4896 => 'Schizosaccharomyces pombe',
+	10228 => 'Trichoplax adherens',
+	8355 => 'Xenopus laevis'
+);
+my %valid = (
+	'TF' => {'T',1, 'F',1},
+	'mode' => {'K',1, 'F',1},
+	'bkg' => {'genome',1, 'complement',1, 'opposite',1},
+	'kalg' => {'HW' => 'Hartigan-Wong', 'L' => 'Lloyd', 'F' => 'Forgy', 'M' => 'MacQueen'},
+	'Ftails' => {1 => ['greater','OVER'], 2 => ['two.sided','BOTH'], -1 => ['lesser','UNDER']},
+	'padj' => {'H' => 'holm', 'HB' => 'hochberg', 'HM' => 'hommel', 'BF' => 'bonferroni', 'BH' => 'BH', 'BY' => 'BY', 'F' => 'fdr', 'NA' => 'none'}
+);
+my %tailuse = ('OVER' => {'OVER',1}, 'UNDER' => {'UNDER',1}, 'BOTH' => {'OVER',1, 'UNDER',1});
+
+# script parameters
+my ($file, $taxon, $showdbs, $showtaxa, $slimtree, $getGOstats, $getdbids, $help, $man, $ver, $GOdb, $wdir, $slim);
+my $bkg = 'complement';
+my $mode = 'K';
+my $dbhost = 'mysql-dev';
+my @log;
+
+# algorithm parameters for R
+my ($krange, $kmin, $kmax, $levmin, $levmax);
+my ($levels, $kiter, $kreps, $kstart, $kalg, $Ftails, $Fclev, $alpha, $padj) = ('3-9', 200, 10, 1, 'HW', 2, 0.95, 0.05, 'BH'); 
+
+GetOptions(
+	"m=s" => \$mode, 
+	"f=s" => \$file, 
+	"x=s" => \$taxon, 
+	"b=s" => \$bkg, 
+	"d=s" => \$GOdb,
+	"h=s" => \$dbhost,
+	"w=s" => \$wdir,
+	"n=s" => \$slim,
+
+	"mode=s" => \$mode, 
+	"file=s" => \$file, 
+	"taxon=s" => \$taxon, 
+	"bkg=s" => \$bkg, 
+	"db=s" => \$GOdb,
+	"host=s" => \$dbhost,
+	"wdir=s" => \$wdir,
+	"slim=s" => \$slim,
+
+	"l=s" => \$levels, 
+	"r=s" => \$krange, 
+	"i=i" => \$kiter,
+	"s=i" => \$kstart,
+	"g=s" => \$kalg,
+	"p=i" => \$kreps,
+	"t=i" => \$Ftails,
+	"v=f" => \$Fclev,
+	"j=s" => \$padj,
+	"a=f" => \$alpha,
+
+	"levels=s" => \$levels, 
+	"krange=s" => \$krange, 
+	"kiter=i" => \$kiter,
+	"kstart=i" => \$kstart,
+	"kalg=s" => \$kalg,
+	"kreps=i" => \$kreps,
+	"Ftails=i" => \$Ftails,
+	"Fclev=f" => \$Fclev,
+	"padj=s" => \$padj,
+	"alpha=f" => \$alpha,
+
+	"showdbs" => \$showdbs,
+	"showtaxa" => \$showtaxa,
+	"slimtree=s" => \$slimtree,
+	"getdbids" => \$getdbids,
+	"getGOstats=s" => \$getGOstats,
+	"help|?" => \$help,
+	"man!" => \$man,
+	"version!" => \$ver
+) or pod2usage(2);
+
+pod2usage(1) if $help;
+pod2usage(-exitstatus => 0, -verbose => 2) if $man;
+if ($ver) {print "$FindBin::Script: $VERSION\n"; exit(0)};
+
+# declare HERE
+my (%four_names, %slimterms, %slimfound, %ignore, %termlevels, %idtable, %allterms);
+my (%accdata, %obsoletes, %levelmap, %relations, %idcounts, %idtrack, %termgenes1);
+my ($dbh, $maxlevel); 
+my $cache = "/home/apa/local/bin/GO_Optimizer_DBcache";	# DB cache directory
+
+if ($showtaxa) {
+	my $commontaxa = join "\n", map { sprintf("%5d = %s", $_, $taxon_ids{$_}) } (sort {$taxon_ids{$a} cmp $taxon_ids{$b}} keys %taxon_ids);
+	print "\n\nSome taxa and their numbers:\n$commontaxa\n\n\n";
+	exit;
+} elsif ($showdbs) {
+	my $dbh = DBI->connect("DBI:mysql:host=$dbhost",'anonymous','guy#fawkes',{RaiseError=>1}) or die "Cannot connect to $dbhost: $DBI::err() $DBI::errstr()\n";
+	my $dbquery = $dbh->prepare("SHOW DATABASES");
+	$dbquery->execute();
+	my $ref = $dbquery->fetchall_arrayref();
+	$dbquery->finish();
+	print "\n\nGO databases on host $dbhost:\n";
+	foreach (@$ref) {
+		print "$$_[0]\n" if $$_[0] =~ /^go_\d{6}$/;
+	}
+	$dbh->disconnect();
+	print "\n\n";
+	exit;
+} elsif ($slimtree) {
+	die "\n--slimtree flag MUST be accompanied by a taxon id, using the -x or --taxon switch!\n" unless $taxon;
+	die "\n--slimtree flag MUST be accompanied by a database name, using the -d or --db switch!\n" unless $GOdb;
+	&GO_queries($taxon);
+	&get_level_mappings;
+
+	my ($tid, %kids1, @kids, %levels, @tree, @gpids);
+	if ($accdata{$slimtree}) {
+		$tid = $accdata{$slimtree}->[2];
+	} elsif ($obsoletes{A2T}{$slimtree}) {
+		$tid = $obsoletes{A2T}{$slimtree};
+	} else {
+		die "GO accession $slimtree not found for taxon $taxon!\n";
+	}
+
+	foreach my $level (keys %{ $levelmap{L} }) {
+		push @kids, (keys %{ $levelmap{L}{$level}{$tid} });
+#		$levels{$_}{$level} = 1 foreach @kids;
+	}
+	my %kids1 = map {($_=>1)} @kids;
+	delete $kids1{$tid};
+	@kids = ($tid, (sort keys %kids1));	# make sure query accession is first!
+	
+	foreach my $tid (@kids) {
+		my $acc = $allterms{I2A}{$tid};
+		my $lev = join ',', (sort {$a <=> $b} keys %{ $levels{$tid} });
+		foreach my $gpid (keys %{ $allterms{I2G}{$taxon}{$tid} }) {
+			my %idtemp;
+			$idtemp{ $idtable{1}{$taxon}{$gpid}{$_} }{$_} = 1 foreach (keys %{ $idtable{1}{$taxon}{$gpid} });
+			my $symbs = join '; ', (sort keys %{ $idtemp{S} });
+			my $names = join '; ', (sort keys %{ $idtemp{N} });
+			my $xrefs = join '; ', (sort keys %{ $idtemp{X} });
+#			push @gpids, "$acc\t$accdata{$acc}->[1]\t$lev\t$xrefs\t$symbs\t$names\n";
+			push @gpids, "$acc\t$accdata{$acc}->[1]\t$lev\t$xrefs\t$symbs\t$names\n";
+		}
+	}
+	
+#	open TREE, "> GO_Tree_${GOdb}_$taxon.txt";
+#	print TREE ;
+#	close TREE;
+	my $outname = "All_GO_Mappings_${slimtree}_${GOdb}_$taxon.txt";
+	print "Outputting $outname\n";
+	open GPIDS, "> $outname";
+#	print GPIDS "Accession\tTerm\tLevels\tXrefs\tSymbols\tNames\n";
+	print GPIDS "Accession\tTerm\tXrefs\tSymbols\tNames\n";
+	print GPIDS @gpids;
+	close GPIDS;
+	exit;
+} elsif ($getdbids) {
+	die "\n--getdbids flag MUST be accompanied by a database name, using the -d or --db switch!\n" unless $GOdb;
+	&GO_queries($taxon);
+	my (%realias, @dbids);
+	my %origins = ('S' => 'SYMBOLS', 'N' => 'NAMES', 'X' => 'XREFS');
+	foreach my $gpid (sort keys %{ $idtable{1}{$taxon} }) {
+		foreach my $alias (keys %{ $idtable{1}{$taxon}{$gpid} }) {
+			$realias{$gpid}{ $idtable{1}{$taxon}{$gpid}{$alias} }{$alias} = 1;	# re-key by alias origin (name, symbol, xref)
+		}
+		foreach my $origin (qw/ S N X /) {
+			my $string = join ';', (sort keys %{ $realias{$gpid}{$origin} });
+			push @dbids, "$gpid\t$origins{$origin}\t$string";
+		}
+	}
+	my $msg = join "\n", @dbids;
+	print "Gene_Product_ID\tType\tIDs\n$msg";
+	exit;
+} elsif ($getGOstats) {
+	($GOdb)? (print "\nChecking entries in database $GOdb...\n") : (die "\n--getGOstats flag MUST be accompanied by a database name, using the -d or --db switch!\n");
+	my (%taxtable, %ml, $ids);
+	my ($genus, $species) = split /\./, $getGOstats;
+	my $dbhq = DBI->connect("DBI:mysql:database=$GOdb:host=$dbhost",'anonymous','guy#fawkes',{RaiseError=>1}) or die "Cannot connect to $GOdb on $dbhost: $DBI::err() $DBI::errstr()\n";
+	my $qgenus = $dbhq->quote($genus);
+	my ($qspecies, $taxidquery);
+	if ($species eq '*') {
+		$taxidquery = $dbhq->prepare("SELECT ncbi_taxa_id, species FROM species WHERE genus = $qgenus");
+	} else {
+		$qspecies = $dbhq->quote("$species%");
+		$taxidquery = $dbhq->prepare("SELECT ncbi_taxa_id, species FROM species WHERE genus = $qgenus AND species like $qspecies");
+	}
+	$taxidquery->execute();
+	while ( my ($taxon, $spec) = $taxidquery->fetchrow_array() ) {
+		$taxtable{$taxon} = [$spec, $taxon, "$genus $spec", 0, 0, 0];	# last 3 fields will be: gene product count, gpid label count, term count from GO database
+	}
+	$taxidquery->finish();
+	if (scalar (keys %taxtable) == 0) {
+		if ($species eq '') {
+			print "No entries of genus \"$genus\" were found for any species!\n\n";
+		} else {
+			print "No entries of genus \"$genus\" were found for any species \"$species*\"!\n\n";
+		}
+		exit;
+	}
+	(scalar (keys %taxtable) == 1) ? ($ids = 'id') : ($ids = 'ids');
+	print scalar (keys %taxtable)," related taxon $ids found.\nQuerying term/identifier prevalence per taxon...\n";
+	foreach my $taxon (keys %taxtable) {
+		&GO_queries($taxon);
+		my (%labels, %terms);
+		$taxtable{$taxon}->[3] = scalar (keys %{ $idcounts{GPID}{$taxon} });
+		foreach my $labeltype (qw/ SYMB NAME XREF /) {
+			$labels{$_} = 1 foreach (keys %{ $idcounts{$labeltype}{$taxon} });
+		}
+		$taxtable{$taxon}->[4] = scalar (keys %labels);
+		foreach my $gpid (keys %{ $idcounts{GPID}{$taxon} }) {
+			$terms{$_} = 1 foreach (keys %{ $allterms{G2I}{$taxon}{$gpid} });
+		}
+		$taxtable{$taxon}->[5] = scalar (keys %terms);
+	}
+	$dbhq->disconnect;	# disconnect HERE after all &GO_queries are complete
+	$dbh->disconnect;	# disconnect HERE after all &GO_queries are complete
+	my @header = ('Taxon ID', 'Scientific Name', 'Genes', 'Labels', 'Terms');
+	foreach my $i (1..5) {
+		$ml{$i} = length($header[$i-1]) if length($header[$i-1]) > $ml{$i};	# max length for sprintf
+		foreach my $taxon (keys %taxtable) {
+			$ml{$i} = length($taxtable{$taxon}->[$i]) if length($taxtable{$taxon}->[$i]) > $ml{$i};	# ditto
+		}
+	}
+	my $msg = sprintf("%-$ml{1}s  %-$ml{2}s  %-$ml{3}s  %-$ml{4}s  %-$ml{5}s\n", @header);
+	$msg .= sprintf("%$ml{1}d  %-$ml{2}s  %$ml{3}d  %$ml{4}d  %$ml{5}d\n", @{ $taxtable{$_} }[1..5]) foreach (sort { $taxtable{$a}->[0] cmp $taxtable{$b}->[0] } keys %taxtable);
+	print "\n\n$msg\n\n";
+	exit;
+} else {
+	## Test script parameters
+	die "File '$file' not accessible!\n" unless -e $file;
+	die "Taxon number '$taxon' must be a positive integer!\n" if $taxon =~ /\D/;
+	die "Background type '$bkg' must be 'genome' or 'complement'!\n" unless $valid{bkg}{$bkg};
+	die "Mode type '$mode' must be 'K' or 'F'!\n" unless $valid{mode}{$mode};
+	if ($wdir) {
+		$wdir = cwd()."/$wdir" unless ($wdir =~ /^\//);	# don't change if rooted
+		if (-d $wdir) {
+			(rmtree $wdir) ? (print "Old working directory '$wdir' successfully removed.\n") : (warn "Could not remove old working directory '$wdir': $!\n");
+		}
+		(mkdir $wdir) ? (print "Working directory '$wdir' successfully created.\n") : (warn "Could not create working directory '$wdir': $!\n");
+	} else {
+		$wdir = cwd();	# don't refresh this directory...
+	}
+	print "Working directory = $wdir\n";
+	
+	## Test R parameters
+	if ($mode eq 'K') {
+		($kmin, $kmax) = ($1, $2) if $krange =~ /^(\d+)-(\d+)$/;
+		die "Invalid format for k range '$krange'!  Must specify as min-max, e.g. 3-10, even if single value\n" unless ($kmin =~ /^\d+$/ && $kmax =~ /^\d+$/);
+		die "k-means iteration value '$kiter' must be a positive integer!\n" if $kiter =~ /\D/;
+		die "k-means repeat number '$kreps' must be a positive integer!\n" if $kreps =~ /\D/;
+		die "k-means nstart value '$kstart' must be a positive integer!\n" if $kstart =~ /\D/;
+		die "k-means algorithm choice '$kalg' invalid!\n" unless $valid{kalg}{$kalg};
+		if ($bkg eq 'opposite') {
+			print "Background mode 'opposite' not allowed for mode=K!  Changing to 'complement'\n";
+			$bkg = 'complement';
+		}
+	}
+	($levmin, $levmax) = ($1, $2) if $levels =~ /^(\d+)-(\d+)$/;
+	die "Invalid format for GO level range '$levels'!  Must specify as min-max, e.g. 4-9, even if single value\n" unless ($levmin =~ /^\d+$/ && $levmax =~ /^\d+$/);
+	die "Fisher's test tails value '$Ftails' must be 1, 2, or -1!\n" unless $valid{Ftails}{$Ftails};
+	die "Fisher's test confidence level value '$Fclev' must be a positive real number!\n" if $Fclev =~ /[^\d\.]/;
+	die "Alpha value '$alpha' must be a positive real number!\n" if $alpha =~ /[^\d\.]/;
+	die "p-value adjustment method '$padj' invalid!\n" unless $valid{padj}{$padj};
+}
+chomp(my $date = `date`);
+
+my $tailname = $valid{Ftails}{$Ftails}->[1];
+my $term_mappings = "$wdir/GO_Optimizer_term_mappings.txt";
+my $term_table = "$wdir/GO_Optimizer_term_table.txt";
+
+my $R_script_K = "$wdir/GO_Optimizer_kmeans.R";
+my $R_session_K = $R_script_K."out";
+my $R_data_K = "$wdir/GO_Optimizer_kmeans_input.txt";
+my $R_results_K = "$wdir/GO_Optimizer_kmeans_cluster_map_$krange.txt";
+my $R_image_K = "$wdir/GO_Optimizer_kmeans_$krange.RData";
+my $R_plot_K = "$wdir/GO_Optimizer_kmeans_${krange}_Cluster_Stats.png";
+my $R_log_K = "$wdir/GO_Optimizer_kmeans_${krange}_log_R.txt";
+
+my $R_script_F = "$wdir/GO_Optimizer_Fishers.R";
+my $R_session_F = $R_script_F."out";
+my $R_data_F = "$wdir/GO_Optimizer_Fishers_input.txt";
+my $R_results_F = "$wdir/GO_Optimizer_Fishers_${tailname}_output.txt";
+my $R_sigterms_F = "$wdir/GO_Optimizer_Fishers_${tailname}_significant_terms.txt";
+my $R_sigrows_F = "$wdir/GO_Optimizer_Fishers_${tailname}_significant_genelist.txt";
+
+my $R_script_P = "$wdir/GO_Optimizer_Summary_Plot.R";
+my $R_session_P = $R_script_P."out";
+my $R_data1_P = "$wdir/GO_Optimizer_kmeans_${krange}_${tailname}_Sig_Term_Matrix.txt";
+my $R_data2_P = "$wdir/GO_Optimizer_kmeans_${krange}_${tailname}_Plot_Table.txt";
+my $R_plot_P = "$wdir/GO_Optimizer_kmeans_${krange}_${tailname}_GO_Stats.png";
+my ($script_text_K, $script_text_F, $script_text_P);
+
+my $logfile = "$wdir/GO_Optimizer_Log.txt";
+open LOG, "> $logfile" or warn "Cannot create logfile '$logfile': $!\n";	# overwrite existing
+close LOG;
+
+my ($kdir, $Fdir, @allk);
+if ($mode eq 'K') {
+	@allk = ($kmin..$kmax);
+	$kdir = "$wdir/K_${krange}_cluster_graphs";			# for final results files that have been broken out by K
+	$Fdir = "$wdir/K_${krange}_${tailname}_result_breakouts";	# for final results files that have been broken out by K
+} elsif ($mode eq 'F') {
+	$kdir = "$wdir/${file}_cluster_graphs";				# for final results files that have been broken out by K
+	$Fdir = "$wdir/${file}_${tailname}_result_breakouts";		# for final results files that have been broken out by K
+}
+my $BTfile = "$Fdir/GO_Optimizer_Fishers_significant_terms";		# these DO NOT HAVE .txt endings!
+my $BGfile = "$Fdir/GO_Optimizer_Fishers_significant_genelist";		# these DO NOT HAVE .txt endings!
+unless ($noK || $mode eq 'F') {			# if skipping k-means, $kdir files will not be regenerated (so don't refresh directory)
+	if (-d $kdir) {
+		(rmtree $kdir) ? (print "Old breakout directory '$kdir' successfully removed.\n") : (warn "Could not remove old breakout directory '$kdir': $!\n");
+	}
+	(mkdir $kdir) ? (print "Breakout directory '$kdir' successfully created.\n") : (warn "Could not create breakout directory '$kdir': $!\n");
+}
+unless ($noF) {			# if skipping Fisher's, $Fdir files will not be regenerated (so don't refresh directory)
+	if (-d $Fdir) {
+		(rmtree $Fdir) ? (print "Old breakout directory '$Fdir' successfully removed.\n") : (warn "Could not remove old breakout directory '$Fdir': $!\n");
+	}
+	(mkdir $Fdir) ? (print "Breakout directory '$Fdir' successfully created.\n") : (warn "Could not create breakout directory '$Fdir': $!\n");
+}
+
+## Get slim list, if specified
+my $slimnum;
+if ($slim) {
+	if (open SLIM, $slim) {
+		my ($slimlines, $slimcount, $slimwarn);
+		while (<SLIM>) {
+			$_ =~ s/[\n\r\"]//g;
+			$slimlines++;
+			if ($_ =~ /^GO:\d{7}/) {
+				$slimterms{1}{$_} = 1;
+				$slimcount++;
+			} else {
+				$slimterms{0}{$_} = 1;
+				$slimwarn++;
+			}
+		}
+		close SLIM;
+		print "SLIM TERMS: $slimlines lines read | $slimcount accessions | ", scalar (keys %{ $slimterms{1} }), " unique.\n";
+		print " There were also ", scalar (keys %{ $slimterms{0} }), " unique non-accession entries in $slimwarn instances.\n" if $slimwarn;
+		$slimnum = scalar (keys %{ $slimterms{1} });
+	} else {
+		print "Slim list '$slim' does not exist!  Slim analysis will not be performed.\n";
+		$slim = undef;
+	}	
+}
+
+
+
+##############################     QUERIES     ##############################
+##############################     QUERIES     ##############################
+##############################     QUERIES     ##############################
+##############################     QUERIES     ##############################
+##############################     QUERIES     ##############################
+
+
+
+### Find all identifiers associated with GO terms
+
+&GO_queries($taxon);
+
+## Get all IDs and their levels (from root); also get immediate children & parents
+
+my $childquery = $dbh->prepare("SELECT DISTINCT term2_id, distance FROM graph_path WHERE term1_id = ?");
+my $parentquery = $dbh->prepare("SELECT DISTINCT term1_id, distance FROM graph_path WHERE term2_id = ?");
+	########## have a query to investigate gene_product_count table somewhere....
+
+print "Mapping GO terms to levels...\n";
+$childquery->bind_param(1, $four_names{all}->[0]);
+$childquery->execute();
+while ( my ($tid, $level) = $childquery->fetchrow_array() ) {
+	if ($allterms{I2A}{$tid}) {		# no relationships or obsoletes
+		$termlevels{T2L}{$tid}{$level} = 1;
+		$termlevels{L2T}{$level}{$tid} = 1;
+		$maxlevel = $level if $level > $maxlevel;
+	}
+}
+warn "Error retrieving data: $childquery->errstr()\n" if $childquery->err();
+$childquery->finish();
+
+if ($levmax > $maxlevel) {
+	print "\nWARNING: given range for GO level analysis was $levmin-$levmax, but the tree only extends to level $maxlevel.\n Range is now $levmin-$maxlevel.\n\n";
+	$levmax = $maxlevel;
+}
+
+&get_level_mappings;
+
+unless (%relations && %levelmap) {
+	print "Mapping downstream GO terms to upper levels...\n";
+	foreach my $level (0..$maxlevel) {
+		my $thislevel = scalar (keys %{ $termlevels{L2T}{$level} });
+		my %downstreams;
+		foreach my $tid (keys %{ $termlevels{L2T}{$level} }) {			# all terms at level $level
+			$childquery->bind_param(1, $tid);
+			$childquery->execute();
+			while ( my ($tid2, $dist) = $childquery->fetchrow_array() ) {
+				if ($allterms{I2A}{$tid2}) {					# no relationships or obsoletes
+					$levelmap{L}{$level}{$tid}{$tid2} = 1 if $dist > 0;	# for each $tid at level $level, what are its downstream $tids? (no self-references)
+					$levelmap{T}{$tid2}{$level}{$tid} = 1;			# for each $tid2, what are its level-$level parental mappings? (need self-references)
+#					print "$tid child = $tid2 @ $dist\n" if $tid == 19;
+					$relations{P2C}{$tid}{$tid2} = 1 if $dist == 1;
+					$downstreams{$tid2} = 1;
+				}
+			}
+			warn "Error retrieving data: $childquery->errstr()\n" if $childquery->err();
+			$childquery->finish();
+	
+			$parentquery->bind_param(1, $tid);
+			$parentquery->execute();
+			while ( my ($tid2, $dist) = $parentquery->fetchrow_array() ) {
+				if ($allterms{I2A}{$tid2} && $tid2 != $tid) {		# no relationships, obsoletes, or self-references
+#					print "$tid parent = $tid2 @ $dist\n" if $tid == 19;
+					$relations{C2P}{$tid}{$tid2} = 1 if $dist == 1;
+				}
+			}
+			warn "Error retrieving data: $parentquery->errstr()\n" if $parentquery->err();
+			$parentquery->finish();
+		}
+		my $msg = sprintf("Level %2d: %5d terms absorbed %5d downstream terms.", $level, $thislevel, scalar (keys %downstreams));
+		&logreport($msg);
+	}
+	&logreport("Storing '$cache/${GOdb}_relations_dump.dat' for next time...");
+	nstore(\%relations,"$cache/${GOdb}_relations_dump.dat") or warn "Cannot store \%relations in file '$cache/${GOdb}_relations_dump.dat': $!";
+	&logreport("Storing '$cache/${GOdb}_levelmap_dump.dat' for next time...");
+	nstore(\%levelmap,"$cache/${GOdb}_levelmap_dump.dat") or warn "Cannot store \%levelmap in file '$cache/${GOdb}_levelmap_dump.dat': $!";
+}
+$dbh->disconnect();
+
+#open PCR, "> $wdir/pc_relations_dump.txt" or warn "Cannot create file '$wdir/pc_relations_dump.txt': $!\n";
+#print PCR Dumper(\%relations),"\n";
+#close PCR;
+
+open TAB, "> $term_table" or warn "Cannot create file '$term_table': $!\n";
+print TAB "Term ID\tGO Accession\tObsolete Accs\tTerm Type\tTerm Name\tTree Level\tParents\tChildren\tDownstream IDs\tGenes\tDownstream Genes\n";
+#foreach my $tid (sort {$allterms{I2A}{$a} cmp $allterms{I2A}{$b}} keys %{ $allterms{I2A} }) {
+foreach my $tid (keys %{ $allterms{I2A} }) {
+	my $gpids = scalar (keys %{ $allterms{I2G}{$taxon}{$tid} });
+	my $obsolete = join ',', (sort keys %{ $obsoletes{T2A}{$tid} });
+	my $acc = $allterms{I2A}{$tid};
+	if ($slimterms{1}{$acc}) {
+		$slimfound{$acc} = $acc;
+	} else {
+		foreach my $obs (keys %{ $obsoletes{T2A}{$tid} }) {
+			$slimfound{$obs} = $acc if $slimterms{1}{$obs};
+		}
+	}
+	my $typename = join "\t", @{ $accdata{$acc} }[0,1];
+	my $alevels = join ',', (sort {$a <=> $b} keys %{ $termlevels{T2L}{$tid} });
+	my $parents = scalar (keys %{ $relations{C2P}{$tid} });
+	my $children = scalar (keys %{ $relations{P2C}{$tid} });
+	my %downstream;
+	foreach my $level (0..$maxlevel) {
+		if ($levelmap{L}{$level}{$tid}) {
+			foreach my $tid2 (keys %{ $levelmap{L}{$level}{$tid} }) {
+				$downstream{I}{$tid2} = 1;
+				$downstream{G}{$_} = 1 foreach (keys %{ $allterms{I2G}{$taxon}{$tid2} });
+			}
+		}
+	}
+	my $dsI = scalar (keys %{ $downstream{I} });
+	my $dsG = scalar (keys %{ $downstream{G} });
+	print TAB "$tid\t$acc\t$obsolete\t$typename\t$alevels\t$parents\t$children\t$dsI\t$gpids\t$dsG\n" if ($gpids || $dsG);	# must have associated products!
+}
+close TAB;
+
+my $slimmap = scalar keys %slimfound;
+my $slimlost = $slimnum - $slimmap;
+print "WARNING: $slimlost/$slimnum slim terms do not exist or are not associated with taxon $taxon in this database!\n" if $slimlost;
+
+my $msg = scalar (keys %{ $idcounts{SYMB}{$taxon} })." Symbols, ".
+	scalar (keys %{ $idcounts{NAME}{$taxon} })." Names, and ".
+	scalar (keys %{ $idcounts{XREF}{$taxon} })." External IDs for ".
+	scalar (keys %{ $idcounts{GPID}{$taxon} })." GP IDs.\n".
+	scalar (keys %accdata)." GO accessions = ".
+	scalar (keys %{ $relations{C2P} })." children assigned to ".
+	scalar (keys %{ $relations{P2C} })." parents.\n";
+&logreport($msg);
+
+
+
+##############################     K-MEANS     ##############################
+##############################     K-MEANS     ##############################
+##############################     K-MEANS     ##############################
+##############################     K-MEANS     ##############################
+##############################     K-MEANS     ##############################
+
+
+
+my (%originals, %allgenes, %equivalents, %matched);
+
+if ($mode eq 'F') {
+
+	$R_results_K = $file;
+
+} else {
+
+	### Process expression matrix
+
+	my ($colcount, $lines, $row, $tcount, @tocluster, $orgwarn);
+	open IN, $file or die "Cannot open expression matrix file '$file': $!\n";
+	while (<IN>) {
+		$_ =~ s/[\n\r\"]//g;
+		my ($id, $data) = split /\t/, $_, 2;
+		$lines++;
+		next if $lines == 1;	# MANDATORY HEADER
+		$row++;			# counting data rows only
+		push @tocluster, "$row\t$data\n";
+		$originals{$row} = $id;
+		my @genes = split /\;/, $id;
+		$tcount += scalar @genes;
+		&matchup(\@genes, $row);
+	}
+	close IN;
+	my $matches = scalar (keys %matched);
+	my $matchpct = sprintf("%0.0f", 100*($matches/$row));
+	my $matchmsg = "$matches/$row rows ($matchpct%) were assigned a GO identifier.";
+	($matchpct <= 50) ? ($orgwarn = "Only $matchmsg  Did you pick the right organism?\n") : ($orgwarn = $matchmsg);
+	my $msg = "$row rows\n$tcount total IDs\n".scalar (keys %allgenes)." unique IDs\n$orgwarn";
+	&logreport($msg);
+
+	open OUT, "> $R_data_K" or warn "Cannot create file '$R_data_K': $!\n";
+	print OUT @tocluster;
+	close OUT;
+	
+	### Run k-means battery in R
+
+	&generate_kmeans_script;
+
+	open OUT, "> $R_script_K" or warn "Cannot create file '$R_script_K': $!\n";
+	print OUT $script_text_K;
+	close OUT;
+	
+	if ($noK) {
+		print "Skipping k-means clustering in R.\n";
+	} else {
+		print "Running k-means clustering in R:\nCalling: nohup R --vanilla < $R_script_K > $R_session_K\n";
+		system "nohup R --vanilla < $R_script_K > $R_session_K";
+	}
+}
+
+### Process resulting cluster matrix
+
+my (%ksets, @kvalues, $kcount, $lines, $row2, $tcount2, $orgwarn, $flagged);
+
+print "Reading clustering matrix...\n";
+open IN, $R_results_K or die "Cannot open cluster matrix file '$R_results_K': $!\n";
+while (<IN>) {
+	$_ =~ s/[\n\r\"]//g;
+	my ($id, @data) = split /\t/, $_;
+	$lines++;
+	if ($lines == 1) {		# first line = header
+		@allk = @data;
+		$_ =~ s/\D//g foreach @allk;	# header may have non-integer components
+		$kcount = scalar @allk;
+		my $ktest;
+		foreach (@allk) {
+			$ktest = 1 if $_;	# does colname still exist?
+		}
+		unless ($ktest) {		# colnames were digit-free
+			@allk = (1..$kcount);	# replace with "virtual k" values = col nums
+		}
+		next;
+	}
+	if ($mode eq 'F') {		# if input is user-supplied cluster matrix, it will have genes as row identifiers.  Must convert to row ID sets.
+		$row2++;
+		my @genes = split /\;/, $id;
+		$tcount2 += scalar @genes;
+		&matchup(\@genes, $row2);
+		$originals{$row2} = $id;
+	} else {
+		$row2 = $id;
+	}
+	foreach my $ki (1..$kcount) {
+		my $k = $allk[$ki-1];
+#		print "Row $row2: ki $ki = k $k: clust $data[$ki-1]\n";
+		$ksets{$k}{ $data[$ki-1] }{$row2} = 1;	# kset X, kcluster Y contains gene Z; automatic removal of duplicates within kclusters
+	}
+}
+close IN;
+$flagged = 1 if ($kcount == 1 && $mode eq 'F');		# flagged list, apparently
+
+#open KT, "> $wdir/Ktest.txt" or warn "Cannot create file '$wdir/Ktest.txt': $!\n";
+#print KT Dumper(\%ksets),"\n";
+#close KT;
+
+my $allclust;
+foreach my $k (@allk) {
+	my %kctemp;
+	foreach my $clust (keys %{ $ksets{$k} }) {
+		(my $set = $clust) =~ s/^-//;	# if exists
+		$allclust++;
+		if ($bkg eq 'opposite') {	# gather sets by column
+			$kctemp{$set}{$clust} = 1;
+		}
+	}
+	if ($bkg eq 'opposite') {	# test to ensure set/antiset completion
+		foreach my $set (keys %kctemp) {
+			print "Incomplete clustering map for k $k: set $set not paired.\n" if (scalar (keys %{ $kctemp{$set} }) < 2);
+		}
+	}
+}
+if ($mode eq 'F') {
+	($kmin, $kmax) = (sort {$a <=> $b} keys %ksets)[0,-1];
+	$krange = "$kmin-$kmax";	# starting with cluster matrix; $kmin, $kmax, $krange were not previously defined
+	print "Flagged list with $allclust sets detected.\n" if $flagged;
+	my $matches = scalar (keys %matched);
+	my $matchpct = sprintf( "%0.0f", 100*($matches/$row2) );
+	my $matchmsg = "$matches/$row2 rows ($matchpct%) were assigned a GO identifier.";
+	($matchpct <= 50) ? ($orgwarn = "Only $matchmsg  Did you pick the right organism?\n") : ($orgwarn = $matchmsg);
+	my $msg = "$row2 rows\n$tcount2 total IDs\n".scalar (keys %allgenes)." unique IDs\n$orgwarn";
+	&logreport($msg);
+}
+my $noun;
+(scalar @allk > 1) ? ($noun = 'values') : ($noun = 'value');
+my $msg = "$row2 IDs / ".scalar (keys %originals)." unique IDs in $allclust total clusters across ".(scalar @allk)." $noun of k.\n";
+&logreport($msg);
+### For each cluster: pool/unique IDs, create background, then get GO terms for cluster and background, then map terms to desired levels
+
+my (%GOtable, %termout, %siginco, %mappings, %termrows, %levelterms, %rowmapped, %termgenes2, %slimhits, %outterms1);
+my ($all_lost, $allout, @preFish);
+
+print "Processing gene lists by k...\n";
+foreach my $k (@allk) {									# k value
+	foreach my $clust (sort {$a <=> $b} keys %{ $ksets{$k} }) {			# cluster for this gene, for given k:  1 <= cluster <= k
+		next if $clust < 0 && $bkg eq 'opposite';				# only need to compare set-antiset one way; drop reverse comparison
+		my (%clustergpids, $bkgcount);
+		my $rowcount = scalar (keys %{ $ksets{$k}{$clust} });			# total rows in cluster
+		$siginco{$k}{$clust}{A} = $siginco{$k}{$clust}{S} = 0;			# ensure printable values for later
+#		print " k $k cluster $clust: $rowcount rows\n";
+
+		## find GO identifiers for row identifiers
+		foreach my $row (sort {$a <=> $b} keys %{ $ksets{$k}{$clust} }) {	# incoming row identifiers from clustering matrix
+			my (%termhits, %rowhits);
+			foreach my $gene (keys %{ $equivalents{R2G}{$row} }) {		# 1 or more equivalent identifiers for the pending row
+				if (exists $idtable{2}{$taxon}{$gene}) {		# identifier found in DB
+					my $gpid = $idtable{2}{$taxon}{$gene};
+					$termhits{GENE}{$gene} = 1;
+					$termhits{GPID}{$gpid} = 1;
+					$clustergpids{$gpid} = 1;
+					foreach my $tid (keys %{ $allterms{G2I}{$taxon}{$gpid} }) {
+#						print "$k | $clust | $row | $tid\n";
+						$termrows{$k}{$clust}{$tid}{C}{$row} = 1;
+						$rowhits{$tid} = 1;
+					}
+				} else {
+#					$ksetlost{$k}{$clust}{$row}{$gene} = 1;
+					$all_lost++;
+				}
+			}
+			if (%termhits) {
+				my $hitgenes = join ',', (sort keys %{ $termhits{GENE} });
+				my $hitaccs = join ',', map { $allterms{I2A}{$_} } (keys %rowhits);
+				$mappings{$row} = "$row\t$originals{$row}\t$hitgenes\t$hitaccs\n";
+			} else {
+#				$rowlost{$k}{$clust}{$row} = 1;			# none of the row identifiers were found in DB
+				$mappings{$row} = "$row\t$originals{$row}\t\n";
+			}
+		}
+
+		## pool GO identifiers for the background
+		if ($bkg eq "genome") {
+			my %termlist;
+			foreach my $gpid (keys %{ $idtable{1}{$taxon} }) {
+				unless (exists $clustergpids{$gpid}) {
+					$termlist{$gpid} = 1;
+					$termrows{$k}{$clust}{$_}{B}{$gpid} = 1 foreach (keys %{ $allterms{G2I}{$taxon}{$gpid} });	# here, $gpid subs for $row
+				}
+			}
+			$bkgcount = scalar (keys %termlist);
+		} elsif ($bkg eq "opposite") {
+			$bkgcount += scalar (keys %{ $ksets{$k}{"-$clust"} });			# total rows in the "opposite" cluster ("-$clust")
+			foreach my $row (sort {$a <=> $b} keys %{ $ksets{$k}{"-$clust"} }) {	# incoming row identifiers from clustering matrix
+				my %tidtemp;
+				foreach my $gene (keys %{ $equivalents{R2G}{$row} }) {		# 1 or more equivalent identifiers for the pending row
+					if (exists $idtable{2}{$taxon}{$gene}) {
+						my $gpid = $idtable{2}{$taxon}{$gene};
+						$termrows{$k}{$clust}{$_}{B}{$row} = 1 foreach (keys %{ $allterms{G2I}{$taxon}{$gpid} });
+					}
+				}
+			}
+		} elsif ($bkg eq "complement") {
+			foreach my $clust2 (keys %{ $ksets{$k} }) {
+				next if $clust2 eq $clust;
+				$bkgcount += scalar (keys %{ $ksets{$k}{$clust2} });			# total rows in other cluster
+				foreach my $row (sort {$a <=> $b} keys %{ $ksets{$k}{$clust2} }) {	# incoming row identifiers from clustering matrix
+					my %tidtemp;
+					foreach my $gene (keys %{ $equivalents{R2G}{$row} }) {		# 1 or more equivalent identifiers for the pending row
+						if (exists $idtable{2}{$taxon}{$gene}) {
+							my $gpid = $idtable{2}{$taxon}{$gene};
+							$termrows{$k}{$clust}{$_}{B}{$row} = 1 foreach (keys %{ $allterms{G2I}{$taxon}{$gpid} });
+						}
+					}
+				}
+			}
+		} else {
+			die "Unknown background specification '$bkg'!\n";	# just in case a new background type was added incorrectly
+		}
+
+#		print "bkgcount: $bkgcount\n";
+		next unless $bkgcount;	# skip this cluster if it has no definable background (can occur when using flagged lists with bkg="opposite")
+
+		### Invert the process and accumulate pre-Fisher's values for each term at each level
+
+		## Collapse term hits into hits for parent terms at level $level
+		my %already;
+		foreach my $tid (keys %{ $termrows{$k}{$clust} }) {		# all terms for this cluster + background
+			foreach my $level ($levmin..$levmax) {
+				foreach my $tid2 (keys %{ $levelmap{T}{$tid}{$level} }) {	# parental mapping(s) for this level (incl. self)
+					foreach my $row (keys %{ $termrows{$k}{$clust}{$tid}{C} }) {	# row numbers AND orig. terms
+						$levelterms{$k}{$clust}{$level}{$tid2}{C}{ROWS}{$row}{$tid} = 1;
+						$termgenes2{$tid2}{C}{$row}{$_} = 1 foreach (keys %{ $termgenes1{$tid}{$row} });	# transfer genes to parent term
+					}
+					foreach my $row (keys %{ $termrows{$k}{$clust}{$tid}{B} }) {	# row numbers only
+						$levelterms{$k}{$clust}{$level}{$tid2}{B}{ROWS}{$row} = 1;
+						$termgenes2{$tid2}{B}{$row}{$_} = 1 foreach (keys %{ $termgenes1{$tid}{$row} });	# transfer genes to parent term
+					}
+				}
+			}
+		}		
+		
+		## tabular (pre-Fisher's) summary
+		foreach my $level ($levmin..$levmax) {
+#			print "level $level\n";
+			foreach my $tid (sort keys %{ $levelterms{$k}{$clust}{$level} }) {
+				next if ($already{$tid});	# term has already been allocated on a higher level
+				my $acc = $allterms{I2A}{$tid};
+				if ($slim) {
+					my $continue;
+					if ($slimterms{1}{$acc}) {	# if slimming, ignore any non-slim terms
+						$continue = 1;
+						$slimhits{$acc} = $acc;
+					} else {
+						foreach my $obs (keys %{ $obsoletes{T2A}{$tid} }) {
+							if ($slimterms{1}{$obs}) {
+								$continue = 1;
+								$slimhits{$obs} = $acc;	# track true accession for hit to obsolete
+							}
+						}
+					}
+					next unless $continue;
+				}
+				$already{$tid} = 1;
+				$termout{$k}{$clust}{A}++;
+				$termout{$k}{$clust}{L}{$level}++;
+				$allout++;
+				$outterms1{$tid}++;
+				my (@temp, %rowhits);
+				foreach my $BC (qw/ B C /) {
+					$rowhits{$BC} = 0;	# guarantee printable value for R
+					my @rowgenes;
+					foreach my $row (keys %{ $levelterms{$k}{$clust}{$level}{$tid}{$BC}{ROWS} }) {
+						$rowhits{$BC}++;
+						my $genes = join ',', (sort keys %{ $termgenes2{$tid}{$BC}{$row} });
+						($genes) ? (push @rowgenes, $genes) : (print "No genes for $k : $clust : $row : $tid!\n");
+					}
+					$levelterms{$k}{$clust}{$level}{$tid}{$BC}{GENES}{$_} = 1 foreach @rowgenes;
+				}
+				$temp[0] = $k;					# k
+				$temp[1] = $clust;				# cluster
+				$temp[2] = $level;				# DB level
+				$temp[3] = $acc;				# GO acc
+				$temp[4] = $rowhits{C};				# cluster ids with term
+				$temp[5] = $rowcount - $rowhits{C};		# cluster ids lacking term
+				$temp[6] = $rowhits{B};				# bkg ids with term
+				$temp[7] = $bkgcount - $rowhits{B};		# bkg ids lacking term
+				my $cpct = 100*$temp[4]/($temp[4]+$temp[5]);	# cluster term %
+				my $bpct = 100*$temp[6]/($temp[6]+$temp[7]);	# bkg term %
+				$temp[8] = sprintf("%0.3f", $cpct);		# nice format
+				$temp[9] = sprintf("%0.3f", $bpct);		# nice format
+				if ($cpct == $bpct) {
+					$temp[10] = 'EQUAL';			# term enrichment (cluster vs. bkg)
+				} else {
+					($cpct > $bpct) ? ($temp[10] = 'OVER') : ($temp[10] = 'UNDER');
+				}
+				$temp[15] = undef;				# elements 11-15 are blank fields for R to fill in
+				$GOtable{$k}{$clust}{$level}{$tid} = \@temp;
+				my $string = join "\t", @temp;
+				push @preFish, "$string\n";
+			}
+		}
+	}
+}
+my $outterms = scalar (keys %outterms1);
+print scalar keys %slimhits, "/$slimnum slim terms had hits.\n" if $slim;
+
+### Generate pre-Fishers dataset and GO term mappings (per row)
+
+# PRE-FISHER'S OUTPUT LOOKS LIKE: 
+# Cols 1-10 (ALL FILLED): k, cluster, DB level, GO acc, cluster in, cluster out, bkg in, bkg out, clust pct, bkg pct
+# Cols 11-16 (ALL BLANK): cluster enrichment, raw pval, adj pval, odds ratio, conf.int lower, conf.int upper
+# R fills in cols 11-16 and returns the "post-Fisher's" dataset
+
+open OUT, "> $R_data_F" or warn "Cannot create file '$R_data_F': $!\n";
+print OUT @preFish;
+close OUT;
+
+open MAP, "> $term_mappings" or warn "Cannot create file '$term_mappings': $!\n";
+print MAP "Row\tInput_IDs\tMapped_IDs\tMapped_Terms\n";
+print MAP $mappings{$_} foreach (sort {$a <=> $b} keys %mappings);
+close MAP;
+
+
+
+##############################     FISHER'S     ##############################
+##############################     FISHER'S     ##############################
+##############################     FISHER'S     ##############################
+##############################     FISHER'S     ##############################
+##############################     FISHER'S     ##############################
+
+
+
+### Run Fisher's tests in R; parse results
+
+&generate_Fishers_script;
+
+open OUT, "> $R_script_F" or warn "Cannot create file '$R_script_F': $!\n";
+print OUT $script_text_F;
+close OUT;
+	
+if ($noF) {
+	print "Skipping Fisher's tests in R.\n";
+} else {
+	print "Running Fisher's tests in R:\nCalling: nohup R --vanilla < $R_script_F > $R_session_F\n";
+	system "nohup R --vanilla < $R_script_F > $R_session_F" unless $noF;
+}
+
+my (%sigterms, %allsig);
+my $Fline = my $sigcountA = 0;
+open RESF, $R_results_F or die "Cannot open Fisher's results file '$R_results_F': $!\n";
+while (<RESF>) {
+	$Fline++;
+	next if $Fline == 1;
+	$_ =~ s/[\n\r]//g;
+	my ($row, @data) = split /\t/, $_;
+	my ($k, $clust, $level, $acc, $padj) = @data[0..3,12];
+	$siginco{$k}{$clust}{$level}{A}++;
+	if ($padj <= $alpha) {
+		$siginco{$k}{$clust}{$level}{S}++;
+		$data[$_] = sprintf("%0.2e", $data[$_]) foreach (11..15);
+		$sigterms{$k}{$clust}{$level}{$acc} = \@data;
+		$allsig{$acc}{$k}{$clust} = 1;
+		$sigcountA++;
+	}
+}
+close RESF;
+my $sigcountU = scalar (keys %allsig);
+my ($msg, $verb, $inst);
+foreach my $k (@allk) {
+	foreach my $clust (sort {$a <=> $b} keys %{ $siginco{$k} }) {
+		foreach my $level ($levmin..$levmax) {
+			($siginco{$k}{$clust}{$level}{S} == 1) ? ($verb = 'was') : ($verb = 'were');
+			$msg .= "\nk $k: cluster $clust: level $level: $termout{$k}{$clust}{L}{$level} terms out | $siginco{$k}{$clust}{$level}{A} terms in | $siginco{$k}{$clust}{$level}{S} $verb significant." if $siginco{$k}{$clust}{$level}{S};
+		}
+	}
+}
+$Fline--;	# don't count header
+($sigcountU == 1) ? (($verb, $inst) = ('was', '')) : (($verb, $inst) = ('were', 's'));
+&logreport("\nTOTAL: $allout lines out | $Fline lines in | $outterms unique terms | $sigcountU $verb significant in $sigcountA instances.");
+
+### Eliminate any parent terms that are significant because a child term is significant; summarize
+
+# Input Cols 0-9 (PRE-FISHER): k, cluster, DB level, term acc, cluster in, cluster out, bkg in, bkg out, clust pct, bkg pct
+# Input Cols 10-15 (FISHER): cluster enrichment, raw pval, adj pval, odds ratio, conf.int lower, conf.int upper
+# Input Cols 16-17 (ACCDATA): GO DB, Term Name
+my @reorder = (0,1,16,2,3,17,8..15,4..7);	# reorders Fisher's + accdata columns into output order
+# Reordered Cols 0-8: k, cluster, GO DB, DB level, term acc, Term Name, clust pct, bkg pct, cluster enrichment, 
+# Reordered Cols 9-17: raw pval, adj pval, odds ratio, conf.int lower, conf.int upper, bkg in, bkg out, clust pct, bkg pct
+
+open OUT2, "> $R_data2_P" or warn "Cannot create file '$R_data2_P': $!\n" unless $flagged;
+print OUT2 "K\tall.terms\tover.terms\tunder.terms\tgenes\tmean.adj.sig\tsig.clusters\n" unless $flagged;
+my (%sigoutput, %Kstat);
+foreach my $k (@allk) {
+	$Kstat{$k}{$_} = 0 foreach (qw/ MSIG CSIG GENE COUT /);	# guarantee printable values
+	my $uterms = my $oterms = my $aterms = 0;		# guarantee printable values
+	my %ctemp;
+	if ($sigterms{$k}) {	# maybe no sig terms?
+		foreach my $clust (keys %{ $sigterms{$k} }) {
+			foreach my $level (keys %{ $sigterms{$k}{$clust} }) {
+				foreach my $acc (keys %{ $sigterms{$k}{$clust}{$level} }) {
+					my ($type, $name, $tid) = @{ $accdata{$acc} };
+					my $enrich = $sigterms{$k}{$clust}{$level}{$acc}->[10];
+					## Sig term data
+					my @reordered = (@{ $sigterms{$k}{$clust}{$level}{$acc} }, @{ $accdata{$acc} }[0,1])[@reorder];
+					$sigoutput{$k}{$clust}{$type}{$level}{$enrich}{$acc}{T} = join "\t", @reordered;
+					## Sig gene data
+					foreach my $row (keys %{ $levelterms{$k}{$clust}{$level}{$tid}{C}{ROWS} }) {		# all rows which mapped to this $acc (converted to $tid) at level $level
+						my $origaccs = join '; ', map { "$allterms{I2A}{$_}: $accdata{ $allterms{I2A}{$_} }->[1]" } (keys %{ $levelterms{$k}{$clust}{$level}{$tid}{C}{ROWS}{$row} });
+						$sigoutput{$k}{$clust}{$type}{$level}{$enrich}{$acc}{G}{$row} = join "\t", (@reordered[0..5], $row, $originals{$row}, $origaccs);
+					}
+					## Pre-plot table
+					$Kstat{$k}{TERM}{$acc} = 1;					# unique sig terms for k
+					$Kstat{$k}{$enrich}{$acc}++;					# number of enriched terms for k (over, under stored separately)
+					$Kstat{$k}{MSIG} += $sigterms{$k}{$clust}{$level}{$acc}->[12];	# sum adj pvalue
+					$Kstat{$k}{GENE} += $sigterms{$k}{$clust}{$level}{$acc}->[4];	# total # genes involved
+					$ctemp{$clust}{S} += $sigterms{$k}{$clust}{$level}{$acc}->[12];	# sum adj pvalue for cluster
+					$ctemp{$clust}{T}++;						# number of adj pvalues for cluster
+				}
+			}
+			$Kstat{$k}{COUT}++ if $ctemp{$clust};			# clusters with significant terms
+		}
+		$uterms = scalar (keys %{ $Kstat{$k}{UNDER} });
+		$oterms = scalar (keys %{ $Kstat{$k}{OVER} });
+		$aterms = scalar (keys %{ $Kstat{$k}{TERM} });
+		$Kstat{$k}{MSIG} /= $aterms if $aterms;				# now, the mean (if anything)
+		foreach my $clust (keys %{ $sigterms{$k} }) {
+			$Kstat{$k}{CSIG} += $ctemp{$clust}{S} / $ctemp{$clust}{T} if $ctemp{$clust}{T};	# mean adj pvalue for cluster
+		}
+		$Kstat{$k}{CSIG} /= scalar (keys %{ $sigterms{$k} });	# average mean adj pvalue for all clusters
+	}
+	print OUT2 "$k\t$aterms\t$oterms\t$uterms\t$Kstat{$k}{GENE}\t$Kstat{$k}{MSIG}\t$Kstat{$k}{COUT}\n" unless $flagged;
+}
+close OUT2 unless $flagged;
+
+if ($flagged) {
+	&logreport("Flagged list used; skipping GO summary plot.");
+} else {	# GO summary plot does not work with only one K
+
+	### Output pre-summary-plot datasets
+
+	open OUT1, "> $R_data1_P" or warn "Cannot create file '$R_data1_P': $!\n";
+	my $header1;
+	foreach my $k (@allk) {
+		$header1 .= "\t$k.$_" foreach (sort {$a <=> $b} keys %{	$ksets{$k} });
+	}
+	print OUT1 "$header1\n";
+	foreach my $acc (keys %allsig) {
+		print OUT1 $acc;
+		foreach my $k (@allk) {
+			foreach my $clust (keys %{ $ksets{$k} }) {
+				($allsig{$acc}{$k}{$clust}) ? (print OUT1 "\t1") : (print OUT1 "\t0");
+			}
+		}
+		print OUT1 "\n";
+	}
+	close OUT1;
+	
+	### Run GO summary plot
+
+	&generate_plot_script;
+	
+	open OUT, "> $R_script_P" or warn "Cannot create file '$R_script_P': $!\n";
+	print OUT $script_text_P;
+	close OUT;
+		
+	if ($noP) {
+		print "Skipping GO summary plot in R.\n";
+	} else {
+		print "Creating GO summary plot in R:\nCalling: nohup R --vanilla < $R_script_P > $R_session_P\n";
+		system "nohup R --vanilla < $R_script_P > $R_session_P" unless $noP;
+	}
+}
+
+### Output final results
+
+my %BCenrich = ('OVER','C', 'UNDER','B');
+my $geneheader = "K\tCluster\tGO DB\tDB Level\tGO Acc\tGO Term\tRow #\tGene IDs\tOrig Terms\n";
+my $termheader = "K\tCluster\tGO DB\tDB Level\tGO Acc\tGO Term\tClust Term %\tBkg Term %\tEnrich\tRaw P\tAdj P\tOdds\t$Fclev CI Lo\t$Fclev CI Up\tClust With\tClust Without\tBkg With\tBkg Without\tGenes\n";
+open GENE, "> $R_sigrows_F" or warn "Cannot create file '$R_sigrows_F': $!\n";		# sig genes
+print GENE $geneheader;
+open TERM, "> $R_sigterms_F" or warn "Cannot create file '$R_sigterms_F': $!\n";	# sig terms
+print TERM $termheader;
+foreach my $k (keys %sigoutput) {
+	open BRKG, "> ${BGfile}_K$k.txt" or warn "Cannot create file '${BGfile}_K$k.txt': $!\n";	# gene breakout by K
+	print BRKG $geneheader;
+	open BRKT, "> ${BTfile}_K$k.txt" or warn "Cannot create file '${BTfile}_K$k.txt': $!\n";	# term breakout by K
+	print BRKT $termheader;
+	foreach my $clust (sort {$a <=> $b} keys %{ $sigoutput{$k} }) {
+		foreach my $type (sort keys %{ $sigoutput{$k}{$clust} }) {
+			foreach my $level (sort {$a <=> $b} keys %{ $sigoutput{$k}{$clust}{$type} }) {
+				foreach my $enrich (sort {$a <=> $b} keys %{ $sigoutput{$k}{$clust}{$type}{$level} }) {
+					next unless $tailuse{$tailname}{$enrich};	# given $Ftails, which $enrich(s) do we allow?
+					foreach my $acc (sort keys %{ $sigoutput{$k}{$clust}{$type}{$level}{$enrich} }) {
+#						my $genecountC = scalar keys %{ $levelterms{$k}{$clust}{$level}{ $accdata{$acc}->[2] }{C}{GENES} };
+#						my $genecountB = scalar keys %{ $levelterms{$k}{$clust}{$level}{ $accdata{$acc}->[2] }{B}{GENES} };
+						my $genelist = join '; ', (sort keys %{ $levelterms{$k}{$clust}{$level}{ $accdata{$acc}->[2] }{ $BCenrich{$enrich} }{GENES} });
+						my $tstring = "$sigoutput{$k}{$clust}{$type}{$level}{$enrich}{$acc}{T}\t$genelist\n";
+						print TERM $tstring;
+						print BRKT $tstring;
+						foreach my $row (sort {$a <=> $b} keys %{ $sigoutput{$k}{$clust}{$type}{$level}{$enrich}{$acc}{G} }) {
+							my $gstring = "$sigoutput{$k}{$clust}{$type}{$level}{$enrich}{$acc}{G}{$row}\n";
+							print GENE $gstring;
+							print BRKG $gstring;
+						}
+					}
+				}
+			}
+		}
+	}
+}
+close GENE;
+close TERM;
+exit;
+
+
+sub GO_queries {		# primary queries for GO terms and gene identifiers
+
+	my $TAXON = shift;
+
+	### Create DB connection
+	$dbh = DBI->connect("DBI:mysql:database=$GOdb:host=$dbhost",'anonymous','guy#fawkes',{RaiseError=>1}) or die "Cannot connect to $GOdb on $dbhost: $DBI::err() $DBI::errstr()\n";
+
+	### Create queries
+	my $idquery1 = $dbh->prepare("
+		SELECT	DISTINCT gp.symbol,
+			gp.full_name,
+			gp.id
+		FROM	gene_product gp,
+			species s
+		WHERE	gp.species_id = s.id
+			AND s.ncbi_taxa_id = $TAXON
+	");
+	my $idquery2 = $dbh->prepare("
+		SELECT	DISTINCT d.xref_key, 
+			gp.id
+		FROM	dbxref d,
+			gene_product gp,
+			species s
+		WHERE	gp.dbxref_id = d.id
+			AND gp.species_id = s.id
+			AND s.ncbi_taxa_id = $TAXON
+	");
+	my $gp2tquery = $dbh->prepare("
+		SELECT	gp.id,
+			t.id
+		FROM	gene_product gp,
+			species s,
+			association a,
+			term t
+		WHERE	gp.species_id = s.id
+			AND gp.id = a.gene_product_id
+			AND a.term_id = t.id
+			AND t.is_relation = 0
+			AND t.is_obsolete = 0
+			AND s.ncbi_taxa_id = $TAXON
+	");
+	my $termquery = $dbh->prepare("SELECT id, term_type, acc, name, is_obsolete FROM term WHERE is_relation = 0");
+
+	### Special handling for level 0,1 terms
+	%four_names = (
+		"all" => [0, "unknown"], 
+		"biological_process" => [0, "biological process unknown", 'BP'], 
+		"cellular_component" => [0, "cellular component unknown", 'CC'], 
+		"molecular_function" => [0, "molecular function unknown", 'MF'] 
+	);	# term id, preferred name, short type name
+
+	foreach my $name (keys %four_names) {
+		my $qname = $dbh->quote($name);
+		my $tid;
+	
+		## Get these particular IDs
+		my $sth1 = $dbh->prepare("select id from term where name = $qname");
+		$sth1->execute();
+		while ( ($tid) = $sth1->fetchrow_array() ) {
+			$four_names{$name}->[0] = $tid;
+			if ($name eq "all") {
+				$ignore{$tid} = $four_names{"all"};
+			} elsif ($name eq "biological_process") {
+				$ignore{$tid} = $four_names{"biological_process"};
+			} elsif ($name eq "molecular_function") {
+				$ignore{$tid} = $four_names{"molecular_function"};
+			} elsif ($name eq "cellular_component") {
+				$ignore{$tid} = $four_names{"cellular_component"};
+			}
+		}
+		warn "Error retrieving data: $sth1->errstr()\n" if $sth1->err();
+		$sth1->finish;
+	}
+
+	### Run primary queries
+	print "Querying all DB identifiers...\n" unless ($getGOstats || $getdbids);
+	$idquery1->execute();
+	while ( my ($symbol, $name, $gpid) = $idquery1->fetchrow_array() ) {
+		$idtable{2}{$TAXON}{$symbol} = $gpid;		# $idtable{2}{$TAXON} goes from external ID to internal (gene product) ID
+		$idtable{2}{$TAXON}{$name} = $gpid;
+		$idtable{1}{$TAXON}{$gpid}{$symbol} = 'S';	# $idtable{1}{$TAXON} goes from internal (gene product) ID to external ID
+		$idtable{1}{$TAXON}{$gpid}{$name} = 'N';
+		$idcounts{GPID}{$TAXON}{$gpid} = 1;		#  $gpids from name, symbol associations
+		$idcounts{SYMB}{$TAXON}{$symbol} = 1;
+		$idcounts{NAME}{$TAXON}{$name} = 1;
+		$idtrack{$TAXON}{1}{$gpid} = 1;
+	}
+	warn "Error retrieving data: $idquery1->errstr()\n" if $idquery1->err();
+	$idquery1->finish();
+	
+	$idquery2->execute();
+	while ( my ($xid, $gpid) = $idquery2->fetchrow_array() ) {
+		$xid =~ s/-\d$// if ($TAXON == 9606 && $HS_uniprot_trim);
+		$idtable{2}{$TAXON}{$xid} = $gpid;
+		$idtable{1}{$TAXON}{$gpid}{$xid} = 'X';
+		$idcounts{GPID}{$TAXON}{$gpid} = 1;		# $gpids from xref associations
+		$idcounts{XREF}{$TAXON}{$xid} = 1;
+		$idtrack{$TAXON}{2}{$gpid} = 1;
+	}
+	warn "Error retrieving data: $idquery2->errstr()\n" if $idquery2->err();
+	$idquery2->finish();
+	
+	#open IDS, "> $wdir/idtable_2_dump.txt" or warn "Cannot create file '$wdir/idtable_2_dump.txt': $!\n";
+	#print IDS Dumper(\%{ $idtable{2}{$TAXON} }),"\n";
+	#close IDS;
+	
+	### Query all GO terms and assign to known identifiers
+	
+	print "Querying all GO terms...\n" unless ($getGOstats || $getdbids);
+	$termquery->execute();
+	while ( my ($tid, $type, $acc, $name, $obsolete) = $termquery->fetchrow_array() ) {
+		if ($obsolete) {
+			$obsoletes{T2A}{$tid}{$acc} = 1;	# for slim lists -- some may have obsolete accessions
+			$obsoletes{A2T}{$acc}{$tid} = 1;	# for slim lists -- some may have obsolete accessions
+		} else {
+			$allterms{I2A}{$tid} = $acc;					# NO TAXON specificity -- this is ALL terms
+			$accdata{$acc} = [$four_names{$type}->[2], $name, $tid];	# switching long type name to short type name
+			$idtrack{$TAXON}{3}{$tid} = 1;
+		}
+	}
+	warn "Error retrieving data: $termquery->errstr()\n" if $termquery->err();
+	$termquery->finish();
+	
+	print "Querying gene-term relationships...\n" unless ($getGOstats || $getdbids);
+	$gp2tquery->execute();
+	while ( my ($gpid, $tid) = $gp2tquery->fetchrow_array() ) {
+		$allterms{G2I}{$TAXON}{$gpid}{$tid} = 1;
+		$allterms{I2G}{$TAXON}{$tid}{$gpid} = 1;
+		$idtrack{$TAXON}{4}{$gpid} = 1;
+		$idtrack{$TAXON}{5}{$tid} = 1;
+	}
+	warn "Error retrieving data: $gp2tquery->errstr()\n" if $gp2tquery->err();
+	$gp2tquery->finish();
+
+	#print "$_: ",scalar (keys %{ $idtrack{$TAXON}{$_} }),"\n" foreach (1..5);
+}
+
+
+sub get_level_mappings {
+	if (-e "$cache/${GOdb}_relations_dump.dat" && -e "$cache/${GOdb}_levelmap_dump.dat") {
+		my $Rref = retrieve("$cache/${GOdb}_relations_dump.dat") or warn "Cannot retrieve \%relations from file '$cache/${GOdb}_relations_dump.dat': $!";
+		%relations = %$Rref if $Rref;
+		print "\%relations regenerated from file '$cache/${GOdb}_relations_dump.dat'\n";
+		my $Lref = retrieve("$cache/${GOdb}_levelmap_dump.dat") or warn "Cannot retrieve \%levelmap from file '$cache/${GOdb}_levelmap_dump.dat': $!";
+		%levelmap = %$Lref if $Lref;
+		print "\%levelmap regenerated from file '$cache/${GOdb}_levelmap_dump.dat'\n";
+	}
+}
+
+
+sub logreport {		# send messages both to screen and to file
+	chomp(my $msg = shift);
+	print "$msg\n";
+	open LOG, ">> $logfile" or warn "Cannot append to logfile '$logfile': $!\n";
+	print LOG "$msg\n";
+	close LOG;
+}
+
+
+sub matchup {		# store incoming row identifiers and match to DB identifiers, if possible
+	my ($generef, $ROW) = @_;
+	foreach my $gene (@$generef) {
+		next unless $gene;			# skip blank entries
+		$allgenes{$gene} = 1;
+		$equivalents{G2R}{$gene} = $ROW;	# look up row by gene
+		$equivalents{R2G}{$ROW}{$gene} = 1;	# look up genes by row
+		if (exists $idtable{2}{$taxon}{$gene}) {
+			$matched{$ROW} = 1;
+			$termgenes1{$_}{$ROW}{$gene} = 1 foreach (keys %{ $allterms{G2I}{$taxon}{ $idtable{2}{$taxon}{$gene} } });	# term ids
+		}
+	}
+}
+
+
+
+###############################################################  KMEANS SCRIPT  ###############################################################
+###############################################################  KMEANS SCRIPT  ###############################################################
+###############################################################  KMEANS SCRIPT  ###############################################################
+###############################################################  KMEANS SCRIPT  ###############################################################
+###############################################################  KMEANS SCRIPT  ###############################################################
+
+sub generate_kmeans_script {
+$script_text_K = <<EOF;
+
+tally <- function(vector) { 
+        u <- sort(unique(vector))
+        v <- as.vector(sapply(u, simplify=TRUE, FUN=function(x,vec){length(which(vec==x))}, vector))
+        names(v) <- u
+        return(v)
+}
+
+rc.conv <- function(x,rows) { 
+	row <- (x %% rows)
+	if (row == 0) {
+		row <- rows
+		col <- trunc(x / rows)
+	} else {
+		col <- trunc(x / rows) + 1
+	}
+	return( c(row,col) )
+}
+
+data <- read.delim("$R_data_K", sep="\\t", header=F, row.names=1)
+data <- as.matrix(data[,2:ncol(data)])
+
+set.seed("20091231")
+dcols <- ncol(data)
+inflate <- 2	# minimum rep inflation
+knum <- $kmax-$kmin+1
+
+results <- vector("list", length=knum)
+names(results) <- paste("k", c($kmin:$kmax), sep="")
+metasets <- results
+allsci <- matrix(data=0, nrow=knum, ncol=3)
+clusters <- matrix(data=0, nrow=nrow(data), ncol=knum)
+rownames(clusters) <- rownames(data)
+colnames(clusters) <- c( paste('',$kmin,sep="\\t"), c(($kmin+1):$kmax) )
+
+report <- vector("character", length=4+11*knum)
+rpos <- 0
+report[[(rpos+1)]] <- paste("Clustering repetitions:",$kreps)
+report[[(rpos+2)]] <- paste("k range start:",$kmin,"-",$kmax)
+report[[(rpos+3)]] <- paste("Genes:",nrow(data))
+report[[(rpos+4)]] <- paste("Measurements:",dcols)
+rpos <- rpos + 4	# last filled position in report
+
+rK <- 0
+for (K in $kmin:$kmax) {
+
+	runtime <- system.time( {
+
+	rK <- rK + 1
+	results[[rK]] <- vector("list", length=$kreps)
+	again <- 1	# repeat switch: keep re-clustering until we get enough equivalent cluster sets!
+	iter <- 0
+
+	while (again == 1) {	
+
+		lost <- pcol <- 0
+		iter <- iter + 1
+		xrep <- $kreps*inflate*iter	# some reps fail; keep expanding # reps to ensure the original quota ($kreps) gets filled
+		good <- vector("numeric", length=xrep)
+		proxy <- matrix(data=0, ncol=xrep, nrow=K)
+
+		## do the k-means clustering repetitions
+		for (i in 1:xrep) {
+			results[[rK]][[i]] <- kmeans(data, centers=K, iter.max=$kiter, nstart=$kstart, algorithm="$valid{kalg}{$kalg}")
+		}
+		
+		## figure out which cluster in rep X corresponds to which cluster in rep 1
+		for (i in 1:xrep) {
+			x <- rbind(results[[rK]][[1]]\$centers, results[[rK]][[i]]\$centers)
+			rownames(x) <- c(paste(1,c(1:K),sep="."),paste(i,c(1:K),sep="."))
+			dm <- matrix(data=0, nrow=nrow(x), ncol=nrow(x))
+			for (m in 1:nrow(x)) { 
+				for (n in 1:nrow(x)) { 
+					dm[m,n] <- dist(rbind(x[m,], x[n,]), method="euclidean")[[1]]
+				}
+			}
+			dm2 <- dm[1:K,(K+1):(2*K)]
+			ymin <- sort(dm2)[K]
+			z <- which(dm2 <= ymin)
+			pmat <- matrix(data=0, nrow=K, ncol=2)
+			for (h in 1:K) { pmat[h,] <- rc.conv(z[h], K) }
+			uniq.1 <- length(unique(pmat[,1]))
+			uniq.2 <- length(unique(pmat[,2]))
+			if (uniq.1 < K | uniq.2 < K) {
+				lost <- lost + 1	# incomplete mapping -- discard
+			} else {
+				pcol <- pcol + 1
+				good[pcol] <- i
+				ord <- order(pmat[,1])
+				proxy[,pcol] <- pmat[ord,2]
+			}
+		}
+	
+		maps <- xrep - lost - 1
+		if (maps >= $kreps) { again <- 0 }	# we can stop now
+	}
+	
+	votes <- matrix(data=0, nrow=nrow(data), ncol=K)
+	rownames(votes) <- rownames(data)
+	
+	## with correspondence map, find which genes mapped to which clusters and how often
+	for (i in 1:nrow(data)) {
+		for (j in 1:$kreps) {	# only using these first columns out of proxy
+			if (sum(proxy[,j] == 0)) {
+				# lost -- ignore
+			} else {
+				res <- good[j]
+				jc <- results[[rK]][[res]][[1]][[i]]	# jth cluster for ith gene
+				orig <- which(proxy[,j] == jc)		# row of jth cluster == original cluster
+				votes[i,orig] <- votes[i,orig] + 1	# vote for this cluster
+			}
+		}
+	}
+	
+	## build consensus (plus tie-breaker for votes, if needed)
+	consensus <- vector("numeric", length=nrow(votes))
+	for (i in 1:nrow(votes)) {
+		x <- which(votes[i,]==max(votes[i,]))
+		if (length(x) > 1) {			# a tie between > 1 cluster
+			y <- length(x) + 1
+			z <- trunc(runif(1, 1, y))	# choose an element of x
+			consensus[i] <- x[z]		# tie broken
+		} else {
+			consensus[i] <- x
+		}
+	}
+	clusters[,rK] <- consensus
+
+	## create image of clusters
+	sets <- vector("list", length=K)
+	allavgs <- matrix(data=0, nrow=K, ncol=dcols)
+	png(paste("$kdir/Consensus_Cluster_Profiles_k",K,".png",sep=""), height=500*K, width=1000)
+	par(mfrow=c(K,2), cex=1.2)
+	for (i in 1:K) { 
+		sets[[i]] <- which(consensus == i)
+		genes <- length(sets[[i]])
+		title <- paste("Cluster",i,":",genes,"Genes :")
+		pmin <- min(data[sets[[i]],])
+		pmax <- max(data[sets[[i]],])
+		avgs <- colMeans(data[sets[[i]],])
+		allavgs[i,] <- avgs
+		meds <- as.vector(apply(data[sets[[i]],], 2, median))
+		IQR <- t(as.matrix(apply(data[sets[[i]],], 2, FUN=function(x){summary(x)[c(2,5)]})))
+		SEM <- as.matrix(apply(data[sets[[i]],], 2, FUN=function(x){sd(x)/sqrt(length(x))}))
+		CSD <- as.matrix(apply(data[sets[[i]],], 2, sd))
+		plot(1:dcols, data[sets[[i]][1],], type="l", ylim=c(pmin,pmax), ylab="Values", xlab="Columns", main=paste(title,"All Profiles + Mean"))
+		for (j in 2:length(sets[[i]])) { lines(1:dcols, data[sets[[i]][j],]) }
+		lines(1:dcols, avgs, lwd=2, col=2)
+		abline(h=0, col=4)
+		plot(1:dcols, avgs, type="l", lwd=2, col=2, ylim=c(pmin,pmax), ylab="Values", xlab="Columns", main=paste(title,"Mean + IQR"))
+		for (j in 1:dcols) { 
+			segments(j,IQR[j,1],j,IQR[j,2]) 		# error bar
+			segments(j-0.2,IQR[j,2],j+0.2,IQR[j,2]) 	# top cap
+			segments(j-0.2,IQR[j,1],j+0.2,IQR[j,1]) 	# bottom cap
+		}
+		abline(h=0, col=4)
+	}
+	dev.off()
+
+	## calculate distances between consensus clusters
+	dm3 <- matrix(data=0, nrow=K, ncol=K)
+	for (m in 1:K) { 
+		for (n in 1:K) { 
+			dm3[m,n] <- cor.test(allavgs[m,], allavgs[n,], method="pearson")[[4]]
+		}
+	}
+
+	distinct <- mean(abs(dm3))
+	stability <- as.vector(apply(votes, 1, max))
+	stability <- stability / $kreps
+	st <- tally(stability)
+	best <- sum(as.numeric(names(st)) * st) / sum(st)
+	ct <- tally(consensus)
+	allsci[rK,1] <- best
+	allsci[rK,2] <- distinct
+	allsci[rK,3] <- iter
+
+	report[[(rpos+1)]] <- ""	# spacer
+	report[[(rpos+2)]] <- paste("Report for k =",K)
+	report[[(rpos+3)]] <- paste("Iterations Required (Effort):",iter)
+	report[[(rpos+4)]] <- paste("Gene Stabilities:")
+	report[[(rpos+5)]] <- paste(sprintf("%0.3f",as.numeric(names(st))), collapse="\\t")
+	report[[(rpos+6)]] <- paste(st, collapse="\\t")
+	report[[(rpos+7)]] <- paste("Overall Cluster Stability:",sprintf("%0.3f",best))
+	report[[(rpos+8)]] <- paste("Overall Cluster Distinctiveness:",sprintf("%0.3f",distinct))
+	report[[(rpos+9)]] <- paste("Consensus Cluster Sizes:")
+	report[[(rpos+10)]] <- paste(names(ct), collapse="\\t")
+	report[[(rpos+11)]] <- paste(ct, collapse="\\t")
+	rpos <- rpos + 11	# last filled position in report
+	
+	} )	# end proc.time call
+
+	cat(K,": Done : ",runtime,"\\n")
+	flush.console()
+
+}
+
+## Final overall outputs
+write(report, file="$R_log_K", sep="\\n")
+write.table(clusters, file="$R_results_K", sep="\\t", quote=F)
+
+cols3 <- c(2,2,4)
+lty3 <- c(1,2,1)
+pseq <- seq(0,1,0.1)
+
+save.image(file="$R_image_K")
+
+## Plot k-means cluster statistics
+
+allsci[,3] <- allsci[,3] / 10
+
+png("$R_plot_K", height=600, width=600)
+par(mar=c(5,5,4,5), cex=1.2)
+plot(1:knum, allsci[,1], col=cols3[1], type="l", ylim=c(0,1), xlab="k", ylab="Percent", axes=F, main="Overall Clustering Behavior per k")
+for (i in 2:3) { lines(1:knum, allsci[,i], col=cols3[i], lty=lty3[i]) }
+axis(1, tick=T, at=c(1:knum), labels=seq($kmin,$kmax))
+axis(2, tick=T, at=pseq, col=2, labels=pseq)
+axis(4, tick=T, at=pseq, col=4, labels=0:10)
+mtext("Iterations", side=4, at=0.5, line=3, cex=1.2)
+legend(x="center", legend=c("Stability","Distinctiveness","Effort"), col=cols3, lty=lty3, bty="n")
+dev.off()
+
+EOF
+}
+
+
+###############################################################  FISHER'S SCRIPT  ###############################################################
+###############################################################  FISHER'S SCRIPT  ###############################################################
+###############################################################  FISHER'S SCRIPT  ###############################################################
+###############################################################  FISHER'S SCRIPT  ###############################################################
+###############################################################  FISHER'S SCRIPT  ###############################################################
+
+sub generate_Fishers_script {
+
+my $adjust_block;
+if ($flagged && $bkg eq 'opposite') {
+	$adjust_block .= "clusters <- unique(data[,2])\n";
+	$adjust_block .= "for (i in 1:length(clusters)) {\n";
+	$adjust_block .= "\tcv <- which(data[,2] == clusters[i])\n";
+	$adjust_block .= "\tdata[cv,13] <- p.adjust(data[cv,12], method=\"$valid{padj}{$padj}\")	# must adjust WITHIN \"clusters\" when using flagged list, bkg=opposite\n";
+	$adjust_block .= "}\n";
+} else {
+	$adjust_block .= "data[,13] <- p.adjust(data[,12], method=\"$valid{padj}{$padj}\")	# global adjustment turns out to be the same as separate within-k adjustments\n";
+}
+
+$script_text_F = <<EOF;
+
+data <- read.delim("$R_data_F", sep="\\t", header=F, fill=T)
+colnames(data) <- c("\\tk","cluster","DB.level","GO.acc","cluster.in","cluster.out","bkg.in","bkg.out","clust.pct","bkg.pct","clust.enrich","p.raw","p.adj","odds","conf.int.lower","conf.int.upper")
+nrow(data)
+data2 <- as.matrix(data[,5:8])
+
+fishers <- function (vec) {
+	fmat <- matrix(data=vec, nrow=2, ncol=2, byrow=T)	# vec = c( cluster in, cluster out, bkg in, bkg out )
+	x <- fisher.test(fmat, alternative="$valid{Ftails}{$Ftails}->[0]", conf.lev=$Fclev)
+	y <- c(x[[1]], x[[3]][[1]], x[[2]][1], x[[2]][2])	# raw p value, odds ratio, confidence interval lower bound, confidence interval upper bound
+}
+
+z <- as.matrix(apply(data2, 1, fishers))
+data[,c(12,14,15,16)] <- t(z)
+$adjust_block
+
+write.table(data, file="$R_results_F", sep="\\t", quote=F)
+EOF
+}
+
+
+#################################################################  PLOT SCRIPT  #################################################################
+#################################################################  PLOT SCRIPT  #################################################################
+#################################################################  PLOT SCRIPT  #################################################################
+#################################################################  PLOT SCRIPT  #################################################################
+#################################################################  PLOT SCRIPT  #################################################################
+
+sub generate_plot_script {
+$script_text_P = <<EOF;
+
+Tdata <- as.matrix(read.delim("$R_data1_P", sep="\\t", header=T, row.names=1))	# terms matrix: rows=terms, cols=presence/absence for k/cluster in colname
+present <- colSums(Tdata) > 0
+Tdata2 <- Tdata[,present]
+pre <- strsplit(sub("X","",colnames(Tdata)), ".", fixed=T)
+uks <- unique(as.numeric(sapply(pre, simplify=T, FUN=function(x){x[1]})))
+pre2 <- strsplit(sub("X","",colnames(Tdata2)), ".", fixed=T)
+ks2 <- as.numeric(sapply(pre2, simplify=T, FUN=function(x){x[1]}))
+cs2 <- as.numeric(sapply(pre2, simplify=T, FUN=function(x){x[2]}))
+cvals <- rep(NA, length(unique(ks2)))
+names(cvals) <- unique(ks2)
+
+i <- 0
+for (k in unique(ks2)) {
+	i <- i + 1
+	kv <- which(ks2 == k)	# significant clusters for this k
+	lk <- length(kv)	# count for above
+	if (lk == 1) {
+		cvals[i] <- NA	# cannot calculate distinctiveness value for single cluster!
+	} else {
+		terms <- rowSums(Tdata2[,kv])	# vector of instances for each term for this k: values from 0 to lk
+		terms <- terms[terms > 0]	# which terms occur for this k
+		uterms <- length(terms)		# count for above
+
+		## distinctiveness: for each present term, (lk-terms) gives degree of redundancy and (lk-1) is the nonredundant value.  
+		## sum(lk-terms) is the total termwise redundancy and uterms*(lk-1) is the ideal score (= no terms redundant).
+		## ratio is weighted % redundancy across all terms = termwise cluster distinctiveness for this k.
+		cvals[i] <- sum(lk-terms) / ( uterms*(lk-1) )
+	}
+}
+cvals2 <- rep(NA, length(uks))
+names(cvals2) <- uks
+for (i in 1:length(uks)) { x <- which(names(cvals) == names(cvals2)[i]); if (length(x) > 0) { cvals2[i] <- cvals[x] } }
+
+Fdata <- as.matrix(read.delim("$R_data2_P", sep="\\t", header=F, skip=1))	# significance summary: k, all terms, "over" terms, "under" terms, genes, mean adj p, sig clusters 
+Fdata[,6] <- -1*log10(Fdata[,6])	# -log10 p value
+Fdata[,7] <- Fdata[,7] / Fdata[,1]	# percent
+Fdata[which(is.infinite(Fdata))] <- 0
+
+knum <- nrow(Fdata)
+cols4 <- c("gold3","green3",4,4)
+lty3 <- c(1,2,3)
+axseqLab <- vector("list", length=7)
+axseqPos <- seq(0, 1, length.out=11)
+for (i in 2:7) { 
+	Fmin <- min(Fdata[,i], na.rm=T)
+	ifelse (i == 6, sigs <- 3, sigs <- 2)
+	if (i == 7) { 
+		axseqLab[[i]] <- seq(0, 1, length.out=11)						# axis label
+	} else {
+		axseqLab[[i]] <- signif(seq(Fmin, max(Fdata[,i], na.rm=T), length.out=11), sigs)	# axis label
+		Fdata[,i] <- Fdata[,i] - Fmin
+	}
+	Fdata[,i] <- Fdata[,i] / max(Fdata[,i], na.rm=T)	# using new maximum
+}
+
+
+## Plot post-Fisher's cluster statistics
+
+png("$R_plot_P", height=700, width=700)
+par(mar=c(5,8,4,8), cex=1.2)
+plot(1:knum, 1:knum, col=0, type="l", ylim=c(0,1), xlab="k", ylab="", axes=F, main="Significance Behavior per k")
+for (i in 2:2) { lines(1:knum, Fdata[,i], col=2, lty=lty3[(i-1)]) }		# term lines
+for (i in 5:7) { lines(1:knum, Fdata[,i], col=cols4[(i-4)], lty=1) }		# other lines
+points(1:knum, cvals2, col=cols4[4], pch=15)					# points for cluster GO distinctiveness percent
+axis(1, tick=T, at=1:knum, labels=Fdata[,1])					# x axis
+axis(2, tick=T, at=axseqPos, col=2, line=3, labels=axseqLab[[2]])		# left axis 1: term counts	(for 3 lines, all red)
+axis(2, tick=T, at=axseqPos, col=cols4[1], line=0, labels=axseqLab[[5]])	# left axis 2: gene counts	(for 1 line, gold)
+axis(4, tick=T, at=axseqPos, col=cols4[2], line=0, labels=axseqLab[[6]])	# right axis 1: -log10 pvalue	(for 1 line, green)
+axis(4, tick=T, at=axseqPos, col=cols4[3], line=3, labels=axseqLab[[7]])	# right axis 2: sig cluster %	(for 1 line, blue)
+legend(x="bottom", legend=c("Sig. Terms","Sig. Genes","-log10(mean(Adj.P))","% Sig. Clusters","Cluster GO Distinction"), col=c(2,cols4), lty=c(1,1,1,1,NA), pch=c(NA,NA,NA,NA,15), bty="n")
+dev.off()
+
+EOF
+}
+
+

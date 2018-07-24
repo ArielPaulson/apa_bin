@@ -1,0 +1,61 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+# Takes BAM input and returns 9 values: bam name | read length | end-1 alignments | end-2 aligmnents | aligned mate-pairs | total reads | aligned reads | unique sequences | aligned unique sequences
+
+my $imode;
+
+print "BAM\tReadLen\tE1.Alns\tE2.Alns\tPE.Alns\tTot.Unq.Rd\tAln.Unq.Rd\tUna.Unq.Rd\tTot.Unq.Seq\tAln.Unq.Seq\tUna.Unq.Seq\n";
+foreach my $file (@ARGV) {
+    if ($file eq 'INT') {  # first arg, hopefully
+	$imode = 1;
+	next;
+    }
+    if (-e $file) {
+	if ($file =~ /\.bam$/i) {
+	    open IN, "samtools view $file | cut -f1,2,3,10 |";
+	} elsif ($file =~ /\.sam$/i) {
+	    open IN, "cut -f1,2,3,10 $file |";
+	} else {
+	    print "'$file' not a BAM or SAM file!\n";
+	    next;
+	}
+	my (%unique, %aligns);
+	my ($idx, $flags, $chr, $seq);
+	while (<IN>) {
+	    next if $_ =~ /^@/;  # SAM header
+	    chomp;
+	    print STDERR "$file: $. lines processed.\n" if $. % 10000000 == 0;
+	    ($idx, $flags, $chr, $seq) = split /\t/, $_;
+	    $seq =~ tr/ACGTN/12345/ if $imode;  # convert sequence to integer -- vast reduction in runtime and footprint (?)
+	    if ($chr eq '*') {
+		$unique{UI}{$idx} = 1;
+		$unique{US}{$seq} = 1;
+	    }
+	    $unique{AI}{$idx} = 1;
+	    $unique{AS}{$seq} = 1;
+	    if ($flags & 128) {   # second read in pair
+		$aligns{R}++;
+	    } else {
+		$aligns{L}++;
+	    }
+	    $aligns{P}++ unless $flags & 8;
+	}
+	close IN;
+	my $readlen = length($seq);  # -1 due to newline
+	my $AIunique = scalar keys %{ $unique{AI} };
+	my $ASunique = scalar keys %{ $unique{AS} };
+	my $UIunique = scalar keys %{ $unique{UI} };
+	my $USunique = scalar keys %{ $unique{US} };
+	my $TIunique = $AIunique + $UIunique;
+	my $TSunique = $ASunique + $USunique;
+	$aligns{P} /= 2;   # these get counted twice
+	print "$file\t$readlen\t$aligns{L}\t$aligns{R}\t$aligns{P}\t$TIunique\t$AIunique\t$UIunique\t$TSunique\t$ASunique\t$USunique\n";
+    } else {
+	print "$file\tCannot read: $!\n";
+    }
+}
+print "bamReads complete!\n";
+system "kill $$ 2>/dev/null";

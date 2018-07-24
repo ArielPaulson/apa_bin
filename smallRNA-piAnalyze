@@ -1,0 +1,313 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+
+## OPTIONAL PIRNA POST-WORKFLOW:
+## 8. given size range, extract pi-size.bam + assign signatures
+## 9. bigWig piRNA fractions
+## 10. detect piRNA clusters
+## 11. quantitate piRNA counts in genes+TEs (total & signatures)
+## 12. quantitate piRNA clusters in genes+TEs
+
+
+### Dependencies
+my $bin = '/home/apa/local/bin';
+my $indexes = '/n/data1/genomes/indexes';
+my $readCount = "$bin/readCount";
+my $bam2track = "$bin/bam2track";
+my $sortBedCoord = "$bin/sortBedCoord";
+my $mergeMatrix = "$bin/mergeMatrix";
+my $bed2BigBed = "$bin/scriptutils/bedToBigBed";
+my $splitBam = "$bin/splitBam";
+my $tracks2hub = "$bin/tracks2hub";
+my $samtools = 'samtools';
+
+
+
+### Inputs
+
+## Mandatory
+my $outdir;    # output location, if not clobbering
+my $pirange;   # size range for piRNAs
+my $geno;      # genome index label, e.g. 'dm6', 'mm10'  ### REQUIRES $anno
+my $anno;      # genome-annotation label, e.g. 'Ens_80'  ### REQUIRES $geno
+my $cores;     # N cores for bowtie2 alignment, default 1 (if running alignments)
+my $mem;       # mem arg for 'samtools sort', default '5G' (if running alignments)
+my $hubname;   # track name for hub files
+
+
+
+### Get arguments
+GetOptions("o=s"=>\$outdir, "rp=s"=>\$pirange, "g=s"=>\$geno, "a=s"=>\$anno, "c=i"=>\$cores, "m=s"=>\$mem, "h=s"=>\$hubname);
+
+
+
+### Globals
+my $genodir   = "$indexes/$geno";   # may not be specified
+my $annodir   = "$genodir/$anno";   # may not be specified
+my $genoidx   = "$genodir/$geno";   # prefix only
+my $srnadir   = "$annodir/smallRNA";
+my $srnaidx   = "$srnadir/$geno.$anno.smallRNA";  # prefix only
+my $TEgtf     = "$genodir/$geno.repeats.gtf";
+my $gtf       = "$annodir/$geno.$anno.cuff.gtf";
+my $gtfidx    = "$annodir/$geno.$anno.cuff.gtf.index/$geno.$anno.cuff";  # prefix only
+my $cmdline   = (split /\n/, qx/ps -o args $$/)[1];  # just for reporting
+my $restart;  # flag if pipeline is restarting or not
+my %trimlens; # post-trim length histogram
+my %stats;    # counts for various read fractions
+my %pstats;   # counts, as % total
+my %pstats2;  # counts, as % reads in size range
+my %stage;    # stage completion tracking
+my %maxstage; # highest consecutive stage completed (restart after here)
+my %P;        # prefix storage
+my %F;        # filename storage
+my %B;        # bed filename storage
+
+
+### Test arguments; initialize workspace and some globals
+die "$0: No input specified!\n" unless $inputfq;
+chomp($inputfq = `readlink -f $inputfq`);
+die "$0: Cannot find input fastq '$inputfq'!\n" unless -e $inputfq;
+if ($anno || $geno) {
+    die "$0: Must specify -g along with -a!\n" if $anno && !$geno;
+    die "$0: Must specify -a along with -g!\n" if $geno && !$anno;
+    die "$0: Geno/anno combination '$annodir' not found!\n" unless -d $annodir;
+    die "$0: Geno/anno combination has no smallRNA build!\n" unless -d $srnadir;
+    die "$0: Cannot resolve genome/annotation GTF file '$gtf'!\n" unless -e $gtf;
+}
+$cores = 1 unless $cores;
+die "$0: Invalid number of cores '$cores'!\n" if $cores <=0 || $cores =~ /\D/;
+$mem = '5G' unless $mem;
+die "$0: Invalid memory string '$mem'!  Try something like '5G'.\n" if $mem !~ /^\d+[KMG]$/;
+
+my @pirange;
+if ($pirange eq 'insect') {
+	@pirange = (23, 29);
+} elsif ($pirange eq 'vertebrate') {
+	@pirange = (26, 31);
+} elsif ($pirange =~ /,/) {
+	@pirange = split /,/, $pirange;
+} else {
+	die "$0: invalid piRNA range value '$pirange'!\n";
+}
+
+if ($hubname) {
+    $hubname =~ s/ /_/g;
+    $hubname .= "_piRNA" unless $hubname =~ /pirna/i;
+}
+
+my %inbams = ('all'=>$allbam, 'unq'=>$unqbam);
+
+### Output directory stuff
+chomp($outdir = `readlink -f $outdir`);
+my $trackdir = "$outdir/tracks";
+my $fastqdir = "$outdir/fastq";
+die "$0: Output location '$outdir' already exists!\n" if -d $outdir;   ##### FIXME: PIPELINE-RESTARTING MECHANISM NOT WORKING YET *****
+system "mkdir $outdir";
+foreach my $subdir ($trackdir, $fastqdir) {
+    system "mkdir $subdir";
+    die "$0: Failed to create subdirectory '$subdir'!\n" unless -d $subdir;
+}
+
+
+### Logfile stuff
+my $log = "$outdir/smallRNA-piAnalyze.log";
+my $LOG;  # $log filehandle
+if (-e $log) {
+    $restart = 1;
+    open $LOG, '>>', $log or die "$0: Failed to reopen log file '$log': $!\n";
+} else {
+    open $LOG, '>', $log or die "$0: Failed to open log file '$log': $!\n";
+}
+
+## Prefixes
+$P{A}{all} = "$pidir/piRNA_A.all";
+$P{U}{all} = "$pidir/piRNA_U.all";
+$P{N}{all} = "$pidir/piRNA_N.all";
+$P{A}{unq} = "$pidir/piRNA_A.unq";
+$P{U}{unq} = "$pidir/piRNA_U.unq";
+$P{N}{unq} = "$pidir/piRNA_N.unq";
+
+
+## Size-fractionate trimmed fastq
+my ($i, $type, @rec);
+my $msg = "Filtering for piRNA size range: ".`date`;
+print $LOG $msg;
+print STDERR $msg;
+
+
+
+## Extract and Classify Putative piRNAs
+foreach my $set (sort keys %bams) {
+	my $msg = "Extracting putative piRNAs ($set): ".`date`;
+	print $LOG $msg;
+	print STDERR $msg;
+	
+	open my $IN, '-|', "samtools view -h $bams{$set}" or die "$0: Failed to read input bam '$bams{$set}': $!\n";
+	open my $OUTU, '|-', "samtools view -bS - > $P{U}{$set}.bam" or die "$0: Failed to write to output bam '$P{U}{$set}.bam': $!\n";
+	open my $OUTA, '|-', "samtools view -bS - > $P{A}{$set}.bam" or die "$0: Failed to write to output bam '$P{A}{$set}.bam': $!\n";
+	open my $OUTN, '|-', "samtools view -bS - > $P{N}{$set}.bam" or die "$0: Failed to write to output bam '$P{N}{$set}.bam': $!\n";
+	
+	my ($i, $type, @rec);
+	while (<$IN>) {
+		if (/^@/) {
+			print $OUTU $_;
+			print $OUTA $_;
+			print $OUTN $_;
+		} else {
+			my @data = split /\t/, $_;
+			my $seq = $data[9];
+			my $bp = length($seq);
+			if ($bp >= $pirange[0] && $bp <= $pirange[1]) {
+				($seq = reverse $seq) =~ tr/ACGT/TGCA/ if $data[1] & 16;  # revcomp
+				my @chars = split //, $seq;
+				if ($chars[0] eq 'T') {
+					## U-type signature
+					print $OUTU "$_\tPI:Z:U\n";
+					$stats{UTYPE}++;
+				} elsif ($chars[9] eq 'A') {
+					## A-type signature
+					print $OUTA "$_\tPI:Z:A\n";
+					$stats{ATYPE}++;
+				} else {
+					## Neither signature
+					print $OUTN "$_\tPI:Z:N\n";
+					$stats{NTYPE}++;
+				}
+			}
+		}
+	}
+	close $IN;
+	close $OUTU;
+	close $OUTA;
+	close $OUTN;
+	
+	&execute("$samtools view $ibam | perl -pe 's/\\s+NH:i:\\d+//' | $htseq_count -s $sense -a 0 -m intersection-nonempty - $F{hts}{I} > $F{hts}{S}", $std, $LOG, 2);  # stripping NH tag removes multiread status
+}
+
+
+
+
+    
+## Analysis Globals
+my %AUNdat = (
+	'A'=>{'FQ'=>$piA, 'UFQ'=>$piA_NT, 'TRK'=>"$hubname.A", 'BCOL'=>'255,0,0', 'HCOL'=>'255,150,150'}, 
+	'U'=>{'FQ'=>$piU, 'UFQ'=>$piU_NT, 'TRK'=>"$hubname.U", 'BCOL'=>'0,0,255', 'HCOL'=>'150,150,255'}, 
+	'N'=>{'FQ'=>$piN, 'UFQ'=>$piN_NT, 'TRK'=>"$hubname.N", 'BCOL'=>'0,0,0', 'HCOL'=>'100,100,100'}
+	);  # data per piRNA signature type: Fastq file, Track file prefix, BED color, Hub color
+
+
+## Hub File Init
+my $DBW;  # + strand block
+my $DBC;  # - strand block
+$DBW = "track ${hubname}_W\ncontainer multiWig\nshortLabel ${hubname}_W\nlongLabel $hubname, (+) Strand piRNA Alignments, 1 Align per Read, RPM, Colored by Signature (Red=A, Blue=U, Gray=None)\ngroup piRNA\n";
+$DBW .= "aggregate transparentOverlay\nshowSubtrackColorOnUi on\ntype bigWig 0 100\nviewLimits 0:15\nmaxHeightPixels 200:100:0\nalwaysZero on\nautoScale on\nvisibility full\npriority 99\n";
+$DBC = "track ${hubname}_C\ncontainer multiWig\nshortLabel ${hubname}_C\nlongLabel $hubname, (-) Strand piRNA Alignments, 1 Align per Read, RPM, Colored by Signature (Red=A, Blue=U, Gray=None)\ngroup piRNA\n";
+$DBC .= "aggregate transparentOverlay\nshowSubtrackColorOnUi on\ntype bigWig 0 100\nviewLimits 0:15\nmaxHeightPixels 200:100:0\nalwaysZero on\nautoScale on\nvisibility full\npriority 99\n";
+
+
+## Process piRNAs per signature 
+foreach my $sig (qw/ A U N /) {
+	
+	my $msg = "\npiExtract analyzing $outdir : $sig-type : ".`date`;
+	#	print $LOG $msg;
+	print STDERR $msg;
+	
+	
+	## Directories and file-set prefixes
+	my $bt2out = "$anadir/TE_$sig";
+	my $TE = "$bt2out/TE_hits";
+	my $TEU = "$bt2out/TE_hits.unq";
+	my $topout = "$anadir/genome_$sig";
+	my $all = "$topout/accepted_hits";
+	my $allU = "$topout/accepted_hits.unq";
+	my $pri = "$topout/accepted_hits_primary";
+	
+	
+	## TE alignment & quantitation, if indicated
+	if ($tei) {
+	    
+	    ## Bowtie2 TE alignment
+	    system "mkdir $bt2out";
+	    die "$0: Failed to create TE-bowtie2 output dir '$bt2out'!\n" unless -d $bt2out;
+	    system "$bowtie2 --un-gz $AUNdat{$sig}{UFQ} -p $cores -x $tei -U $AUNdat{$sig}{FQ} -S $TE.sam 2> $TE.align_stats.txt";
+	    system "$samtools view -F 4 -bS $TE.sam | $samtools sort -@ $cores -m $mem -o $TE.sorted.bam -";
+	    system "mv -f $TE.sorted.bam $TE.bam";
+	    system "rm -f $TE.sam";
+	    
+	    ## Unique-reads and Stranded Bams
+	    system "$stripMultireads --mode2 --bowtie $TE.bam";
+	    system "rename stripMultireads unq $TE.*";  ############# MUST MATCH $TEU
+	    system "$samtools view -h -f 16 $TE.bam | $samtools view -Sb - > $TE.W.bam";
+	    system "$samtools view -h -F 16 $TE.bam | $samtools view -Sb - > $TE.C.bam";
+	    system "$samtools view -h -f 16 $TEU.bam | $samtools view -Sb - > $TEU.W.bam";
+	    system "$samtools view -h -F 16 $TEU.bam | $samtools view -Sb - > $TEU.C.bam";
+	    
+	    ## Counting hits
+	    system "for bam in $TE.*.bam; do samtools index \$bam; done";
+	    system "$samtools idxstats $TE.W.bam > $TE.W.idxstats.txt";
+	    system "$samtools idxstats $TE.C.bam > $TE.C.idxstats.txt";
+	    system "$samtools idxstats $TEU.W.bam > $TEU.W.idxstats.txt";
+	    system "$samtools idxstats $TEU.C.bam > $TEU.C.idxstats.txt";
+	    
+	}
+	
+	
+	## Tophat transcriptome/genome alignment (for 2 reasons: transcriptome prealignment, and also splice alignments)
+	system "$tophat -p $cores -o $topout --transcriptome-index=$gtfi --segment-length=10 --no-coverage-search --no-novel-juncs $bti $AUNdat{$sig}{FQ}";
+	system "$samtools index $all.bam";
+	
+	
+	## Primary Alignments, Unique-read BAMs
+	system "$stripMultireads --mode1 --tophat --index $all.bam";
+#	system "rename stripMultireads unq $all.*";  ############# MUST MATCH $ALLU
+	system "$samtools view -h -F 256 $all.bam | $samtools view -Sb - > $pri.bam";
+	system "$samtools index $pri.bam";
+	
+	
+	## Counts
+	system "$samtools view $pri.bam | $htseq_count -s yes -a 0 -m intersection-nonempty - $gtf > $pri.htseq_counts_sense.txt";
+	system "$samtools view $pri.bam | $htseq_count -s reverse -a 0 -m intersection-nonempty - $gtf > $pri.htseq_counts_anti.txt";
+#	system "$samtools view $allU.bam | $htseq_count -s yes -a 0 -m intersection-nonempty - $gtf > $allU.htseq_counts_sense.txt";
+#	system "$samtools view $allU.bam | $htseq_count -s reverse -a 0 -m intersection-nonempty - $gtf > $allU.htseq_counts_anti.txt";
+	
+	
+	## Stranded BAMs & bigWigs
+	system "$samtools view -h -f 16 $pri.bam | $samtools view -Sb - > $pri.W.bam";
+	system "$samtools view -h -F 16 $pri.bam | $samtools view -Sb - > $pri.C.bam";
+	system "$bam2track -b $pri.W.bam -g $geno -p $trackdir/$AUNdat{$sig}{TRK}.W --color=$AUNdat{$sig}{BCOL} -n APM --BB --BW";
+	system "$bam2track -b $pri.C.bam -g $geno -p $trackdir/$AUNdat{$sig}{TRK}.C --color=$AUNdat{$sig}{BCOL} -n APM --BB --BW --neg";
+	
+	
+	## extend trackDb files for A, U, N tracks
+	my $labelW = "${hubname}_${sig}type_W";
+	my $labelC = "${hubname}_${sig}type_C";
+	$DBW .= "\n\ttrack $labelW\n\tparent ${hubname}_W\n\tbigDataUrl $AUNdat{$sig}{TRK}.W.bw\n\ttype bigWig 0 100\n\tcolor $AUNdat{$sig}{HCOL}\n";
+	$DBC .= "\n\ttrack $labelC\n\tparent ${hubname}_C\n\tbigDataUrl $AUNdat{$sig}{TRK}.C.bw\n\ttype bigWig 0 100\n\tcolor $AUNdat{$sig}{HCOL}\n";
+    }
+    
+    
+    ## Create Counts Matrices
+    system "$mergeIdxStats -o $TE_cts $anadir/*/*.idxstats.txt";
+    system "$mergeMatrix -k 1 -v 2 -h 0 -o $gene_cts $anadir/*/*.htseq_counts_*.txt";
+    
+    ## Write Hub Files
+    open my $GRP, '>', $hubgrp or die "$0: Failed to write to hub group file '$hubgrp': $!\n";
+    print $GRP "\nname piRNA\nlabel piRNA Coverage by Signature\npriority 99\ndefaultIsClosed 0\n";
+    close $GRP;
+    open my $TDB, '>', $hubdb or die "$0: Failed to write to hub trackDb file '$hubdb': $!\n";
+    print $TDB "\n$DBW\n$DBC\n";
+    close $TDB;
+
+    my $msg = "\npiExtract analysis complete: ".`date`;
+#    print $LOG $msg;
+    print STDERR $msg;
+}
+
+exit;
+
+

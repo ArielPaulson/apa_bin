@@ -1,0 +1,252 @@
+#!/usr/bin/env perl
+
+=pod
+
+=head1 NAME
+
+Takes a bigwig and a bed file and extracts coverage vectors for every base in every feature.  Can also return an example R script for visualization.
+
+=head1 SYNOPSIS
+
+/home/apa/local/bin/coverageVectors [-b bigwig.bw] [-u uxons.bed | -g genes.bed] [-o output.txt] --showintrons --Rscript
+
+=head1 DESCRIPTION
+
+Output is 5-column tsv file: Gene ID, Vector Length, Gene Chrom, Gene Strand, Gene Coverage Vector.  The vector is CSV; 0-coverage positions have no value (instead of '0') to keep file size down.
+
+=head1 OPTIONS
+
+=over
+
+=item B<-b bigwig>
+
+Extract coverage vectors from this bigwig.
+
+=item B<-u uxons.bed>
+
+Take feature definitions from this bed file of uxons (merged exons, a.k.a. unioned exons). Uxon names MUST use convention "GeneID:UxonID". Ordered uxon coverages are concatenated by gene and introns are ignored, so this approximates mRNA coverage. NOTE: cannot mix -u and -g.
+
+=item B<-g genes.bed>
+
+Take feature definitions from this bed file of genes. This retrieves coverage for the entire gene, introns and all. NOTE: cannot mix -u and -g.
+
+=item B<-o output_file>
+
+Write vectors to this file.
+
+=item B<--showintrons>
+
+Mark intron positions in vector with "Intron:intronNum:intronBp" strings.
+
+=item B<--Rscript>
+
+Writes an example R script to <output_file>.R with code for visualizing the coverage vectors.
+
+=item B<-h, --help>
+
+Prints what you are looking at now.  Also --man, --ver.
+
+=back
+
+=head1 VERSION
+
+$Revision: 1.0$
+
+=head1 AUTHOR
+
+Ariel Paulson (apa@stowers.org)
+
+=cut
+
+
+## extra documentation for the hidden '--detail' option:
+# =item B<--detail>
+# 
+# !!! LARGE FILE WARNING !!! Instead of a single coverage vector, print the tabular bedgraph data, including zero positions, for every region. Useful for debugging. 
+
+
+use Getopt::Long;
+use Pod::Usage;
+use Pod::Text;
+use FindBin;
+use strict;
+
+our $VERSION =  qw$Revision: 1.0 $[-1];
+our $VC_DATE =  qw$Date: $[-2];
+
+my ($uxonbed, $genebed, $bigwig, $outfile, $detail, $showintrons, $Rscript, $help, $man, $ver);
+GetOptions(
+    "u=s" => \$uxonbed, 
+    "g=s" => \$genebed, 
+    "b=s" => \$bigwig, 
+    "o=s" => \$outfile, 
+    "detail" => \$detail, 
+    "showintrons" => \$showintrons,
+    "Rscript" => \$Rscript,
+    
+    "help|?" => \$help,
+    "man!" => \$man,
+    "version!" => \$ver
+) or pod2usage();
+
+pod2usage(1) if $help;
+pod2usage(-exitstatus => 0, -verbose => 2) if $man || $help;
+if ($ver) {print "$FindBin::Script: $VERSION\n"; exit(0)};
+
+die "Cannot specify -u and -g at the same time!\n" if ($uxonbed && $genebed);
+if ($showintrons && $genebed) {
+    print "--showintrons only meaningful if using -u!\n";
+    $showintrons = 0;
+}
+
+my ($mode, $features);
+if ($uxonbed) {
+    $mode = 'uxons';
+    $features = $uxonbed;
+} elsif ($genebed) {
+    $mode = 'genes';
+    $features = $genebed;
+} else {
+    die "Must specify one of -u or -g!\n";
+}
+
+my ($fbname) = ($features =~ /([^\/]+)\.bed$/);
+my ($bgname) = ($bigwig =~ /([^\/]+)\.(bw|bigwig)$/i);
+$outfile = "$bigwig.$fbname.gene.vectors.txt" unless $outfile;
+die "Bigwig file '$bigwig' does not exist!\n" unless -e $bigwig;
+die "Couldn't read '$features': $!\n" unless -e $features;
+my $tempbg = "coverageVectors.$$.tmp";
+
+my %data;
+chomp(my $N = `cat $features | wc -l`);
+open IN, $features or die "$0: Failed to read features file '$features': $!\n";
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    my ($chr, $fstart, $fend, $feat, $score, $strand) = split /\t/, $_;
+    my $gene = $mode eq 'uxons' ? (split /:/, $feat)[0] : $feat;
+    $fstart++;  # now 1-based
+    $data{$gene}{CHRSTR} = [$chr, $strand];
+    $data{$gene}{COORDS}{$fstart} = $fend;
+}
+close IN;
+
+print "Extracting coverages for $bigwig: ".`date`;
+system "bigWigToBedGraph $bigwig $tempbg";
+die "Failed to generate temporary bedGraph '$tempbg'!\n" unless -s $tempbg;
+open INT, "intersectBed -wao -a $features -b $tempbg |";
+while (<INT>) {
+    chomp;
+    my ($feat, $start, $end, $height) = (split /\t/, $_)[3,7..9];
+    my $gene = $mode eq 'uxons' ? (split /:/, $feat)[0] : $feat;
+    $start++;   # now 1-based
+    $data{$gene}{MAP}{$_} = $height foreach ($start..$end);   # may overrun gene boundaries
+}
+close INT;
+unlink $tempbg;
+
+my ($delim1, $delim2, $delim3) = $detail ? ("\n","\t","\n") : (',','',"\t");
+
+print "Writing $outfile: ".`date`;
+open OUT, "> $outfile" or die "Couldn't write output file '$outfile': $!\n";
+foreach my $gene (sort keys %data) {
+    my (@vec, $length);
+    my @starts = sort {$a <=> $b} keys %{ $data{$gene}{COORDS} };
+    print "$gene BAD!\n" unless $data{$gene}{CHRSTR};
+    my ($chr, $str) = @{ $data{$gene}{CHRSTR} };
+    foreach my $i (0..$#starts) {
+	my $end = $data{$gene}{COORDS}{$starts[$i]};
+	$length += $end-$starts[$i]+1;
+	foreach my $j ($starts[$i]..$end) {   # ensure complete map AND ignore anything beyond uxon boundaries
+	    my $value = $data{$gene}{MAP}{$j};
+	    my $line = $detail ? "\t".($i+1)."\t$j\t".($value||0) : $value;
+	    push @vec, $line;
+	}
+	push @vec, "${delim2}Intron:".($i+1).":".($starts[$i+1]-$end) if ($showintrons && $i < $#starts);   # flag intron breaks
+    }
+    @vec = reverse(@vec) if $str eq '-';
+    my $vec = join $delim1, @vec;
+    print OUT "$gene\t$length\t$chr\t$str$delim3$vec\n";
+}
+close OUT;
+
+&write_Rscript if $Rscript;
+
+print "Complete! ".`date`;
+exit;
+
+
+
+
+sub write_Rscript {
+
+    my $doc = <<EOF;
+
+### RUN THIS ON LINUX NOT WINDOWS -- coverage vectors take a lot of memory.
+
+source("/home/apa/apa_tools.R")  # for lineplot, row.norm, binify, zerofy
+nbins <- 100        # number of bins to break coverage vectors into
+drop.short <- TRUE  # drop coverage vectors with < nbins elements to begin with?  Otherwise, get stretched until length = nbins
+summ.fun <- mean    # summarize coverages per bin using this function
+
+## read coverage vector dataset(s) -- change names, add more output files as required
+cov.vecs <- list(
+    covg.1=scan("$outfile", sep="\t", what=list("",0,"","",""))
+)
+
+samples <- names(cov.vecs)
+N <- length(samples)
+
+## split up covg vec string into actual vector
+for (i in 1:N) {
+	cov.vecs[[i]][[5]] <- lapply(cov.vecs[[i]][[5]], FUN=function(x){as.numeric(unlist(strsplit(x,',')))})
+}
+
+## collapse covg vecs into 100 bins each (bin.vecs), then add to N x nbins matrix (bin.mats)
+## also collect other coverage stats
+bin.vecs <- bin.mats <- nonzero <- cov.vecs
+cov.pcts <- cov.meds <- matrix(0, length(cov.vecs[[1]][[1]]), N, F, list(cov.vecs[[1]][[1]],names(cov.vecs)))
+colnames(cov.pcts) <- paste(colnames(cov.pcts), "covPct", sep=".")
+colnames(cov.meds) <- paste(colnames(cov.meds), "covMed", sep=".")
+
+for (i in 1:N) {
+    message(i)
+    bin.vecs[[i]] <- lapply(cov.vecs[[i]][[5]], FUN=function(x){ binify(zerofy(x),nbins,summ.fun,FALSE,drop.short) })
+    bin.mats[[i]] <- row.norm(do.call(rbind, bin.vecs[[i]]))
+    nonzero[[i]] <- apply(!is.na(bin.mats[[i]]),1,all)   # genes which actually have coverage
+    bin.mats[[i]] <- bin.mats[[i]][nonzero[[i]],]
+    cov.meds[,i] <- sapply(cov.vecs[[i]][[5]], median)   # median coverage depth per gene
+    cov.pcts[,i] <- sapply(cov.vecs[[i]][[5]], FUN=function(x){ sum(!is.na(x))/length(x) })    # percent gene/exon space with nonzero coverage
+}
+
+## extract gene data into separate data.frame
+gene.data <- nameless(as.data.frame(cov.vecs[[1]][1:4],stringsAsFactors=F))
+colnames(gene.data) <- c("Gene","CovVecLen","Chrom","Strand")
+
+## summarize by total coverage, avg coverage
+allmeans <- t(sapply(bin.mats,colMeans))
+allsums <- t(sapply(bin.mats,colSums))
+
+## plot sum
+png("coverage_sums.png", 800, 600); par(cex=1.2, las=2)
+lineplot(allsums, col=1:N, legend="topleft", main="Sum of Gene or Exonic Coverage", xlab=paste("Gene or Exonic space, 5'-3',",nbins,"bins per gene"), ylab="Coverage Sum")
+dev.off()
+
+## plot mean
+png("coverage_means.png", 800, 600); par(cex=1.2, las=2)
+lineplot(allmeans, col=1:N, legend="topleft", main="Mean of Gene or Exonic Coverage", xlab=paste("Gene or Exonic space, 5'-3',",nbins,"bins per gene"), ylab="Coverage Sum")
+dev.off()
+
+## plot sum as % max
+png("coverage_sums_pct_max.png", 800, 600); par(cex=1.2, las=2)
+lineplot(allsums/apply(allsums,1,max), col=1:N, legend=NA, main="Sum of Gene or Exonic Coverage, as % Maximum", xlab=paste("Gene or Exonic space, 5'-3',",nbins,"bins per gene"), ylab="Percent of Maximum")
+dev.off()
+
+save.image("$outfile.RData")
+
+EOF
+
+open OUT, "> $outfile.R";
+print OUT $doc;
+close OUT;
+
+}

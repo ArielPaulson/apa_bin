@@ -1,0 +1,489 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+require '/home/apa/local/bin/scriptutils/alignToX_routines.pm';
+use Data::Dumper;
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+## TO DO: PE mode, specifiable match length, if $mixed get all read stats from $trimlog & grep " 0$" $trimlog for untrimmed reads
+
+
+### Dependencies
+my $bin = '/home/apa/local/bin';
+my $indexes = '/n/data1/genomes/indexes';
+my $readCount = "$bin/readCount";
+my $fqrTotal = "$bin/fqrTotal";
+my $trimadap = "$bin/scriptutils/adapter_collection.fa";   # adapter fasta for trimming; may specify non-default with '-t'
+my $fastx_trimmer = 'fastx_trimmer';
+my $trimmomatic = '/n/apps/CentOS7/bin/trimmomatic-0.36.jar';
+$trimmomatic = '/n/local/stage/trimmomatic/Trimmomatic-0.30/trimmomatic-0.30.jar' unless -e $trimmomatic;
+my $java = 'java';
+
+
+
+### Inputs
+
+## Mandatory
+my $infq1;       # end 1 input fastq
+my $infq2;       # end 2 input fastq, if any
+my $outdir;      # output path
+my $clobber;     # output path if clobbering
+my $mixed;       # are input read lengths mixed?
+my $lenmin;      # min trimmed length to return (default 1)
+my $lenmax;      # max trimmed length to return (default = read length)
+my $nountrim;    # discard untrimmed reads? (should be unnecessary if using $lenmax)
+my $rlsplit;     # split trimmed fastq into separate read-length fastqs?
+my $runfqr;      # generate fastqReads files for the output fastqs?
+my $cores = 1;   # N cores for Trimmomatic
+my $mem = '1G';  # RAM string for java
+my $xtrim;       # extra post-Trimmomatic trimming argument, currently must be "X,Y" indicating 5' crop bp (X) and 3' crop bp (Y), e.g. "6,0" or "4,4"
+my $uhisto;      # run readCount --uhisto on post-trim results
+my $script;      # optional: give a script name (may already exist).  Do not actually run commands; print the commands to this script instead
+
+
+### Get arguments
+GetOptions("fq1=s"=>\$infq1, "fq2=s"=>\$infq2, "o=s"=>\$outdir, "oc=s"=>\$clobber, "min=i"=>\$lenmin, "max=i"=>\$lenmax, "c=i"=>\$cores, "m=s"=>\$mem, "t=s"=>\$trimadap, "x=s"=>\$xtrim, "mixed"=>\$mixed, "no-untrimmed"=>\$nountrim, "split"=>\$rlsplit, "uhisto"=>\$uhisto, "script=s"=>\$script);
+
+
+### Globals
+my %stats;      # trim stats and length histo
+my $readlen;
+my @fqrlist;    # POPULATED, BUT NOT ACTUALLY PROCESSED ANYWHERE
+my %trimlens;
+my %pstats;
+my @xtrim;
+
+
+### Test arguments; initialize workspace and some globals
+die "$0: No input specified!\n" unless $infq1;
+chomp($infq1 = `readlink -f $infq1`);
+die "$0: Cannot find input fastq '$infq1'!\n" unless -e $infq1;
+die "$0: Cannot find indicated adapter fasta '$trimadap'!\n" if $trimadap && ! -e $trimadap;
+die "$0: -min must be a positive integer!\n" if $lenmin =~ /\D/;
+die "$0: -max must be a positive integer!\n" if $lenmax =~ /\D/;
+if ($xtrim) {
+    @xtrim = split /,/, $xtrim;
+    if ($#xtrim!=1 || $xtrim[0] =~ /\D/ || $xtrim[1] =~ /\D/) {
+        die "$0: '-x' value must be a single pair of positive integers, separated by a comma!\n";
+    }
+    $xtrim[0]++ if $xtrim[0];  # if cropping, first base to keep = last base to crop + 1
+}
+
+
+## Initialize locations and files
+my ($outdir, $outpref, $qsha, $qshu, $logfile, $LOG, $SH) = &initialize($outdir, $clobber, $script);  # (path, prefix, file, file, filehandle, filehandle)
+my $trimpref = "$outdir/trimmed";
+my @SHDAT = ($SH, $outpref, $outdir);
+my $rlsplitdir = "$outdir/split";
+if ($rlsplit) {
+    if ($script) {
+        print $SH "\nrlsplitdir=$rlsplitdir\nmkdir \$rlsplitdir\n";
+    } else {
+        &execute2("mkdir $rlsplitdir", 1, $LOG, 2);
+    }
+}
+my $blurb = $rlsplit ? ' and splitting' : '';
+
+if ($mixed) {
+    chomp($readlen = `zcat $infq1 $infq2 | sed -n 2~4p | wc -c | sort -nr | head -1`);
+} else {
+    chomp($readlen = `zcat $infq1 | head -2 | tail -1 | wc -c`);
+}
+$readlen--;   ##### SUBTRACT THE NEWLINE!!! #####
+$lenmin = 1 unless $lenmin;          # default minimum post-trim fragment length
+unless ($lenmax) {
+    $lenmax = $nountrim ? $readlen-1 : $readlen;  # default maximum post-trim fragment length
+}
+$nountrim = 0 unless $nountrim;
+$rlsplit = 0 unless $rlsplit;
+
+
+## Filenames etc.
+my $substage  = "$outdir/.substage";
+my $trimerr   = "$trimpref.stderr.txt";
+my $trimlog   = "$trimpref.trimlog.txt";
+my $trimstat  = "$trimpref.stats.txt";
+my $trimstat2 = "$trimpref.stats2.txt";
+my $trimhist  = "$trimpref.histogram.txt";
+my $trimfqr   = "$trimpref.fqReads.txt";
+my $trimfq    = "$trimpref.fastq.gz";             # unless $rlsplit
+my $trimfq1   = "$trimpref-1.fastq.gz";           # temp data
+#my $trimfq2   = "$trimpref-2.fastq.gz";           # temp data
+my $untrimfq  = "$outdir/untrimmed.fastq.gz";     # symlink, if $rlsplit
+my $smallfq   = "$trimpref.too-small.fastq.gz";   # may or may not exist
+my $largefq   = "$trimpref.too-large.fastq.gz";   # may or may not exist
+my $passfq    = "$trimpref.passing.fastq.gz";     # hopefully exists!!
+my $uhfile    = "$trimpref.passing.uhisto.txt";   # 
+my %LFQ;    # only used if $rlsplit
+$LFQ{$_}{FQ} = "$rlsplitdir/trimmed.${_}-bp.fastq.gz" foreach ($lenmin..$lenmax);
+
+
+## Trim reads
+
+## Trimmomatic manual: http://www.usadellab.org/cms/uploads/supplementary/Trimmomatic/TrimmomaticManual_V0.32.pdf
+## ILLUMINACLIP:<fastaWithAdaptersEtc>:<seed mismatches>:<palindrome clip threshold>:<simple clip threshold>:<minAdapterLength>
+
+## See also: http://seqanswers.com/forums/showthread.php?t=11186 for discussion on simpleClip value -- '6' will require something like 10 high-quality base matches:
+## "These values are (very roughly speaking) log-10 probabilities of getting a match at random. Each perfectly matching base scores just over 0.6, so 15 requires a perfect 25 base match. Each mismatching base reduces the score by the Q/10 value of that base. So it takes 5 or even 6 additional matching bases to overcome one high quality mismatch, but maybe only 1 or 2 additional bases if the mismatching base is low quality.  "Palindrome" mode is only used in paired mode, when appropriately named "prefix" sequences are provided, and since it does 'end to end' matching of the pairs, it can afford a higher threshold, as suggested"
+
+
+##### FIXME: ADD PE MODE
+
+if ($script) {
+    print $SH "\n##### VARIABLE SETUP #####\n\ntrimadap=$trimadap\ninfq=$infq1\nreadlen=$readlen\nlenmin=$lenmin\nlenmax=$lenmax\n";
+    print $SH "xtrim5=$xtrim[0]\nxtrim3=$xtrim[1]\n" if $xtrim;
+    print $SH "nountrim=$nountrim\nrlsplit=$rlsplit\n\n";
+    print $SH "substage=$substage\ntouch \$substage\ncomplete=\$(cat \$substage)\nif [ -z \$complete ]; then complete=0; fi\n\n";
+    print $SH "\n##### TRIM READS #####\n\n";
+}
+
+print $SH "if [ \$complete -lt 1 ]; then\n" if $script;
+&logreport2("Trimming input fastq...", 1, 0, $LOG, \@SHDAT);
+my $cmd = "$java -Xmx$mem -jar $trimmomatic SE -threads $cores -trimlog $trimlog $infq1 $trimfq ILLUMINACLIP:$trimadap:2:10:3 MINLEN:1 2> $trimerr";
+if ($script) {
+    $cmd =~ s/$infq1/\$infq/;
+    $cmd =~ s/$trimadap/\$trimadap/;
+}
+&execute2($cmd, 1, $LOG, 1, \@SHDAT);  # min match = 5bp (at 3' end...), min returned read = 1bp
+&execute2("echo 1 > $substage", 1, $LOG, 1, \@SHDAT);  # finished with substage 1
+print $SH "fi\n" if $script;  # end if $complete -lt 1
+
+&logreport2("Trimmomatic complete: ", 1, 1, $LOG, \@SHDAT);
+
+my $trimerr_z = "Failed to interpret Trimmomatic output: cannot find read statistics!";
+my $trimerr_0 = "Trimmomatic reports that the input fastq was empty!";
+my @statnames =  qw/  Input  Trimmed  Dropped  Untrimmed  TooSmall  TooLarge  Passing /;  # to $trimstats
+my @xstatnames = qw/ xInput xTrimmed xDropped xUntrimmed xTooSmall xTooLarge xPassing /;  # to $trimstats2  // will get valued if $xtrim
+my $bash_assoc = '[Input]=0 [Trimmed]=0 [Dropped]=0 [Untrimmed]=0 [TooSmall]=0 [TooLarge]=0 [Passing]=0';
+
+print $SH "\n\n##### INITIAL TRIMMING EVAL #####\n\ndeclare -A STATS=( $bash_assoc )\ndeclare -A PSTATS=( $bash_assoc )\ndeclare -A TRIMLENS\nstatnames=( @statnames )\n";
+print $SH "declare -A STATSx=( $bash_assoc )\ndeclare -A PSTATSx=( $bash_assoc )\ndeclare -A TRIMLENSx\n" if $xtrim;
+print $SH "\n";
+
+print $SH "if [ \$complete -lt 2 ]; then\n" if $script;
+
+    &logreport2("Collecting stats...", 1, 0, $LOG, \@SHDAT);
+    my $block = "\n".'tsline=$(grep "^Input" '."$trimerr)\n"
+        . 'STATS[Input]=$(echo $tsline | grep -oP "Input Reads: \d+" | '."sed 's/.*: //')\n"
+        . 'STATS[Trimmed]=$(echo $tsline | grep -oP "Surviving: \d+" | '."sed 's/.*: //')\n"
+        . 'STATS[Dropped]=$(echo $tsline | grep -oP "Dropped: \d+" | '."sed 's/.*: //')\n"
+        . 'if [ -z ${STATS[Input]} ]; then echo "'.$trimerr_z.'"; exit 1; fi'."\n"
+        . 'if [ ${STATS[Input]} -eq 0 ]; then echo "'.$trimerr_0.'"; exit 1; fi'."\n\n";
+    print $SH &shorten_bash($block, \@SHDAT);
+    
+    my $block = "\n\n##### GET POST-TRIMMING STATS #####\n\n"
+        . 'while read line; do'."\n"
+        . '  len=$(echo "$line" | cut -f1)'."\n"
+        . '  N=$(echo "$line" | cut -f2)'."\n"
+        . '  ((TRIMLENS[$len]=${TRIMLENS[$len]}+$N))'."\n"
+        . '  if [ $len -eq $readlen ]; then ((STATS[Untrimmed]=${STATS[Untrimmed]}+$N)); fi'."\n"
+        . '  if [ $len -lt $lenmin ]; then'."\n"
+        . '      ((STATS[TooSmall]=${STATS[TooSmall]}+$N))'."\n"
+        . '  elif [ $len -gt $lenmax ]; then'."\n"
+        . '      ((STATS[TooLarge]=${STATS[TooLarge]}+$N))'."\n"
+        . '  else'."\n"
+        . '      ((STATS[Passing]=${STATS[Passing]}+$N))'."\n"
+        . '  fi'."\n"
+        . "done < $trimhist\n\n"
+        . 'for stat in $(echo ${!STATS[@]}); do'."\n"
+        . '  PSTATS[$stat]=$(printf "%0.2f" $(echo "100*${STATS[$stat]}/${STATS[Input]}" | bc))'."\n"
+        . "done\n";
+    print $SH &shorten_bash($block, \@SHDAT);
+    
+    print $SH "fi\n" if $script;  # end if $complete -lt 2
+    
+    print $SH "if [ \$complete -lt 3 ]; then\n" if $script;
+    
+    my $block = "\n\n##### EXTRA TRIMMING REQUESTED #####\n\n";
+    $block .= "mv -f $trimfq $trimfq1\nzcat $trimfq1";
+    $block .= " | $fastx_trimmer -f \$xtrim5" if $xtrim[0];
+    $block .= " | $fastx_trimmer -t \$xtrim3 -m 1" if $xtrim[1];
+    $block .= " | gzip -f > $trimfq\n\n\n##### GET POST-EXTRA-TRIMMING STATS #####\n\n"
+        . '((STATSx[Input]=$(zcat $trimfq1 | wc -l)/4))'."\n"
+        . '((STATSx[Trimmed]=$(zcat $trimfq | wc -l)/4))'."\n"
+        . '((STATSx[Dropped]=${STATSx[Input]}-${STATSx[Trimmed]}))'."\n"
+        . 'while read line; do'."\n"
+        . '  ((len=$(echo $line | wc -c)-1))'."\n"
+        . '  ((TRIMLENSx[$len]=${TRIMLENSx[$len]}+1))'."\n"
+        . '  if [ $len -lt $lenmin ]; then'."\n"
+        . '      ((STATSx[TooSmall]=${STATSx[TooSmall]}+$N))'."\n"
+        . '  elif [ $len -gt $lenmax ]; then'."\n"
+        . '      ((STATSx[TooLarge]=${STATSx[TooLarge]}+$N))'."\n"
+        . '  else'."\n"
+        . '      ((STATSx[Passing]=${STATSx[Passing]}+$N))'."\n"
+        . '  fi'."\n"
+        . 'done < <(zcat $trimfq | sed -n 2~4p)'."\n\n"
+        . 'for stat in $(echo ${!STATSx[@]}); do'."\n"
+        . '  PSTATSx[$stat]=$(printf "%0.2f" $(echo "100*${STATSx[$stat]}/${STATSx[Input]}" | bc)'."\n"
+        . "done\n" if $xtrim;
+    print $SH &shorten_bash($block, \@SHDAT);
+    
+    print $SH "fi\n" if $script;  # end if $complete -lt 3
+    
+    my $block = "\n\n##### POST-TRIM READ LENGTH REPORT #####\n\n"
+        . 'echo -e "Post-trim read lengths:\nLength\tNreads"'."\n"
+        . 'for tlen in ${!TRIMLENS[@]}; do'."\n"
+        . '  echo -e "$tlen\t${TRIMLENS[$tlen]}"'."\n" 
+        . "done\n\n\n##### POST-TRIM READ STATUS REPORT #####\n\n"
+        . '((w=$(echo ${STATS[Input]} | wc -c)-1))'."\n"
+        . 'if [ $w -lt 5 ]; then w=5; fi'."\n"
+        . 'echo -e "\nReads Percent Class"'."\n"
+        . 'for stat in ${statnames[@]}; do'."\n"
+        . '  N=$(printf "%${w}i" "${STATS[$stat]}")'."\n"
+        . '  P=$(printf "%7.2f" "${PSTATS[$stat]}")'."\n"
+        . '  echo "$N $P $stat"'."\n"
+        . "done\n";
+    
+    if ($xtrim) {
+        $block .= "\n\n##### POST-EXTRA-TRIM READ LENGTH REPORT #####\n\n"
+            . 'echo -e "Post-extra-trim read lengths:\nLength\tNreads"'."\n"
+            . 'for tlen in ${!TRIMLENSx[@]}; do'."\n"
+            . '  echo -e "$tlen\t${TRIMLENSx[$tlen]}"'."\n" 
+            . "done\n\n\n##### POST-EXTRA-TRIM READ STATUS REPORT #####\n\n"
+            . 'echo -e "\nReads Percent Class"'."\n"
+            . 'for stat in ${statnames[@]}; do'."\n"
+            . '  N=$(printf "%${w}i" "${STATSx[$stat]}")'."\n"
+            . '  P=$(printf "%7.2f" "${PSTATSx[$stat]}")'."\n"
+            . '  echo "$N $P $stat"'."\n"
+            . "done\n";
+    }
+    print $SH &shorten_bash($block, \@SHDAT);
+   
+} else {
+    
+    ## 3 basic trimming stats
+    chomp(my $trimstats = `grep "^Input" $trimerr`);
+    ($stats{Input}, $stats{Trimmed}, $stats{Dropped}) = ($trimstats =~ /Input Reads: (\d+) Surviving: (\d+) .* Dropped: (\d+)/);
+    if (!$stats{Input}) {
+        ## No read totals??
+        if (defined $stats{Input}) {
+            ## 0 reads in input??
+            &logreport2("$0: $trimerr_0\n", 1, 0, $LOG);
+        } else {
+            &logreport2("$0: $trimerr_z\n", 1, 0, $LOG);
+        }
+        die "$0: no input reads, apparently!\n";  # nothing to do now
+    }
+
+    foreach (split /\n/, `cat $trimhist`) {
+        chomp;
+        my ($len, $N) = split;
+        $trimlens{$len} = $N;
+        $stats{Untrimmed} += $N if $len == $readlen;
+        if ($len < $lenmin) {
+            $stats{TooSmall} += $N;
+        } elsif ($len > $lenmax) {
+            $stats{TooLarge} += $N;
+        } else {
+            $stats{Passing} += $N;
+        }
+    }
+    $pstats{$_} = sprintf("%0.2f", 100*$stats{$_}/$stats{Input}) foreach @statnames;
+    
+}
+
+&execute2("echo 2 > $substage", 1, $LOG, 1, \@SHDAT);  # finished with substage 2
+
+## Post-trimmomatic reporting
+&execute2("cat $trimlog | rev | cut -f4 -d' ' | rev | sort -n | uniq -c | awk '{ print \$2\"\\t\"\$1 }' > $trimhist", 1, $LOG, 2, \@SHDAT);
+&execute2("rm -f $trimlog", 1, $LOG, 3, \@SHDAT);      # massive file; only need a few stats from it
+&execute2("echo 3 > $substage", 1, $LOG, 1, \@SHDAT);  # finished with substage 3
+
+## Extra trimming, if specified
+if (@xtrim) {
+    
+        &execute2("mv -f $trimfq $trimfq1", 1, $LOG, 2);
+        my $fastx_cmd = "zcat $trimfq1";
+        $fastx_cmd .= " | $fastx_trimmer -f $xtrim[0]" if $xtrim[0];
+        $fastx_cmd .= " | $fastx_trimmer -t $xtrim[1] -m 1" if $xtrim[1];
+        $fastx_cmd .= " | gzip -f > $trimfq";
+        &execute2($fastx_cmd, 1, $LOG, 2);
+        
+        ## Update post-trim stats
+        open IN, "zcat $trimfq | sed -n 2~4p |";
+        while (<IN>) {
+            $stats{xTrimmed}++;
+            my $len = length($_)-1;  # -1 for newline
+            if ($len < $lenmin) {
+                $stats{xTooSmall}++;
+            } elsif ($len > $lenmax) {
+                $stats{xTooLarge}++;
+            } else {
+                $stats{xPassing}++;
+            }
+        }
+        close IN;
+        $stats{xInput} = $stats{Input} - $stats{Dropped};
+        $stats{xDropped} = $stats{xInput} - $stats{xTrimmed};
+        $pstats{$_} = sprintf("%0.2f", 100*$stats{$_}/$stats{xInput}) foreach @xstatnames;
+        
+    }
+    
+}
+&execute2("rm -f $trimfq1", 1, $LOG, 2, \@SHDAT);
+
+
+if ($script) {
+    
+} else {
+    
+    my $fmt = '%'.length($stats{Input}).'i (%6.2f'."%) %s\n";
+    my $report;
+    $report .= "\nPost-trim read lengths:\nLength\tReads\n";
+    $report .= "$_\t$trimlens{$_}\n" foreach sort { $a <=> $b } keys %trimlens;
+    $report .= "\nReads\tPercent\tClass\n";
+    $report .= sprintf($fmt, $stats{$_}, $pstats{$_}, $_) foreach sort { $stats{$b} <=> $stats{$a} } @statnames;
+    if (@xtrim) {
+        $report .= sprintf($fmt, $stats{$_}, $pstats{$_}, $_) foreach sort { $stats{$b} <=> $stats{$a} } @xstatnames;
+    }
+    &logreport2($report, 1, 0, $LOG);
+    
+}
+
+
+if ($script) {
+    
+    my $block = "\n\n##### TRIMMED FASTQ FRACTIONATION #####\n\n"
+        . 'mintrim=$(echo ${!TRIMLEN[@]} | sed "s/ /\n/g" | sort -n | head -1)'."\n"
+        . 'maxtrim=$(echo ${!TRIMLEN[@]} | sed "s/ /\n/g" | sort -n | tail -1)'."\n"
+        . 'if [ $mintrim -lt $lenmin ]; then toosmall=1; else toosmall=0; fi'."\n"
+        . 'if [ $maxtrim -gt $lenmax ]; then toolarge=1; else toolarge=0; fi'."\n"
+        . 'if [ $nountrim -eq 1 ] && [ $maxtrim -eq $readlen ]; then untrimmed=1; else untrimmed=0; fi'."\n\n"
+        . 'smallfq=$smallfq'."\n"
+        . 'largefq=$largefq'."\n"
+        . 'untrimfq=$untrimfq'."\n"
+        . 'passfq=$passfq'."\n";
+    
+    ## If $script, these files must NOT have '.gz' extension initially
+    $smallfq =~ s/\.gz//;
+    $largefq =~ s/\.gz//;
+    $untrimfq =~ s/\.gz//;
+    $passfq =~ s/\.gz//;
+    ## Ensure all output fastqs are gone; all write commands below are APPEND
+    $block .= "\n".'rm -f $smallfq $largefq $untrimfq $passfq   # some may not exist'."\n";
+    $block .= 'rm -f $rlsplitdir/*'."\n" if $rlsplit;
+    
+    $block .= join("\n", '', '$i=0', '$len=0', '$rec=""', '')
+        . 'while read line; do'."\n"
+        . '  ((i=$i+1))'."\n"
+        . '  rec="$rec$line\n"'."\n"
+        . '  if [ $i -eq 4 ]; then'."\n"
+        . '    if [ $toosmall -eq 1 ] && [ $len -lt $lenmin ]; then'."\n"
+        . '      echo -e $rec >> '."$smallfq\n"
+        . '    elif [ $toolarge -eq 1 ] && [ $len -gt $lenmax ]; then'."\n"
+        . '      echo -e $rec >> '."$largefq\n"
+        . '    elif [ $untrimmed -eq 1 ] && [ $len -eq $readlen ]; then'."\n"
+        . '      echo -e $rec >> '."$untrimfq\n"
+        . '    elif [ $rlsplit -eq 1 ]; then'."\n"
+        . '      echo -e $rec >> $rlsplitdir/trimmed.$len-bp.fastq'."\n"
+        . '    else'."\n"
+        . '      echo -e $rec >> '."$passfq\n"
+        . '    fi'."\n"
+        . '    rec=""'."\n"
+        . '    i=0'."\n"
+        . '  elif [ $i -eq 2 ]; then'."\n"
+        . '    ((len=$(echo $line | wc -c)-1))'."\n"
+        . '  fi'."\n"
+        . "done < <(zcat $trimfq)\n\n"
+        . 'gzip $smallfq $largefq $untrimfq $passfq   # some may not exist'."\n";
+    $block .= 'gzip $rlsplitdir/*'."\n" if $rlsplit;
+    print $SH &shorten_bash($block, \@SHDAT);
+    
+} else {
+    
+    ## Prepare for fastq filtering
+    my ($mintrim, $maxtrim) = (sort {$a <=> $b} keys %trimlens)[0,-1];
+    my $toosmall = $mintrim < $lenmin ? 1 : 0;  # too-small fraction exists
+    my $toolarge = $maxtrim > $lenmax ? 1 : 0;  # too-large fraction exists
+    my $untrimmed = $nountrim && $maxtrim == $readlen ? 1 : 0;     ############# FIXME: if $mixed, how do we know who is truly untrimmed? (can get it from $trimlog?)
+    
+    push @fqrlist, $passfq unless $rlsplit;
+    push @fqrlist, $smallfq if $toosmall;
+    push @fqrlist, $largefq if $toolarge;
+    push @fqrlist, $untrimfq if $untrimmed;
+    
+    &logreport2("Filtering$blurb trimmed fastq: ", 1, 1, $LOG, \@SHDAT);
+    
+    my ($TFsm, $TFlg, $TFun, $TFok);
+    $TFsm = &open2('W', $smallfq, 'too-small trimmed fastq') if $toosmall;
+    $TFlg = &open2('W', $largefq, 'too-large trimmed fastq') if $toolarge;
+    $TFun = &open2('W', $untrimfq, 'untrimmed fastq') if $untrimmed;
+    $TFok = &open2('W', $passfq, 'passing trimmed fastq') if !$rlsplit;
+    
+    if ($rlsplit) {
+        foreach my $len (keys %trimlens) {
+            open my $FH, '|-', "gzip > $LFQ{$len}{FQ}";
+            $LFQ{$len}{FH} = $FH;
+            push @fqrlist, $LFQ{$len}{FQ};
+        }
+    }
+
+    ## Filter fastqs
+    my $TFI = &open2('R', $trimfq, 'Trimmed fastq');
+    my ($i, $len, @rec);
+    while (<$TFI>) {
+        $i++;
+        push @rec, $_;
+        if ($i == 4) {
+            if ($toosmall && $len < $lenmin) {
+                print $TFsm @rec;
+            } elsif ($toolarge && $len > $lenmax) {
+                print $TFlg @rec;
+            } elsif ($untrimmed && $len == $readlen) {
+                print $TFun @rec;
+            } elsif ($rlsplit) {
+                my $FH = $LFQ{$len}{FH};
+                print $FH @rec;
+            } else {
+                print $TFok @rec;
+            }
+            @rec = ();
+            $i = 0;
+        } elsif ($i == 2) {
+            $len = length($_)-1;   # -1 because of newline
+        }
+    }
+    close $TFI;
+
+    if ($rlsplit) {
+        foreach my $len (keys %LFQ) {
+            my $FH = $LFQ{$len}{FH};
+            close $FH;
+        }
+    }
+
+    close $TFsm if $toosmall;
+    close $TFlg if $toolarge;
+    close $TFun if $untrimmed;
+    close $TFok unless $rlsplit;
+
+}
+
+&execute2("rm -f $trimfq", 1, $LOG, 2, \@SHDAT);   # redundant now, has been split into sub-fastqs
+&execute2("$readCount --uhisto $passfq > $uhfile", 1, $LOG, 2, \@SHDAT) if $uhisto && !$rlsplit;
+&logreport2("Filtering$blurb complete: ", 1, 1, $LOG, \@SHDAT);
+exit;
+
+
+
+
+sub substage_trim {
+}
+
+sub substage_stats {
+}
+
+sub substage_histo {
+}
+
+sub substage_xtrim {
+}
+
+sub substage_xstats {
+}
+
+sub substage_xhisto {
+}
+

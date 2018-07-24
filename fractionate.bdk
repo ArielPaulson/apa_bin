@@ -1,0 +1,343 @@
+#!/usr/bin/perl
+use strict;
+use Cwd;
+
+my $skip = $ARGV[0] eq 'skip' ? 1 : 0;
+
+my $MM9 = "~/uapa/stuff/bowtie_building/mm9/Ens_65";
+my $ETC = "~/uapa/stuff/bowtie_building/mm9_UCSC_models";
+
+my %labels = ( 1 => "Models", 3 => "cDNA", 2 => "ncRNA" );
+my %gtfs = ( 1 => "$ETC/all_models.exons.gtf", 3 => "$ETC/all_est.exons.gtf", 2 => "$ETC/lncRNA_mouse.exons.gtf" );
+my %beds = ( 1 => "$ETC/all_models.genes.bed", 3 => "$ETC/all_est.genes.bed", 2 => "$ETC/lncRNA_mouse.genes.bed" );
+my %antis = ( 1 => "$ETC/all_models.antigenes.bed", 3 => "$ETC/all_est.antigenes.bed", 2 => "$ETC/lncRNA_mouse.antigenes.bed" );
+
+my $maxpass = (sort {$b <=> $a} keys %labels)[0];
+my $base = cwd();
+my @types = qw/ strong weak intron cisnat /;
+my @ilabs;
+my @samples = qw/ 24A 24B UnA UnB /;
+#my @replics = qw/ 24B 24A UnB UnA /;
+
+foreach my $i (0..$#samples) {
+    my $sample = $samples[$i];
+    my $W = "$base/data/$sample/novelW";
+    my $C = "$base/data/$sample/novelC";
+    next if (-e "$W/exons.gtf" && -e "$C/exons.gtf");
+    ## Strip "transcript" lines from the gtf files
+    system "grep -P \"\texon\t\" $C/transcripts.gtf > $C/exons.gtf";
+    system "grep -P \"\texon\t\" $W/transcripts.gtf > $W/exons.gtf";
+    system "rm -f $W/exons.all.gtf";
+    system "rm -f $C/exons.all.gtf";
+    ## Get BAM coverage
+    print "BAM sense coverage...\n";
+    system "/home/apa/local/bin/uxonCoverage $C/exons.gtf $base/data/$samples[0]/$samples[0].C.bam $C/$samples[0].counts.S.txt";
+    system "/home/apa/local/bin/uxonCoverage $C/exons.gtf $base/data/$samples[1]/$samples[1].C.bam $C/$samples[1].counts.S.txt";
+    system "/home/apa/local/bin/uxonCoverage $C/exons.gtf $base/data/$samples[2]/$samples[2].C.bam $C/$samples[2].counts.S.txt";
+    system "/home/apa/local/bin/uxonCoverage $C/exons.gtf $base/data/$samples[3]/$samples[3].C.bam $C/$samples[3].counts.S.txt";
+    system "/home/apa/local/bin/uxonCoverage $W/exons.gtf $base/data/$samples[0]/$samples[0].W.bam $W/$samples[0].counts.S.txt";
+    system "/home/apa/local/bin/uxonCoverage $W/exons.gtf $base/data/$samples[1]/$samples[1].W.bam $W/$samples[1].counts.S.txt";
+    system "/home/apa/local/bin/uxonCoverage $W/exons.gtf $base/data/$samples[2]/$samples[2].W.bam $W/$samples[2].counts.S.txt";
+    system "/home/apa/local/bin/uxonCoverage $W/exons.gtf $base/data/$samples[3]/$samples[3].W.bam $W/$samples[3].counts.S.txt";
+    sleep 1;  # for killing
+    print "BAM antisense coverage...\n";
+    system "/home/apa/local/bin/uxonCoverage $W/exons.gtf $base/data/$samples[0]/$samples[0].C.bam $W/$samples[0].counts.A.txt";
+    system "/home/apa/local/bin/uxonCoverage $W/exons.gtf $base/data/$samples[1]/$samples[1].C.bam $W/$samples[1].counts.A.txt";
+    system "/home/apa/local/bin/uxonCoverage $W/exons.gtf $base/data/$samples[2]/$samples[2].C.bam $W/$samples[2].counts.A.txt";
+    system "/home/apa/local/bin/uxonCoverage $W/exons.gtf $base/data/$samples[3]/$samples[3].C.bam $W/$samples[3].counts.A.txt";
+    system "/home/apa/local/bin/uxonCoverage $C/exons.gtf $base/data/$samples[0]/$samples[0].W.bam $C/$samples[0].counts.A.txt";
+    system "/home/apa/local/bin/uxonCoverage $C/exons.gtf $base/data/$samples[1]/$samples[1].W.bam $C/$samples[1].counts.A.txt";
+    system "/home/apa/local/bin/uxonCoverage $C/exons.gtf $base/data/$samples[2]/$samples[2].W.bam $C/$samples[2].counts.A.txt";
+    system "/home/apa/local/bin/uxonCoverage $C/exons.gtf $base/data/$samples[3]/$samples[3].W.bam $C/$samples[3].counts.A.txt";
+    sleep 1;  # for killing
+}
+
+foreach my $i (0..$#samples) {
+    
+    my $sample = $samples[$i];
+    my $W = "$base/data/$sample/novelW";
+    my $C = "$base/data/$sample/novelC";
+#    my $replic = $replics[$i];
+#    my $rW = "$base/data/$replic/novelW";
+#    my $rC = "$base/data/$replic/novelC";
+    
+#    system "intersectBed -u -a $C/exons.all.gtf -b $rC/exons.all.gtf > $C/exons.hiconf.gtf";
+#    system "intersectBed -u -a $W/exons.all.gtf -b $rW/exons.all.gtf > $W/exons.hiconf.gtf";
+#    system "intersectBed -wo -a $C/exons.hiconf.gtf -b $rC/exons.hiconf.gtf > $C/exons.hiconf.gtf_annotated";
+#    system "intersectBed -wo -a $W/exons.hiconf.gtf -b $rW/exons.hiconf.gtf > $W/exons.hiconf.gtf_annotated";
+    
+    my %terminals;
+    foreach my $pass (1..$maxpass) {
+	my $gtf = $gtfs{$pass};
+	my $bed = $beds{$pass};
+	my $anti = $antis{$pass};
+	my $label = $labels{$pass};
+	my $prev = $pass-1;
+	my $basegtf = $pass == 1 ? 'exons.gtf' : "intergenic_$prev.gtf";
+	
+	if ($sample eq '24A') {   # load @ilabs ONLY ONCE
+	    push @ilabs, "$label.$_" foreach @types;
+	}
+	
+	push @{ $terminals{$W} }, "$W/$label.exonic_strong.gtf";
+	push @{ $terminals{$C} }, "$C/$label.exonic_strong.gtf";
+	push @{ $terminals{$W} }, "$W/$label.exonic_weak.gtf";
+	push @{ $terminals{$C} }, "$C/$label.exonic_weak.gtf";
+	push @{ $terminals{$W} }, "$W/$label.intronic.gtf";
+	push @{ $terminals{$C} }, "$C/$label.intronic.gtf";
+	push @{ $terminals{$W} }, "$W/$label.cisnat.gtf";
+	push @{ $terminals{$C} }, "$C/$label.cisnat.gtf";
+	next if $skip;
+
+	print "$sample: $pass: all exon hits\n";
+	## ALL EXON HITS: Match novels strandwise to Ensembl exons (even if 1bp overlap...)
+	system "intersectBed -u -s -wa -a $C/$basegtf -b $gtf > $C/$label.exonic_all.gtf";
+	system "intersectBed -u -s -wa -a $W/$basegtf -b $gtf > $W/$label.exonic_all.gtf";
+	## ALL EXON HITS: Annotate
+	system "intersectBed -s -wo -a $C/$basegtf -b $gtf > $C/$label.exonic_all.gtf_annotated";
+	system "intersectBed -s -wo -a $W/$basegtf -b $gtf > $W/$label.exonic_all.gtf_annotated";
+	sleep 1;  # for killing
+
+	print "$sample: $pass: strong exon hits\n";
+	## STRONG EXON HITS: Match novels strandwise to Ensembl exons (require reciprocal 50% overlap)
+	system "intersectBed -u -s -wa -f 0.5 -r -a $C/$basegtf -b $gtf > $C/$label.exonic_strong.gtf";
+	system "intersectBed -u -s -wa -f 0.5 -r -a $W/$basegtf -b $gtf > $W/$label.exonic_strong.gtf";
+	## STRONG EXON HITS: Annotate
+	system "intersectBed -s -wo -f 0.5 -r -a $C/$basegtf -b $gtf > $C/$label.exonic_strong.gtf_annotated";
+	system "intersectBed -s -wo -f 0.5 -r -a $W/$basegtf -b $gtf > $W/$label.exonic_strong.gtf_annotated";
+	sleep 1;  # for killing
+	
+	print "$sample: $pass: weak exon hits\n";
+	## WEAK EXON HITS: Subtract STRONG exon hits from all exon hits (lacking reciprocal 50% overlap)
+	system "intersectBed -v -f 1 -r -s -wa -a $C/$label.exonic_all.gtf -b $C/$label.exonic_strong.gtf > $C/$label.exonic_weak.gtf";
+	system "intersectBed -v -f 1 -r -s -wa -a $W/$label.exonic_all.gtf -b $W/$label.exonic_strong.gtf > $W/$label.exonic_weak.gtf";
+	## WEAK EXON HITS: Annotate
+	system "intersectBed -s -wo -a $C/$label.exonic_weak.gtf -b $gtf > $C/$label.exonic_weak.gtf_annotated";
+	system "intersectBed -s -wo -a $W/$label.exonic_weak.gtf -b $gtf > $W/$label.exonic_weak.gtf_annotated";
+	sleep 1;  # for killing
+	
+	print "$sample: $pass: intron hits\n";
+	## INTRON HITS: Match novels strandwise to loci, then subtract all known exon hits
+	system "intersectBed -u -s -wa -a $C/$basegtf -b $bed > $C/$label.locus.gtf";
+	system "intersectBed -u -s -wa -a $W/$basegtf -b $bed > $W/$label.locus.gtf" ;
+	system "intersectBed -v -f 1 -r -s -wa -a $C/$label.locus.gtf -b $C/$label.exonic_all.gtf > $C/$label.intronic.gtf";
+	system "intersectBed -v -f 1 -r -s -wa -a $W/$label.locus.gtf -b $W/$label.exonic_all.gtf > $W/$label.intronic.gtf";
+	## INTRON HITS: Annotate
+	system "intersectBed -s -wo -a $C/$label.intronic.gtf -b $bed > $C/$label.intronic.gtf_annotated";
+	system "intersectBed -s -wo -a $W/$label.intronic.gtf -b $bed > $W/$label.intronic.gtf_annotated";
+	sleep 1;  # for killing
+	
+	print "$sample: $pass: all sense hits\n";
+	## ALL SENSE HITS: Merge strong exon, weak exon, intronic
+	system "cat $C/$label.exonic_all.gtf $C/$label.intronic.gtf > $C/$label.sense_all.gtf";
+	system "cat $W/$label.exonic_all.gtf $W/$label.intronic.gtf > $W/$label.sense_all.gtf";
+	sleep 1;  # for killing
+	
+	print "$sample: $pass: antisense hits\n";
+	## CIS-NAT HITS: Match novels strandwise to Ensembl cisnat loci, then subtract all sense locus hits
+	system "intersectBed -u -s -wa -a $C/$basegtf -b $anti > $C/$label.antilocus.gtf";
+	system "intersectBed -u -s -wa -a $W/$basegtf -b $anti > $W/$label.antilocus.gtf";
+	system "intersectBed -v -f 1 -r -s -wa -a $C/$label.antilocus.gtf -b $C/$label.sense_all.gtf > $C/$label.cisnat.gtf";
+	system "intersectBed -v -f 1 -r -s -wa -a $W/$label.antilocus.gtf -b $W/$label.sense_all.gtf > $W/$label.cisnat.gtf";
+	sleep 1;  # for killing
+	
+	print "$sample: $pass: antisense annots\n";
+	## CIS-NAT HITS: Annotate, but not-strandwise to sense loci
+	system "intersectBed -wo -a $C/$label.cisnat.gtf -b $bed > $C/$label.cisnat.gtf_annotated";
+	system "intersectBed -wo -a $W/$label.cisnat.gtf -b $bed > $W/$label.cisnat.gtf_annotated";
+	## CIS-NAT HITS: Annotate with nearest same-strand neighbors
+	system "closestBed -s -d -a $C/$label.cisnat.gtf -b $bed > $C/$label.cisnat.gtf_NN_Str.bed_annotated";
+	system "closestBed -s -d -a $W/$label.cisnat.gtf -b $bed > $W/$label.cisnat.gtf_NN_Str.bed_annotated";
+	## ALL LOCUS HITS: Merge sense, cisnat hits
+	system "cat $C/$label.sense_all.gtf $C/$label.cisnat.gtf > $C/$label.locus_all.gtf";
+	system "cat $W/$label.sense_all.gtf $W/$label.cisnat.gtf > $W/$label.locus_all.gtf";
+	sleep 1;  # for killing
+	
+	print "$sample: $pass: intergenics\n";
+	## Subtract all models from novels -> first-pass intergenic exons
+	system "intersectBed -v -f 1 -r -a $C/$basegtf -b $C/$label.locus_all.gtf > $C/intergenic_$pass.gtf";
+	system "intersectBed -v -f 1 -r -a $W/$basegtf -b $W/$label.locus_all.gtf > $W/intergenic_$pass.gtf";
+	sleep 1;  # for killing
+    }
+    
+    print "$sample: final intergenics\n";
+    my $intergenic = "intergenic_$maxpass.gtf";
+    push @{ $terminals{$W} }, "$W/$intergenic";
+    push @{ $terminals{$C} }, "$C/$intergenic";
+    if ($sample eq '24A') {   # load @ilabs ONLY ONCE
+	push @ilabs, 'intergenic';
+    }
+    my $Nsets = $#ilabs;
+    
+    unless ($skip) {
+	## Get nearest same-strand neighbors for intergenic models
+	system "intersectBed -wao -a $C/$intergenic -b $ETC/intergenes_annot_C.bed > $C/${intergenic}_NN_Str.bed_annotated";
+	system "intersectBed -wao -a $W/$intergenic -b $ETC/intergenes_annot_W.bed > $W/${intergenic}_NN_Str.bed_annotated";
+	## Get nearest any neighbors for intergenic models
+	system "intersectBed -wao -a $C/$intergenic -b $ETC/intergenes_annot_all.bed > $C/${intergenic}_NN_Any.bed_annotated";
+	system "intersectBed -wao -a $W/$intergenic -b $ETC/intergenes_annot_all.bed > $W/${intergenic}_NN_Any.bed_annotated";
+	## Find SAS pairs of intergenics
+	system "cp $W/$intergenic $W/anti$intergenic";
+	system "/home/apa/local/bin/antisense $W/anti$intergenic";
+	system "intersectBed -wo -a $C/$intergenic -b $W/anti$intergenic > $C/${intergenic}_SAS_pairs_annotated";
+	## redundant to SAS pairs above, but whatever
+	system "cp $C/$intergenic $C/anti$intergenic";
+	system "/home/apa/local/bin/antisense $C/anti$intergenic";
+	system "intersectBed -wo -a $W/$intergenic -b $C/anti$intergenic > $W/${intergenic}_SAS_pairs_annotated";
+	sleep 1;  # for killing
+	
+	## still-unclassified exons
+	my $class = "all_classified_exons.gtf";
+	my $lost = "lost_exons.gtf";
+	system "cat @{ $terminals{$W} } > $W/$class";
+	system "cat @{ $terminals{$C} } > $C/$class";
+	system "intersectBed -v -f 1 -r -a $W/exons.gtf -b $W/$class > $W/$lost";  # try to remove only the exact exons, not just anything overlapping
+	system "intersectBed -v -f 1 -r -a $C/exons.gtf -b $C/$class > $C/$lost";
+	sleep 1;  # for killing
+    }
+
+    ## Final tally -- have all exons been classified?
+    my $IW = (split /\s+/, `wc -l $W/exons.gtf`)[0];
+    my $IC = (split /\s+/, `wc -l $C/exons.gtf`)[0];
+    my $LW = (split /\s+/, `wc -l $W/lost_exons.gtf`)[0];
+    my $LC = (split /\s+/, `wc -l $C/lost_exons.gtf`)[0];
+    my ($FW, $FC);
+    $FW += (split /\s+/, `wc -l $_`)[0] foreach @{ $terminals{$W} };
+    $FC += (split /\s+/, `wc -l $_`)[0] foreach @{ $terminals{$C} };
+    print "$W exons: $IW in | $FW classified | $LW lost\n";
+    print "$C exons: $IC in | $FC classified | $LC lost\n";
+    sleep 1;  # for killing
+   
+    
+    ## read in annotated exon sets; assign to transcripts and prioritize; patch splice juncs from junctions.bed; tabulate
+    
+#chrX_random	14138	21653	JUNC00000001	10	-	14138	21653	255,0,0	2	29,26	0,7489
+    my %juncs;
+    open IN, "$base/data/$sample/junctions.bed" or die;
+    while (<IN>) {
+	my ($chr, $start, $end, $id, $reads, @else) = split /\t/, $_;
+	next if $reads == 1;  # has to be seen at least twice
+	$juncs{$chr}{"$start\t$end"} = "R$reads";  # R = reads
+    }
+    close IN;
+    
+#chrX_random	14138	21653	JUNC001	1
+    open IN, "$base/trinity/$sample/contig_eval/Trinity.junctions.bed" or die;
+    while (<IN>) {
+	my ($chr, $start, $end, $id, $trans, @else) = split /\t/, $_;
+	next if $juncs{$chr}{"$start\t$end"};  # already seen at read level
+	$juncs{$chr}{"$start\t$end"} = "T$trans";  # T = transcripts (or Trinity)
+    }
+    close IN;
+
+    my (%xannot, %tdat, %counts);
+    foreach my $str ($W, $C) {
+	print "Tallying $str counts...\n";
+	foreach my $samp (@samples) {
+	    foreach my $SAS (qw/ S A /) {
+#CUFF.10001.1	221	17	0.81981981981982
+		open IN, "$str/$samp.counts.$SAS.txt" or die;
+		while (<IN>) {
+		    $_ =~ s/[\n\r]+$//;
+		    my ($trans, $uxlen, $counts, $covpct) = split /\t/, $_;
+		    $counts{$str}{$trans}{$SAS}{$samp} += $counts;
+		}
+		close IN;
+	    }
+	}
+    
+	print "Tabularizing $str...\n";
+	foreach my $i (0..$Nsets) {
+	    next unless $terminals{$str}->[$i];  # sometimes get blank files?
+	    my $annot = $terminals{$str}->[$i] =~ /intergenic/ ? $terminals{$str}->[$i].'_NN_Any.bed_annotated' : $terminals{$str}->[$i].'_annotated';
+	    print " $annot";
+	    $| = 1;
+#chr1	Cufflinks	exon	183958813	183959023	1000	+	.	gene_id "CUFF.1148"; transcript_id "CUFF.1148.1"; exon_number "1"; FPKM "87.6808320377"; frac "1.000000"; conf_lo "42.402645"; conf_hi "132.959019"; cov "17.314720";	chr1	183957414	183959024	n424054	1000	-	183957414	183959024	0	1	1610,	0,	211
+	    open IN, $annot or die;
+	    while (<IN>) {
+		$_ =~ s/[\n\r]+$//;
+		my @data = split /\t/, $_;
+		my $coord = join "\t", @data[0,3,4,6];  # exon coords
+		$xannot{$coord}{TYPE} = $ilabs[$i];
+		if ($ilabs[$i] =~ /intron/ || $ilabs[$i] =~ /cisnat/) {   # bed-based annotations
+		    push @{ $xannot{$coord}{DATA} }, [(join ':', (@data[12,9..11,14], $data[-1])), $data[-1]];  # id chr start end strand, overlap
+		} elsif ($ilabs[$i] =~ /intergenic/) {   # double-bed-based annotations
+		    my ($start, $end, $astart, $aend) = @data[3,4,13,14];
+		    my ($neighb, $dist) = ($start-$aend>0) ? ('N5', $start-$aend) : ('N3', $astart-$end);
+		    push @{ $xannot{$coord}{DATA} }, [(join ':', (@data[15,12..14,17], $data[-1], $dist, $neighb)), $data[-1]];  # id chr start end strand overlap dist side, overlap
+		} else {   # gtf-based annotations
+		    my ($id) = ($data[17] =~ /^(?:gene|transcript)_id "(.*?)"/);
+		    print "$ilabs[$i]: $data[17]\n" unless $id;
+		    push @{ $xannot{$coord}{DATA} }, [(join ':', ($id, @data[9,12,13,15], $data[-1])), $data[-1]];  # id chr start end strand overlap, overlap
+		}
+	    }
+	    print "  |  $ilabs[$i]: $.\n";
+	    close IN;
+	}
+	
+	my $yes = my $no = 0;
+	print " Reading transcripts.gtf\n";
+	open IN, "$str/transcripts.gtf" or die;
+	while (<IN>) {
+	    $_ =~ s/[\n\r]+$//;
+	    my @data = split /\t/, $_;
+	    my $coord = join "\t", @data[0,3,4,6];
+	    my ($gene, $trans) = ($data[8] =~ /gene_id "(.*?)"; transcript_id "(.*?)";/); 
+	    my ($fpkm) = ($data[8] =~ /FPKM "(.*?)";/); 
+	    if ($data[2] eq 'transcript') {
+		$tdat{$trans}{DATA} = "$gene\t$coord\t$fpkm";
+	    } elsif ($data[2] eq 'exon') {
+#		my ($nexon) = ($data[8] =~ /exon_number "(\d+)";/); 
+		$tdat{$trans}{EXONS}++;
+		$tdat{$trans}{LENGTH} += $data[4]-$data[3]+1;
+		$xannot{$coord} ? $yes++ : $no++;
+#		next unless $xannot{$coord}{TYPE};   # assuming complete fractionation, this indicates a non-hiconf element (so ignore)
+		$tdat{$trans}{TYPES}{ $xannot{$coord}{TYPE} }++;  # num exons @ annot type
+		push @{ $tdat{$trans}{ANNOT}{ $xannot{$coord}{TYPE} } }, @{ $xannot{$coord}{DATA} };  # unique exon annot data
+	    }
+	}
+	close IN;
+	
+	foreach my $trans (keys %tdat) {
+	    $tdat{$trans}{TYPES}{$_} += 0 foreach @ilabs;  # ensure printable values
+	}
+	
+	print "$yes yes | $no no\n";
+	print " Writing assigned_transcripts.txt\n";
+	open OUT, "> $str/assigned_transcripts.txt";
+	print OUT "Transcript\tChr\tStart\tEnd\tStrand\tFPKM\tLength\tNexons";
+	print OUT "\t$_.S" foreach @samples;
+	print OUT "\t$_.A" foreach @samples;
+	print OUT "\t$_" foreach @ilabs;
+	print OUT "\t$_.BP" foreach @ilabs;
+	print OUT "\t$_.ANNOT" foreach @ilabs;
+	print OUT "\n";
+	foreach my $trans (keys %tdat) {
+	    print OUT "$tdat{$trans}{DATA}\t$tdat{$trans}{LENGTH}\t$tdat{$trans}{EXONS}";
+	    print OUT "\t$counts{$str}{$trans}{S}{$_}" foreach @samples;
+	    print OUT "\t$counts{$str}{$trans}{A}{$_}" foreach @samples;
+	    print OUT "\t$tdat{$trans}{TYPES}{$_}" foreach @ilabs;
+	    my (%bp, %annots);
+	    foreach my $i (0..$Nsets) {
+		if ($tdat{$trans}{ANNOT}{$ilabs[$i]}) {
+#		    print "  $trans | $ilabs[$i] | ", (scalar @{ $tdat{$trans}{ANNOT}{$ilabs[$i]} }), "\n";
+		    foreach my $entry (@{ $tdat{$trans}{ANNOT}{$ilabs[$i]} }) {
+			push @{ $annots{$i} }, $entry->[0];
+			$bp{$i} = $entry->[1] if $entry->[1] > $bp{$i};
+		    }
+		    $annots{$i} = join '; ', @{ $annots{$i} };   # convert array to delimited scalar
+		} else {
+#		    print "  $trans | $ilabs[$i] | 0\n";
+		    $bp{$i} = 0;
+		    $annots{$i} = '';
+		}
+	    }
+	    print OUT "\t$bp{$_}" foreach (0..$Nsets);
+	    print OUT "\t$annots{$_}" foreach (0..$Nsets);
+	    print OUT "\n";
+	}
+#	die;   # test mode: 24A W only
+    }
+    chdir '..';
+}
+exit;

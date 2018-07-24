@@ -1,0 +1,67 @@
+#!/usr/bin/env perl
+use Image::Magick;
+use strict;
+
+# welds a stack of images together, horizontally or vertically
+
+my ($direction, @pngs);
+my %directions = map {("-$_"=>"\U$_")} qw/ H V h v /;
+foreach (@ARGV) {
+    if ($directions{$_}) {
+	$direction = $directions{$_};
+    } else {
+	push @pngs, $_;
+    }
+}
+my $N = scalar @pngs;
+die "No images specified!\n" unless $N;
+die "No merge direction specified!  Use -h or -v.\n" unless $direction;
+
+print "Reading $N PNGs...\n";
+
+my ($path) = ($pngs[0] =~ /^(.*)\//);  # may not exist
+my $outfile = $path ? "$path/imageWeld.png" : 'imageWeld.png';
+
+## get component dimensions
+my (%dims, %max);
+foreach (@pngs) {
+    print "File '$_' does not exist!\n" unless -e $_;
+    my $img = Image::Magick->new;
+    my @idata = $img->Ping($_);
+    $dims{$_}{W} = $idata[0];
+    $dims{$_}{H} = $idata[1];
+    $max{W} = $idata[0] if $idata[0] > $max{W};
+    $max{H} = $idata[1] if $idata[1] > $max{H};
+}
+
+print "Setting image dimensions...\n";
+
+my ($ht, $wd);
+if ($direction eq 'H') {
+    ($ht, $wd) = ($max{H}, $max{W}*$N);
+} elsif ($direction eq 'V') {
+    ($ht, $wd) = ($max{H}*$N, $max{W});
+}
+
+print "Loading image @ ${wd}x$ht...\n";
+
+my $final = Image::Magick->new(size=>"${wd}x$ht");
+foreach (@pngs) {
+    ## load motif
+    my $img = Image::Magick->new;
+    $img->Read($_);
+    push @$final, $img;
+}
+print "Appending $final: @$final\n";
+eval { $final = $direction eq 'V' ? $final->Append(stack=>'true') : $final->Append(stack=>'false'); };
+print "FAIL: $@\n" if $@;
+#$final = $final->Append();  # fortunately turns out to be 'true' by default, which is what we need most of the time
+
+print "Writing...\n";
+
+my $msg = $final->Write($outfile);
+warn "$msg\n" if $msg;
+print "Complete!\n";
+exit;
+
+

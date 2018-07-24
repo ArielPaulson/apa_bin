@@ -1,0 +1,87 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+# takes 2+ bed files and returns the N-way mergeBed result as a bed file (can be made strand-specific)
+# BEDS MUST BE SORTED BY CHROM THEN START!!!!!!!!!!
+# merged IDs are in col 4, and col 5 is the number of merge events
+
+my $samestr;   # strand-specific merging -- DO NOT USE UNLESS ALL BEDS HAVE STRAND INFO!!!!!!!!
+my $oneperset; # if > 1 coord per bed is merged into a peak, only count the first (thus, if N beds, # merges per peak always <= N)
+my $outfile;   # output file
+my @inpbeds;   # input BED file set
+my @sortbeds;  # sorted BED file set
+my %beddata;   # data per bed file
+my %merged;    # merged data
+my $tmp = "bedPileup.$$.tmp";  # post-merge temp file
+
+GetOptions("o=s" => \$outfile, "s" => \$samestr, "ops" => \$oneperset);
+
+foreach (@ARGV) {   # all your beds
+    if (-e $_) {
+	push @inpbeds, $_;
+    } else {
+	die "Bed file '$_' not found!\n";
+    }
+}
+
+foreach my $bed (@inpbeds) {
+    my ($bedname) = ($bed =~ /([^\/]+).bed$/);
+    system "/home/apa/local/bin/sortBedCoord -i $bed > $tmp.$bedname";
+    push @sortbeds, "$tmp.$bedname";
+    my ($prev_chr, $prev_start, $i);
+    open IN, "$tmp.$bedname" or die "bedPileup: Failed to open '$tmp.$bedname' for reading: $!\n";
+    while (<IN>) {
+	next if ($_ =~ /^track/ || $_ =~ /^#/);
+	$i++;
+	$_ =~ s/[\n\r]+$//;
+	my @data = split /\t/, $_;
+	die "Bed file '$bed' line $. has no strand, but same-strand matching requested: mergeBed will fail!\n" if ($samestr && $#data<5);
+	if ($i > 1) {
+	    die "Bed file '$bed' line $. has no name (field 4)!\n" unless $data[3];
+	    die "Bed file '$bed' line $. start < previous start!\n" if ($data[0] eq $prev_chr && $data[1] < $prev_start);
+	}
+	die "Coordinate name '$data[3]' is not unique across beds!  $bedname, $beddata{$data[3]}\n" if exists $beddata{$data[3]};
+	$beddata{$data[3]} = $bedname;
+	($prev_chr, $prev_start) = @data[0,1];
+    }
+    close IN;
+    system "rm -f $tmp";
+}
+
+my $strflag = $samestr ? '-s' : '';
+system "cat @sortbeds > $tmp";
+system "/home/apa/local/bin/sortBedCoord -i $tmp > $tmp.sorted";
+system "mergeBed -nms $strflag -i $tmp.sorted > $tmp";
+die "Merging failed!\n" unless -s $tmp;
+system "/home/apa/local/bin/sortBedCoord -i $tmp > $tmp.sorted";
+
+open IN, "$tmp.sorted" or die "bedPileup: Failed to open '$tmp.sorted' for reading: $!\n";
+while (<IN>) {
+    chomp;
+    my @data = split /\t/, $_;
+    my ($chr, $start, $end, $names) = @data[0..3];
+    my $coord = join("\t",@data[0..3]);
+    my $else = $#data > 3 ? join("\t",('',@data[4..$#data])) : '';
+    my $N;
+    if ($oneperset) {
+	my %present;
+	foreach (split /;/, $names) {
+	    $present{ $beddata{$_} } = 1;
+	}
+	$N = scalar keys %present;
+    } else {
+	$N = scalar (split /;/, $names);
+    }
+    push @{ $merged{$N} }, "$coord\t$N$else\n";  # keep sort order within each $N array
+}
+close IN;
+
+system "rm -f $tmp*";
+
+open OUT, "> $outfile" or die "bedPileup: Failed to open '$outfile' for writing: $!\n";
+print OUT @{ $merged{$_} } foreach (sort {$b <=> $a} keys %merged);
+close OUT;
+exit;
+

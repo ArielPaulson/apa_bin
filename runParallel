@@ -1,0 +1,136 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+
+die;   # IN DEVELOPMENT
+
+
+
+# This script parallelizes some common parallel jobs, like blast, blat, bowtie, tophat, etc.  See %jobtypes below.
+# INPUTS: an input file and format, an output file (or dir), a job type and command (as a quoted command-line string) and the number of cores (N) to use.
+# The input is split into N files, each of which is interpolated into the job string and run in parallel, each writing to a custom temp dir.
+# OUTPUTS: when the jobs have completed, the results are either merged into a single output file, or if using a dir, a dir with merged files
+# - THIS IS JOB-SPECIFIC.  For instance, blat gets a single merged file, while tophat gets a directory of merged files (bam, beds, etc)
+# Use of '--script <prefix>' will not run jobs, but will output a script to <prefix>.run.sh which will run the jobs.  The script <prefix>.merge.sh will merge the results.
+
+#my %jobtypes = map {($_=>1)} qw/ blast blast-tab wublast wublast-tab blat exonerate-est2genome match patch miranda bowtie tophat /;   # eventual version
+my %jobtypes = ('blast',1, 'blast-tab',1, 'blat',1, 'bowtie',1, 'tophat',2);   # current accepted jobtypes; use '2' if produces a dir with multiple files
+my %formats = map {($_=>1)} qw/ fastq fasta /;   # current known input formats
+my %servercores = ('genekc01',8, 'genekc03',24, 'genekc04',32, 'maple',24);  # processors per server
+my %reformat = ('-gz','txt-gz', '-bz2','txt-bz2', '','txt');  # cmd-arg-to-file-format conversion for bowtie side outputs
+
+my ($input, $format, $outfile, $outdir, $jobtype, $jobcmd, $cores, $script);
+GetOptions("i=s" => \$input, "f=s" => \$format, "of=s" => \$outfile, "od=s" => \$outdir, "jt=s" => \$jobtype, "jc=s" => \$jobcmd, "c=i" => \$cores, "script=s" => \$script);
+$format = "\L$format";
+$jobtype = "\L$jobtype";
+
+my $host = (split /\./, `hostname`)[0];
+warn "$cores cores is more than half of $server ($servercores{$server})!\n<Enter> to continue, or CTRL-C to exit\n" if defined $servercores{$host} && $cores > $servercores{$host}/2;
+
+my %jobvars = &get_jobvars;
+
+
+
+
+
+
+
+
+
+
+exit;
+
+
+
+sub get_jobvars {
+    
+    my ($jobtype, $jobcmd) = @_;
+    my %data;
+    
+    die "Job type '$jobtype' not supported!\n" unless $jobtypes{$jobtype};
+    
+    # %data holds one entry per output file it may encounter.
+    # keys are filenames; values are: 'data' => [arrays of information for each file], and if necessary 'identify_header_lines' => "code for finding the length of a variable header"
+    # 'data' array format is: (header_lines, footer_lines, file_format, output_name)
+    # 'header_lines': a number of lines N, such that the header is the first N lines.  IF VARIABLE HEADER like sam format: use -1, then set 'identify_header_lines' value.  See bowtie section.
+    # 'footer_lines': a number of lines M, such that the footer is the last M lines.
+    # 'file_format': the most basic format of the file: use 'txt', 'txt-gz', 'txt-bz2', or 'bam'.  Use of anything else triggers custom merge code for that format; see &custom_merge;
+    # 'output_name': the final filename which all instances of this file will be merged into.  E.g. all 'out.psl' might be merged into 'final.psl' or '$outfile'
+    
+    if ($jobtypes{
+    
+    if ("\L$jobtype" eq 'blat') {
+	
+	$data{'out.psl'}{data} = [5,0,'txt',""];
+	
+    } elsif ("\L$jobtype" eq 'blast') {
+    
+	$data{'out.blast'}{data} = [0,0,'txt',""];
+	
+    } elsif ("\L$jobtype" eq 'blast-tab') {
+    
+	$data{'out.blast'}{data} = [0,0,'txt',""];
+	
+    } elsif ("\L$jobtype" eq 'wublast') {
+    
+	$data{'out.blast'}{data} = [0,0,'txt',""];
+	
+    } elsif ("\L$jobtype" eq 'wublast-tab') {
+    
+	$data{'out.blast'}{data} = [0,0,'txt',""];
+	
+    } elsif ("\L$jobtype" eq 'exonerate-est2genome') {
+    
+	$data{'out.blast'}{data} = [,,'txt',""];
+	
+    } elsif ("\L$jobtype" eq 'miranda') {
+    
+	$data{'out.blast'}{data} = [,,'txt',""];
+	
+    } elsif ("\L$jobtype" eq 'match') {
+    
+	$data{'out.blast'}{data} = [,,'txt',""];
+	
+    } elsif ("\L$jobtype" eq 'patch') {
+    
+	$data{'out.blast'}{data} = [,,'txt',""];
+	
+    } elsif ("\L$jobtype" eq 'bowtie') {
+
+	$data{'out.sam'}{data} = [-1,0,'txt',""];
+	$data{'out.sam'}{identify_header_lines} = "bash -c 'grep -n \"^@\" out.sam | wc -l'";
+   	$data{'bowtie.err'}{data} = [0,0,'bowtie-err',""];
+   	$data{'bowtie2.err'}{data} = [0,0,'bowtie-err',""];
+   	$data{'unaligned.fq.gz'}{data} = [0,0,'txt-gz',""];
+	
+	if ($jobcmd =~ /--un-conc(-gz|-bz2|'') (\S+)/) {
+	    $data{$2}{data} = [0,0,$reformat{$1},$2];
+	} elsif ($jobcmd =~ /--un(-gz|-bz2|'') (\S+)/) {
+	    $data{$2}{data} = [0,0,$reformat{$1},$2];
+	}
+	if ($jobcmd =~ /--al-conc(-gz|-bz2|'') (\S+)/) {
+	    $data{$2}{data} = [0,0,$reformat{$1},$2];
+	} elsif ($jobcmd =~ /--al(-gz|-bz2|'') (\S+)/) {
+	    $data{$2}{data} = [0,0,$reformat{$1},$2];
+	}
+	
+    } elsif ("\L$jobtype" eq 'tophat') {
+    
+	$data{'accepted_hits.bam'}{data} = [0,0,'bam',"accepted_hits.bam"];  # no header that we need to consider; 'samtools merge' takes care of it
+  	$data{'unmapped.bam'}{data} = [0,0,'bam',"unmapped.bam"];
+	$data{'junctions.bed'}{data} = [0,0,'txt',"junctions.bed"];
+	$data{'insertions.bed'}{data} = [0,0,'txt',"insertions.bed"];
+	$data{'deletions.bed'}{data} = [0,0,'txt',"deletions.bed"];
+   	$data{'prep_reads.info'}{data} = [0,0,'prep_reads.info',"prep_reads.info"];
+	
+    } else {
+    
+	die "Known job type '$jobtype', but no parameters exist!  Check &get_jobvars in '$0'.\n";
+	
+    }
+    
+    return %data;
+}

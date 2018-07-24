@@ -1,0 +1,69 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use strict;
+require '/home/apa/local/bin/apa_routines.pm';  # for blockify(), revcomp()
+
+my ($fasta, $outfile, $strings, $grep, $ci, $verbose);
+
+GetOptions("f=s" => \$fasta, "o=s" => \$outfile, "s=s"=>\$strings, "grep"=>\$grep, "ci"=>\$ci, "verbose"=>\$verbose);
+
+my %strings;
+if ($strings) {
+    if (-e $strings) {
+	open IN, $strings;
+	while (<IN>) {
+	    $_ =~ s/[\n\r]+$//;
+	    $strings{$_} = 1;
+	}
+	close IN;
+    } else {
+	%strings = map {($_=>1)} split /,/, $strings;
+    }
+}
+
+my (@headers, %seq, %revcomps, $header);
+open IN, $fasta;
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    if ($_ =~ /^>(.*)/) {
+	$header = $1;
+	push @headers, $header;
+    } else {
+	$seq{$header} .= $_;
+    }
+}
+close IN;
+
+foreach my $header (@headers) {
+    if ($strings) {
+	my $pass;
+	if ($grep) {
+	    $pass = 0;
+	    foreach (keys %strings) {
+		if ($ci) {
+		    $pass = 1 if $header =~ /$_/i;
+		} else {
+		    $pass = 1 if $header =~ /$_/;
+		}
+	    }
+	} else {
+	    $pass = $strings{$header} ? 1 : 0;
+	}
+	$revcomps{$header} = $pass;
+    } else {
+	$revcomps{$header} = 1;
+    }
+}
+
+open OUT, "> $outfile";
+foreach my $header (@headers) {
+    if ($revcomps{$header}) {
+ 	print "$0: revcomped $header in $fasta\n" if $verbose;
+	$seq{$header} = ${ revcomp($seq{$header}) };
+    }
+    my $block = ${ blockify($seq{$header}) };
+    print OUT ">$header\n$block\n";
+}
+close OUT;
+exit;
+

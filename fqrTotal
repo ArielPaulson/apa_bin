@@ -1,0 +1,29 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my $input;
+my $header_rows = 0;
+my $leading_cols = 0;
+my $delim = "\t";
+
+GetOptions("i=s"=>\$input, "h=i"=>\$header_rows, "l=i"=>\$leading_cols, "d=s"=>\$delim);
+
+my @sums;
+
+open my $IN, '<', $input or die "$0: cannot open '$input': $!\n";
+while (<$IN>) {
+	s/[\n\r]+$//;
+	print "$_\n";
+	if ($. > $header_rows) {
+		my @data = split /\t/, $_;
+	  	$sums[$_] += $data[$_] foreach ($leading_cols..$#data);
+	}
+}
+close $IN;
+
+print join("\t", map {'Total'} (0..$leading_cols-1)) if $leading_cols;
+print "\t";
+print join("\t", @sums), "\n";
+exit;

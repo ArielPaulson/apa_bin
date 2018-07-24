@@ -1,0 +1,363 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Data::Dumper;
+use File::Spec;
+use Pod::Usage;
+use strict;
+
+
+
+### Dependencies
+
+my $bin = '/home/apa/local/bin';
+my $sortBedCoord = "$bin/sortBedCoord";
+my $mergeBed = '/n/apps/CentOS7/install/bedtools-2.19.0/bin/mergeBed';
+$mergeBed = '/n/local/stage/bedtools/bedtools2-2.19.0/bin/mergeBed' unless -e $mergeBed;
+my $intersectBed = '/n/apps/CentOS7/install/bedtools-2.19.0/bin/intersectBed';
+$intersectBed = '/n/local/stage/bedtools/bedtools2-2.19.0/bin/intersectBed' unless -e $intersectBed;
+
+
+
+### Globals
+
+my %strandMap = ('+'=>'+', '-'=>'-', '++'=>'+', '+-'=>'-', '-+'=>'-', '--'=>'+', '.'=>'.', ''=>'.', '*'=>'.');
+
+
+
+### Inputs
+
+my ($gtf, $outdir) = @ARGV;
+die "$0: GTF not found!\n" unless -e $gtf;
+$outdir = '.' unless $outdir;
+system "mkdir -p $outdir" unless -d $outdir;
+
+
+
+### Main
+
+my (%data, @chrs, %meta, %t2g, %allkeys, %nexon2coord, %starts);
+
+print STDERR "Reading $gtf: ",`date`;
+open my $IN1, '<', $gtf or die "$0: Cannot open gtf file '$gtf' for reading: $!\n";
+while (<$IN1>) {
+    my ($chr, $src, $type, $start, $end, $score, $strand, $phase, $annot) = split /\t/, $_;
+    
+    next unless $type eq 'exon' || $type eq 'CDS';
+    push @chrs, $chr unless $data{$chr};  # record only once
+    
+    my $start0 = $start-1;  # for BED files
+    my ($gene) = ($annot =~ /gene_id "([^"]+)"/);
+    my ($trans) = ($annot =~ /transcript_id "([^"]+)"/);
+    my ($gname) = ($annot =~ /gene_name "([^"]+)"/);
+    my ($gbio) = ($annot =~ /biotype "([^"]+)"/);
+    print "$0: No gene! '$annot' on line $.: $_\n" unless $gene;
+    print "$0: No trans! '$annot' on line $.: $_\n" unless $trans;
+    print "$0: Unknown strand '$strand' on line $.: $_\n" unless $strandMap{$strand};
+    while ($annot =~ m/(\S+) ([^;]+)[;\r\n]/g) {
+        my ($key, $value) = ($1, $2);
+        next if $key eq 'gene_id' || $key eq 'transcript_id';  # redundant
+        $value =~ s/"//g;
+        $value =~ s/^\s*//;
+        $value =~ s/\s*$//;
+        $data{$chr}{G}{$gene}{A}{$key} = $value unless defined $data{$chr}{G}{$gene}{A}{$key};   # if duplicate keys, take first only
+        $data{$chr}{T}{$trans}{A}{$key} = $value unless defined $data{$chr}{T}{$trans}{A}{$key}; # if duplicate keys, take first only
+        $allkeys{$key} = 1;
+    }
+    
+    if ($type eq 'CDS') {
+        
+        push @{ $data{$chr}{T}{$trans}{P} }, ($start, $end);
+        push @{ $data{$chr}{G}{$gene}{P} }, ($start, $end);
+        $data{$chr}{T}{$trans}{CDSL} += $end-$start0;
+        
+        $data{$chr}{G}{$gene}{C}{"$start0\t$end"}{S} = $strandMap{$strand};
+#        $data{$chr}{T}{$trans}{C}{"$start0\t$end"}{S} = $strandMap{$strand};
+        $data{$chr}{T}{$trans}{C}{$start0}{S} = [$end, $strandMap{$strand}];
+        
+    } else {
+        
+        $meta{$gene} = [$chr, $strand, $gname, $gbio];
+        
+        push @{ $data{$chr}{G}{$gene}{B} }, ($start, $end);
+        $data{$chr}{G}{$gene}{E}{"$start0\t$end"}{S} = $strandMap{$strand};
+        $data{$chr}{G}{$gene}{E}{"$start0\t$end"}{T}{$trans} = 1;
+        $data{$chr}{G}{$gene}{S} = $strand;
+        $data{$chr}{G}{$gene}{T}{$trans} = 1;
+        
+        push @{ $data{$chr}{T}{$trans}{B} }, ($start, $end);
+#        $data{$chr}{T}{$trans}{E}{"$start0\t$end"}{S} = $strandMap{$strand};
+        $data{$chr}{T}{$trans}{E}{$start0}{S} = [$end, $strandMap{$strand}];
+        $data{$chr}{T}{$trans}{L} += $end-$start0;
+        $data{$chr}{T}{$trans}{S} = $strand;
+        $data{$chr}{T}{$trans}{G} = $t2g{$trans} = $gene;
+        $data{$chr}{T}{$trans}{NE}++;
+        
+    }
+}
+close $IN1;
+
+my ($name) = ($gtf =~ /([^\/]+)\.gtf$/i);
+$name = "$outdir/$name";
+my $gdat = "$name.gene_data.txt";
+my $tdat = "$name.transcript_data.txt";
+my $gint = "$name.gene_overlaps.txt";
+my $tint = "$name.transcript_overlaps.txt";
+my $gbed = "$name.genes.bed";
+my $tbed = "$name.transcripts.bed";
+my $gtbed = "$name.gene-transcripts.bed";
+my $gxbed = "$name.gene_exons.bed";
+my $gcbed = "$name.gene_CDSs.bed";
+my $txbed = "$name.transcript_exons.bed";
+my $tcbed = "$name.transcript_CDSs.bed";
+my $pre_ubed = "$name.pre_uxons.bed";
+my $ubed = "$name.gene_uxons.bed";
+my $gxdat = "$name.gene_exon_data.txt";
+
+open my $GDAT, '>', $gdat or die "$0: Cannot write to output gene data file '$gdat': $!\n";
+open my $TDAT, '>', $tdat;  # assume the others will be fine if the first is fine
+open my $GINT, '>', $gint;
+open my $TINT, '>', $tint;
+open my $GBED, '>', $gbed;
+open my $TBED, '>', $tbed;
+open my $GTBED, '>', $gtbed;
+open my $GXBED, '>', $gxbed;
+open my $GCBED, '>', $gcbed;
+open my $TXBED, '>', $txbed;
+open my $TCBED, '>', $tcbed;
+open my $PRE_UBED, '>', $pre_ubed;
+open my $UBED, '>', $ubed;
+open my $GXDAT, '>', $gxdat;
+
+print STDERR "Processing chromosomes: ",`date`;
+foreach my $chr (@chrs) {
+    foreach my $gene (keys %{ $data{$chr}{G} }) {
+        my ($gstart, $gend) = (sort {$a <=> $b} @{ $data{$chr}{G}{$gene}{B} })[0,-1];
+        my $gstart0 = $gstart-1;
+        $starts{G}{$gene} = $gstart;
+        $data{$chr}{G}{$gene}{TL} = $gend-$gstart0;
+        $data{$chr}{G}{$gene}{GC} = "$chr\t$gstart\t$gend\t$data{$chr}{G}{$gene}{S}";
+        print $GBED "$chr\t$gstart0\t$gend\t$gene\t1\t$data{$chr}{G}{$gene}{S}\n";
+        my ($nexons, $ncds);
+        foreach my $coord (keys %{ $data{$chr}{G}{$gene}{E} }) {
+            $nexons++;
+            print $GXBED "$chr\t$coord\t$gene:$nexons\t1\t$data{$chr}{G}{$gene}{E}{$coord}{S}\n";
+            print $PRE_UBED "$gene\t$coord\t$nexons\t1\t$data{$chr}{G}{$gene}{E}{$coord}{S}\n";
+            $nexon2coord{$gene}{$nexons} = $coord;
+        }
+        foreach my $coord (keys %{ $data{$chr}{G}{$gene}{C} }) {
+            $ncds++;
+            print $GCBED "$chr\t$coord\t$gene:$ncds\t1\t$data{$chr}{G}{$gene}{C}{$coord}{S}\n";
+        }
+    }
+    foreach my $trans (keys %{ $data{$chr}{T} }) {
+        next unless exists $data{$chr}{T}{$trans}{B};
+        my ($tstart, $tend) = (sort {$a <=> $b} @{ $data{$chr}{T}{$trans}{B} })[0,-1];
+        my $tstart0 = $tstart-1;
+        $starts{T}{$trans} = $tstart;
+        my $tlen = $data{$chr}{T}{$trans}{L};
+        my ($cdsbp, $utrbp) = ($data{$chr}{T}{$trans}{CDSL}, 0);
+        my ($cds_start, $cds_end);
+        $data{$chr}{T}{$trans}{TL} = $tend-$tstart0;
+        $data{$chr}{T}{$trans}{TC} = "$chr\t$tstart\t$tend\t$data{$chr}{T}{$trans}{S}";
+        print $TBED "$chr\t$tstart0\t$tend\t$trans\t1\t$data{$chr}{T}{$trans}{S}\n";
+        my $gene = $data{$chr}{T}{$trans}{G};
+        print $GTBED "$chr\t$tstart0\t$tend\t$gene|$trans\t1\t$data{$chr}{T}{$trans}{S}\n";
+        my ($nexons, $ncds);
+        foreach my $xstart (keys %{ $data{$chr}{T}{$trans}{E} }) {
+            my ($xend, $xstr) = @{ $data{$chr}{T}{$trans}{E}{$xstart}{S} };
+            my $xlen = $xend-$xstart;  # 0-BASED
+            $nexons++;
+            print $TXBED "$chr\t$xstart\t$xend\t$trans:$nexons\t1\t$xstr\n";
+            $data{$chr}{T}{$trans}{SL} += $xlen;
+            next if $data{$chr}{T}{$trans}{CDSC};
+            my $cds_init;
+            foreach my $cstart (keys %{ $data{$chr}{T}{$trans}{C} }) {
+                if ($cstart >= $xstart && $cstart <= $xend) {
+                    $cds_init = 1;
+                    $utrbp += $cstart-$xstart;
+                    if ($xstr eq '-') {
+                       ($cds_start, $cds_end) = ($tlen-$utrbp-$cdsbp+1, $tlen-$utrbp);  # 1-BASED
+                    } else {
+                       ($cds_start, $cds_end) = ($utrbp+1, $utrbp+$cdsbp);  # 1-BASED
+                    }
+                    $data{$chr}{T}{$trans}{CDSC} = "$cds_start\t$cds_end";
+#                    print STDERR "$trans, $tlen: $nexons, $utrbp\n";
+                    last;
+                }
+            }
+            $utrbp += $xlen unless $cds_init;
+        }
+        foreach my $cstart (keys %{ $data{$chr}{T}{$trans}{C} }) {
+            my ($cend, $cstr) = @{ $data{$chr}{T}{$trans}{C}{$cstart}{S} };
+            $ncds++;
+            print $TCBED "$chr\t$cstart\t$cend\t$trans:$ncds\t1\tcstr\n";
+        }
+    }
+}
+close $_ foreach ($GBED, $TBED, $GTBED, $GXBED, $GCBED, $TXBED, $TCBED, $PRE_UBED);
+
+print STDERR "Creating uxons: ",`date`;
+system "$sortBedCoord -i $_ --overwrite" foreach ($gbed, $tbed, $gxbed, $txbed, $pre_ubed);
+system "";
+
+open my $UM, '-|', "$mergeBed -nms -i $pre_ubed";
+while (<$UM>) {
+    chomp;
+    my ($gene, $start, $end, $nexons) = split /\t/, $_;
+    my ($chr, $str, $gname, $gbio) = @{ $meta{$gene} };
+    my @nexons = sort {$a <=> $b} (split /,/, $nexons);
+    my $Nexons = scalar @nexons;
+    foreach my $nexon (@nexons) {
+        my $coord = $nexon2coord{$gene}{$nexon};
+        $data{$chr}{G}{$gene}{E}{$coord}{O} = $Nexons;  # number of within-gene exon overlaps, including self
+    }
+    my $newid = "$gene:".join('|',@nexons);
+    print $UBED "$chr\t$start\t$end\t$newid\t1\t$str\n";
+}
+close $UM;
+close $UBED;
+system "rm -f $pre_ubed";
+system "$sortBedCoord -i $ubed --overwrite";
+
+print $GXDAT "Chr\tStart\tEnd\tID\tWidth\tStrand\tGene\tExonNum\tOverlaps\tConstitutive\tN_Trans\tTranscripts\n";
+open my $GXBED2, '<', $gxbed;
+while (<$GXBED2>) {
+    chomp;
+    my ($chr, $start, $end, $exon, $score, $str) = split /\t/, $_;
+    my ($gene, $nexon) = split /:/, $exon;
+    my $width = $end-$start;
+    my $coord = "$start\t$end";
+    my $overlaps = $data{$chr}{G}{$gene}{E}{$coord}{O} || 0;
+    my @trans = keys %{ $data{$chr}{G}{$gene}{E}{$coord}{T} };
+    my $ntrans = scalar @trans;
+    my $trans = join ';', @trans;
+    my $ngtrans = scalar keys %{ $data{$chr}{G}{$gene}{T} };
+    my $constitutive = $ntrans == $ngtrans ? 1 : '';
+    print $GXDAT join("\t", $chr, $start, $end, $exon, $width, $str, $gene, $nexon, $overlaps, $constitutive, $ntrans, $trans),"\n";
+    if ($constitutive) {
+        $data{$chr}{T}{$_}{NC}++ foreach @trans;
+    }
+    if ($ntrans == 1) {
+        $data{$chr}{T}{$_}{NS}++ foreach @trans;  # singletons
+    }
+}
+close $GXBED2;
+close $GXDAT;
+
+open my $UBED2, '<', $ubed;
+while (<$UBED2>) {
+    my ($chr, $start, $end, $id) = (split /\t/, $_)[0..3];
+    my ($gene, $nexons) = split /:/, $id;
+    my @xnums = split /\|/, $nexons;
+    $data{$chr}{G}{$gene}{U}{"$start\t$end"} = 1;
+    $data{$chr}{G}{$gene}{UL} += $end-$start;
+}
+close $UBED2;
+
+print STDERR "Testing gene and transcript intersections: ",`date`;
+open my $GM, '-|', "$intersectBed -wo -a $gbed -b $gbed | cut -f1-4,6,8-10,12,13";
+while (<$GM>) {
+    chomp;
+    my ($chr, $start1, $end1, $gene1, $strand1, $start2, $end2, $gene2, $strand2, $over) = split;
+    next if $gene1 eq $gene2;
+    next if ($gene1 cmp $gene2) == -1;  # one way to ensure each gene pair only gets analyzed once
+    my $ss = $strand1 eq $strand2 ? 1 : 0;
+    my ($len1, $len2) = ($end1-$start1, $end2-$start2);
+    if ($over == $len1) {
+        $ss ? $data{$chr}{G}{$gene1}{IECS}++ : $data{$chr}{G}{$gene1}{IECO}++;
+        $ss ? $data{$chr}{G}{$gene2}{OECS}++ : $data{$chr}{G}{$gene2}{OECO}++;
+    } elsif ($over == $len2) {
+        $ss ? $data{$chr}{G}{$gene1}{OECS}++ : $data{$chr}{G}{$gene1}{OECO}++;
+        $ss ? $data{$chr}{G}{$gene2}{IECS}++ : $data{$chr}{G}{$gene2}{IECO}++;
+    } else {
+        $ss ? $data{$chr}{G}{$gene1}{OLS}++ : $data{$chr}{G}{$gene1}{OLO}++;
+        $ss ? $data{$chr}{G}{$gene2}{OLS}++ : $data{$chr}{G}{$gene2}{OLO}++;
+    }
+}
+close $GM;
+
+open my $TM, '-|', "$intersectBed -wo -a $tbed -b $tbed | cut -f1-4,6,8-10,12,13";
+while (<$TM>) {
+    chomp;
+    my ($chr, $start1, $end1, $trans1, $strand1, $start2, $end2, $trans2, $strand2, $over) = split;
+    next if $trans1 eq $trans2;
+    next unless $t2g{$trans1} eq $t2g{$trans2};  # must belong to same gene
+    next if ($trans1 cmp $trans2) == -1;  # one way to ensure each trans pair only gets analyzed once
+    my $ss = $strand1 eq $strand2 ? 1 : 0;
+    my ($len1, $len2) = ($end1-$start1, $end2-$start2);
+    if ($over == $len1) {
+        $ss ? $data{$chr}{T}{$trans1}{IECS}++ : $data{$chr}{T}{$trans1}{IECO}++;
+        $ss ? $data{$chr}{T}{$trans2}{OECS}++ : $data{$chr}{T}{$trans2}{OECO}++;
+    } elsif ($over == $len2) {
+        $ss ? $data{$chr}{T}{$trans1}{OECS}++ : $data{$chr}{T}{$trans1}{OECO}++;
+        $ss ? $data{$chr}{T}{$trans2}{IECS}++ : $data{$chr}{T}{$trans2}{IECO}++;
+    } else {
+        $ss ? $data{$chr}{T}{$trans1}{OLS}++ : $data{$chr}{T}{$trans1}{OLO}++;
+        $ss ? $data{$chr}{T}{$trans2}{OLS}++ : $data{$chr}{T}{$trans2}{OLO}++;
+    }
+}
+close $TM;
+
+print $GINT "Gene\tSolitary\tN_Exons\tSS-Eclipsed\tOS-Eclipsed\tSS-Eclipses\tOS-Eclipses\tSS-Overlaps\tOS-Overlaps\n";
+foreach my $chr (@chrs) {
+    foreach my $gene (sort keys %{ $data{$chr}{G} }) {
+        my %x = %{ $data{$chr}{G}{$gene} };
+        $x{NE} = scalar keys %{ $x{E} };
+        my $over = join("\t", map {($x{$_}||'.')} qw/ IECS IECO OECS OECO OLS OLO /);
+        my $solitary = $over =~ /\d/ ? '.' : 1;
+        print $GINT join("\t",$gene,$solitary,$x{NE},$over),"\n";
+    }
+}
+close $GINT;
+
+print $TINT "Transcript\tGene\tSolitary\tN_Exons\tSS-Eclipsed\tOS-Eclipsed\tSS-Eclipses\tOS-Eclipses\tSS-Overlaps\tOS-Overlaps\n";
+foreach my $chr (@chrs) {
+    foreach my $trans (keys %{ $data{$chr}{T} }) {
+        my %x = %{ $data{$chr}{T}{$trans} };
+        $x{NE} = scalar keys %{ $x{E} };
+        my $over = join("\t", map {($x{$_}||'.')} qw/ IECS IECO OECS OECO OLS OLO /);
+        my $solitary = $over =~ /\d/ ? '.' : 1;
+        print $TINT join("\t",$trans,$t2g{$trans},$solitary,$x{NE},$over),"\n";
+    }
+}
+close $TINT;
+
+my @annot_keys = sort keys %allkeys;
+print $GDAT "Gene\tChr\tStart\tEnd\tStrand\tTotLen\tUxonLen\tN_Trans\tN_Exons\tN_Uxons\tGenomic_CDS_Start\tGenomic_CDS_End";
+print $GDAT "\t$_" foreach @annot_keys;
+print $GDAT "\n";
+foreach my $chr (@chrs) {
+    foreach my $gene (sort {$starts{G}{$a} <=> $starts{G}{$b}} keys %{ $data{$chr}{G} }) {
+        my ($gname, $gbio) = @{ $meta{$gene} }[2,3];
+        my %x = %{ $data{$chr}{G}{$gene} };
+        $x{NT} = scalar keys %{ $x{T} };
+        $x{NE} = scalar keys %{ $x{E} };
+        $x{NU} = scalar keys %{ $x{U} };
+        my ($gcds1, $gcds2);
+        if (exists $x{P}) {
+            ($gcds1, $gcds2) = (sort {$a <=> $b} @{ $x{P} })[0,-1];
+        }
+        print $GDAT join("\t", $gene, (map {$x{$_}} qw/ GC TL UL NT NE NU /), $gcds1, $gcds2, (map {$x{A}{$_}} @annot_keys)), "\n";
+    }
+}
+close $GDAT;
+
+print $TDAT "Transcript\tGene\tChr\tStart\tEnd\tStrand\tTotLen\tSpliceLen\tN_Exons\tN_Constitutive\tN_Singleton\tGenomic_CDS_Start\tGenomic_CDS_End\tTranscript_CDS_Start\tTranscript_CDS_End";
+print $TDAT "\t$_" foreach @annot_keys;
+print $TDAT "\n";
+foreach my $chr (@chrs) {
+    foreach my $trans (sort {$starts{T}{$a} <=> $starts{T}{$b}} keys %{ $data{$chr}{T} }) {
+        my %x = %{ $data{$chr}{T}{$trans} };
+        my ($gcds1, $gcds2);
+        if (exists $x{P}) {
+            ($gcds1, $gcds2) = (sort {$a <=> $b} @{ $x{P} })[0,-1];
+        }
+        $data{$chr}{T}{$trans}{CDSC} = "\t" unless exists $data{$chr}{T}{$trans}{CDSC};
+        print $TDAT join("\t", $trans, (map {$x{$_}} qw/ G TC TL SL NE NC NS /), $gcds1, $gcds2, $data{$chr}{T}{$trans}{CDSC}, (map {$x{A}{$_}} @annot_keys)), "\n";
+    }
+}
+close $TDAT;
+
+print STDERR "$0 complete! ",`date`;
+## NO EXIT
+

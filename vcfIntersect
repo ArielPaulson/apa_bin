@@ -1,0 +1,216 @@
+#!/usr/bin/env Rscript
+
+source("/home/apa/apa_tools.R")
+
+ca <- commandArgs(trailing=TRUE)
+outprefix <- ca[1]
+minreps <- as.numeric(ca[2])            # either 'NA', or, min reps a variant must be seen in to be believed, min=2, max=N.
+master <- ifelse(ca[3]=="NA",NA,ca[3])  # either 'NA', or, a master VCF to compare the VCFs in 'inputs' to.  Expected case: master=master-bam VCF, inputs-downsampled-bam VCFs.
+
+if (is.na(ca[4])) {
+    stop("Some non-master input VCFs must be given!\n")
+} else {
+    inputs <- ca[4:length(ca)]
+    N <- length(inputs)
+}
+
+if (!is.na(minreps)) {
+    if (minreps<=1|minreps>N) stop(paste("If specified, 'minreps' must be > 1 and <= ",N,"\n"))
+}
+
+
+checkpoint <- 0
+if (!grepl("\\.$",outprefix)) outprefix <- paste0(outprefix,".")
+RData <- paste0(outprefix,"RData")
+
+
+if (file.exists(RData)) {
+    message(paste0("Reloading from last checkpoint... (",RData,")"))
+    load(RData)  # to get 'checkpoint' value
+}
+
+
+if (checkpoint==0) {
+    
+    message("Reading input VCFs...")  # and split on chromosome
+    vcfs <- lapply(lapply(inputs, read.vcf), function(v) {
+        lapply(mat.split(v, v[,1]), function(x) cbind( CHRIDX=gsub(" ","",apply(x[,c(2,4,5)],1,paste,collapse=".")), UNIQ=FALSE, x ) )  # UNIQ not used here, just added to make all VCF dataframes identical
+    })
+    vcols <- lapply(vcfs, function(x) ncol(x[[1]]))
+    V <- length(vcfs)
+    checkpoint <- 1; save.image(RData)
+    
+}
+
+
+if (checkpoint==1) {
+    
+    if (is.na(master)) {
+        ## output VCF data will be from first input
+        vhead <- attributes(vcfs[[1]])$header
+        mvcf <- vcfs[[1]]
+    } else {
+        ## output VCF data will be from this file
+        message("Reading master VCF...")
+        mvcf <- read.vcf(master)
+        vhead <- attributes(mvcf)$header
+        mvcf <- lapply(mat.split(mvcf, mvcf[,1]), function(x) cbind( CHRIDX=gsub(" ","",apply(x[,c(2,4,5)],1,paste,collapse=".")), UNIQ=FALSE, x ) )
+    }
+    mcols <- max(sapply(mvcf,ncol))
+    checkpoint <- 2; save.image(RData)
+    
+}
+
+
+if (checkpoint==2) {
+    
+    message("Collecting unique variants...")
+    uchrs <- sort(unique(c( unlist(lapply(vcfs,names)), names(mvcf) )))
+    message("CHRS: ",paste(uchrs,collapse=" "))
+    names(uchrs) <- uchrs
+    chrvar <- lapply(uchrs, function(u) {
+        x <- unique(unlist(lapply(vcfs, function(v) v[[u]]$CHRIDX )))
+        vbin <- matrix(0, length(x), V, FALSE, list(c(),inputs))
+        if (length(x)>0) data.frame( CHRIDX=x, N=0, LOST=FALSE, vbin )
+    })
+    cvnz <- listLengths(chrvar)>0
+    IM("NZ:",sum(cvnz))
+    IM("Z:",sum(!cvnz))
+    chrvar <- chrvar[cvnz]
+    uchrs <- names(chrvar)
+    checkpoint <- 3; save.image(RData)
+    
+}
+
+
+if (checkpoint==3) {
+    
+    message("Intersecting variants...")
+    for (u in uchrs) {
+        for (i in 1:V) {  # files
+            w <- which(chrvar[[u]]$CHRIDX %in% vcfs[[i]][[u]]$CHRIDX)
+            if (length(w)>0) {
+                chrvar[[u]]$N[w] <- chrvar[[u]]$N[w] + 1
+                chrvar[[u]][w,3+i] <- 1
+            }
+        }
+        if (!is.na(master)) {
+            chrvar[[u]]$LOST[!(chrvar[[u]]$CHRIDX %in% mvcf[[u]]$CHRIDX)] <- TRUE  # chrvar variants NOT found in master
+            mvcf[[u]]$UNIQ[!(mvcf[[u]]$CHRIDX %in% chrvar[[u]]$CHRIDX)] <- TRUE    # master variants NOT found in chrvar
+        }
+    }
+    checkpoint <- 4; save.image(RData)
+    
+}
+
+
+if (checkpoint==4) {
+    
+    listSum <- function(x) ifelse(length(x)>0, sum(listLengths(x)), 0)
+    message("Fractionating variants...")
+    for (u in setdiff(names(mvcf),uchrs)) mvcf[[u]]$UNIQ <- TRUE  # master chrs which had no variants in VCFs
+    msonly <- lapply(mvcf, function(x) which(x$UNIQ) )
+    mslost <- lapply(chrvar, function(x) which(x$LOST) )
+    
+    ## chr variant types
+    ## list, one elem per chr
+    single <- lapply(chrvar, function(x) which(x$N==1) )
+    ubiqui <- lapply(chrvar, function(x) which(x$N==N) )
+    interm <- lapply(uchrs, function(u) setdiff(1:nrow(chrvar[[u]]), c(single[[u]],ubiqui[[u]])) )
+    names(interm) <- uchrs
+    ## drop empty chrs
+    single <- single[listLengths(single)>0]
+    interm <- interm[listLengths(interm)>0]
+    ubiqui <- ubiqui[listLengths(ubiqui)>0]
+    
+    ## chr variant types matching in master
+    ## list, one elem per chr
+    single2 <- lapply(uchrs, function(u) which(mvcf[[u]]$CHRIDX %in% chrvar[[u]]$CHRIDX[single[[u]]]) )
+    interm2 <- lapply(uchrs, function(u) which(mvcf[[u]]$CHRIDX %in% chrvar[[u]]$CHRIDX[interm[[u]]]) )
+    ubiqui2 <- lapply(uchrs, function(u) which(mvcf[[u]]$CHRIDX %in% chrvar[[u]]$CHRIDX[ubiqui[[u]]]) )
+    names(single2) <- names(interm2) <- names(ubiqui2) <- uchrs
+    ## drop empty chrs
+    single2 <- single2[listLengths(single2)>0]
+    interm2 <- interm2[listLengths(interm2)>0]
+    ubiqui2 <- ubiqui2[listLengths(ubiqui2)>0]
+    
+    ## total variants per fraction
+    Nonly <- listSum(msonly)
+    Nlost <- listSum(mslost)
+    Nsingle <- listSum(single)
+    Ninterm <- listSum(interm)
+    Nubiqui <- listSum(ubiqui)
+    Nsingle2 <- listSum(single2)
+    Ninterm2 <- listSum(interm2)
+    Nubiqui2 <- listSum(ubiqui2)
+    
+    ## compare input-only variant counts to input-and-master variant counts
+    cv.total <- sum(listLengths(chrvar,nrow))
+    m.total <- sum(listLengths(mvcf,nrow))
+    cv.sum <- Nsingle + Ninterm + Nubiqui
+    m.sum <- Nsingle2 + Ninterm2 + Nubiqui2+Nonly
+    message(paste0(cv.total," observed variants | ",Nsingle," singletons + ",Ninterm," intermediate + ",Nubiqui," ubiquitous = ",cv.sum,", discrep = ",cv.total-cv.sum))
+    message(paste0(m.total," master variants | ",Nsingle2," singletons + ",Ninterm2," intermediate + ",Nubiqui2," ubiquitous + ",Nonly," master-only = ",m.sum,", discrep = ",m.total-m.sum))
+    message(paste0(Nlost," observed variants not found in master"))
+    
+    ## "Believable" counts, if necessary
+    ## Identical workflow to the other fractions above
+    if (!is.na(minreps)) {
+        believ <- lapply(chrvar, function(x) which(x$N>=minreps) )
+        believ <- believ[listLengths(believ)>0]
+        believ2 <- lapply(uchrs, function(u) which(mvcf[[u]]$CHRIDX %in% chrvar[[u]]$CHRIDX[believ[[u]]]) )
+        names(believ2) <- uchrs
+        believ2 <- believ2[listLengths(believ2)>0]
+        Nbeliev <- listSum(believ)
+        Nbeliev2 <- listSum(believ2)
+        bdisc <- abs(Nbeliev - Nbeliev2)
+        message(paste0(Nbeliev," believable observed variants | ",Nbeliev2," believable master variants | discrep = ",bdisc))
+    }
+    
+    checkpoint <- 5; save.image(RData)
+    
+}
+
+
+source("/home/apa/apa_tools.R")
+if (checkpoint==5) {
+    
+    message("Writing fraction VCFs...")
+    message(paste0(Nsingle2," singletons (",round(100*Nsingle2/m.total,2),"%)"))
+    if (Nsingle2>0) write.vcf(do.call(rbind, lapply(names(single2), function(u) mvcf[[u]][single2[[u]],3:mcols])), paste0(outprefix,"singletons.vcf.gz"), header=vhead, tabix=TRUE)
+    message(paste0(Ninterm2," intermediate (",round(100*Ninterm2/m.total,2),"%)"))
+    if (Ninterm2>0) write.vcf(do.call(rbind, lapply(names(interm2), function(u) mvcf[[u]][interm2[[u]],3:mcols])), paste0(outprefix,"intermediate.vcf.gz"), header=vhead, tabix=TRUE)
+    message(paste0(Nubiqui2," ubiquitous (",round(100*Nubiqui2/m.total,2),"%)"))
+    if (Nubiqui2>0) write.vcf(do.call(rbind, lapply(names(ubiqui2), function(u) mvcf[[u]][ubiqui2[[u]],3:mcols])), paste0(outprefix,"ubiquitous.vcf.gz"), header=vhead, tabix=TRUE)
+    message(paste0(Nonly," master-only (",round(100*Nonly/m.total,2),"%)"))
+    if (Nonly>0) write.vcf(do.call(rbind, lapply(names(Nonly), function(u) mvcf[[u]][msonly[[u]],3:mcols])), paste0(outprefix,"master-only.vcf.gz"), header=vhead, tabix=TRUE)
+    
+    if (!is.na(minreps)) {
+        message(paste0(Nbeliev2," believable (",round(100*Nbeliev2/m.total,2),"%)"))
+        if (Nbeliev2>0) write.vcf(do.call(rbind, lapply(names(believ2), function(u) mvcf[[u]][believ2[[u]],3:mcols])), paste0(outprefix,"believable.vcf.gz"), header=vhead, tabix=TRUE)
+    }
+    
+    ## FOR NOW: not writing the not-in-master fraction
+    ## we would have to decide which record to print, since some may appear > once
+    #if (Nlost>0) {
+    #   vclost <- lapply(chrvar, function(x) {
+    #        w <- which(x$LOST)
+    #        v <- apply(as.matrix(x[w,1:V+3]>0,1,function(y)which(y)[1]))  # select first input VCF having lost variant
+    #        
+    #    })
+    #    lost.vcf <- do.call(rbind, lapply())
+    #    write.vcf(lost.vcf, paste0(outprefix,"master-missing.vcf.gz"), header=vhead, tabix=TRUE)
+    #}
+    
+    write.table(cbind(CHR=rep(names(chrvar),times=listLengths(chrvar,nrow)), do.call(rbind,chrvar)), paste0(outprefix,"all_var_table.txt"), sep="\t", quote=FALSE, row.names=FALSE, col.names=TRUE)
+    vtab <- matrix( c(Nlost,Nsingle,Ninterm,Nubiqui,0, Nonly,Nsingle2,Ninterm2,Nubiqui2,0), 5, 2, FALSE, list(c("UNIQ","SING","INTM","UBIQ","TOTAL"),c("VCFS","MASTER")) )
+    vtab[5,] <- colSums(vtab)
+    write.table(vtab, paste0(outprefix,"vartype_table.txt"), sep="\t", quote=FALSE, row.names=TRUE, col.names=c("\tVCFS","MASTER"))
+    
+}
+
+
+system(paste("rm -f",RData))
+message(paste("vcfIntersect",sub("\\.$","",outprefix),"complete!"))
+
+

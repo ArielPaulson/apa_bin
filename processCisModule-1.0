@@ -1,0 +1,93 @@
+#!/usr/bin/perl
+use Getopt::long;
+use strict;
+
+my ($cmoutput, $writedir);
+GetOptions("f=s" => \$cmoutput, "o=s" => \$writedir);
+
+my ($cmname) = ($cmoutput =~ /([^\/]+)$/);
+system "mkdir -p $writedir";
+die "Failed to create write dir '$writedir'\n" unless -d $writedir;
+
+my ($block, %bed, %patt, %combo, %mdat, %pwm, $motif);
+open IN, $cmoutput or die "Cannot read file '$cmoutput': $!\n";
+print "Reading $cmoutput...\n";
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    $block++ if ($_ && $_ !~ /[^*]/);  # all-asterisk lines
+    if ($block == 1) {
+	if ($_ =~ /^>(\d+)\s+\[([\d,]+)\]\s+([\d\(\)+-]+)/) {
+	    my ($seq, $win, $module) = ($1, $2, $3);
+	    $win =~ s/,/-/;
+	    my (@pattern, %cpattern);
+	    while ($module =~ /([+-])(\d+)\((\d+)\)/g) {
+		push @{ $bed{$seq}{$win} }, [$2, $3, $1];  # motif, start, strand
+#		print "$seq, $win: $2, $3, $1\n";
+		push @pattern, $2;
+		$cpattern{$2}++;
+	    }
+	    my $pattern = join ',', @pattern;
+	    $patt{$pattern}{S}{$seq}++;
+	    $patt{$pattern}{T}++;
+	    my $combination = join ',', sort {$a <=> $b} keys %cpattern;
+	    $combo{$combination}{S}{$seq}++;
+	    $combo{$combination}{T}++;
+	}
+    } elsif ($block > 1) {
+	if ($_ =~ /^Motif_(\d+)/) {
+	    $motif = $1;
+	} elsif ($_ =~ /^number of sites: (\d+)/) {
+	    $mdat{$motif}{SITES} = $1;
+	} elsif ($_ =~ /^(\d+)\t([\d.]+)\t([\d.]+)\t([\d.]+)\t([\d.]+)\t[ACGT]/) {
+	    $mdat{$motif}{PWM}{$1} = [$2, $3, $4, $5];
+	    $mdat{$motif}{WIDTH} = $1;  # stops at true width
+	}
+    }
+}
+close IN;
+
+print "Writing patterns...\n";
+open OUT, "> $writedir/$cmname.patterns.txt";
+print OUT "Pattern\tInstances\tSequences\tSequence Names\n";
+foreach my $combination (sort keys %combo) {
+    my $nseq = scalar keys %{ $combo{$combination}{S} };
+    my $allseq = join ', ', sort {$a <=> $b}  keys %{ $combo{$combination}{S} };
+    print OUT "COMBO:$combination\t$combo{$combination}{T}\t$nseq\t$allseq\n";
+}
+foreach my $pattern (sort keys %patt) {
+    my $nseq = scalar keys %{ $patt{$pattern}{S} };
+    my $allseq = join ', ', sort {$a <=> $b}  keys %{ $patt{$pattern}{S} };
+    print OUT "$pattern\t$patt{$pattern}{T}\t$nseq\t$allseq\n";
+}
+close OUT;
+
+print "Writing bed...\n";
+open OUT, "> $writedir/$cmname.bed";
+foreach my $seq (sort {$a <=> $b} keys %bed) {
+    my @bed2;
+    foreach my $win (keys %{ $bed{$seq} }) {
+	foreach (@{ $bed{$seq}{$win} }) {
+	    my ($motif, $start, $strand) = @$_;
+	    my $end = $start + $mdat{$motif}{WIDTH} - 1;
+	    $start--;  # bed = 0-based
+	    push @bed2, "$start\t$end\t$win\t$motif\t$strand";
+	}
+    }
+    print OUT "$seq\t$_\n" foreach sort {$a <=> $b} @bed2;
+}
+close OUT;
+
+print "Writing minimal meme...\n";
+open OUT, "> $writedir/$cmname.meme";
+print OUT "MEME version 4\nALPHABET= ACGT\nstrands= +-\n";
+print OUT "\nBackground letter frequencies (from uniform background):\nA 0.25000 C 0.25000 G 0.25000 T 0.25000\n";
+foreach my $motif (sort {$a <=> $b} keys %mdat) {
+    print OUT "\nMOTIF $motif\nletter-probability matrix: alength= 4 w= $mdat{$motif}{WIDTH} nsites= $mdat{$motif}{SITES} E= 0\n";
+    printf OUT "  %0.6f\t  %0.6f\t  %0.6f\t  %0.6f\t\n", @{ $mdat{$motif}{PWM}{$_} } foreach (1..$mdat{$motif}{WIDTH});
+}
+close OUT;
+
+print "Running Tomtom...\n";
+system "tomtom_4.8.1 -oc $writedir/tomtom -min-overlap 4 -thresh 0.1 $writedir/$cmname.meme /n/facility/Genomics/CWS/Krumlauf/bony_dekumar/bdk14/apa_analysis/redo_from_scratch/transfac-2012.2.meme";
+exit;
+

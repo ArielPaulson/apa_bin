@@ -1,0 +1,51 @@
+#!/usr/bin/env perl
+require '/home/apa/local/bin/apa_routines.pm';
+use strict;
+
+# takes a fasta + bed, and turns the bed regions to Ns in the fasta.
+
+my ($inFasta, $zapBed, $outFasta) = @ARGV;
+die "$0: bed file of coords to zap not specified!\n" unless $zapBed;
+die "$0: output fasta path not specified!\n" unless $outFasta;
+
+my ($header, @headers, %seq);
+open IN, $inFasta or die "$0: Cannot read from input fasta '$inFasta': $!\n";
+while (<IN>) {
+    $_ =~ s/[\n\r]$//;
+    if ($_ =~ /^>(.*)/) {
+	$header = $1;
+	push @headers, $header;
+    } else {
+	$seq{$header} .= $_;
+    }
+}
+close IN;
+
+my %lens = map {( $_ => length($seq{$_}) )} @headers;
+
+open IN, $zapBed or die "$0: Cannot read from bed file '$zapBed': $!\n";
+while (<IN>) {
+    print $_;
+    $_ =~ s/[\n\r]$//;
+    my @data = split /\t/, $_;
+    my ($chr, $start, $end) = @data[0..2];
+    unless (exists $seq{$chr}) {
+	print "Sequence '$chr' not found in fasta!\n";
+	next;
+    }
+    unless ($end <= $lens{$chr}) {
+	my $name = $data[3] ? " ($data[3])" : '';
+	print "$chr:$start-$end$name is outside sequence ($lens{$chr}bp)!\n";
+	next;
+    }
+    substr($seq{$chr}, $start, $end-$start) = 'N' x ($end-$start);
+}
+close IN;
+
+open OUT, "> $outFasta";
+foreach my $header (@headers) {
+    print OUT ">$header\n";
+    print OUT ${ &blockify($seq{$header}) };
+    print OUT "\n";
+}
+close OUT;

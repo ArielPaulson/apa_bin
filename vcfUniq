@@ -1,0 +1,28 @@
+#!/usr/bin/env perl
+use strict;
+
+## reads/writes STDIO only
+## returns only the FIRST instance per chrom/pos/ref/alt combination
+## also uniques header lines
+
+## FUTURE: enable frequency histogram
+
+my (%header, %already, $skip);
+while (<>) {
+    if (/^#/) {
+        $skip = exists $header{$_};
+        $header{$_}++;
+        next if $skip;
+        print $_;
+    } else {	
+        my ($chr, $pos, $ref, $alt) = (split /\t/, $_, 6)[0,1,3,4];
+        $skip = exists $already{$chr}{$pos}{$ref}{$alt};
+        $already{$chr}{$pos}{$ref}{$alt}++;
+        next if $skip;
+        print $_;
+    }
+}
+
+print STDERR "$0 complete!\n";
+exit;
+

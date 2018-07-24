@@ -1,0 +1,32 @@
+#!/usr/bin/env perl
+use strict;
+
+my (@genes, %css, %coords, %exons);
+open IN, $ARGV[0] or die;
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    my ($chr, $start, $end, $id, $score, $str) = split /\t/, $_;
+    my ($gene, $uxon) = split /:/, $id;
+    push @genes, $gene unless $css{$gene};  # input order
+    $css{$gene} = [$chr, $str, $score];
+    push @{ $coords{$gene} }, ($start, $end);
+    $exons{$gene}{"$start\t$end"} = 1;
+}
+close IN;
+
+foreach my $gene (@genes) {
+    my ($chr, $str, $score) = @{ $css{$gene} };
+    my ($start, $end) = (sort {$a <=> $b} @{ $coords{$gene} })[0,-1];
+    my ($nblocks, $blocksizes, $blockstarts);
+    foreach my $exon (sort {$a <=> $b} keys %{ $exons{$gene} }) {
+	my ($xstart, $xend) = split /\t/, $exon;
+	$xstart -= $start;
+	$xend -= $start;
+	$nblocks++;
+	$blocksizes .= ($xend-$xstart).',';
+	$blockstarts .= "$xstart,";
+    }
+    print "$chr\t$start\t$end\t$gene\t$score\t$str\t$start\t$end\t0\t$nblocks\t$blocksizes\t$blockstarts\n";
+}
+
+

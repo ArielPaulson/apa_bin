@@ -1,0 +1,199 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## Converts a cross_match .screen file to a fasta of un-screened sequence fragments
+
+## Inputs
+my $input;    # input .screen fasta from cross_match
+my $output;   # output fasta file; else gets $input.fa
+my $origfa;   # original fasta file (that cross_match was run on); required if $minintX==0
+my $minintX;  # smallest internal screening event (in bp) to take seriously (default 1, see below)
+my $minfrag;  # smallest unscreened fragment (in bp) to write to output (default 1, see below)
+my $nounscr;  # do not output reads which had no screening events
+
+GetOptions("i=s"=>\$input, "o=s"=>\$output, "r=s"=>\$origfa, "x=i"=>\$minintX, "f=i"=>\$minfrag, "no-unscreened"=>\$nounscr);
+
+## Explanation of .screen fasta contents, and what $minintX and $minfrag do
+## cross_match will take an input fasta, and a fasta of maskable sequences, and mask sequences like so:
+
+## 5' MASK
+## INPUT:  >SEB9BZKS1:271:C47FYACXX:7:1101:11802:3759
+##         ACTCCCTACCAAGACTAAAATGCTGATCCTTGGAATTCTCGGGTGCCAAG
+## OUTPUT: >SEB9BZKS1:271:C47FYACXX:7:1101:11802:3759
+##         XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXGGAATTCTCGGGTGCCAAGG
+
+## 3' MASK
+## INPUT:  >SEB9BZKS1:271:C47FYACXX:7:1203:8969:43709
+##         AGTTCTACAGTCCGACGATCTCTGACATTGAAGACTCTGCTGCCCGAGAT
+## OUTPUT: >SEB9BZKS1:271:C47FYACXX:7:1203:8969:43709
+##         AGTTCTACAGTCCGACGATCXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+
+## INTERNAL MASK
+## INPUT:  >SEB9BZKS1:271:C47FYACXX:7:1212:12657:95043
+##         CCGACGATCTTCGGGAATTGTCGGACAAGTTTAACGCTGGAATTCTCGGG
+## OUTPUT: >SEB9BZKS1:271:C47FYACXX:7:1212:12657:95043
+##         CCGACGATXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXGGAATTCTCGGGT
+
+## COMPLETE MASK
+## INPUT:  >SEB9BZKS1:271:C47FYACXX:7:1102:7679:74358
+##         GACAGCGAACCAGGACGGGTGACGCATAGGTTTATCCCATACGTCACTCTT
+## OUTPUT: >SEB9BZKS1:271:C47FYACXX:7:1102:7679:74358
+##         XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+
+## this script will return non-X fragments from a .screen fasta.
+## 
+## '$minfrag' indicates the largest fragment, in bp, to write out:
+##   Default is 1, which writes any fragment, even 1bp, out.
+##   Setting $minfrag = 0 will not write any fragments to file (only untouched reads); any screening causes entire read to be discarded.
+## 
+## '$minintX' indicates the largest internal masking event to take seriously:
+##   Often the masking sequences are hundreds of bp; should a masking event of only, say, 10bp be considered 'real'?
+##   A masking event of only 10bp at the 5' or 3' end is probably unfinished; 
+##     it is unclear how much further the masking could have continued, if the sequence were longer.
+##   A masking event of only 10bp in the middle of the read, leaving flank sequence intact, is another matter.
+##   It is only this latter event that $minintX considered.  Masks extending to 5' or 3' ends are not ignored.
+##   Setting a meaningful $minintX requires some knowledge of the masking sequences and their expected behavior.
+##   Default is 1, which takes all events seriously, even if only 1bp, and splits the read accordingly.
+##   Setting $minintX = 0 causes internal screening events to be ignored (i.e. replaces X with original sequence); requires $origfa.
+
+
+
+## Globals & Filehandles
+my %filter;  # read filter (reads needed from $origfa)
+my $header;  # read header
+my $seq;     # read sequence
+my $IN;      # input fasta FH
+my $ORIG;    # original fasta FH
+my $OUT;     # output fasta FH
+
+
+
+## Initialize IO
+
+if ($input =~ /.gz$/) {
+    open $IN, '-|', "gunzip -c $input" or die "$0: Cannot read input fasta '$input': $!\n";
+} else {
+    open $IN, '<', $input or die "$0: Cannot read input fasta '$input': $!\n";
+}
+if ($origfa) {
+    if ($origfa =~ /.gz$/) {
+	open $ORIG, '-|', "gunzip -c $origfa" or die "$0: Cannot read original fasta '$origfa': $!\n";
+    } else {
+	open $ORIG, '<', $origfa or die "$0: Cannot read original fasta '$origfa': $!\n";
+    }
+}
+if ($output =~ /.gz$/) {
+    open $OUT, '|-', "gzip > $output" or die "$0: Cannot write output fasta '$output': $!\n";
+} else {
+    open $OUT, '>', $output or die "$0: Cannot write output fasta '$output': $!\n";
+}
+
+
+
+## Main
+
+my ($header, $seq);
+while (<$IN>) {
+    s/[\n\r]+$//;
+    if (/^>(.*)/) {
+	&process($header, $seq) if $header;
+	$header = $1;
+	$seq = '';
+    } else {
+	$seq .= $_;
+    }
+}
+&process($header, $seq) if $header;
+if ($origfa) {
+    while (<$ORIG>) {
+	s/[\n\r]+$//;
+	if (/^>(.*)/) {
+	    &Xfill($header, $seq) if exists $filter{$header};
+	    $header = $1;
+	    $seq = '';
+	} else {
+	    $seq .= $_;
+	}
+    }
+    &Xfill($header, $seq) if exists $filter{$header};
+}
+
+
+
+## Exit
+print STDERR "filterScreenFasta $input complete!\n";
+system "kill $$";  # vastly faster than 'exit', when giant hashes are in play
+
+
+
+
+sub process {
+    
+    my ($HEADER, $SEQ) = @_;
+    
+    next if $minfrag==0 && $SEQ =~ /X/;
+    my @frags = split /X+/, $_;
+    shift @frags if length($frags[0])==0;  # artifact of 5' screening event
+    
+    if (@frags) {
+	## read was not entirely X
+	if ($#frags==0) {
+	    ## read had either single 5' or 3' screening event, or none at all
+	    if ($SEQ =~ /^X/) {
+		## read had single 5' screening event
+		print $OUT ">$HEADER\n$frags[0]\n" if length($frags[0]) >= $minfrag;
+	    } elsif ($SEQ =~ /X$/) {
+		## read had single 3' screening event
+		print $OUT ">$HEADER\n$frags[0]\n" if length($frags[0]) >= $minfrag;
+	    } else {
+		## read had no X
+		print $OUT ">$HEADER\n$frags[0]\n" if length($frags[0]) >= $minfrag && !$nounscr;
+	    }
+	} elsif ($#frags == 1) {
+	    ## single internal screening event
+	    if (length($SEQ)-length($frags[0])-length($frags[1]) < $minintX) {
+		## ignorable internal screening event; replace with original sequence (later)
+		$filter{$HEADER} = [];
+	    } else {
+		## internal screening event was long enough to believe
+		foreach my $f (0,1) {
+		    print $OUT ">$HEADER.",($f+1),"\n",$frags[$f],"\n" if length($frags[$f]) >= $minfrag;
+		}
+	    }
+	} else {
+	    ## multiple internal screening events: must get context for each
+	    my $SEQ2 = $SEQ;
+	    my @Xfrags = split /[^X]+/, $SEQ;
+	    my $X5 = $SEQ2 =~ s/^X// ? length($Xfrags[0]) : 0;   # measure and remove 5' Xs
+	    my $X3 = $SEQ2 =~ s/X$// ? length($Xfrags[-1]) : 0;  # measure and remove 3' Xs
+	    while ($SEQ2 =~ /X+/g) {
+		## internal screening events only
+		if (length($&) <= $minintX) {
+#		    $SEQ3 =~ s/X+/#/;   # replace 5'-most run of Xs with #s (# = believable Xs)
+#		    $SEQ3 =~ s/X+/%/;   # replace 5'-most run of Xs with %s (% = ignorable Xs)
+		    ## too-short internal screening event
+		    ## record offset, length for reverse-substr() sequence replacement (later)
+		    push @{ $filter{$HEADER} }, [$pos{$SEQ2}+$X5, length($&)];
+		}
+	    }
+	}
+    } else {
+	## read was entirely X
+	## ignore
+    }
+}
+
+
+sub Xfill {
+    my ($HEADER, $SEQ) = @_;
+    
+    my @replace = @{ $filter{$HEADER} };
+    
+    if (@replace) {
+	my $SEQ2
+    } else {
+	print $OUT ">$HEADER\n$SEQ\n";  # full original read sequence
+    }
+}

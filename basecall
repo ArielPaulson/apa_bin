@@ -1,0 +1,64 @@
+#!/usr/bin/env perl
+use strict;
+
+## http://samtools.sourceforge.net/pileup.shtml
+
+my ($bam, $ref_arg) = @ARGV;
+
+(my $out = $bam) =~ s/.bam/.basecalls.txt.gz/;
+my $cmd = 'samtools mpileup -A -B -Q 0 -d 100000 --ff 1540';
+
+if (-e $ref_arg) {
+    $cmd .= " -f $ref_arg"  # must be fasta file
+} else {
+    my $genofa = "/n/data1/genomes/indexes/$ref_arg/$ref_arg.fa";
+    if (-e $genofa) {
+        $cmd .= " -f $genofa";
+    } else {
+        die "$0: reference argument '$ref_arg' is not a fasta or a genome index name!\n";
+    }
+}
+
+$cmd .= " $bam";
+print "$cmd\n";
+
+my @B   = qw/ A C G T N /;
+my @BID = qw/ A C G T N INS DEL /;
+open my $OUT, '|-', "gzip -f > $out";
+print $OUT join("\t", qw/ CHR POS REF DEPTH A C G T N INS DEL AQ CQ GQ TQ NQ /), "\n";
+open my $IN, '-|', $cmd;
+while (<$IN>) {
+    chomp;
+    my ($chr, $pos, $ref, $dp, $calls, $quals) = split /\t/, $_;
+    $ref = "\U$ref";
+    if ($dp) {
+        my %x = ();
+        $x{INS}{N}++ while ($calls =~ s/\+\d+\w+//);
+        $x{DEL}{N}++ while ($calls =~ s/-\d+\w+//);
+        $calls =~ s/[^.,ACGTNacgtn]//g;
+        $calls = "\U$calls";
+        $calls =~ s/[.,]/$ref/g;
+        $quals =~ s/\s//g;
+        my @calls = split //, $calls;
+        my @quals = split //, $quals;
+        foreach my $i (0..$#calls) {
+            $x{$calls[$i]}{N}++;
+            push @{ $x{$calls[$i]}{Q} }, ord($quals[$i])-33;
+        }
+        foreach my $base (@B) {
+            if (exists $x{$base}) {
+                $x{$base}{Q} = join(' ', sort @{ $x{$base}{Q} });
+            } else {
+                $x{$base}{Q} = '.';
+            }
+        }
+        print $OUT join("\t", $chr, $pos, $ref, $dp, (map { $x{$_}{N}||0 } @BID), (map { $x{$_}{Q} } @B)), "\n";
+    } else {
+        print $OUT join("\t", $chr, $pos, $ref, $dp, (map {0} @B), (map {''} @B)), "\n";
+    }
+}
+close $IN;
+close $OUT;
+
+print "$0 $bam complete!\n";
+exit; 

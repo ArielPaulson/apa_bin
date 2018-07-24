@@ -1,0 +1,40 @@
+#!/usr/bin/env perl
+use strict;
+
+my (%junctions, $ID, $bookends);
+open IN, $ARGV[0] or die "Cannot read '$ARGV[0]': $!\n";
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//g;
+    next if $. < 6;
+    my ($ident, $misses, $reps, $Ns, $qgaps, $qgapbp, $sgaps, $sgapbp, $strand, $query, $querylen, $qpos1, $qpos2, $subj, $subjlen, $spos1, $spos2, $blocks, $blocksizes, $qstarts, $tstarts) = split /\t/, $_;
+    $tstarts =~ s/,$//;
+    $blocksizes =~ s/,$//;
+    my @tstarts = split /,/, $tstarts;
+    my @blocksizes = split /,/, $blocksizes;
+    foreach my $i (1..$#tstarts) {
+	my ($jstart, $jend) = ($tstarts[$i-1]+$blocksizes[$i-1]+1, $tstarts[$i]);   # remember this is in 0-based
+	if ($jstart > $jend) {
+	    $bookends++;  # bookended "junction" = query insertion
+	    next;  # do not record
+	}
+	$junctions{$subj}{"$jstart\t$jend"}++;  # N = transcripts with junction, NOT reads crossing junction
+    }
+}
+close IN;
+
+foreach my $subj (sort keys %junctions) {
+    foreach my $junc (sort {$a <=> $b} keys %{ $junctions{$subj} }) {
+	$ID++;
+    }
+}
+my $maxdig = length($ID);
+$ID = undef;
+foreach my $subj (sort keys %junctions) {
+    foreach my $junc (sort {$a <=> $b} keys %{ $junctions{$subj} }) {
+	$ID++;
+	my $gap = $maxdig-length($ID);
+	my $pID = $gap ? ('0'x$gap).$ID : $ID;
+	print "$subj\t$junc\tJUNC$pID\t$junctions{$subj}{$junc}\n";
+    }
+}
+exit;

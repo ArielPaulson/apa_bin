@@ -1,0 +1,155 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+## Author: Ariel Paulson (apa@stowers.org).
+## Filters, sorts, indexes, and idxstats an input bam (or sam)
+## Catches corrupted bams and retries operations, up to 3 times per op.
+##
+## NOTE: minimum memory allocation is $cores GB; $mem has effect ONLY when > $cores GB.
+
+
+my $samtools = 'samtools';
+
+my ($inbam, $outbam, $sort, $aligned, $minqual, $primary, $concordant, $cores, $mem, $nosort);
+GetOptions("i=s"=>\$inbam, "o=s"=>\$outbam, "q=i"=>\$minqual, "c=i"=>\$cores, "m=s"=>\$mem, "aligned"=>\$aligned, "concordant"=>\$concordant, "sort"=>\$sort, "primary"=>\$primary);
+
+die "$0: input bam '$inbam' is empty or does not exist!\n" unless -s $inbam;
+my $sam = $inbam =~ /\.sam$/;
+my $filter = $minqual || $aligned || $primary || $concordant;
+
+$cores = 1 unless $cores;
+my $threadmem;   # 'samtools sort' per-thread mem
+if ($mem) {
+    my ($memN, $memL) = ($mem =~ /^(\d+)([A-Z])$/);
+    my $memL2 = $memL eq 'T' ? 'G' : $memL eq 'G' ? 'M' : $memL eq 'M' ? 'K' : $memL eq 'K' ? 'B' : '';
+    die "$0: memory string '$mem' not understood!\n" unless $memL2;
+    $threadmem = sprintf("%0.3f", $memN/$cores);
+    if ($threadmem < 1) {
+        $threadmem = sprintf("%0.0f", 1024*$threadmem) . $memL2;
+    } else {
+        $threadmem .= $memL;
+    }
+    $threadmem = '1G' if $mem < $cores;
+}
+
+my $tmp = "$outbam.tmp";
+my $tempbam = "$tmp.bam";
+my $tempsort = "$tmp.sort.bam";
+
+my $corrupt = &validate_bam($inbam);
+die "$0: input bam '$inbam' is corrupted!\n" if $corrupt;
+
+
+if ($filter) {
+    
+    ## Must filter bam before sorting
+    my $cmd = "$samtools view -h";
+    $cmd .= " -q $minqual" if $minqual;
+    $cmd .= " -F 4" if $aligned;
+    $cmd .= " -F 256" if $primary;
+    $cmd .= " -f 2" if $concordant;
+    $cmd .= " $inbam | $samtools view -bS - > $tempbam";
+    
+    &retry_until_valid($cmd, $tempbam, 3);
+    
+} else {
+    
+    ## No filtering
+    if ($sam) {
+        system "$samtools view -h -bS $inbam > $tempbam";
+    } else {
+        system "ln -sf $inbam $tempbam";
+    }
+    
+}
+
+
+if ($sort) {
+    
+    my $cmd = "$samtools sort -@ $cores";
+    $cmd .= " -m $threadmem" if $threadmem;
+    $cmd .= " -o $tempsort $tempbam";
+    &retry_until_valid($cmd, $tempbam, 3);
+    system "mv -f $tempsort $tempbam";
+    
+}
+
+
+## Index and idxstats
+chomp(my $tmp_true = `readlink -f $tempbam`);
+chomp(my $out_true = `readlink -f $outbam`);
+system "mv -f $tempbam $outbam" if $tmp_true ne $out_true;   ## if $inbam==$outbam and no filter or sort, then tmp and out will be the same...
+&execute("$samtools index $outbam", 1);
+(my $outidx = $outbam) =~ s/\.bam$/.idxstats.txt/;
+&execute("$samtools idxstats $outbam > $outidx", 1);
+
+
+system "rm -f $tmp.*";
+print "$0 $inbam complete!\n";
+exit;
+
+
+
+
+
+sub execute {
+    
+    ## Runs command and maybe prints to STDOUT/ERR
+    
+    my ($cmd, $out) = @_;
+    
+    my $FH = $out==1 ? *STDOUT : $out==2 ? *STDERR : undef;
+    print $FH "\n$cmd\n" if $FH;
+    system $cmd;
+}
+
+
+
+
+
+sub validate_bam {
+    
+    ## Returns non-null if the bam file is corrupted
+    
+    my $BAM = shift;  # /path/to/file.bam
+    my $MSG = "validate.bam.$$.msg";
+    my $ERR;
+    if (-s $BAM) {
+        system "samtools view $BAM 2> $MSG | head > /dev/null";
+        chomp($ERR = `cat $MSG`);
+        system "rm -f $MSG";
+    } else {
+        $ERR = "$BAM does not exist or is empty!";
+    }
+    return $ERR;
+}
+
+
+
+
+
+sub retry_until_valid {
+    
+    ## Retries an operation N times, or until output bam is OK.
+    
+    my ($cmd, $testbam, $max_attempts) = @_;
+    
+    my $attempts;
+    {
+        $attempts++;
+        &execute($cmd, 1);
+        my $corrupt = &validate_bam($testbam);
+        if ($corrupt) {   # truncated bam or something
+            print "$corrupt\n*** Bam has errors, retrying operations...\n";
+            if ($attempts == $max_attempts) {
+                die "$0: failed $attempts times to produce error-free bam; not trying again!\n";
+            } else {
+                redo;
+            }
+        }
+    }
+     
+}   

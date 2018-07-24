@@ -1,0 +1,119 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## Takes a fasta and a number of output files to split it into, 
+##  and tries to make the byte counts of the files as evenly as possible.
+## It doesn't try THAT hard, not doing any combinatorics.
+## Basically, sorts sequences by length, then sends N extremes from either end to one file, removes them, and repeats.
+
+my $verbose = 0;
+my ($fasta, $N, $prefix) = @ARGV;
+$prefix = "$fasta.fastaDistribute" unless $prefix;
+die "Number of outputs not specified!\n" unless $N;
+
+my (@headers, $header, %seq, %len);
+print STDERR "Reading fasta...\n";
+open my $IN, '<', $fasta or die "$0: Cannot read fasta '$fasta': $!\n";
+while (<$IN>) {
+    if (/^>(.*)/) {
+	$header = $1;
+	push @headers, $header;
+    } else {
+	$seq{$header} .= $_;
+    }
+}
+close $IN;
+
+%len = map {($_=>length($seq{$_}))} %seq;
+@headers = sort { $len{$b} <=> $len{$a} } @headers;
+my $spformat = '%0'.length($N).'i';
+
+my ($sum, $mean, @overmax, @undermax, $over);
+
+print STDERR "Writing oversized sequences...\n";
+my $iter = -1;
+{
+    $iter++;
+    $sum += $_ foreach values %len;
+    $mean = $sum / $N;
+    
+    foreach my $header (@headers) {  # sorted by length decreasing
+	if ($len{$header} >= $mean) {
+	    push @overmax, $header;
+	} else {
+	    push @undermax, $header;
+	}
+    }
+    
+    if (@overmax) {
+	foreach my $i (0..$#overmax) {
+	    $over++;
+	    my $i2 = sprintf($spformat, $i);
+	    open my $OUT1, '>', "$prefix.$i2.fa" or die "$0: Cannot write fasta '$prefix.$i2.fa': $!\n";
+	    print $OUT1 ">$overmax[$i]\n$seq{$overmax[$i]}";
+	    close $OUT1;
+	}
+	print STDERR "$0 iter 1: ".scalar(@overmax)." over max\n";
+	$N -= scalar @overmax;
+	$sum = $mean = 0;
+	@headers = @undermax;
+	@overmax = @undermax = ();
+	print STDERR " Iter $iter: $over overmax sequences\n" if $verbose;
+	redo;
+    }
+}
+print STDERR " Iter $iter: $over overmax sequences\n";
+
+print STDERR "Writing remaining sequences...\n";
+my %OUT;
+foreach my $i (1..$N) {
+    my $j = $i + $over;
+    my $j2 = sprintf($spformat, $j);
+    open $OUT{$i}, '>', "$prefix.$j2.fa" or die "$0: Cannot write fasta '$prefix.$j2.fa': $!\n";
+}
+
+my $rem = scalar @undermax;
+my $pass;
+my ($total, %unique);
+{
+    $pass++;
+    my $write = 0;
+    if ($rem) {
+	## Write N largest to files
+	foreach my $i (1..$N) {
+	    my $fh = $OUT{$i};
+	    my $header = shift @undermax;
+	    print $fh ">$header\n$seq{$header}";
+#	    print STDERR " $i Hi: $header\n" if $verbose;
+	    $unique{$header} = 1;
+	    $write++;
+	    $rem--;
+	    last unless $rem;
+	}
+    }
+    if ($rem) {
+	## Write N smallest to files
+	foreach my $i (1..$N) {
+	    my $fh = $OUT{$i};
+	    my $header = pop @undermax;
+	    print $fh ">$header\n$seq{$header}";
+#	    print STDERR " $i Lo: $header\n" if $verbose;
+	    $unique{$header} = 1;
+	    $write++;
+	    $rem--;
+	    last unless $rem;
+	}
+    }
+    $total += $write;
+    print STDERR "Pass $pass: $write written | $rem remaining | $total total writes | ",scalar(keys %unique)," unique\n" if $verbose;
+    redo if $rem;
+}
+
+foreach my $i (1..$N) {
+    close $OUT{$i};
+}
+
+print STDERR "$0 complete!\n";
+exit;

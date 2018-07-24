@@ -1,0 +1,21 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my ($ingtf, $chrsizes, $outbb) = @ARGV;
+
+($outbb = $ingtf) =~ s/.gtf\d?$/.bb/ unless $outbb;
+
+my $tmp = "gtf2bb.$$.tmp";
+
+die "Input GTF file unspecified or nonexistent!\n" unless -e $ingtf;
+die "Chromosome sizes file unspecified or nonexistent!\n" unless -e $chrsizes;
+
+##/home/apa/local/bin/fixBed -i $ingtf --UCSC-gtf > $tmp.gtf    # maybe add 'fix' step later; for now, fix before sending to gtf2bb
+system "gtfToGenePred $ingtf $tmp.genepred";
+system "/home/apa/local/bin/scriptutils/genePredToBed $tmp.genepred $tmp.bed12";
+system "/home/apa/local/bin/sortBedCoord -i $tmp.bed12 --overwrite";
+system "bedToBigBed -tab -type=bed12 $tmp.bed12 $chrsizes $outbb";
+system "rm -f $tmp.*";
+print "gtf2bb $ingtf complete!\n";

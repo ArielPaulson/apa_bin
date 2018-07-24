@@ -1,0 +1,53 @@
+#!/usr/bin/perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my $ext;
+my @chrs;
+my %exons;
+my %allgenes;
+#my %ok_ext = map {($_=>1)} qw/ gff gff2 gff3 gtf /;  # not here yet
+my %ok_ext = map {($_=>1)} qw/ gtf /; 
+
+my $input = $ARGV[0];
+my $bytrans = $ARGV[1];
+($ext) = ($input =~ /\.(\w{3,4})$/);
+$ext = "\L$ext";
+die "Unknown input extension '$ext': must be one of: ", join(', ', sort keys %ok_ext), " !\n" unless $ok_ext{$ext};
+
+my %strandMap = ('+'=>'+', '-'=>'-', '++'=>'+', '+-'=>'-', '-+'=>'-', '--'=>'+', '.'=>'.', ''=>'.', '*'=>'.');
+
+open IN, $input or die "$0: Cannot open GxF file '$input' for reading: $!\n";
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    my ($chr, $src, $type, $start, $end, $score, $strand, $frame, $annot) = split /\t/, $_;
+    next unless $type eq 'exon';
+    $start--;  # now 0-based
+    push @chrs, $chr unless $exons{$chr};  # record only once
+    my ($gene) = ($annot =~ /gene_id "([^"]+)"/);
+    my ($trans) = ($annot =~ /transcript_id "([^"]+)"/);
+    $gene = $trans if $bytrans;
+    print "$0: No gene on line $.: $_\n" unless $gene;
+    print "$0: Unknown strand '$strand' on line $.: $_\n" unless $strandMap{$strand};
+    $exons{$chr}{$gene}{"$start\t$end"} = $strandMap{$strand};
+    $allgenes{$gene} = 1;
+}
+my $exonN = $.;
+my $geneN = scalar keys %allgenes;
+close IN;
+
+my $label = $bytrans ? 'transcripts' : 'genes';
+print STDERR "$exonN exons in $geneN $label counted.\n";
+
+#print "track name=$fname.exons\n";
+foreach my $chr (@chrs) {
+    foreach my $gene (keys %{ $exons{$chr} }) {
+	my $nexons = 0;
+	foreach my $exon (sort {$a <=> $b} keys %{ $exons{$chr}{$gene} }) {
+	    $nexons++;
+	    print "$chr\t$exon\t$gene:$nexons\t1\t$exons{$chr}{$gene}{$exon}\n";
+	}
+    }
+}
+exit;

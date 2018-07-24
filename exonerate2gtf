@@ -1,0 +1,116 @@
+#!/usr/bin/env perl
+require '/home/apa/local/bin/apa_routines.pm';
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+## Converts Exonerate output into target GTF and optional query fasta.
+## CURRENTLY DESIGNED TO WORK WITH REMAPMODELS OUTPUT ONLY.  
+## Not designed to handle just any old Exonerate -m est2genome output, but it might.
+## This is because remapModels has a set Exonerate output format, and has extra info in the target names.
+## In any case, Exonerate MUST have been run with flags '--showcigar --showtargetgff -n 1'.
+
+
+## Dependencies
+my $bin = '/home/apa/local/bin';
+my $genePredToBed = "$bin/scriptutils/genePredToBed";
+my $gtfToGenePred = 'gtfToGenePred';
+my $fastaFromBed = 'fastaFromBed';
+
+
+## Inputs
+my $input;     # input, which is Exonerate output
+my $outpref;   # output prefix, otherwise uses $input
+my $fasta;     # output fasta of transcripts? (requires $ref_fa) 
+my $ref_fa;    # reference for sequence extraction -- $input must be relative to this -- only required if $fasta
+my $native;    # if coords (i.e., $ref_fa) is a genomic region, then provide the CSV BED6 definition for that region here, and will remap back to genomic coords.
+               # CSV BED6 i.e. "-n chrom,start,end,name,score,strand"
+
+
+## Get and Test Arguments
+GetOptions("i=s"=>\$input, "o=s"=>\$outpref, "r=s"=>\$ref_fa, "n=s"=>\$native, "fasta"=>\$fasta);
+
+$outpref = $input unless $outpref;
+die "$0: Must specify -g if calling --fasta!\n" if $fasta && !$ref_fa;
+&validate('file', $input, 'Exonerate output', 1);
+&validate('file', $ref_fa, 'Genome fasta') if $fasta;
+
+
+## Locations, Files and Filehandles
+my $gtf = "$outpref.gtf";
+my $fa = "$outpref.fa";
+my $gp = "$outpref.genePred";  # temporary
+my $bed12 = "$outpref.bed12";  # temporary
+my $IN = &open2('R', $input, 'Exonerate output');
+my $GTF = &open2('W', $gtf, 'Target gtf');
+
+
+## Globals
+my %GAR;   # cigar/vulgar-related data
+my ($Nchr, $Nstart, $Nend, $Nstrand) = (split /,/, $native)[1,2,5];   # 0-BASED
+my $Nlen = $Nend - $Nstart;
+
+
+## Process Input
+# CIGAR, SUGAR, VULGAR: http://sss.hgc.jp/?phase=help;program=exonerate
+my ($begin, $trans, $nexon);
+while (<$IN>) {
+    s/[\n\r]+$//;
+    if (/^cigar: (.*)/) {
+	my @data = split /\s+/, $1;
+	$GAR{C}{Q} = [@data[0..3]];  # query dat
+	$GAR{C}{T} = [@data[4..7]];  # target dat
+	$GAR{C}{S} = $data[8];       # score
+	@data = @data[9..$#data];
+	for (my $i = 0; $i < $#data; $i += 2) {
+	    push @{ $GAR{C}{E} }, [@data[$i..$i+1]];  # cigar events
+	}
+    } elsif (/^vulgar: (.*)/) {
+	my @data = split /\s+/, $1;
+	$trans = $data[0];
+	$GAR{V}{Q} = [@data[0..3]];  # query dat
+	$GAR{V}{T} = [@data[4..7]];  # target dat
+	$GAR{V}{S} = $data[8];       # score
+	@data = @data[9..$#data];
+	for (my $i = 0; $i < $#data; $i += 3) {
+	    push @{ $GAR{V}{E} }, [@data[$i..$i+2]];  # vulgar events
+	}
+    } elsif (/^##gff-version/) {
+	$begin = 1;
+    } elsif ($begin && $_ !~ /^#/) {
+	my @data = split /\t/, $_;
+	next unless $data[2] eq 'exon';
+	$nexon++;
+	my ($score, $xstrand, $phase) = @data[5..7];
+	my ($gene, $chr, $gstart, $gend) = split /\./, $data[0];
+	my ($xstart, $xend) = ($data[3]+$gstart, $data[4]+$gstart);   # 1-BASED
+	my ($Tchr, $Tstart, $Tend, $Tstrand);  # 1-BASED
+	if ($native) {
+	    $Tchr = $Nchr;
+	    if ($Nstrand eq '-') {
+		$Tstart = $Nstart + ($Nlen - $xend) + 1;  # +1 because $Nstart is 0-based, but we want 1-based
+		$Tend = $Tstart + ($xend - $xstart);
+		$Tstrand = $xstrand = '-' ? '+' : '-';
+	    } else {
+		$Tstart = $xstart + $Nstart;
+		$Tend = $xend + $Nstart;
+		$Tstrand = $xstrand;
+	    }
+	} else {
+	    ($Tchr, $Tstart, $Tend, $Tstrand) = ($chr, $xstart, $xend, $xstrand);
+	}
+	print $GTF join("\t", $Tchr, @data[1..2], $Tstart, $Tend, $score, $Tstrand, $phase, "gene_id \"$gene\" ; transcript_id \"$trans\" ; exon_num $nexon ; $data[8]\n");
+    }
+}
+close $IN;
+close $GTF;
+
+if ($fasta) {
+    system "$gtfToGenePred $gtf $gp";
+    system "$genePredToBed $gp $bed12";
+    system "$fastaFromBed -name -s -split -fi $ref_fa -bed $bed12 -fo $fa";
+    system "perl -i -pe 's/(\\w{50})/\$1\\n/g' $fa";
+    system "rm -f $gp $bed12";
+}
+exit;

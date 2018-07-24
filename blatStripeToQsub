@@ -1,0 +1,77 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Getopt::Long;
+use File::Spec;
+use Pod::Usage;
+use strict;
+
+
+my $blat = 'blat';
+my $faToTwoBit = 'faToTwoBit';
+
+
+my $geno;
+my $window;
+my $query;
+my $outdir;
+my $clobber;
+my $blat_args;
+my $ignore_mask;
+my $mem = '5G';
+
+GetOptions("g=s"=>\$geno, "w=i"=>\$window, "q=s"=>\$query, "o=s"=>\$outdir, "oc=s"=>\$clobber, "a=s"=>\$blat_args, "m=s"=>\$mem, "ignore-mask"=>\$ignore_mask);
+
+die "$0: Window size must be greater than!\n" if $window < 1;
+die "$0: Query file does not exist!\n" unless -e $query;
+my $gpref = "/n/data1/genomes/indexes/$geno/$geno";
+my $chrsz = &validate('file', "$gpref.chrom.sizes", 'Chromosome size list', 1);
+my $fasta = &validate('file', "$gpref.fa", 'Genome fasta', 1);
+my $bit2m = "$gpref.masked.2bit";
+my $bit2u = "$gpref.2bit";
+my $bit2;
+if ($ignore_mask) {
+    system "faToTwoBit $fasta $bit2u" unless -e $bit2u;
+    $bit2 = &validate('file', $bit2u, 'Unmasked 2-bit file', 1);
+} else {
+    system "faToTwoBit -noMask $fasta $bit2m" unless -e $bit2m;
+    $bit2 = &validate('file', $bit2m, 'Masked 2-bit file', 1);
+}
+
+$outdir = &create_writedir($outdir, $clobber, 'Output location', 'blatStripeToQsub_out');
+my $sgedir = "$outdir/sge";
+my $psldir = "$outdir/psl";
+&validate('dir', $psldir, 'PSL location');
+&validate('dir', $sgedir, 'SGE location');
+
+my $halfwin = int($window/2);
+my %chrlen;
+my $qsub_sh = "$outdir/qsub.sh";
+
+my $QS = &open2('W', $qsub_sh, 'Output qsub script');
+my $CS = &open2('R', $chrsz, 'Chromosome size list');
+while (<$CS>) {
+    chomp;
+    my ($chr, $len) = split /\t/, $_;
+    my $chrlast = $len-$window;
+    $chrlast = 1 if $chrlast < 1;
+    my $nbatches = $len/$window;
+    $nbatches = int($nbatches)+1 if int($nbatches)<$nbatches;
+    $nbatches += ($nbatches-1) if $nbatches > 1;
+    my $nbw = length($nbatches);
+    my $i;
+    print STDERR "$chr : $len bp | $nbatches batches\n";
+    for (my $pos=0; $pos<=$chrlast; $pos+=$halfwin) {
+	my ($start, $end) = ($pos, $pos+$window);
+	$end = $len if $end > $len;
+	$i++;
+	my $zi = sprintf("%0${nbw}i", $i);
+	print $QS "qsub -l h_vmem=$mem -q all.q -b y -cwd -N $chr.$i.blatStripeToQsub.$$ -o $sgedir/$chr.$zi.out -e $sgedir/$chr.$zi.err '$blat $blat_args $bit2:$chr:$start-$end $query $psldir/$chr.$zi.psl'\n";
+    }
+}
+close $QS;
+close $CS;
+
+
+
+
+

@@ -1,0 +1,138 @@
+#!/usr/bin/perl
+use Getopt::Long;
+use strict;
+
+my ($defs, $bam, $outfile, $overpct, $nosumm, $components);
+my $ftype = 'exon';   # default feature type to process if using gtf/gff
+GetOptions("d=s" => \$defs, "b=s" => \$bam, "t=s" => \$ftype, "p=f" => \$overpct, "o=s" => \$outfile, "no-summary" => \$nosumm, "components" => \$components);
+my %exts = map {($_=>1)} qw/ bed gtf gff /;
+my ($ext) = ($defs =~ /\.(bed|gff|gtf)/i);
+$ext = "\L$ext";
+die "Unknown feature definition file type '$ext': must be one of: bed, gtf, gff.\n" unless $exts{$ext};
+die "Cannot mix '--components' and '--no-summary'!\n" if $components && $nosumm;
+my ($bampath) = ($bam =~ /^(.*)\/[^\/]+$/);
+$bampath = '.' unless $bampath;   # bam file might not have explicit path
+my $tempout = "featureCounts.$$.tmp";
+
+my ($bed, %featdata, %compdata);
+chomp(my $now = `date`);
+print "Reading $defs : $now\n";
+open IN, $defs or die "Cannot read '$defs': $!\n";
+if ($ext eq 'bed') {   # assuming uxon/iintron bed file; summarize at gene level
+    $bed = 1;
+    while (<IN>) {
+	next if ($_ =~ /^track/ || $_ =~ /^#/);
+	$_ =~ s/[\n\r]+$//;
+	my @data = split /\t/, $_;
+	my ($gene, $feat) = split /:/, $data[3];
+	my $len = $data[2]-$data[1];
+	&process_feat($gene, $feat, $len);
+   }
+} elsif ($ext eq 'gtf') {   # assuming cufflinks gtf; summarize at transcript level
+    while (<IN>) {
+	next if ($_ =~ /^track/ || $_ =~ /^#/);
+	$_ =~ s/[\n\r]+$//;
+	my @data = split /\t/, $_;
+	next unless $data[2] eq $ftype;
+	my ($trans, $feat) = ($data[8] =~ /gene_id ".*?"; transcript_id "(.*?)"; exon_number "(\d+)";/);
+	my $len = $data[4]-$data[3];
+	&process_feat($trans, $feat, $len);
+    }
+} elsif ($ext eq 'gff') {
+    die "gff processing not yet ready!\n";
+    while (<IN>) {
+	next if ($_ =~ /^track/ || $_ =~ /^#/);
+	$_ =~ s/[\n\r]+$//;
+	my @data = split /\t/, $_;
+	next unless $data[2] eq $ftype;
+	my ($trans, $feat) = ($data[8] =~ /gene_id ".*?"; transcript_id "(.*?)"; exon_number "(\d+)";/);
+	my $len = $data[4]-$data[3];
+	&process_feat($trans, $feat, $len);
+    }
+}
+close IN;
+
+my $fblurb = $overpct ? "-f $overpct" : '';
+my $com = "coverageBed -split $fblurb-abam $bam -b $defs > $tempout";
+chomp(my $now = `date`);
+print "$com : $now\n";
+system $com;
+
+chomp(my $now = `date`);
+print "Post-processing $tempout : $now\n";
+open IN, $tempout or die "Cannot open feature coverage file '$tempout': $!\n";
+if ($ext eq 'bed') {
+    while (<IN>) {
+	$_ =~ s/[\n\r]+$//;
+	my @data = split /\t/, $_;
+	my ($feat, $reads, $nzb, $width) = @data[3,6..8];
+	my ($gene, $else) = split /:/, $feat;
+	&postprocess_feat($gene, $feat, $reads, $nzb, $width);
+    }
+} elsif ($ext eq 'gtf') {
+    while (<IN>) {
+	$_ =~ s/[\n\r]+$//;
+	my @data = split /\t/, $_;
+	my ($trans, $feat) = ($data[8] =~ /gene_id ".*?"; transcript_id "(.*?)"; exon_number "(\d+)";/);
+	my ($reads, $nzb, $width) = @data[9..11];
+	&postprocess_feat($trans, $feat, $reads, $nzb, $width);
+    }
+} elsif ($ext eq 'gff') {
+    while (<IN>) {
+	$_ =~ s/[\n\r]+$//;
+	my @data = split /\t/, $_;
+	my ($trans, $feat) = ($data[8] =~ /gene_id ".*?"; transcript_id "(.*?)"; exon_number "(\d+)";/);
+	my ($reads, $nzb, $width) = @data[9..11];
+	&postprocess_feat($trans, $feat, $reads, $nzb, $width);
+    }
+}
+close IN;
+
+foreach (keys %featdata) {
+    print "$_: Length ($featdata{$_}{L}) != Width ($featdata{$_}{W})!\n" if $featdata{$_}{L} != $featdata{$_}{W};
+}
+
+$outfile = "$bampath/featureCounts.txt" unless $outfile;
+open OUT, "> $outfile" or die "Cannot write results to '$outfile': $!\n";
+print OUT "Object\tLength\tReads\tCovBp\n";
+foreach my $feat (sort keys %featdata) {
+    print OUT join ("\t", ($feat, map {$featdata{$feat}{$_}} qw/ L R C /));
+    if ($components) {
+	foreach my $comp (sort keys %{ $featdata{$feat} }) {
+	    print OUT join (',', ($comp,map {$compdata{$feat}{$comp}{$_}} qw/ L R C /)), ' ';
+	}
+    }
+    print OUT "\n";
+}
+close OUT;
+
+unlink $tempout;
+chomp(my $now = `date`);
+print "Complete: $now\n";
+exit;
+
+
+sub process_feat {
+    my ($gene, $feat, $len) = @_;
+    my $obj = $nosumm ? $feat : $gene;
+    $featdata{$obj}{L} += $len;    # feature length
+    $featdata{$obj}{$_} = 0 foreach qw/ R C /;  # ensure printable values
+    if ($components) {
+	$compdata{$gene}{$feat}{L} = $len;
+	$compdata{$gene}{$feat}{$_} = 0 foreach qw/ L W R C /;  # no $obj here, because this data is hierarchical
+    }
+}
+
+sub postprocess_feat {
+    my ($gene, $feat, $reads, $nzb, $width) = @_;
+    my $obj = $nosumm ? $feat : $gene;
+    $featdata{$obj}{W} += $width;  # reported feature length
+    $featdata{$obj}{R} += $reads;  # read count
+    $featdata{$obj}{C} += $nzb;    # nonzero (covered) bases   
+    if ($components) {
+	$compdata{$gene}{$feat}{W} = $width;
+	$compdata{$gene}{$feat}{R} = $reads;
+	$compdata{$gene}{$feat}{C} = $nzb;
+    }
+}
+

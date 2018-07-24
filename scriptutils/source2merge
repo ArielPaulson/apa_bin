@@ -1,0 +1,32 @@
+#!/usr/bin/env perl
+use strict;
+
+## THIS SCRIPT MUST BE SUBSUMED BY MERGEPEAKS IN ORDER TO ALWAYS WORK CORRECTLY
+## MUST HAVE LIST OF PEAKS-PER-SOURCE IN ORDER TO CORRECTLY IDENTIFY SOURCE PER PEAK
+
+## must be run inside an output directory of 'mergePeaks'
+
+my %data;
+open my $IN, '<', 'merged_peaks_key.txt' or die;
+while (<$IN>) {
+    $_ =~ s/[\n\r]+$//;
+    next if $. == 1;
+    my ($merge, $inputs) = split /\t/, $_;
+    my ($group) = ($merge =~ /_(P\d+)_\d+$/);
+    foreach my $peak (split /;/, $inputs) {
+#	my ($source, $n) = ($peak =~ /(.*)\D(\d+)$/);
+	my ($source, $n) = ($peak =~ /([^_]+)_(.*)$/);
+	$data{$source}{$n} = "$source\t$peak\t$group\t$merge\n";
+    }
+}
+close $IN;
+
+open my $OUT, '>', 'source2merge.txt' or die;
+print $OUT "Source\tPeak\tGroup\tMerge\n";
+foreach my $source (sort keys %data) {
+    foreach my $n (sort {$a <=> $b} keys %{ $data{$source} }) {
+	print $OUT $data{$source}{$n};
+    }
+}
+close $OUT;
+exit;

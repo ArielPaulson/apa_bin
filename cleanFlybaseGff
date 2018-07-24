@@ -1,0 +1,28 @@
+#!/usr/bin/env perl
+use strict;
+
+## This script strips all sequence and all lines starting with '#' from a gff -- especially useful when dealing with flybase gffs
+## Also has "core" mode, which retains only fields related to gene and transcript structure (see below), not all the other junk.
+##  This might have to be updated periodically and flybase might add new transcript structure features or change names.
+
+my ($file, $core) = @ARGV;
+$core = 1 if $core eq '--core';
+
+my %corefields = map {($_=>1)} qw/ gene pseudogene exon intron CDS three_prime_UTR five_prime_UTR polyA_site mRNA pre_miRNA miRNA snRNA snoRNA rRNA tRNA ncRNA transposable_element /;
+
+my $newext = $core ? 'core' : 'clean';
+
+open IN, $file or die "Cannot open '$file': $!\n";
+open OUT, "> $file.$newext";
+while (<IN>) {
+    next if $_ =~ /^\#/;			# random header junk
+    next if scalar (split /\t/, $_) == 1;	# not a tab-delimited line -- probably sequence
+    my @data = split /\t/, $_, 4;
+    if ($core) {
+	print OUT $_ if $corefields{$data[2]};
+    } else {
+	print OUT $_;
+    }
+}
+close OUT;
+exit;

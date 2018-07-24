@@ -1,0 +1,137 @@
+#!/usr/bin/perl
+use strict;
+
+# command line: /home/apa/local/bin/fimo2fishers <config_file> --text
+# "--text" indicates that fimo call also used --text (= different format from normal fimo output)
+# config file described below
+
+## NAMING CONVENTIONS:
+# files / dirs must be organized around 2 name sets: fasta names and motif-db names
+# 1. fastas must have names = $fasta.fa
+# 2. motif dbs can have any name ($db) as long as it is consistent; this includes meme.html files
+# 3. fimo directory for given fasta/motifdb = $fasta.$db
+# 
+## CONFIG FILE: 
+# tab delim, 2 types of entries: 1 for motif databases and one for sample-sample comparisons
+# Motif-DB entries have 3 fields: 'DB', Name (from #2 above), and path to db file
+#  - To use a meme.html as the motif db, just give it a unique name (e.g. "up_meme") and use the path to the meme.html
+# Comparison entries have 2 fields: sample name 1, sample name 2 (from #1 above)
+# 
+# Example from a microarray DE experiment:
+# 1. fastas: up.fa and down.fa
+# 2. motif dbs: transfac and jaspar, also up_meme and down_meme for MEME runs
+# 3. fimo dirs: up.transfac, up.jaspar, up.up_meme, up.down_meme, down.transfac, down.jaspar, down.up_meme, down.down_meme
+# 
+# Config file looks like:
+# DB    transfac    /memedir/db/motif_databases/transfac-2011.4.meme     # transfac db entry
+# DB    jaspar      /memedir/db/motif_databases/JASPAR_CORE_2009.meme    # jaspar db entry
+# DB    up_meme     /up.meme_out/meme.html                               # meme results for up.fa
+# DB    down_meme   /down.meme_out/meme.html                             # meme results for down.fa
+# up    down                                                             # comparison of 'up' vs 'down'
+
+
+my $cfg = $ARGV[0];
+my $text;
+foreach (@ARGV) {
+    $text = 1 if $_ eq '--text';
+}
+
+my (%dbs, @pairs);
+open IN, $cfg or die "Cannot open config file '$cfg': $!\n";
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    $_ =~ s/\s+#.*$//;         # can have comments in cfg file; this strips them
+     my @data = split /\t/, $_;
+    if ($data[0] eq 'DB') {    # motif-db entry
+	$dbs{$data[1]} = $data[2];   # name = path
+    } else {  	               # fasta name pair (extensionless)
+	push @pairs, \@data;
+    }
+}
+close IN;
+
+my ($motif, %motifdata);
+foreach my $db (keys %dbs) {
+    open IN, $dbs{$db} or die "Cannot read motif database '$dbs{$db}': $!\n";
+    if ($dbs{$db} =~ /\.meme$/) {
+	while (<IN>) {
+	    $_ =~ s/[\n\r]+$//;
+	    if ($_ =~ /^MOTIF (\S+) (\S+)/) {
+		$motif = $1;
+		$motifdata{$motif}->[0] = $2;  # motif name
+	    } elsif ($_ =~ /^URL (\S+)/) {
+		$motifdata{$motif}->[1] = $1;  # URL for motif page at db website
+	    }
+	}
+    } elsif ($dbs{$db} =~ /meme\.html$/) {
+	# nothing to parse, but format OK
+    } else {
+	die "Motif database '$dbs{$db}' is not in .meme or meme.html format!  Cannot parse.\n";
+    }
+    close IN;
+}
+
+my (%pairdata, %pairmotifs, %N);
+open OUT, "> fimo2fishers.out.txt";
+print OUT "Set1\tSet2\tDB\tMotif\tName\tFG.W\tFG.WO\tBG.W\tBG.WO\tURL\n";
+foreach my $pair (@pairs) {
+    
+    # header count
+    chomp($N{$$pair[0]} = `grep '>' $$pair[0].fa | wc -l`);
+    chomp($N{$$pair[1]} = `grep '>' $$pair[1].fa | wc -l`);
+    
+    foreach my $db (keys %dbs) {
+	
+	print "Processing: $$pair[0] / $$pair[1], $db\n";  # reporter
+	
+	## process fimo output
+	open IN, "$$pair[0].$db/fimo.txt" or die "Fimo output '$$pair[0].$db/fimo.txt' does not exist!\n";
+	$text ? &process_fimo_out_text($$pair[0], $db) : &process_fimo_out_full($$pair[0], $db);
+	close IN;
+	
+	open IN, "$$pair[1].$db/fimo.txt" or die "Fimo output '$$pair[1].$db/fimo.txt' does not exist!\n";
+	$text ? &process_fimo_out_text($$pair[1], $db) : &process_fimo_out_full($$pair[1], $db);
+	close IN;
+	
+	$pairmotifs{$db}{$_} = 1 foreach ((keys %{ $pairdata{$$pair[0]}{$db} }), (keys %{ $pairdata{$$pair[1]}{$db} }));  # all motifs found in either fasta
+	
+	foreach my $motif (keys %{ $pairmotifs{$db} }) {
+	    my ($name, $url) = $motifdata{$motif} ? @{ $motifdata{$motif} } : ("$db:$motif",'');
+	    my $fgw = scalar keys %{ $pairdata{$$pair[0]}{$db}{$motif} };   # foreground (sample 1) peaks with motif
+	    my $bgw = scalar keys %{ $pairdata{$$pair[1]}{$db}{$motif} };   # background (sample 2) peaks with motif
+	    my $fgwo = $N{$$pair[0]} - $fgw;                                # foreground peaks without motif
+	    my $bgwo = $N{$$pair[1]} - $bgw;                                # background peaks without motif
+	    print OUT "$$pair[0]\t$$pair[1]\t$db\t$motif\t$name\t$fgw\t$fgwo\t$bgw\t$bgwo\t$url\n";
+	}
+    }
+}
+close OUT;
+exit;
+
+
+
+
+sub process_fimo_out_full {
+    my ($set, $db) = @_;
+    while (<IN>) {
+	$_ =~ s/[\n\r]+$//;
+	my @data = split /\t/, $_;
+	if ($. > 1) {
+	    my ($motif, $seq, $start, $end, $score, $pval, $qval, $match) = @data;   # 'full' output has score, q-values; no strand or log-odds
+	    $pairdata{$set}{$db}{$motif}{$seq}++;
+	}
+    }
+}
+
+
+sub process_fimo_out_text {
+    my ($set, $db) = @_;
+    while (<IN>) {
+	$_ =~ s/[\n\r]+$//;
+	my @data = split /\t/, $_;
+	if ($. > 1) {
+	    my ($motif, $seq, $start, $end, $strand, $lods, $pval, $match) = @data;  # 'text' output has strand, log-odds; no score or q-values
+	    $pairdata{$set}{$db}{$motif}{$seq}++;
+	}
+    }
+}

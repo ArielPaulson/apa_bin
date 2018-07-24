@@ -1,0 +1,203 @@
+#!/usr/bin/env Rscript
+
+stop("Not ready to run yet!\n")
+
+## THIS SCRIPT EXPECTS THAT YOU HAVE ALREADY CREATED SAMPLE HEATMAP MATRICES WITH /home/apa/local/bin/prepareHeatmapMatrices.
+
+## SETUP
+
+rdata.suffix <- ".coverage_matrix_data.RData"    ## MUST MATCH SUFFIX USED BY apa_tools.R::coverage.matrix.generate()
+
+source("/home/apa/apa_tools.R")
+
+ca <- commandArgs(trailing=TRUE)
+samples <- ca[1]    # 2- to 5-col tab-delim file w/ header row: sample name, matrix type, optional 1|0 use for clustering?, optional sample bed file, optional sample-bed metadata file.  See more description below.
+bedfile <- ca[2]    # the original bed file behind the coord set used for ALL the RData files given in 'samples'.
+matpath <- ca[3]    # directory where sample matrix RData files can be found, i.e. /path/to/dataroot/bedfile/kvalue/ (see prepareHeatmapMatrices script for more info).
+outpref <- ca[4]    # prefix for output files
+#sampsig <- ca[5]    # sample-bed significance value, assuming IDR, so default is 0.01
+
+
+## samples=""; bedfile=""; matpath=""; outpref=""
+
+idr.p <- 0.01
+macs2.p <- 1e-06    ## FIXME: this needs to be better handled, somehow...
+
+
+## Get samples table and ensure format is complete
+samples <- as.matrix(read.delim(samples, as.is=TRUE))
+samples[is.na(samples)] <- ""
+if (ncol(samples)==2) samples <- cbind(samples, CLUST=1)  # add optional 3rd column, if not there originally (if unspecified, ALL samples are used for clustering)
+if (ncol(samples)==3) samples <- cbind(samples, BED="")   # add optional 4th column, if not there originally
+if (ncol(samples)==4) samples <- cbind(samples, META="")  # add optional 5th column, if not there originally
+S <- nrow(samples)
+
+## Validate sample files ('samples' column 1)
+if (!grepl("/$",matpath)) matpath <- paste0(matpath,"/")
+rdatas <- paste0(matpath, samples[,1], rdata.suffix)
+if (any(!file.exists(rdatas))) {
+    lost <- rdatas[!file.exists(rdatas)]
+    stop(paste(c("The following expected RData files were not found:",paste("",lost)),collapse="\n"))
+}
+
+## Validate matrix-type names ('samples' column 2)
+mat.types <- c("raw","logrpm","pctmax","zscore")
+mat.ok <- samples[,2] %in% mat.types
+LFC.N <- rep(NA, S)
+if (any(!mat.ok)) {
+    is.LFC <- grep("^LFC",samples[,2])
+    mat.ok[is.LFC] <- TRUE
+    n <- as.numeric(sub("^LFC","",samples[is.LFC,2]))  # expecting "LFC" or "LFC1", or maybe "LFC2" etc, depending on which of N inputs (associated with IP) is the pertinent one.
+    LFC.N[is.LFC] <- ifelse(is.na(n), 1, n)            # since 99% of objects will only have 1 LFC.matrix entry anyway, allow "LFC" as shorthand for "LFC1"
+}
+if (any(!mat.ok)) {
+    stop(paste("The following matrix types are not supported:",paste(sort(unique(samples[!mat.ok,2])),collapse=", "),"!\n"))
+}
+
+## Check for sample bed and metadata files, read in if exist
+## First fill in for any "auto" sample-bed entries
+which.auto4 <- which(samples[,4]=="auto")
+if (length(which.auto4)>0) samples[which.auto4,4] <- sub("/bams/pooled.bam","/idr/macs2_idr_compare.pooled_idr_stats.true.bed",mat.bams[which.auto4])
+have.sb <- file.exists(samples[,4])
+
+## if autodetecting bed, then can also autodetect metadata
+which.auto5 <- which(samples[,4]=="auto" & samples[,5]=="")  # if bed is "auto", then meta will also be auto (no need to specify "auto" again).
+if (length(which.auto5)>0) samples[which.auto5,5] <- sub("/bams/pooled.bam","/idr/macs2_idr_compare.pooled_idr_stats.true.txt",mat.bams[which.auto5])
+have.sm <- file.exists(samples[,5])
+
+## ensure all metas have corresponding beds (although beds need not have corresponding metas)
+meta.not.bed <- which(have.sm & !have.sb)
+bed.not.meta <- which(have.sb & !have.sm)
+if (any(meta.not.bed)) stop(paste0("FATAL: Some sample metadata files lack a corresponding bed file!\n ",paste(samples[meta.not.bed,5],collapse="\n ")))
+if (any(bed.not.bed)) message(paste0("FYI: Some sample bed files lack a corresponding metadata file!\n ",paste(samples[bed.not.meta,4],collapse="\n ")))
+## read in any sample beds
+if (any(have.sb)) {
+    samp.bed <- samp.sig <- lapply(samples[,4], function(x) if (x!="") read.bed(x) )
+    for (i in 1:S) if (length(samp.bed[[i]])>0) samp.sig[[i]] <- rep(TRUE,nrow(samp.bed[[i]]))  # default: assume all peaks in bed file are "significant"
+}
+
+## read in any metadata
+if (any(have.sm)) {
+    samp.meta <- lapply(samples[,5], function(x) if (x!="") read.delim(x,as.is=TRUE) )
+    for (i in 1:S) {
+        if (length(samp.meta[[i]])>0) {
+            ## Match bed names in metadata file
+            name.col <- NA
+            for (j in 1:ncol(samp.meta[[i]])) {
+                if (all(samp.bed[,4] %in% samp.meta[[i]][,j])) name.col <- j
+            }
+            if (is.na(name.col)) {
+                stop(paste0("Peak names for sample '",samples[i,1],"' were not matched in the corresponding metadata file!\n"))
+            } else {
+                samp.meta[[i]] <- samp.meta[[i]][real(match(samp.bed[,4],samp.meta[[i]][,name.col])),]   # ensure metadata has same row order as bed file
+            }
+            ## Identify "significant" sample peaks, for samples with metadata
+            if ("IDR.Pglobal" %in% colnames(samp.meta[[i]])) {      # new IDR output
+                samp.sig[[i]] <- samp.meta[[i]]$IDR.Pglobal<=idr.p
+            } else if ("IDR" %in% colnames(samp.meta[[i]])) {       # old IDR output
+                samp.sig[[i]] <- samp.meta[[i]]$IDR<=idr.p
+            } else if (grepl("pvalue",colnames(samp.meta[[i]]))) {  # MACS2 output?
+                samp.sig[[i]] <- samp.meta[[i]][,grep("pvalue",colnames(samp.meta[[i]]))[1]]>=-log10(macs2.p)
+            } else {   
+                stop(paste0("Metadata for sample '",samples[i,1],"' does not have a detectable p-value column!\n"))
+            }
+        }
+    }
+}
+
+
+
+
+## Load matrix list, ensure they actually exist (perhaps files were generated from an older version of coverage.matrix.generate()...)
+mat.beds <- mat.bams <- rep("",S)
+matrices <- new.list(samples[,1])
+for (i in 1:S) {
+    load(rdatas[i])  # 'coverage.matrix.data'
+    if (!is.na(LFC.N[i])) {
+        lfc.len <- length(coverage.matrix.data$matrix$LFC.matrix)
+        if (lfc.len<LFC.N[i]) stop(paste0("Requested LFC.matrix element '",LFC.N[i],"' does not exist! (length=",lfc.len,", file=",rdatas[i],")  Halting.\n"))
+        matrices[[i]] <- coverage.matrix.data$LFC.matrix[[LFC.N[i]]]
+    } else {
+        mat.names <- names(coverage.matrix.data$matrix)
+        if (!(samples[i,2] %in% mat.names)) stop(paste0("Requested matrix name '",samples[i,2],"' does not exist!  (names=",paste(mat.names,collapse=","),", file=",rdatas[i],")  Halting.\n"))
+        matrices[[i]] <- coverage.matrix.data$matrix[[samples[i,2]]]
+    }
+    ## ############# FIXME: later, make "FC0/Z0" behavior switchable
+    if (TRUE) matrices[[i]] <- threshold(matrices[[i]],0,"lt")  # set all values < 0 to 0 (will only affect LFC, Z-score matrices)
+    mat.beds[i] <- coverage.matrix.data$bed
+    mat.bams[i] <- coverage.matrix.data$bam
+}
+
+## Ensure that someone did not screw up their pipeline calls...
+if (length(unique(mat.beds))>1) stop(paste0("RData files were not all made from the same bed file!  These may not be merged into the same heatmap!\nUsed bed files:\nBED\tRDATA FILE\n",paste(mat.beds,rdatas,sep="\t"),"\n"))
+NR <- nrow(matrices[[1]])
+spacer <- matrix(NA, NR, 10)
+
+## Get original and extended heatmap beds
+main.bed <- read.bed(bedfile)[,1:6]
+main.bed.ext <- read.bed(mat.beds[1])
+
+## prepare heatmaps list
+## always 3 versions: full-signal (not binarized), bound-signal (red/blue indicating sample cobinding), and binarized (1/0 for peak-area/nonpeak-area)
+## each has 2 sub-versions: all-peaks, sig-peaks
+matrices.bound <- matrices.binary <- new.list(qw(all,sig), elem=matrices)
+
+## create all matrix versions
+for (i in 1:S) {
+    if (have.sb[i]) {
+        ## WARNING: RETURN VALUE OF coverage.matrix.bound() IS A LIST: list(heatmap,bound)
+        matrices.bound$all[[i]]  <- coverage.matrix.bound(matrices[[i]], main.bed, samp.bed[[i]],       500              )
+        matrices.binary$all[[i]] <- coverage.matrix.bound(matrices[[i]], main.bed, samp.bed[[i]],       500, main.bed.ext)
+        sig <- which(samp.sig[[i]])
+        matrices.bound$sig[[i]]  <- coverage.matrix.bound(matrices[[i]], main.bed, samp.bed[[i]][sig,], 500              )
+        matrices.binary$sig[[i]] <- coverage.matrix.bound(matrices[[i]], main.bed, samp.bed[[i]][sig,], 500, main.bed.ext)
+    } else {
+        ## no sample bed, no binarization (i.e. just a matrix of 0s)
+        matrices.binary$all[[i]] <- matrices.binary$sig[[i]] <- list(heatmap=matrix(0, NR, ncol(matrices[[i]]), FALSE, dimnames(matrices[[i]])), bound=c())
+    }
+}
+
+## clustering
+## NOTE ON ORDERINGS:
+## there are six heatmap versions: bound-all, bound-sig, binary-all, binary-sig, full-all, and full-sig
+## 'bound' and 'binary' heatmaps will have row-order changes depending on use of 'all' or 'sig' peaks
+## 'bound' versions are for optical comparison of peak calls to signal profiles: *** each heatmap column is sorted independently of all the others, and in no way relates to 'full' or 'binary' row-orderings. ***
+## 'full-all' and 'full-sig' are two orderings on the same 'full' matrix, which are the row orderings of the 'binary-all' and 'binary-sig' matrices.
+clust.use <- which(samples[,3]==1)  # samples to use for clustering
+
+## condensed matrix versions to accelerate clustering
+full.cm <- coverage.matrix.compress(do.call(cbind, lapply(matrices[clust.use], function(x) cbind(x,spacer) )), 10, NA)  # per sample: expecting 100 input columns -> averaged down to 10 output columns
+bin.cm  <- do.call(cbind, lapply(matrices.bound[clust.use], function(x) rowMeans(x$heatmap) ))  # per sample: 1 value, basically peak width
+
+## sample-cobound matrix (0|1, 1 col per sample)
+cobound.matrix <- new.list(qw(all,sig), elem=matrix(0,NR,S))
+for (i in 1:2) {  # all, sig
+    for (j in clust.use) {
+        is.bound <- 1:NR %in% matrices.bound[[i]][[j]]$bound[,1]
+        cobound.matrix[[i]][is.bound,j] <- 1
+    }
+}
+bc.dat <- lapply(cobound.matrix, bclust, by.max=TRUE)
+
+## final row orderings
+bin.ord  <- lapply(bc.dat, function(x) unlist(lapply(x, function(y) y[reorder.hclust2(hclust(dist( bin.cm[y,]),"average"),  bin.cm[y,], mean)$order] )) )
+full.ord <- lapply(bc.dat, function(x) unlist(lapply(x, function(y) y[reorder.hclust2(hclust(dist(full.cm[y,]),"average"), full.cm[y,], mean)$order] )) )
+## the two orderings have the same co-binding group order, but within groups, 'bin.ord' is sorted by peak widths while 'full.ord' uses hclust().
+
+## compile heatmaps
+heatmaps.bound  <- name(lapply(1:2, function(i) coverage.matrix.cbind(lapply(matrices.bound[[i]],"[[","heatmap"),sort.each=TRUE) ), qw(all,sig))
+heatmaps.binary <- name(lapply(1:2, function(i) coverage.matrix.cbind(lapply(matrices.binary[[i]],"[[","heatmap"))[bin.ord[[i]],] ), qw(all,sig))
+heatmaps.full   <- name(lapply(1:2, function(i) coverage.matrix.cbind(matrices[[i]])[full.ord[[i]],] ), qw(all,sig))
+
+## Write heatmaps
+hm.samples <- paste0(samples[,1], collapse="; ")
+for (i in 1:2) {
+    png(paste0(outpref,".bound_",qw(all,sig)[i],".png"), 2000, 900); mipu(threshold(heatmaps.bound[[i]],3,"gt",abs=TRUE), pal="RWB", col.center=0, cex=1.2, pmar=c(1,1), main=hm.samples); dev.off()
+    png(paste0(outpref,".binary_",qw(all,sig)[i],".png"), 2000, 900); mipu(heatmaps.binary[[i]], pal=c("white",2), cex=1.2, pmar=c(1,1), main=hm.samples); dev.off()
+    png(paste0(outpref,".full_",qw(all,sig)[i],".png"), 2000, 900); mipu(heatmaps.full[[i]], pal=c("white",2), cex=1.2, pmar=c(1,1), main=hm.samples); dev.off()
+}
+
+## save and exit
+save.image(paste0(outpref,".peakHeatmaps.RData"))
+
+

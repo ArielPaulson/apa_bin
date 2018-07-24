@@ -1,0 +1,55 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## populates VCF identifier column (col 3)
+
+my ($input, $output, $stdio, $prefix, $autoprefix, $clobber);
+
+GetOptions("i=s"=>\$input, "o=s"=>\$output, ""=>\$stdio, "p=s"=>\$prefix, "auto-prefix"=>\$autoprefix, "clobber"=>\$clobber);
+
+die "$0: no ID prefix given!\n" unless $prefix || $autoprefix;
+
+my ($IN, $OUT) = &generic_io($input, $output, $stdio);
+
+my %variants;
+while (my $line = <$IN>) {
+    if ($line =~ /^#/) {
+        print $OUT $line;
+    } else {
+        my @fields = split /\t/, $line, 7;   # must cut at minimum of 7 fields (6 if normal, 7 if autoprefixed)
+        my $thisprefix;
+        if ($autoprefix) {
+            $thisprefix = shift @fields;
+        } else {
+            $thisprefix = $prefix;
+        }
+        if ($fields[2] eq '.' || !$fields[2]) {
+            ## variant is not identified; add new
+            $fields[2] = $thisprefix.':'.++$variants{$thisprefix};
+            print $OUT join("\t",@fields);
+        } else {
+            ## variant is already identified...
+            if ($clobber) {
+                ## but add new anyway
+                $fields[2] = $thisprefix.':'.++$variants{$thisprefix};
+                print $OUT join("\t",@fields);
+            } else {
+                ## leave as-is
+                if ($autoprefix) {
+                    print $OUT join("\t",@fields);  # $fields[0] was removed...
+                } else {
+                    print $OUT $line;  # intact input line is OK
+                }
+            }
+        }
+    }
+}
+close $OUT;
+close $IN;
+
+print STDERR "$0 complete!\n";
+exit;
+

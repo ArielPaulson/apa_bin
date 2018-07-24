@@ -1,0 +1,169 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my ($geno, $anno, $prombp, $tailbp, $boundaries);
+GetOptions("g=s"=>\$geno, "a=s"=>\$anno, "p=i"=>\$prombp, "t=i"=>\$tailbp, "b=s"=>\$boundaries);
+my @beds = @ARGV;
+
+die "$0: No genome build specified!\n" unless $geno;
+die "$0: No annotation build specified!\n" unless $anno;
+my $gendir = "/n/data1/genomes/indexes/$geno";
+my $genpref = "$gendir/$geno";
+my $anndir = "$gendir/$anno";
+my $annpref = "$anndir/$geno.$anno";
+die "$0: -g $geno -a $anno not a valid combination!\n" unless -d $anndir;
+
+my $minboundpct;
+if ($boundaries) {
+	my @boundaries = split /:/, $boundaries;
+	die "$0: '--boundaries' argument must be '<pos int>:<pos int>' not '$boundaries'!\n" if $#boundaries != 1;
+	my $boundsum = $boundaries[0] + $boundaries[1];
+	die "$0: values of '--boundaries' argument are not both positive integers!\n" unless $boundsum > 2;  # each value <= 1, so at minimum 1 + 1 = 2
+	$minboundpct = (sort {$a <=> $b} @boundaries)[0] / $boundsum;
+}
+
+my %featnames = ('uxon'=>'Exonic', 'iint'=>'Intronic', 'exin'=>'Exon-Intron', 'nutr'=>'Novel-UTR', 'prom'=>'Promoter', 'tail'=>'Tailregion', 'dist'=>'Distal-Itgc', 'itgc'=>'Intergenic');
+my %summary;
+my @bednames;
+
+my $bin = '/home/apa/local/bin';
+my $sortBedCoord = "$bin/sortBedCoord";
+my $intersectBed = 'intersectBed';
+my $subtractBed = 'subtractBed';
+my $flankBed = 'flankBed';
+
+my $tmp = "peaks2features.$$.tmp";
+system "mkdir $tmp";
+my $chrsz = "$genpref.chrom.sizes";
+my $tmpdist = "$tmp/distal.bed";
+my %fbeds = (
+    'uxon' => "$annpref.uxons.bed", 
+    'iint' => "$annpref.iintrons.bed", 
+    'gene' => "$annpref.genes.bed", 
+    'itgc' => "$annpref.intergenes.bed"
+    );
+my @okfeat = qw/ uxon iint /;  # features allowed to compete for max-feature (initially)
+push @okfeat, qw/ exin nutr / if $boundaries;
+
+## make promoter, tailregion, reduced-intergene beds
+if ($prombp) {
+    $fbeds{prom} = "$tmp/promoters.bed", 
+    &execute("$flankBed -i $fbeds{gene} -l $prombp -r 0 -s -g $chrsz > $fbeds{prom}", 1);
+    &execute("cat $fbeds{prom} > $tmp/pt.bed", 1);
+}
+if ($tailbp) {
+    $fbeds{tail} = "$tmp/tailregions.bed",
+    &execute("$flankBed -i $fbeds{gene} -l 0 -r $tailbp -s -g $chrsz > $fbeds{tail}", 1);
+    &execute("cat $fbeds{tail} >> $tmp/pt.bed", 1);
+}
+if ($prombp || $tailbp) {
+    &execute("$sortBedCoord -i $tmp/pt.bed --overwrite", 1);
+    &execute("subtractBed -a $annpref.intergenes.bed -b $tmp/pt.bed > $tmpdist", 1);
+    $fbeds{dist} = $tmpdist;  # replace with reduced
+    push @okfeat, qw/ prom tail dist /;
+} else {
+    push @okfeat, qw/ itgc /;
+}
+
+## process each input bed
+foreach my $bed (@beds) {
+    
+    print "Processing $bed\n";
+    (my $prefix = $bed) =~ s/\.bed$//i;
+	(my $bedname =	$prefix) =~ s/.*\///;
+	push @bednames, $bedname;
+    my (%bdat, %int);
+    
+    ## Get bed data
+    my $IN = &open2('R', $bed, 'Input bed');
+    while (<$IN>) {
+		s/[\n\r]+$//;
+		my @fields = split /\t/, $_;
+		$fields[4] = 1 unless defined $fields[4];
+		$fields[5] = '+' unless defined $fields[5];
+		$bdat{$fields[3]}{1} = [@fields[0..5]];
+		$bdat{$fields[3]}{2} = [$fields[2]-$fields[1]];
+#		$int{$fields[3]}{$_} = 0 foreach @okfeat;  # ensure these have values
+    }
+    close $IN;
+    
+    ## Find feature overlaps
+    foreach my $feat (keys %fbeds) {
+		my $cmd = "$intersectBed -wo -a $bed -b $fbeds{$feat}";
+		print "$cmd\n";
+		open IN, "$cmd |";
+		while (<IN>) {
+			chomp;
+			my ($peak, $olbp) = (split /\t/, $_)[3,-1];
+			$int{$peak}{$feat} = $olbp if $olbp > $int{$peak}{$feat};
+		}
+		close IN;
+    }
+    
+    ## Output assignments
+    my $DET = &open2('W', "$prefix.peaks2features.detail.txt", 'Detail table');
+    print $DET join("\t", qw/ Chr Start End Name Score Strand Length MaxFeat MaxPct AllFeatures /),"\n";
+    foreach my $peak (keys %int) {
+		my $len = $bdat{$peak}{2}->[0];
+		$bdat{$peak}{3} = join(', ', map {sprintf("$_:%0.2f",100*$int{$peak}{$_}/$len)} keys %{ $int{$peak} });
+		my ($maxfeat, $maxol);
+		if ($boundaries) {
+			if (exists $int{$peak}{uxon} && exists $int{$peak}{iint}) {
+				## Exon-Intron boundary candidate
+				$maxol = &eval_boundary($int{$peak}{uxon}, $int{$peak}{iint});
+				$maxfeat = 'exin' if $maxol;
+			} elsif (exists $int{$peak}{uxon} && exists $int{$peak}{prom} && exists $int{$peak}{tail}) {
+				## probably eclipses single-exon gene -- ignore, let it be classified below
+			} elsif (exists $int{$peak}{uxon} && exists $int{$peak}{prom}) {
+				## 5'-UTR overlap candidate
+				$maxol = &eval_boundary($int{$peak}{uxon}, $int{$peak}{prom});
+				$maxfeat = 'nutr' if $maxol;
+			} elsif (exists $int{$peak}{uxon} && exists $int{$peak}{tail}) {
+				## 3'-UTR overlap candidate
+				$maxol = &eval_boundary($int{$peak}{uxon}, $int{$peak}{tail});
+				$maxfeat = 'nutr' if $maxol;
+			}
+		}
+		if (!$maxol) {  # not a boundary peak, or $boundaries turned off
+			$maxfeat = (sort { $int{$peak}{$b} <=> $int{$peak}{$a} } @okfeat)[0];
+			$maxol = $int{$peak}{$maxfeat};
+		}
+		push @{ $bdat{$peak}{2} }, ($maxfeat, sprintf("%0.2f", 100*$maxol/$len));
+		$summary{$maxfeat}{$bedname}++;
+		print $DET join("\t", @{ $bdat{$peak}{1} }, @{ $bdat{$peak}{2} }, $bdat{$peak}{3}),"\n";
+    }
+    close $DET;
+	
+	my $SUM = &open2('W', "$prefix.peaks2features.summary.txt", 'Summary table');
+	print $SUM "Feature\tPeaks\n";
+	print $SUM "$featnames{$_}\t",($summary{$_}{$bedname}||0),"\n" foreach @okfeat;
+	close $SUM;
+}
+
+my $SUM2 = &open2('W', "all-beds.peaks2features.summary.txt", 'Master summary table');
+print $SUM2 join("\t", 'Feature', @bednames),"\n";
+foreach my $feat (@okfeat) {
+	print $SUM2 join("\t", $featnames{$feat}, map { $summary{$feat}{$_}||0 } @bednames), "\n";
+}
+close $SUM2;
+
+&execute("rm -rf $tmp", 1);
+print "$0 complete\n";
+exit;
+
+
+
+sub eval_boundary {
+	
+	my ($bpA, $bpB) = @_;
+	
+	my $smaller = (sort {$a <=> $b} ($bpA, $bpB))[0];
+	my $total = $bpA+$bpB;
+	my $OL = $smaller/$total >= $minboundpct ? $bpA+$bpB : undef;
+	## If smaller feature overlap is >= 20% total, then consider it to be a "true" boundary hit
+	## If smaller feature overlap is < 20% total, ignore it and let it be classified later
+	return $OL;
+}

@@ -1,0 +1,12 @@
+#!/usr/bin/env Rscript
+
+library(methods)
+source("/n/projects/apa/R/apa_tools.R")
+
+ca <- commandArgs(trailing=TRUE)
+if (length(ca)!=2) stop("Must have exactly 2 parameters: FatiClone input file, and output prefix!\n")
+fc.file <- ca[1]
+out.prefix <- ca[2]
+
+GO.heatmap.plus(fc.file, out.prefix)
+

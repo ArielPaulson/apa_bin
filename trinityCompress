@@ -1,0 +1,36 @@
+#!/usr/bin/env perl
+
+my $trindir = $ARGV[0];
+die "'$trindir' not a directory!\n" unless -d $trindir;
+die "'$trindir' not a trinity directory!\n" unless -e "$trindir/Trinity.fasta";
+
+chdir $trindir or die "Cannot access '$trindir': $!\n";
+chdir 'chrysalis';
+my @comps = glob "RawComps*";
+foreach my $comp (@comps) {
+    system "tar -cf $comp.tar $comp/";
+    system "gzip -9 $comp.tar";
+}
+my @files;
+foreach (glob "*") {
+    push @files, $_ unless -d $_;  # will pick up all .tar.gz and other files
+}
+system "tar -cf chrysalis.tar @files";
+system "gzip -9 chrysalis.tar";
+system "mv chrysalis.tar.gz ..";
+chdir '..';
+
+my @meryls = qw/ meryl_kmer_db.mcdat meryl_kmer_db.mcidx meryl.kmers.min1.fa /;
+system "tar -cf meryl.tar @meryls";
+system "gzip -9 meryl.tar";
+
+open OUT, "> cleanup.sh";
+print OUT "rm -Rf chrysalis/\n";
+print OUT "rm -f meryl_kmer_db.mcdat meryl_kmer_db.mcidx meryl.kmers.min1.fa\n";
+print OUT "rm -f single.fa single.fa.headless single.fa.headless.fastaidx\n";
+close OUT;
+system "chmod a+x cleanup.sh";
+
+print "$trindir complete.  Please run 'cleanup.sh' after verifying chrysalis.tar.gz and meryl.tar.gz\n";
+exit;
+

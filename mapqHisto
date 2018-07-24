@@ -1,0 +1,106 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my %aligners = map {($_=>1)} qw/ bowtie tophat bwa /;
+
+my ($input, $stdio, $output, $aligner, $readlen, $perbase, $nomulti);
+
+GetOptions("i=s" => \$input, "" => \$stdio, "o=s" => \$output, "a=s" => \$aligner, "r=i" => \$readlen, "per-base" => \$perbase, "no-multi" => \$nomulti);
+
+my $IN;
+if ($stdio) {
+    $IN = 'STDIN';   # Not yet tested??
+} elsif ($input =~ /\.sam/i) {
+    open $IN, '<', $input or die "$0: Cannot open path '$input' for writing: $!\n";
+} elsif ($input =~ /\.bam/i) {
+    open $IN, '<', "samtools view $input |";
+} else {
+    die "$0: '-i' value must be SAM or BAM file with correct extension!\n";
+}
+
+if ($perbase) { 
+    
+    die "'--per-base' must be accompanied by '-r <read length>'!\n" if ($perbase && !$readlen);
+    die "'--no-multi' must be accompanied by '-a <aligner>!\n" if ($nomulti && !$aligner);
+    my (@chrs, %chrpos, %master);
+    
+    while (<$IN>) {
+	my ($chr, $pos, $mapq, $else) = (split /\t/, $_, 6)[2..5];
+	next if $nomulti && &is_multi($else);
+	$chrpos{$chr}{MIN} = $pos unless exists $master{$chr};
+	push @chrs, $chr unless exists $master{$chr};
+	foreach my $i ($pos..$pos+$readlen-1) {
+	    if (exists $master{$chr}{$i}) {
+		$master{$chr}{$i}{MIN} = $mapq if $mapq < $master{$chr}{$i}{MIN};
+		$master{$chr}{$i}{MAX} = $mapq if $mapq > $master{$chr}{$i}{MAX};
+	    } else {
+		$master{$chr}{$i}{MIN} = $master{$chr}{$i}{MAX} = $mapq;
+	    }
+	    $master{$chr}{$i}{N}++;
+	    $master{$chr}{$i}{SUM} += $mapq;
+	}
+	$chrpos{$chr}{MAX} = $pos+$readlen-1;
+    }
+    close $IN;
+    
+    my @states = qw/ N MIN MAX MEAN /;
+    open my $OUT, '>', $output or die "$0: Cannot open path '$output' for writing: $!\n";  # test writability first, before all the parsing begins
+    print $OUT join("\t", 'CHR', 'POS', @states), "\n";
+    foreach my $chr (@chrs) {
+	foreach my $pos ($chrpos{$chr}{MIN}..$chrpos{$chr}{MAX}) {
+	    $master{$chr}{$pos}{MEAN} = sprintf("%0.2f", $master{$chr}{$pos}{SUM}/($master{$chr}{$pos}{N}||1));
+	    print $OUT join("\t", $chr, $pos, (map {$master{$chr}{$pos}{$_}||0} @states)), "\n";
+	}
+    }
+    close $OUT;
+    
+} else {
+    
+    die "$0: '-a' must be one of: ", join(", ", map {"'$_'"} sort keys %aligners), "\n" unless $aligners{$aligner};
+    my %data;
+    
+    while (<$IN>) {
+	my ($flags, $chr, $mapq, $else) = (split /\t/, $_, 6)[1,2,4,5];
+	my $multi = &is_multi($else) ? 'MULTI' : 'UNIQUE';
+	my $align = $chr eq '*' ? 'UNALIGN' : 'ALIGN';
+	$data{$mapq}{ALL}++;
+	$data{$mapq}{$multi}++;
+	$data{$mapq}{$align}++;
+    }
+    close $IN;
+    
+    my @states = qw/ ALL ALIGN UNALIGN UNIQUE MULTI /;
+    open my $OUT, '>', $output or die "$0: Cannot open path '$output' for writing: $!\n";  # test writability first, before all the parsing begins
+    print $OUT join("\t", ('MAPQ', @states)), "\n";
+    foreach my $mapq (sort {$a <=> $b} keys %data) {
+	print $OUT join("\t", ($mapq, map {$data{$mapq}{$_}||0} @states)), "\n";
+    }
+    close $OUT;
+}
+exit;
+
+
+
+sub is_multi {
+    
+    my $ELSE = shift;
+    my $MULTI = 0;
+    
+    if ($aligner eq 'bowtie') {
+	if ($ELSE =~ /\tAS:i:([-\d]+)\tXS:i:([-\d]+)/) {  # potential multiread
+	    $MULTI = 1 if $1-$2<=1;  # best, second-best too close: call it a multiread
+	}
+    } elsif ($aligner eq 'tophat') {
+	if ($ELSE =~ /\tNH:i:([\d]+)/) {  # potential multiread
+	    $MULTI = 1 if $1>1;  # > 1 reported alignment
+	}
+    } elsif ($aligner eq 'bwa') {
+	if ($ELSE =~ /\tX0:i:([\d]+)/) {  # potential multiread
+	    $MULTI = 1 if $1>1;  # > 1 reported alignment
+	}
+    }
+    
+    return $MULTI;
+}

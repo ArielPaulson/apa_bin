@@ -1,0 +1,254 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Getopt::Long;
+use File::Spec;
+use Pod::Usage;
+use strict;
+
+
+## v2.0 is intended for advanced handling of paired-ends
+
+
+### Dependencies
+my $samtools = 'samtools';
+
+
+
+### Inputs
+my @bams;       # bam input list = post-GetOptions @ARGV
+my $tophat;     # use Tophat's NH tag to determine multireads
+my $star;       # use STAR's NH tag to determine multireads
+my $bowtie2;    # use Bowtie2's AS and XS tags to determine multireads
+my $bowtie1;    # NOT READY YET *****************************************************************************************************************
+my $bwa;        # use BWA's XA:Z: tag to determine multireads
+my $shortstack; # use ShortStack's XY:Z:[RP] tags to determine multireads
+my $stay_sam;   # can input sam or bam -> bam output.  If sam in, stay sam out?
+my $multi_bam;  # output multireads in their own bam(/sam) file?
+my $PE_any;     # reads are paired; pairs are multi if one end is multi
+my $PE_all;     # reads are paired; pairs are multi if both ends are multi
+my $PE_full;    # reads are paired; split all pairs into four groups (1=both unique, 2=only E1 unique, 3=only E2 unique, 4=neither unique).  Output of groups 2-4 is dependent on $multi_bam.
+
+
+
+### Get, test arguments
+GetOptions("tophat"=>\$tophat, "star"=>\$star, "bowtie2"=>\$bowtie2, "bowtie1"=>\$bowtie1, "bwa"=>\$bwa, "stay-sam"=>\$stay_sam, "multi-bam"=>\$multi_bam, "PE-any"=>\$PE_any, "PE-all"=>\$PE_all, "PE-full"=>\$PE_full);
+@bams = @ARGV;
+die "$0: No bams specified!\n" unless @bams;
+die "$0: Bowtie1 mode not available yet!\n" if $bowtie1;
+print STDERR "INPUTS: @bams\n";
+my $anyPE = $PE_all|$PE_any|$PE_full ? 1 : 0;  # reads are treated as paired
+my $fast = !$anyPE && ($tophat || $bowtie2) ? 1 : 0;  # fast mode possible
+my $useNH = ($tophat || $star) ? 1 : 0;
+my $useASXS = ($bowtie2) ? 1 : 0;
+
+
+### Globals
+my %files;  # output files per input
+
+
+
+### Test input files
+foreach my $bam (@bams) {
+    die "$0: Input file '$bam' does not exist!\n" unless -e $bam;
+    my $is_sam = $bam =~ /\.sam$/i ? 1 : 0;
+    if ($is_sam) {
+	my $ext = $stay_sam ? 'sam' : 'bam';
+	($files{$bam}{OUT} = $bam) =~ s/sam$/noMultireads.$ext/i;
+	($files{$bam}{OUTM} = $bam) =~ s/sam$/onlyMultireads.$ext/i;
+    } else {
+	($files{$bam}{OUT} = $bam) =~ s/bam$/noMultireads.bam/i;
+	if ($PE_full) {
+	    ($files{$bam}{OUTPM2} = $bam) =~ s/bam$/E1_Multireads.bam/i;
+	    ($files{$bam}{OUTPM3} = $bam) =~ s/bam$/E2_Multireads.bam/i;
+	    ($files{$bam}{OUTPM4} = $bam) =~ s/bam$/E1E2_Multireads.bam/i;
+	} else {
+	    ($files{$bam}{OUTM} = $bam) =~ s/bam$/onlyMultireads.bam/i;
+	}
+    }
+    die "$0: Unable to parse file name '$bam': bad extension?\n" if $files{$bam}{OUT} eq $bam;
+}
+
+
+
+### Main
+foreach my $bam (@bams) {
+    
+    print STDERR "Processing $bam\n";
+    my $is_sam = $bam =~ /\.sam$/i ? 1 : 0;
+    my (%filter, %stats, $pass, @samheader);
+    my $samheader = my $alignments = my $removed = my $retained = 0;
+    $stats{$_} = 0 foreach qw/ bt2_solo bt2_uniq bt2_multi bt2_subpe PM2 PM3 PM4 MbyN MbyM /;
+    
+    my ($IN, $OUT, $OUTM, $OUTPM2, $OUTPM3, $OUTPM4);
+    if ($is_sam) {
+		$IN = &open2('R', $bam, 'Input sam');
+    } else {
+		open $IN, '-|', "$samtools view -h $bam" or die "$0: failed to '$samtools view' input bam '$bam': $!\n";
+    }
+    
+    ## Test for multireads by:
+    ## 1. Counting instances of read headers (N)
+    ## 2. Assessing aligner's multiread indicators (M)  ### {M} KEY SHOULD NOT BE VALUED UNLESS VALUE INDICATES MULTIREAD.  FOR UNIQUE READS {M} SHOULD NEVER EXIST.
+    print STDERR "  Scanning alignments: ".`date`;
+    while (<$IN>) {
+		next if /^@/;   # DO NOT filter the header lines
+		my ($idx, $flag) = (split /\t/, $_, 3)[0,1];
+		my ($end, $M);
+		if ($anyPE) {
+			$end = $flag & 64 ? 1 : $flag & 128 ? 2 : 0;
+		} else {
+			$end = 1;
+		}
+		$filter{$idx}{$end}{N}++;  # N times read seen (vs M, which is aligner-given multiread-ness)
+		if ($useNH && $_ =~ /\tNH:i:(\d+)/) {
+			$filter{$idx}{$end}{M} = $1 if $1 > 1;
+		} elsif ($useASXS) {
+			if ($_ =~ /\tAS:i:([-\d]+)\tXS:i:([-\d]+)/) {
+#				if ($1-$2 <= 1) {  # best secondary align is equal to (or 1 less than) primary
+				if ($1==$2) {      # best secondary align is equal to primary
+					$filter{$idx}{$end}{M} = 2;  # anything larger than 1
+					$stats{bt2_multi}++;
+				} elsif ($2 > $1) {  # likely from paired-end, where a better single-end align exists for an optimal-pair align
+					$filter{$idx}{$end}{M} = 2;  # anything larger than 1
+					$stats{bt2_subpe}++;
+				} else {
+					$stats{bt2_uniq}++;
+				}
+			} else {
+				$stats{bt2_solo}++;
+			}
+		} elsif ($bwa) {
+			if ($_ =~ /\tXA:Z:\S/) {
+				$filter{$idx}{$end}{M} = $1;
+			}
+		} elsif ($shortstack) {
+			if ($_ =~ /\tXY:Z:[RP]/) {
+				$filter{$idx}{$end}{M} = $1;
+			}
+		} else {
+			die "No multiread testing criteria were chosen!  Cannot proceed.\n";
+		}
+	}
+	print STDERR "  $. alignments scanned\n";
+	close $IN;
+
+	print STDERR "  Consolidating filters: ".`date`;
+	foreach my $idx (keys %filter) {
+		$stats{MbyN}++ if $filter{$idx}{1}{N} > 1 || ($anyPE && $filter{$idx}{2}{N} > 1);
+		$stats{MbyM}++ if exists $filter{$idx}{1}{M} || ($anyPE && exists $filter{$idx}{2}{M});
+		my $e1m = $filter{$idx}{1}{N} > 1 || $filter{$idx}{1}{M} > 1 ? 1 : 0;
+		my $e2m = $anyPE && ($filter{$idx}{2}{N} > 1 || $filter{$idx}{2}{M} > 1) ? 1 : 0;
+		delete $filter{$idx};   # remove previous values
+		if ($PE_full) {
+			if ($e1m && $e2m) {
+				$filter{$idx} = 4;
+			} elsif ($e2m) {
+				$filter{$idx} = 3;
+			} elsif ($e1m) {
+				$filter{$idx} = 2;
+			}
+			$stats{"PM$filter{$idx}"}++;
+		} elsif ($PE_any) {
+			$filter{$idx} = 1 if $e1m || $e2m;
+		} elsif ($PE_all) {
+			$filter{$idx} = 1 if $e1m && $e2m;
+		} else {
+			## not PE, or not treated as such
+			$filter{$idx} = 1 if $e1m;
+		}
+	}
+
+	## Separate multireads and write outputs
+	print STDERR "  Filtering multireads: ".`date`;
+	if ($is_sam) {
+		$IN = &open2('R', $bam, 'Input sam');
+	} else {
+		open $IN, '-|', "$samtools view -h $bam" or die "$0: failed to '$samtools view' input bam '$bam': $!\n";
+	}
+
+	my @outbams = ($files{$bam}{OUT});  # this one guaranteed
+	if ($is_sam && $stay_sam) {
+		$OUT  = &open2('W', $files{$bam}{OUT}, 'Output sam');
+		$OUTM = &open2('W', $files{$bam}{OUTM}, 'Output multiread sam') if $multi_bam;
+	} else {
+		print STDERR "$samtools view -bS - > $files{$bam}{OUT}\n";
+		open $OUT, '|-', "$samtools view -bS - > $files{$bam}{OUT}" or die "$0: failed to '$samtools view' to output bam '$files{$bam}{OUT}': $!\n";
+		if ($multi_bam) {
+			if ($PE_full) {
+				open $OUTPM2, '|-', "$samtools view -bS - > $files{$bam}{OUTPM2}" or die "$0: failed to '$samtools view' to output bam '$files{$bam}{OUTPM2}': $!\n";
+				open $OUTPM3, '|-', "$samtools view -bS - > $files{$bam}{OUTPM3}" or die "$0: failed to '$samtools view' to output bam '$files{$bam}{OUTPM3}': $!\n";
+				open $OUTPM4, '|-', "$samtools view -bS - > $files{$bam}{OUTPM4}" or die "$0: failed to '$samtools view' to output bam '$files{$bam}{OUTPM4}': $!\n";
+				push @outbams, $files{$bam}{OUTPM2};
+				push @outbams, $files{$bam}{OUTPM3};
+				push @outbams, $files{$bam}{OUTPM4};
+			} else {
+				print STDERR "$samtools view -bS - > $files{$bam}{OUTM}\n";
+				open $OUTM, '|-', "$samtools view -bS - > $files{$bam}{OUTM}" or die "$0: failed to '$samtools view' to output bam '$files{$bam}{OUTM}': $!\n";
+				push @outbams, $files{$bam}{OUTM};
+			}
+		}
+	}
+	while (<$IN>) {
+		if (/^@/) {
+			$samheader++;
+			print $OUT $_;
+			if ($multi_bam) {
+				if ($PE_full) {
+					print $OUTPM2 $_;
+					print $OUTPM3 $_;
+					print $OUTPM4 $_;
+				} else {
+					print $OUTM $_;
+				}
+			}
+			next;
+		}
+		$alignments++;
+		my ($idx, $flag) = (split /\t/, $_, 3)[0,1];
+		if (exists $filter{$idx}) {
+			$removed++;
+			if ($multi_bam) {
+				if ($PE_full && $filter{$idx} == 4) {
+					print $OUTPM4 $_;
+				} elsif ($PE_full && $filter{$idx} == 3) {
+					print $OUTPM3 $_;
+				} elsif ($PE_full && $filter{$idx} == 2) {
+					print $OUTPM2 $_;
+				} else {
+					print $OUTM $_;
+				}
+			}
+		} else {
+			$retained++;
+			print $OUT $_;
+		}
+	}
+
+	close $IN;
+	close $OUT;
+	if ($multi_bam) {
+		if ($PE_full) {
+			close $OUTPM2;
+			close $OUTPM3;
+			close $OUTPM4;
+		} else {
+			close $OUTM;
+		}
+	}
+
+	print STDERR "  $alignments alignments | $removed multi ($stats{MbyM} M, $stats{MbyM} N) | $retained unique | $samheader header lines\n";
+	print STDERR "  Bowtie2 filters: $stats{bt2_solo} solo | $stats{bt2_uniq} unique | $stats{bt2_multi} multi | $stats{bt2_subpe} sub-pe\n" if $bowtie2;
+	print STDERR "  E1U/E2U: $retained | E1M/E2U: $stats{PM2} | E1U/E2M: $stats{PM3} | E1M/E2M: $stats{PM4}\n" if $PE_full;
+
+	## Index, if bam
+	unless ($is_sam) {
+		foreach my $bam (@outbams) {
+			system "$samtools index $bam";
+			print STDERR "  Wrote $bam\n";
+		}
+	}
+}
+
+print STDERR "$0 Complete: ".`date`;
+kill $$;  # avoids exit() bug with large hashes
+

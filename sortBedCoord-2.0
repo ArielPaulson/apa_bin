@@ -1,0 +1,202 @@
+#!/usr/bin/env perl
+require '/home/apa/local/bin/apa_routines.pm';  # chrsort
+use Data::Dumper;
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+use Cwd;
+
+
+## Dependencies
+my $unique = '/home/apa/local/bin/unique';
+
+
+## Inputs
+my $infile;     # input file (bed, gtf, vcf)
+my $outfile;    # output file (bed, gtf, vcf)
+my $orient;     # correct coords where start > end? default 'yes', or 'no', 'strand'.  'strand' also flips strand value.
+my $sort;       # how to sort? default 'lexico', or 'none', 'apa', or file.  If file, adopts chrom ord found in column 1.
+my $headerN;    # ignore N header lines?
+my $chrconv;    # convert chrom names?  'ensembl2ucsc' or 'ucsc2ensembl', requires $geno.
+my $geno;       # associated genome build (if $chrconv)
+my $gtf;        # input is GTF
+my $vcf;        # input is VCF
+my $stdio;      # piped input (and thus output)
+my $overwrite;  # overwrite input file? (if not $stdio)
+
+GetOptions("i=s"=>\$infile, "o=s"=>\$outfile, "r=s"=>\$orient, "s=s"=>\$sort, "c=s"=>\$chrconv, "g=s"=>\$geno, "h=i"=>\$headerN, "gtf"=>\$gtf, "vcf"=>\$vcf, "overwrite"=>\$overwrite, ""=>\$stdio);
+
+die "$0: Cannot use '--overwrite' on stdio!\n" if $stdio && $overwrite;
+if ($infile && $infile eq $outfile) {
+    $outfile = undef;
+    $overwrite = 1;
+}
+
+my %otherstrand = ('+','-', '-','+', 1,-1, -1,1);  # for strand reversal
+my @headers;    # headers from input file
+my %data;       # records from input file
+my @ordchr;     # ordered chromosome list
+my %ccdat;      # chromosome name conversions
+
+## TEST ARGUMENTS
+my %orientval = ('no',0, 'yes',1, 'strand',2);
+$orient = 'yes' unless $orient;
+die "$0: invalid '-r' value $orient!\n" unless exists $orientval{$orient};
+
+my %sortval = ('none',0, 'lexico',1, 'apa',2);
+$sort = 'lexico' unless $sort;
+if ($sortval{$sort}) {
+    ## do nothing; just prefer known values to any files
+} elsif (-e $sort) {
+    chomp(@ordchr = split /\n/, `cut -f1 $sort | grep -v "^#" | $unique`);
+} else {
+    die "$0: invalid '-s' value $sort or file '$sort' not found!\n" unless exists $sortval{$sort};
+}
+
+die "$0: use of '-c' requires '-g'!\n" if $chrconv && !$geno;
+my %conval = ('ensembl2ucsc',1, 'ucsc2ensembl',2);
+die "$0: invalid '-c' value $chrconv!\n" if $chrconv && ! exists $conval{$chrconv};
+my $chrdat = "/n/data1/genomes/indexes/$geno/$geno.chrom_data.txt";
+if ($chrconv) {
+    my $CC = &open2('R', $chrdat, 'chromosome data file');
+    my ($ucsc, $ens);
+    while (<$CC>) {
+        my @data = split /\t/, $_;
+        if ($. == 1) {
+            foreach my $i (0..$#data) {
+                $ucsc = $i if $data[$i] eq 'UCSC.Name';
+                $ens = $i if $data[$i] eq 'Ensembl.Name';
+            }
+        } elsif ($conval{$chrconv} == 1) {
+            $ccdat{ $data[$ens] } = $data[$ucsc];  # Ensembl -> UCSC
+        } elsif ($conval{$chrconv} == 2) {
+            $ccdat{ $data[$ucsc] } = $data[$ens];  # UCSC -> Ensembl
+        }
+    }
+    close $CC;
+}
+
+## OPEN INPUT
+my $IN;
+if ($infile) {
+    $IN = &open2('R', $infile, 'input file');
+} elsif ($stdio) {
+    open $IN, '<-';
+} else {
+    die "$0: No input specified!\n";
+}
+
+
+## PROCESS INPUT
+if ($vcf) {
+    
+    while (<$IN>) {
+        if (/^#/) {
+            push @headers, $_;
+        } else {
+            s/[\n\r]+$//;
+            my ($chr, $pos, $else) = split /\t/, $_, 3;
+            push @{ $data{$chr}{$pos} }, "$pos\t$else";
+        }
+    }
+    
+} else {
+    
+    my @fields = $gtf ? (0,3,4,6) : (0,1,2,5);
+    my ($i, $maxcol);
+    while (<$IN>) {
+        if (/^(#|track)/) {
+            push @headers, $_;
+        } elsif ($headerN && $. <= $headerN) {
+            push @headers, $_;
+        } else {
+            $i++;
+            s/[\n\r]+$//;
+            my @data = split /\t/, $_;
+            $maxcol = $#data if $i == 1;
+            my ($chr, $pos1, $pos2, $strand) = @data[@fields];
+            my ($start, $end);
+            if ($maxcol > 2) {
+                if ($orientval{$orient} == 0) {
+                    ($start, $end) = ($pos1, $pos2);
+                } elsif ($orientval{$orient} == 1) {
+                    ($start, $end) = ($pos1 < $pos2) ? ($pos1, $pos2) : ($pos2, $pos1);
+                } elsif ($orientval{$orient} == 2) {
+                    ($start, $end, $strand) = ($pos1 < $pos2) ? ($pos1, $pos2, $strand) : ($pos2, $pos1, $otherstrand{$strand});
+                } else {
+                    die "$0: developer has no handling for '-r' value '$orient'!\n";
+                }
+            } else {
+                ($start, $end) = ($pos1, $pos2);
+            }
+            @data[@fields] = ($chr, $start, $end, $strand);
+            push @{ $data{$chr}{"$start\t$end"} }, (join "\t", @data[1..$maxcol]);
+        }
+    }
+    
+}
+close $IN;
+
+
+## CONVERT CHROMOSOME NAMES BEFORE APPLYING ORDERING
+if ($chrconv) {
+    my (%data2, @fail);
+    foreach my $chr (sort keys %data) {
+        if (exists $ccdat{$chr}) {
+            $data2{ $ccdat{$chr} } = $data{$chr};
+            delete $data{$chr};
+        } else {
+            push @fail, $chr;
+        }
+    }
+    if (@fail) {
+        my $fail = join(', ', sort @fail);
+        die "$0: the following data chromosomes were not found in the chrom data file '$chrdat':\n$fail\nHalting.\n";
+    }
+    %data = %data2;  # REPLACE WITH NAME-CONVERTED DATA
+}
+
+
+## APPLY CHROMOSOME ORDERING
+if (@ordchr) {
+    my %lost;
+    my %oc = map {($_=>1)} @ordchr;
+    foreach (keys %data) {
+        $lost{$_} = 1 unless exists $oc{$_};
+    }
+    if (%lost) {
+        my $lost = join(', ', sort keys %lost);
+        die "$0: the following data chromosomes were not found in the ordering file '$sort':\n$lost\nHalting.\n";
+    }
+} elsif ($sortval{$sort} == 0) {
+    @ordchr = keys %data;
+} elsif ($sortval{$sort} == 1) {
+    @ordchr = sort {$a cmp $b} keys %data;
+} elsif ($sortval{$sort} == 2) {
+    @ordchr = @{ &chrsort([keys %data], 0) };
+} else {
+    die "$0: developer has no handling for '-s' value '$sort'!\n";
+}
+
+
+## WRITE OUTPUT
+my $OUT;
+if ($outfile) {
+    $OUT = &open2('W', $outfile, 'output file', $vcf);
+} elsif ($overwrite) {
+    unlink $infile;
+    $OUT = &open2('W', $infile, 'output file', $vcf);
+} else {
+    open $OUT, '>-';
+}
+print $OUT @headers;
+foreach my $chr (@ordchr) {
+    foreach my $coord (sort {$a <=> $b} keys %{ $data{$chr} }) {
+        print $OUT "$chr\t$_\n" foreach @{ $data{$chr}{$coord} };
+    }
+}
+close $OUT;
+
+print STDERR "$0 $infile complete!\n" unless $stdio;
+## DO NOT 'exit'
+

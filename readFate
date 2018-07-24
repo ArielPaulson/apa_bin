@@ -1,0 +1,222 @@
+#!/usr/bin/perl
+
+## Takes 2 arguments: targets_file, output_prefix
+##
+## Calculates fate mapping between alignment variations of the same fastq set (SE or PE)
+## Requires a tab-separated targets file with the following format (leave PE cols empty if SE):
+## On line 1:
+## /path/to/fastq1<tab>/path/to/fastq2
+## Lines 2-N, 3 columns each:
+## 1. Alias
+## 2. Alignment directory
+## 3. bam name
+##
+## prints out two matrices for analysis in R, one row per mate-pair. 
+## Matrix#1 holds alignment success patterns.
+## Column 1 is read header (1 per mate-pair).  Columns 2-N are alignment-type numbers, one for each row in the targets file:
+## 0 = E1 unalignable, E2 unalignable
+## 1 = E1 unalignable, E2 singly
+## 2 = E1 unalignable, E2 multiply
+## 3 = E1 singly,      E2 unalignable
+## 4 = E1 singly,      E2 singly
+## 5 = E1 singly,      E2 multiply
+## 6 = E1 multiply,    E2 unalignable
+## 7 = E1 multiply,    E2 singly
+## 8 = E1 multiply,    E2 multiply
+##
+## Matrix #2 holds alignment location patterns.
+## Column 1 is read header (1 per mate-pair).  Columns 2-N occur in 4-column sets, one set for each row in targets.txt:
+## Per set: Columns 1-2 are E1 chrom, start.  If run was PE, columns 3-4 are E2 chrom, start, otherwise blank.
+## Also: only singly-aligning reads are recorded; chrom, start entries for unalignable or multiply-aligned ends will get NA.
+
+my $start = `date`;
+
+my ($targets, $outfile) = @ARGV;
+$outfile = 'readFate_fatemaps.txt' unless $outfile;
+
+my $headers = 'readFate_headers.txt';
+my $aligned = 'readFate_aligned.txt';
+my $unalnlf = 'readFate_unaligned_left.txt';
+my $unalnrt = 'readFate_unaligned_right.txt';
+
+## read targets file
+print "Reading '$targets'...\n";
+my (%fq, %runs, @order);
+
+open IN, $targets or die "Cannot open targets file '$targets': $!\n";
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    my @data = split /\t/, $_;
+    if ($. == 1) {
+	$fq{1} = $data[0];
+	$fq{2} = $data[1] if $data[1];
+    } else {
+	push @order, $data[0];
+	$runs{$data[0]}{DIR} = $data[1];
+	$runs{$data[0]}{BAM} = "$data[1]/$data[2]";
+	if (-e "$data[1]/unmapped_left.fq.z") {
+	    $runs{$data[0]}{UNL} = "$data[1]/unmapped_left.fq.z";
+	} elsif (-e "$data[1]/unmapped_left.fq") {
+	    $runs{$data[0]}{UNL} = "$data[1]/unmapped_left.fq";
+	}
+	if (-e "$data[1]/unmapped_right.fq.z") {
+	    $runs{$data[0]}{UNR} = "$data[1]/unmapped_right.fq.z";
+	} elsif (-e "$data[1]/unmapped_right.fq") {
+	    $runs{$data[0]}{UNR} = "$data[1]/unmapped_right.fq";
+	}
+    }
+}
+close IN;
+
+## generate intermediate data
+print "Generating intermediate data, if necessary...\n";
+
+unless (-e $headers) {
+    print "file '$headers' not detected: generating...\n";
+    if ($fq{1} =~ /\.gz$/) {
+	my $cmd = "gunzip -c $fq{1} | grep -P ".'"^@"'." > $headers";
+	print "$cmd\n"; system $cmd;
+    } else {
+	my $cmd = "grep -P ".'"^@"'." $fq{1} > $headers";
+	print "$cmd\n"; system $cmd;
+    }
+    my $cmd = "perl -i -p -e 's/^@//' $headers";
+    print "$cmd\n"; system $cmd;
+    die "Unable to detect or generate file '$headers'!\n" unless -e $headers;
+}
+
+foreach my $run (@order) {
+    unless (-e "$runs{$run}{DIR}/$aligned") {
+	print "file '$runs{$run}{DIR}/$aligned' not detected: generating...\n";
+	my $cmd = "samtools view $runs{$run}{BAM} | cut -f 1,2,3,4,7,8 > $runs{$run}{DIR}/$aligned";
+	print "$cmd\n"; system $cmd;
+	die "Unable to detect or generate file '$runs{$run}{DIR}/$aligned'!\n" unless -e "$runs{$run}{DIR}/$aligned";
+    }
+    
+    unless (-e "$runs{$run}{DIR}/$unalnlf") {
+	print "file '$runs{$run}{DIR}/$unalnlf' not detected: generating...\n";
+	next unless $runs{$run}{UNL};
+	if ($runs{$run}{UNL} =~ /\.z$/) {
+	    my $cmd = "gunzip -c $runs{$run}{UNL} | grep -P ".'"^@"'." > $runs{$run}{DIR}/$unalnlf";
+	    print "$cmd\n"; system $cmd;
+	} else {
+	    my $cmd = "grep -P ".'"^@"'." $runs{$run}{UNL} > $runs{$run}{DIR}/$unalnlf";
+	    print "$cmd\n"; system $cmd;
+	}
+	my $cmd = "perl -i -p -e 's/^@//' $runs{$run}{DIR}/$unalnlf";
+	print "$cmd\n"; system $cmd;
+	die "Unable to detect or generate file '$runs{$run}{DIR}/$unalnlf'!\n" unless -e "$runs{$run}{DIR}/$unalnlf";
+    }
+    
+    unless (-e "$runs{$run}{DIR}/$unalnrt") {
+	print "file '$runs{$run}{DIR}/$unalnrt' not detected: generating...\n";
+	next unless $runs{$run}{UNR};
+	if ($runs{$run}{UNR} =~ /\.z$/) {
+	    my $cmd = "gunzip -c $runs{$run}{UNR} | grep -P ".'"^@"'." > $runs{$run}{DIR}/$unalnrt";
+	    print "$cmd\n"; system $cmd;
+	} else {
+	    my $cmd = "grep -P ".'"^@"'." $runs{$run}{UNR} > $runs{$run}{DIR}/$unalnrt";
+	    print "$cmd\n"; system $cmd;
+	}
+	my $cmd = "perl -i -p -e 's/^@//' $runs{$run}{DIR}/$unalnrt";
+	print "$cmd\n"; system $cmd;
+	die "Unable to detect or generate file '$runs{$run}{DIR}/$unalnrt'!\n" unless -e "$runs{$run}{DIR}/$unalnrt";
+    }
+} 
+
+## read in data
+print "Reading in data...\n";
+my (%prefate, %coords, %SE);
+
+foreach my $i (0..$#order) {
+    my $run = $order[$i];
+    if (-e "$runs{$run}{DIR}/$unalnlf") {
+	open IN, "$runs{$run}{DIR}/$unalnlf";
+	while (<IN>) {
+	    $_ =~ s/[\n\r]+$//;
+	    $prefate{$_}{$run}{U} = 1;
+	}
+	print "$run: $. E1 unaligned\n";
+	close IN;
+    }
+    if (-e "$runs{$run}{DIR}/$unalnrt") {
+	open IN, "$runs{$run}{DIR}/$unalnrt";
+	while (<IN>) {
+	    $_ =~ s/[\n\r]+$//;
+	    $prefate{$_}{$run}{U} = 2;
+	}
+	print "$run: $. E2 unaligned\n";
+	close IN;
+    }
+    open IN, "$runs{$run}{DIR}/$aligned";
+    while (<IN>) {
+	$_ =~ s/[\n\r]+$//;
+	my ($read, $flags, $chr1, $pos1, $chr2, $pos2) = split /\t/, $_;
+	if ($chr2 eq '=') {
+	    push @{ $prefate{$read}{$run}{1} }, "$chr1\t$pos1";
+	    push @{ $prefate{$read}{$run}{2} }, "$chr2\t$pos2";
+	} elsif ($flags & 4) {  # E1 unmapped
+	    if ($prefate{$read}{$run}{U} == 1) {  # E1 unalignable
+		push @{ $prefate{$read}{$run}{1} }, "-1\t-1";
+		push @{ $prefate{$read}{$run}{2} }, "$chr2\t$pos2";
+	    } else {   # E1 over multimatch threshold, apparently
+		push @{ $prefate{$read}{$run}{1} }, "0\t0";
+		push @{ $prefate{$read}{$run}{2} }, "$chr2\t$pos2";
+	    }
+	} elsif ($flags & 8) {  # E2 unmapped
+	    if ($prefate{$read}{$run}{U} == 2) {  # E2 unalignable
+		push @{ $prefate{$read}{$run}{1} }, "$chr1\t$pos1";
+		push @{ $prefate{$read}{$run}{2} }, "-1\t-1";
+	    } else {   # E2 over multimatch threshold, apparently
+		push @{ $prefate{$read}{$run}{1} }, "$chr2\t$pos2";
+		push @{ $prefate{$read}{$run}{2} }, "0\t0";
+	    }
+	} elsif ($flags & 1) {  # read was paired...
+	    die "Unalignment test failure: $run: $_\n";
+	} else {  # read was not paired
+	    push @{ $prefate{$read}{$run}{1} }, "$chr1\t$pos1";
+	    push @{ $prefate{$read}{$run}{2} }, "\t";
+	    $SE{$run} = 1;
+	}
+    }
+    print "$run: $. Alignments\n";
+    close IN;
+}
+
+## create fate codes hash
+my %codes = (
+    0 => { 0 => 0, 1 => 1, 2 => 2 },
+    1 => { 0 => 3, 1 => 4, 2 => 5 },
+    2 => { 0 => 6, 1 => 7, 2 => 8 }
+    );
+
+
+## analyze/write
+print "Analyzing and writing...\n";
+
+open OUT, "> $outfile";
+print OUT 'Read', join("\t", ('', map { "$run.$_" } qw/ CODE CHR1 POS1 CHR2 POS2 /)), "\n";
+open IN, $headers;
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    print OUT $_;
+    foreach my $run (@order) {
+	my $e1 = scalar @{ $prefate{$_}{$run}{1} };
+	my $e2 = scalar @{ $prefate{$_}{$run}{2} };
+	$e1 = 2 if $e1 > 2;
+	$e2 = 2 if $e2 > 2;
+	print OUT "\t$codes{$e1}{$e2}";
+	my $s1 = $e1 == 0 ? "-1\t-1" : 
+	    $e1 == 2 ? "0\t0" : $prefate{$_}{$run}{1}->[0];
+	my $s2 = $SE{$run} ? "\t" : 
+	    $e2 == 0 ? "-1\t-1" : 
+	    $e1 == 2 ? "0\t0" : $prefate{$_}{$run}{2}->[0];
+	print OUT "\t$s1\t$s2";  # $s1, $s2 are 2-column strings
+    }
+    print OUT "\n";
+}
+close $_ foreach qw/ IN OUT /;
+
+my $end = `date`;
+print "readFate complete!\nStart: $start\nEnd:   $end\n";
+kill $$;  # much faster than exit!

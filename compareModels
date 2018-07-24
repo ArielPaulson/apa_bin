@@ -1,0 +1,262 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+#### $file2 handling is gtf-dependent -- MUST FIX
+
+
+my $file1;
+my $file2;
+my $outfile;
+my $minover = 1;
+my $self;
+my $stranded;
+my $unmatched = 'all';
+my $summary;
+
+my %strand_values = ('same',1, 'anti',1);
+my %unmatched_values = ('all',1, 'none',1, 1,1, 2,1);
+
+GetOptions("a=s" => \$file1, "b=s" => \$file2, "o=s" => \$outfile, "s=s" => \$stranded, "u=s" => \$unmatched, "m=i" => \$minover, "self" => \$self, "summary" => \$summary);
+
+die "'-u' must be 'all', 'none', '1', or '2'!\n" unless $unmatched_values{$unmatched};
+die "'-s' must be 'same' or 'anti'\n" if ($stranded && !$strand_values{$stranded});
+die "$0: Input #1 '$file1' does not exist!\n" unless -e $file1;
+$outfile = 'compareModels.txt' unless $outfile;
+
+my $scripts = '/home/apa/local/bin';
+my $intersectBed = '/n/local/stage/bedtools/bedtools2-2.24.0/bin/intersectBed';
+
+my $ibCall = "$intersectBed -wao";
+$ibCall .= ' -s' if $stranded eq 'same';
+$ibCall .= ' -S' if $stranded eq 'anti';
+print "$ibCall\n";
+
+if ($self) {
+    $file2 = $file1;
+} else {
+    die "$0: Input #2 '$file2' does not exist!\n" unless -e $file2;
+}
+
+my ($ext1) = ($file1 =~ /([^\.]+)$/);
+my ($ext2) = ($file2 =~ /([^\.]+)$/);
+$ext1 = "\L$ext1";
+$ext2 = "\L$ext2";
+$ext1 =~ s/\d+$//;  # strip any numeric components to extension, e.g. '3' in 'gff3' or '12' in 'bed12'
+$ext2 =~ s/\d+$//;
+
+die "$0: Input types not consistent!\n" if $ext1 ne $ext2;
+
+my $tmp = "compareModels.$$.tmp";
+die "Tempdir '$tmp' already exists!\n" if -d $tmp;
+system "mkdir $tmp";
+die "Failed to create tempdir '$tmp'!\n" unless -d $tmp;
+
+my ($bed1m, $bed2m);
+my $int = "compareModels.$$.tmp/int.txt";
+
+if ($ext1 eq 'bed') {
+
+    $bed1m = $file1;
+    $bed2m = $file2;
+
+} elsif ($ext1 eq 'gtf') { # || $ext1 eq 'gff') {
+    
+    my $bed1 = "compareModels.$$.tmp/1.bed";
+    my $bed2 = "compareModels.$$.tmp/2.bed";
+    $bed1m = "compareModels.$$.tmp/1.merged";
+    $bed2m = "compareModels.$$.tmp/2.merged";
+
+    print "Processing input #1...\n";
+    system "$scripts/gtf2exons $file1 1 | $scripts/sortBedCoord - > $bed1";
+    system "$scripts/exons2uxons $bed1 bed > $bed1m";
+    
+    if ($self) {
+	$bed2 = $bed1;
+	$bed2m = $bed1m;
+    } else {
+	print "Processing input #2...\n";
+	system "$scripts/gtf2exons $file2 1 | $scripts/sortBedCoord - > $bed2";
+	system "$scripts/exons2uxons $bed2 bed > $bed2m";
+    }
+    
+#} elsif ($ext1 eq 'psl') {
+
+
+} else {
+
+#    die "$0: Inputs must be BED, GTF, GFF, or PSL format!\n";
+#    die "$0: Inputs must be BED, GTF, or GFF format!\n";
+    die "$0: Inputs must be BED or GTF format!\n";
+    
+}
+
+my (%gdat, %N);
+
+open my $IN1, '<', $bed1m or die "$0: Failed to open file '$bed1m': $!\n";
+while (<$IN1>) {
+    $_ =~ s/[\n\r]+$//;
+    my @data = split /\t/, $_;
+    my ($gene, $num) = split /:/, $data[3];
+    my $len = $data[2]-$data[1];
+    $gdat{1}{$gene}{S} = $data[5];
+    $gdat{1}{$gene}{N}++;
+    $gdat{1}{$gene}{L} += $len;
+}
+close $IN1;
+
+if ($self) {
+    $gdat{2} = $gdat{1};
+} else {
+    open my $IN2, '<', $bed2m or die "$0: Failed to open file '$bed2m': $!\n";
+    while (<$IN2>) {
+	$_ =~ s/[\n\r]+$//;
+	my @data = split /\t/, $_;
+	my ($gene, $num) = split /:/, $data[3];
+	my $len = $data[2]-$data[1];
+	$gdat{2}{$gene}{S} = $data[5];
+	$gdat{2}{$gene}{N}++;
+	$gdat{2}{$gene}{L} += $len;
+    }
+    close $IN2;
+}
+
+
+
+print "Inter-set intersections...\n";
+system "$ibCall -a $bed1m -b $bed2m > $int";
+
+my @temp = &process(1,2);
+my %overlap = %{$temp[0]};
+my %uxons = %{$temp[1]};
+my %already = %{$temp[2]};
+my %output = %{$temp[3]};
+
+my (%intra, %summData);
+if ($summary) {
+    print "Intra-set 1 intersections...\n";
+    system "$ibCall -a $bed1m -b $bed1m > $int";
+    my @temp = &process(1,1);
+    $intra{1}{overlap} = $temp[0];
+    $intra{1}{uxons} = $temp[1];
+    $intra{1}{already} = $temp[2];
+    $intra{1}{output} = $temp[3];
+    print "Intra-set 2 intersections...\n";
+    system "$ibCall -a $bed2m -b $bed2m > $int";
+    my @temp = &process(2,2);
+    $intra{2}{overlap} = $temp[0];
+    $intra{2}{uxons} = $temp[1];
+    $intra{2}{already} = $temp[2];
+    $intra{2}{output} = $temp[3];
+    foreach my $i (1,2) {
+	foreach my $over (sort {$b <=> $a} keys %{ $intra{$i}{output} }) {
+	    next unless $over >= $minover;
+	    foreach my $maxN (sort {$b <=> $a} keys %{ $intra{$i}{output}{$over} }) {
+		foreach (@{ $intra{$i}{output}{$over}{$maxN} }) {
+		    $summData{intra}{$i}{ $_->[0] }++;  # only count first; second column is reciprocal
+		}
+	    }
+	}
+    }
+}
+
+system "rm -Rf compareModels.$$.tmp";
+
+open my $OUT1, '>', $outfile;
+print $OUT1 join("\t", qw/ Transcript1 Transcript2 Str1 Str2 UxonicBpOverlap UxonBp1 UxonBp2 BpPct1 BpPct2 TotUxons1 AffUxons1 AffPct1 TotUxons2 AffUxons2 AffPct2 /),"\n";
+foreach my $over (sort {$b <=> $a} keys %output) {
+    next unless $over >= $minover;
+    foreach my $maxN (sort {$b <=> $a} keys %{ $output{$over} }) {
+	foreach (sort { $a->[2] cmp $b->[2] } @{ $output{$over}{$maxN} }) {
+	    $summData{inter}{1}{ $_->[0] }++;
+	    $summData{inter}{2}{ $_->[1] }++;
+	    print $OUT1 $_->[2];
+	}
+    }
+}
+if ($unmatched eq 'all' || $unmatched eq '1') {
+    foreach my $gene1 (keys %{ $gdat{1} }) {
+	my $str1 = $gdat{1}{$gene1}{S};
+	my $len1 = $gdat{1}{$gene1}{L};
+	my $uxons1 = $gdat{1}{$gene1}{N};
+	print $OUT1 "$gene1\t\t$str1\t\t0\t$len1\t\t0\t\t$uxons1\t0\t0\t\t\t\n" unless $already{$gene1};
+    }
+}
+if ($unmatched eq 'all' || $unmatched eq '2') {
+    foreach my $gene2 (keys %{ $gdat{2} }) {
+	my $str2 = $gdat{2}{$gene2}{S};
+	my $len2 = $gdat{2}{$gene2}{L};
+	my $uxons2 = $gdat{2}{$gene2}{N};
+	print $OUT1 "\t$gene2\t\t$str2\t0\t\t$len2\t\t0\t\t\t\t$uxons2\t0\t0\n" unless $already{$gene2};
+    }
+}
+close $OUT1;
+
+if ($summary) {
+    my %tally;
+    foreach my $set (qw/ inter intra /) {
+	foreach my $i (1,2) {
+	    $tally{$set}{ $summData{$set}{$i}{$_} || 0 }{$i}++ foreach keys %{ $gdat{$i} };
+	}
+    }
+    open my $OUT2, '>', "$outfile.summary";
+    print $OUT2 "Inter-set Overlaps:\nN Overlaps\tA Models\tB Models\n";
+    foreach my $n (sort {$b <=> $a} keys %{ $tally{inter} }) {
+	print $OUT2 "$n\t$tally{inter}{$n}{1}\t$tally{inter}{$n}{2}\n";
+    }
+    print $OUT2 "\nIntra-set Overlaps:\nN Overlaps\tA Models\tB Models\n";
+    foreach my $n (sort {$b <=> $a} keys %{ $tally{intra} }) {
+	print $OUT2 "$n\t$tally{intra}{$n}{1}\t$tally{intra}{$n}{2}\n";
+    }
+    close $OUT2;
+}
+exit;
+
+
+
+
+sub process {
+    
+    my ($i, $j) = @_;
+    my (%OVERLAP, %UXONS, %ALREADY, %OUTPUT);
+    my $SELF = $i == $j ? 1 : $self ? 1 : 0;
+    
+    open my $IN3, '<', $int or die "Failed to open intersection file '$int': $!\n";
+    while (<$IN3>) {
+	chomp;
+	my @data = split /\t/, $_;
+	next if $data[6] eq '.';  # no match
+	my @fields1 = @data[0..5];
+	my @fields2 = @data[6..11];
+	my ($gene1) = (split /:/, $fields1[3])[0];
+	my ($gene2) = (split /:/, $fields2[3])[0];
+	next if ($SELF && $gene1 eq $gene2);
+	$OVERLAP{$gene1}{$gene2} += $data[12];
+	$UXONS{$i}{$gene1}{$fields1[3]}++;
+	$UXONS{$j}{$gene2}{$fields2[3]}++;
+    }
+    close $IN3;
+
+    foreach my $gene1 (keys %OVERLAP) {
+	$ALREADY{$gene1} = 1;
+	foreach my $gene2 (keys %{ $OVERLAP{$gene1} }) {
+	    $ALREADY{$gene2} = 1;
+	    my $over = $OVERLAP{$gene1}{$gene2};
+	    my $N1 = scalar keys %{ $UXONS{$i}{$gene1} };
+	    my $N2 = scalar keys %{ $UXONS{$j}{$gene2} };
+	    my $maxN = $N1 > $N2 ? $N1 : $N2;
+	    my ($str1, $str2) = ($gdat{$i}{$gene1}{S}, $gdat{$j}{$gene2}{S});
+	    my ($len1, $len2) = ($gdat{$i}{$gene1}{L}, $gdat{$j}{$gene2}{L});
+	    my ($uxons1, $uxons2) = ($gdat{$i}{$gene1}{N}, $gdat{$j}{$gene2}{N});
+	    my $bpp1 = sprintf("%0.2f", 100*$over/$len1);
+	    my $bpp2 = sprintf("%0.2f", 100*$over/$len2);
+	    my $uxp1 = sprintf("%0.2f", 100*$N1/$uxons1);
+	    my $uxp2 = sprintf("%0.2f", 100*$N2/$uxons2);
+	    push @{ $OUTPUT{$over}{$maxN} }, [$gene1, $gene2, join("\t", $gene1, $gene2, $str1, $str2, $over, $len1, $len2, $bpp1, $bpp2, $uxons1, $N1, $uxp1, $uxons2, $N2, "$uxp2\n")];
+	}
+    }
+    
+    return (\%OVERLAP, \%UXONS, \%ALREADY, \%OUTPUT);
+}

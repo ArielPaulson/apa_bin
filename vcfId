@@ -1,0 +1,34 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use strict;
+
+my ($invcf, $label, $outvcf) = @ARGV;
+
+die "$0: no snp ID label specified!  (IDs are '\$label#', where '#' is the VCF row number)\n" unless $label;
+($outvcf = $invcf) =~ s/\.vcf/.id.vcf/ unless $outvcf;
+
+print "Calculating field width...\n";
+my $cmd = $invcf =~ /\.gz$/ ? "zcat" : "cat";
+$cmd .= " $invcf | grep -v \"^#\" | wc -l";
+chomp(my $N = `$cmd`);
+my $W = length($N);
+
+print "Adding IDs...\n";
+my $IN = &open2('R', $invcf, 'input vcf');
+my $OUT = &open2('W', $outvcf, 'output vcf', 1);  # 1 for bgzip
+my $i;
+while (<$IN>) {
+    if (/^#/) {
+        print $OUT $_;
+    } else {
+        $i++;
+        my @data = split /\t/, $_, 4;
+        $data[2] = sprintf("$label%0${W}i", $i);
+        print $OUT join("\t",@data);
+    }
+}
+close $IN;
+close $OUT;
+
+print "$0 $invcf complete!\n";
+exit;

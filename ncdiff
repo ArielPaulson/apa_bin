@@ -1,0 +1,343 @@
+<     if (exists("known.genes")) {
+<         kg.ngenes <- length(unique(known.genes$Gene.ID))
+<         kg.ntrans <- nrow(known.genes)
+<         ignored <- known.genes$Alt.Biotype=="IGNORE"
+<         g.ignored <- length(unique(known.genes$Gene.ID[ignored]))
+<         t.ignored <- length(unique(known.genes$Transcript.ID[ignored]))
+<         message(paste0(t.ignored," prior transcripts (",g.ignored," genes) were flagged as IGNORE."))
+<         no.symbol <- which(known.genes$Use.Symbol=="")    # any missing Use Symbols?
+<         known.genes$Use.Symbol[no.symbol] <- known.genes$Symbol[no.symbol]      # if Use Symbol is empty, take old symbol
+<         no.biotype <- which(known.genes$Alt.Biotype=="")  # any missing Alt Biotypes?
+<         known.genes$Alt.Biotype[no.biotype] <- known.genes$Biotype[no.biotype]  # if Alt Biotype is empty, take Ensembl biotype
+<         g.no.biotype <- length(unique(known.genes$Gene.ID[no.biotype]))
+<         t.no.biotype <- length(unique(known.genes$Transcript.ID[no.biotype]))
+<         message(paste(kg.ngenes-g.no.biotype-g.ignored,"prior genes have a prior Alt.Biotype (which is not IGNORE)."))
+---
+>     if (exists("known.trans")) {
+>         ignored <- sum(known.trans$Alt.Biotype=="IGNORE")
+>         message(paste(ignored,"prior genes were flagged as IGNORE."))
+>         no.symbol <- which(known.trans$Use.Symbol=="")    # any missing Use Symbols?
+>         known.trans$Use.Symbol[no.symbol] <- known.trans$Symbol[no.symbol]      # if Use Symbol is empty, take old symbol
+>         no.biotype <- which(known.trans$Alt.Biotype=="")  # any missing Alt Biotypes?
+>         known.trans$Alt.Biotype[no.biotype] <- known.trans$Biotype[no.biotype]  # if Alt Biotype is empty, take Ensembl biotype
+>         message(paste(length(unique(known.trans$Gene.ID))-length(no.biotype)-ignored,"prior genes have a prior Alt.Biotype (which is not IGNORE)."))
+481,486c442,445
+<         kg.ens <- known.genes[!mgrepl(non.ensembl,known.genes$Gene.Status),]  # restrict to Ensembl (non-Ensembl handled separately)
+<         kg.ens.ngenes <- length(unique(kg.ens$Gene.ID))
+<         kg.ens.ntrans <- nrow(kg.ens)
+<         if (nrow(kg.ens)>0) use.kg <- TRUE   # if any genes left in 'known.genes', then use it.  Otherwise, generate something like it from scratch.
+<         message(paste0(kg.ntrans," prior transcripts (",kg.ngenes," genes) accepted."))
+<         message(paste0(kg.ens.ntrans," prior Ensembl transcripts (",kg.ens.ngenes," Ensembl genes) accepted."))
+---
+>         kt.ens <- known.trans[!mgrepl(non.ensembl,known.trans$Gene.Status),]  # restrict to Ensembl (non-Ensembl handled separately)
+>         if (nrow(kt.ens)>0) use.kg <- TRUE   # if any genes left in 'known.trans', then use it.  Otherwise, generate something like it from scratch.
+>         message(paste(nrow(kt.ens),"prior Ensembl genes accepted."))
+>         message(paste(nrow(known.trans),"prior genes accepted."))
+492,501c451,459
+<         ## Comparison must be transcript-wise, as some ncRNAs actually have multiple transcripts
+<         trans.va <- venn.areas(list(KNOWN=kg.ens$Transcript.ID,CURRENT=nc.genes$Transcript.ID))  # venn diag areas list, comparing transcripts in 'known.genes' object (from gene_master file) vs current Ensembl data
+<         message(paste("PRIOR-ONLY:  ",length(trans.va[[1]])))
+<         message(paste("CURRENT-ONLY:",length(trans.va[[2]])))
+<         message(paste("OVERLAP:     ",length(trans.va[[3]])))
+<         
+<         ## any Ensembl transcripts in known.genes which no longer exist in Ensembl?
+<         if (length(trans.va[[1]])>0) {
+<             old.genes <- kg.ens[kg.ens$Transcript.ID %in% trans.va[[1]],]
+<             write.table(old.genes, paste0(out.path,"/",orgver,".old_genes.txt"), sep="\t", quote=FALSE, row.names=FALSE)  # write expired transcripts to their own file
+---
+>         genes.va <- venn.areas(list(KNOWN=kt.ens$Gene.ID,CURRENT=nc.trans$Gene.ID))  # venn diag areas list, comparing genes in 'known.trans' object (from gene_master file) vs current Ensembl data
+>         message(paste("PRIOR-ONLY:  ",length(genes.va[[1]])))
+>         message(paste("CURRENT-ONLY:",length(genes.va[[2]])))
+>         message(paste("OVERLAP:     ",length(genes.va[[3]])))
+>         
+>         ## any Ensembl genes in known.trans which no longer exist in Ensembl?
+>         if (length(genes.va[[1]])>0) {
+>             old.trans <- kt.ens[kt.ens$Gene.ID %in% genes.va[[1]],]
+>             write.table(old.trans, paste0(out.path,"/",org,".old_genes.",enstxt), sep="\t", quote=FALSE, row.names=FALSE)  # write expired genes to their own file
+505,507c463,465
+<         if (length(trans.va[[2]])>0) {
+<             new.genes <- nc.genes[nc.genes$Transcript.ID %in% trans.va[[2]],]
+<             write.table(new.genes, paste0(out.path,"/",orgver,".new_genes.txt"), sep="\t", quote=FALSE, row.names=FALSE)  # write novel transcripts to their own file
+---
+>         if (length(genes.va[[2]])>0) {
+>             new.trans <- nc.trans[nc.trans$Gene.ID %in% genes.va[[2]],]
+>             write.table(new.trans, paste0(out.path,"/",org,".new_genes.",enstxt), sep="\t", quote=FALSE, row.names=FALSE)  # write novel genes to their own file
+511c469,472
+<         if (length(trans.va[[3]])>0) {
+---
+>         if (length(genes.va[[3]])>0) {
+>             
+>             ## Some Ensembl gene IDs were shared between existing, new Ensembl datasets
+>             ## Initialize 'final.trans' table with genes shared between current-Ensembl and existing gene_master table
+513,514c474,491
+<             ## Some Ensembl transcript IDs were shared between existing, new Ensembl datasets
+<             ## Initialize 'final.genes' table with transcripts shared between current-Ensembl and existing gene_master table
+---
+>             ca <- match(genes.va[[3]],all.trans$Gene.ID)    # where are common genes in all.trans object (current)
+>             cf <- match(genes.va[[3]],final.trans$Gene.ID)  # where are common genes in final.trans object (current)
+>             ck <- match(genes.va[[3]],known.trans$Gene.ID)  # where are common genes in known.trans object (prior)
+>             
+>             final.trans$Alt.Biotype[cf] <- known.trans$Alt.Biotype[ck]  # import prior alternate (hand-crafted) Biotype annotations, if any
+>             final.trans$Use.Symbol[cf] <- known.trans$Use.Symbol[ck]    # import prior alternate (hand-crafted) Symbol annotations, if any
+>             all.trans$Alt.Biotype[ca] <- known.trans$Alt.Biotype[ck]    # ditto
+>             all.trans$Use.Symbol[ca] <- known.trans$Use.Symbol[ck]      # ditto
+>             
+>             no.alt.bio <- which(truthify(final.trans$Alt.Biotype==""))  # any missing alt biotypes? (most will be missing)
+>             no.use.sym <- which(truthify(final.trans$Use.Symbol==""))   # any missing use symbols?  (most will be missing)
+>             no.alt.bio.a <- match(final.trans$Gene.ID[no.alt.bio], all.trans$Gene.ID)  # equivalent positions in 'all.trans'
+>             no.use.sym.a <- match(final.trans$Gene.ID[no.use.sym], all.trans$Gene.ID)  # ditto
+>             
+>             final.trans$Alt.Biotype[no.alt.bio] <- final.trans$Biotype[no.alt.bio]  # if missing "alt" biotypes, copy from old
+>             final.trans$Use.Symbol[no.use.sym] <- final.trans$Symbol[no.use.sym]    # if missing "use" symbols, copy from old
+>             all.trans$Alt.Biotype[no.alt.bio.a] <- final.trans$Biotype[no.alt.bio]  # ditto
+>             all.trans$Use.Symbol[no.use.sym.a] <- final.trans$Symbol[no.use.sym]    # ditto
+516,538c493,494
+<             ca <- match(trans.va[[3]],all.genes$Transcript.ID)    # where are common genes in all.genes object (current)
+<             cf <- match(trans.va[[3]],final.genes$Transcript.ID)  # where are common genes in final.genes object (current)
+<             ck <- match(trans.va[[3]],known.genes$Transcript.ID)  # where are common genes in known.genes object (prior)
+<             
+<             final.genes$Alt.Biotype[cf] <- known.genes$Alt.Biotype[ck]  # import prior alternate (hand-crafted) Biotype annotations, if any
+<             final.genes$Use.Symbol[cf] <- known.genes$Use.Symbol[ck]    # import prior alternate (hand-crafted) Symbol annotations, if any
+<             all.genes$Alt.Biotype[ca] <- known.genes$Alt.Biotype[ck]    # ditto
+<             all.genes$Use.Symbol[ca] <- known.genes$Use.Symbol[ck]      # ditto
+<             
+<             no.alt.bio <- which(truthify(final.genes$Alt.Biotype==""))  # any missing alt biotypes? (most will be missing)
+<             no.use.sym <- which(truthify(final.genes$Use.Symbol==""))   # any missing use symbols?  (most will be missing)
+<             no.alt.bio.a <- match(final.genes$Transcript.ID[no.alt.bio], all.genes$Transcript.ID)  # equivalent positions in 'all.genes'
+<             no.use.sym.a <- match(final.genes$Transcript.ID[no.use.sym], all.genes$Transcript.ID)  # ditto
+<             
+<             final.genes$Alt.Biotype[no.alt.bio] <- final.genes$Biotype[no.alt.bio]  # if missing "alt" biotypes, copy from old
+<             final.genes$Use.Symbol[no.use.sym] <- final.genes$Symbol[no.use.sym]    # if missing "use" symbols, copy from old
+<             all.genes$Alt.Biotype[no.alt.bio.a] <- final.genes$Biotype[no.alt.bio]  # ditto
+<             all.genes$Use.Symbol[no.use.sym.a] <- final.genes$Symbol[no.use.sym]    # ditto
+<             
+<             ## Genes may have > 1 transcript.  Ensure "IGNORE" flags propagate to all transcripts per ignored gene.
+<             ignored.gids <- all.genes$Gene.ID[all.genes$Alt.Biotype=="IGNORE"]  # gene IDs affected by the IGNORE alt-biotype
+<             all.genes$Alt.Biotype[all.genes$Gene.ID %in% ignored.gids] <- "IGNORE"
+<             final.genes$Alt.Biotype[final.genes$Gene.ID %in% ignored.gids] <- "IGNORE"
+---
+>             ## Genes mave have > 1 transcript.  Ensure "IGNORE" flags propagate to transcripts.
+>             ignores.gids <- 
+541,542c497,498
+<             final.biotype.stats <- biotype.gt(final.genes, "Final")  # gene biotypes
+<             final.biotype.stats2 <- biotype.gt(final.genes, "Final", TRUE)  # gene + transcript biotypes
+---
+>             final.biotype.stats <- biotype.gt(final.trans, "Final")  # gene biotypes
+>             final.biotype.stats2 <- biotype.gt(final.trans, "Final", TRUE)  # gene + transcript biotypes
+546,549c502,505
+<             ignored.genes <- all.genes[all.genes$Alt.Biotype=="IGNORE",]  # genes affected by the IGNORE alt-biotype
+<             if (nrow(ignored.genes)>0) {
+<                 ignored.biotype.stats <- biotype.gt(ignored.genes, "Excluded")  # stats for IGNOREd gene biotypes only; treat as Excluded
+<                 ignored.biotype.stats2 <- biotype.gt(ignored.genes, "Excluded", TRUE)  # stats for IGNOREd gene + transcript biotypes only; treat as Excluded
+---
+>             ignored.trans <- all.trans[all.trans$Alt.Biotype=="IGNORE",]  # genes affected by the IGNORE alt-biotype
+>             if (nrow(ignored.trans)>0) {
+>                 ignored.biotype.stats <- biotype.gt(ignored.trans, "Excluded")  # stats for IGNOREd gene biotypes only; treat as Excluded
+>                 ignored.biotype.stats2 <- biotype.gt(ignored.trans, "Excluded", TRUE)  # stats for IGNOREd gene + transcript biotypes only; treat as Excluded
+559c515
+<             message(paste0("WARNING: No transcripts in common between old (",length(unique(kg.ens$Transcript.ID)),"), new (",length(unique(nc.genes$Transcript.ID)),") datasets!"))
+---
+>             message(paste0("WARNING: No genes in common between old (",length(unique(kt.ens$Gene.ID)),"), new (",length(unique(nc.trans$Gene.ID)),") datasets!"))
+571,572c527,528
+<     final.genes[,1] <- apply(final.genes[,c(3,6:8,5)], 1, paste, collapse="|")
+<     message(paste0(nrow(final.genes)," final transcripts (",length(unique(final.genes$Gene.ID))," genes) selected."))
+---
+>     final.trans[,1] <- apply(final.trans[,c(3,6:8,5)], 1, paste, collapse="|")
+>     message(paste0(length(unique(final.trans$Gene.ID))," final genes (",nrow(final.trans)," transcripts) selected."))
+581,583c537,539
+<     final.seq <- getSequence(id=final.genes$Transcript.ID, type="ensembl_transcript_id", seqType="cdna", mart=mart)   # transcript sequences for 'final.genes'
+<     seq.ord <- match(final.genes$Transcript.ID, final.seq[[2]])  # order same as 'final.genes'
+<     for (i in 1:2) final.seq[[i]] <- final.seq[[i]][seq.ord]     # order same as 'final.genes'
+---
+>     final.seq <- getSequence(id=final.trans$Transcript.ID, type="ensembl_transcript_id", seqType="cdna", mart=mart)   # transcript sequences for 'final.trans'
+>     seq.ord <- match(final.trans$Transcript.ID, final.seq[[2]])  # order same as 'final.trans'
+>     for (i in 1:2) final.seq[[i]] <- final.seq[[i]][seq.ord]     # order same as 'final.trans'
+585c541
+<     names(out.fasta) <- final.genes[,1]  # switch to final fasta headers
+---
+>     names(out.fasta) <- final.trans[,1]  # switch to final fasta headers
+587c543
+<     lengths.mismatch <- sum(final.lens!=final.genes$Length)
+---
+>     lengths.mismatch <- sum(final.lens!=final.trans$Length)
+635c591
+<             ## finally, headers are reformatted to match first 11 columns of final.genes table
+---
+>             ## finally, headers are reformatted to match first 11 columns of final.trans table
+656c612
+<         old.trna.names <- names(trna.fa)  # the original fasta headers -- will become "Description" field in final.genes table
+---
+>         old.trna.names <- names(trna.fa)  # the original fasta headers -- will become "Description" field in final.trans table
+659,660c615,616
+<         trna.genes <- data.frame(trna.dat,exons,sapply(trna.fa,nchar),trna.gcp,trna.biotype,trna.biotype,trna.biotype,old.trna.names)  # in 'final.genes' format
+<         colnames(trna.genes) <- colnames(final.genes)
+---
+>         trna.trans <- data.frame(trna.dat,exons,sapply(trna.fa,nchar),trna.gcp,trna.biotype,trna.biotype,trna.biotype,old.trna.names)  # in 'final.trans' format
+>         colnames(trna.trans) <- colnames(final.trans)
+662c618
+<             trna.redundant.fin <- final.genes$Gene.ID %in% trna.genes$Gene.ID  # these trnas are already in 'final.genes'
+---
+>             trna.redundant.fin <- final.trans$Gene.ID %in% trna.trans$Gene.ID  # these trnas are already in 'final.trans'
+664,665c620,621
+<             if (sum(trna.redundant.fin)>0) final.genes <- final.genes[!trna.redundant.fin,]  # so remove them
+<             trna.redundant.all <- all.genes$Gene.ID %in% trna.genes$Gene.ID  # these trnas are already in 'all.genes'
+---
+>             if (sum(trna.redundant.fin)>0) final.trans <- final.trans[!trna.redundant.fin,]  # so remove them
+>             trna.redundant.all <- all.trans$Gene.ID %in% trna.trans$Gene.ID  # these trnas are already in 'all.trans'
+667c623
+<             if (sum(trna.redundant.all)>0) all.genes <- all.genes[!trna.redundant.all,]  # so remove them
+---
+>             if (sum(trna.redundant.all)>0) all.trans <- all.trans[!trna.redundant.all,]  # so remove them
+669,670c625,626
+<             final.genes <- rbind(final.genes, trna.genes)  # add all tRNA data to final.genes table
+<             all.genes <- rbind(all.genes, trna.genes)  # add all tRNA data to all.genes table
+---
+>             final.trans <- rbind(final.trans, trna.trans)  # add all tRNA data to final.trans table
+>             all.trans <- rbind(all.trans, trna.trans)  # add all tRNA data to all.trans table
+711c667
+<         old.ribo.names <- names(ribo.fa)  # NCBI fasta headers -- will become "Description" field in final.genes table
+---
+>         old.ribo.names <- names(ribo.fa)  # NCBI fasta headers -- will become "Description" field in final.trans table
+714,715c670,671
+<         ribo.genes <- data.frame(names(ribo.fa),ribo.biotype,"rRNA","",cfg$NCBI_RIBO[,2],cfg$NCBI_RIBO[,1],ribo.ver,NA,NA,NA,NA,1,sapply(ribo.fa,nchar),ribo.gcp,ribo.biotype,ribo.biotype,ribo.biotype,old.ribo.names)  # in 'final.genes' format
+<         colnames(ribo.genes) <- colnames(final.genes)
+---
+>         ribo.trans <- data.frame(names(ribo.fa),ribo.biotype,"rRNA","",cfg$NCBI_RIBO[,2],cfg$NCBI_RIBO[,1],ribo.ver,NA,NA,NA,NA,1,sapply(ribo.fa,nchar),ribo.gcp,ribo.biotype,ribo.biotype,ribo.biotype,old.ribo.names)  # in 'final.trans' format
+>         colnames(ribo.trans) <- colnames(final.trans)
+717c673
+<             ribo.redundant.fin <- final.genes$Gene.ID %in% ribo.genes$Gene.ID  # these ribos are already in 'final.genes'
+---
+>             ribo.redundant.fin <- final.trans$Gene.ID %in% ribo.trans$Gene.ID  # these ribos are already in 'final.trans'
+719,720c675,676
+<             if (sum(ribo.redundant.fin)>0) final.genes <- final.genes[!ribo.redundant.fin,]  # so remove them
+<             ribo.redundant.all <- all.genes$Gene.ID %in% ribo.genes$Gene.ID  # these ribos are already in 'all.genes'
+---
+>             if (sum(ribo.redundant.fin)>0) final.trans <- final.trans[!ribo.redundant.fin,]  # so remove them
+>             ribo.redundant.all <- all.trans$Gene.ID %in% ribo.trans$Gene.ID  # these ribos are already in 'all.trans'
+722c678
+<             if (sum(ribo.redundant.all)>0) all.genes <- all.genes[!ribo.redundant.all,]  # so remove them
+---
+>             if (sum(ribo.redundant.all)>0) all.trans <- all.trans[!ribo.redundant.all,]  # so remove them
+724,725c680,681
+<             final.genes <- rbind(final.genes, ribo.genes)  # add rRNA data to final.genes table
+<             all.genes <- rbind(all.genes, ribo.genes)  # add rRNA data to all.genes table
+---
+>             final.trans <- rbind(final.trans, ribo.trans)  # add rRNA data to final.trans table
+>             all.trans <- rbind(all.trans, ribo.trans)  # add rRNA data to all.trans table
+786c742
+<     write.table(biotype.stats, paste0(out.path,"/",orgver,".gene_biotype_stats.txt"), sep="\t", quote=FALSE, row.names=FALSE)  # write biotype status table (gene biotypes only)
+---
+>     write.table(biotype.stats, paste0(out.path,"/",org,".gene_biotype_stats.",enstxt), sep="\t", quote=FALSE, row.names=FALSE)  # write biotype status table (gene biotypes only)
+790c746
+<     write.table(biotype.stats2, paste0(out.path,"/",orgver,".trans_biotype_stats.txt"), sep="\t", quote=FALSE, row.names=FALSE)  # write biotype status table #2 (gene + transcript biotypes)
+---
+>     write.table(biotype.stats2, paste0(out.path,"/",org,".trans_biotype_stats.",enstxt), sep="\t", quote=FALSE, row.names=FALSE)  # write biotype status table #2 (gene + transcript biotypes)
+801c757
+<                 len.by.bio[[wsb]] <- final.genes$Length[final.genes$Alt.Biotype==b]
+---
+>                 len.by.bio[[wsb]] <- final.trans$Length[final.trans$Alt.Biotype==b]
+803c759
+<                 len.by.bio[[wsb]] <- trna.genes$Length
+---
+>                 len.by.bio[[wsb]] <- trna.trans$Length
+805c761
+<                 len.by.bio[[wsb]] <- ribo.genes$Length
+---
+>                 len.by.bio[[wsb]] <- ribo.trans$Length
+807c763
+<                 len.by.bio[[wsb]] <- nc.genes$Length[nc.genes$Biotype==b]
+---
+>                 len.by.bio[[wsb]] <- nc.trans$Length[nc.trans$Biotype==b]
+809c765
+<                 len.by.bio[[wsb]] <- obsolete.genes$Length[obsolete.genes$Biotype==b]
+---
+>                 len.by.bio[[wsb]] <- obsolete.trans$Length[obsolete.trans$Biotype==b]
+811c767
+<                 len.by.bio[[wsb]] <- c(excluded.genes$Length[excluded.genes$Biotype==b], ignored.genes$Length[ignored.genes$Biotype==b])
+---
+>                 len.by.bio[[wsb]] <- c(excluded.trans$Length[excluded.trans$Biotype==b], ignored.trans$Length[ignored.trans$Biotype==b])
+832c788
+<     png(paste0(out.path,"/",orgver,".biotype_lengths.png"), 700, 300+20*length(len.by.bio))
+---
+>     png(paste0(out.path,"/",org,".biotype_lengths.png"), 700, 300+20*length(len.by.bio))
+849c805
+<     ## Sort output fasta and final.genes in same order; add fasta-header column to final.genes
+---
+>     ## Sort output fasta and final.trans in same order; add fasta-header column to final.trans
+851c807
+<     final.genes <- final.genes[match(names(out.fasta),final.genes$Fasta.Header),]  # order final.genes in fasta order.
+---
+>     final.trans <- final.trans[match(names(out.fasta),final.trans$Fasta.Header),]  # order final.trans in fasta order.
+855c811
+<     message(paste("Gene Table Genes:",nrow(final.genes)))
+---
+>     message(paste("Gene Table Genes:",nrow(final.trans)))
+858,861c814,816
+<     ignored <- final.genes$Alt.Biotype=="IGNORE"
+<     final.genes$Fasta.Header[ignored] <- ""  # zap fasta header entries for ignorable transcripts
+<     gd.drop <- match(c("Biotype","Symbol"), colnames(final.genes))
+<     genedata <- final.genes[!ignored,-gd.drop]  # genedata.txt file: gene_master lite (single columns for biotype, symbol; no ignorable records: fasta companion dataset)
+---
+>     ignored <- final.trans[,3]=="IGNORE"
+>     final.trans[!ignored,1] <- ""  # zap fasta header entries for ignorable transcripts
+>     genedata <- final.trans[!ignored,-c(2,4)]  # genedata.txt file: gene_master lite (single columns for biotype, symbol; no ignorable records: fasta companion dataset)
+863,866c818,820
+<     gd.repl <- match(c("Alt.Biotype","Use.Symbol"), colnames(final.genes))
+<     colnames(genedata)[gd.repl] <- qw(Biotype,Symbol)   # genedata.txt file "Alt.Biotype" and "Use.Symbol" will not be referred to as such
+<     write.table(genedata, paste0(out.path,"/",orgver,".genedata.txt"), sep="\t", quote=FALSE, row.names=FALSE)  # write genedata.txt file
+<     write.fasta(out.fasta[!grepl("^IGNORE",names(out.fasta))], paste0(out.path,"/",orgver,".fa"))  # write final fasta
+---
+>     colnames(genedata)[2:3] <- qw(Biotype,Symbol)   # genedata.txt file "Alt.Biotype" and "Use.Symbol" not referred to as such
+>     write.table(genedata, paste0(out.path,"/",org,".genedata.",enstag,".txt"), sep="\t", quote=FALSE, row.names=FALSE)  # write genedata.txt file
+>     write.fasta(out.fasta[!grepl("^IGNORE",names(out.fasta))], paste0(out.path,"/",org,".fa"))  # write final fasta
+869c823
+<     masterdata <- final.genes  # regenerate gene_master dataset 
+---
+>     masterdata <- final.trans  # regenerate gene_master dataset 
+873,876c827
+<     masterdata <- masterdata[order(masterdata$Symbol),]       # sorted tertiarily by Symbol...
+<     masterdata <- masterdata[order(masterdata$Alt.Biotype),]  # ...secondarily by Alt.Biotype...
+<     masterdata <- masterdata[order(masterdata$Biotype),]      # ...and primarily by original Biotype
+<     write.table(masterdata, paste0(out.path,"/",orgver,".gene_master.txt"), sep="\t", quote=FALSE, row.names=FALSE)  # write gene_master table
+---
+>     write.table(masterdata, paste0(out.path,"/",org,".gene_master.",enstag,".txt"), sep="\t", quote=FALSE, row.names=FALSE)  # write gene_master table
+894d844
+<     btblog <- paste0(orgpref,".bowtie2_build.log")
+896c846
+<     system(paste("bowtie2-build",orgfa,orgpref,"&>",btblog))  # create bowtie2 indexes, send ALL screen output to log file
+---
+>     system(paste("bowtie2-build",orgfa,orgpref))  # create bowtie2 indexes
+1032c982
+< all.biotypes <- suniq(all.genes$Biotype)
+---
+> all.biotypes <- suniq(all.trans$Biotype)
+1034,1035c984,985
+< pc.genes <- all.genes[mgrep(pc.biotypes,all.genes$Biotype),]    # select all other transcripts
+< pc.gr <- bed2gr(pc.genes[,c(7:9,6,11,10)])
+---
+> pc.trans <- all.trans[mgrep(pc.biotypes,all.trans$Biotype),]    # select all other transcripts
+> pc.gr <- bed2gr(pc.trans[,c(7:9,6,11,10)])
+1037,1039c987,989
+< for (i in 9:10) final.genes[,i] <- as.numeric(final.genes[,i])  # for some reason
+< use <- which(!is.na(final.genes[,9])&final.genes[,3]!="IGNORE")
+< nc.gr <- bed2gr(final.genes[use,c(8:10,7,12,11)])
+---
+> for (i in 9:10) final.trans[,i] <- as.numeric(final.trans[,i])  # for some reason
+> use <- which(!is.na(final.trans[,9])&final.trans[,3]!="IGNORE")
+> nc.gr <- bed2gr(final.trans[use,c(8:10,7,12,11)])
+1043,1044c993,994
+< ol2[,1] <- final.genes[use[ol[,1]],1]
+< ol2[,2] <- paste(pc.genes[ol[,2],1],pc.genes[ol[,2],3],sep="|")
+---
+> ol2[,1] <- final.trans[use[ol[,1]],1]
+> ol2[,2] <- paste(pc.trans[ol[,2],1],pc.trans[ol[,2],3],sep="|")
+1051c1001
+< pc.exons <- getBM(attributes=c("ensembl_transcript_id","chromosome_name","exon_chrom_start","exon_chrom_end","ensembl_exon_id"), filters="ensembl_transcript_id", values=pc.genes[ol[,2],6], mart=mart)  # get exons per overlapping PC transcript
+---
+> pc.exons <- getBM(attributes=c("ensembl_transcript_id","chromosome_name","exon_chrom_start","exon_chrom_end","ensembl_exon_id"), filters="ensembl_transcript_id", values=pc.trans[ol[,2],6], mart=mart)  # get exons per overlapping PC transcript
+1056,1057c1006,1007
+< ol2[,1] <- final.genes[use[ol[,1]],1]
+< ol2[,2] <- paste(pc.genes[ol[,2],1],pc.genes[ol[,2],3],sep="|")
+---
+> ol2[,1] <- final.trans[use[ol[,1]],1]
+> ol2[,2] <- paste(pc.trans[ol[,2],1],pc.trans[ol[,2],3],sep="|")

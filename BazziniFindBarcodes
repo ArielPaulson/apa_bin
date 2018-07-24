@@ -1,0 +1,93 @@
+#!/usr/bin/env Rscript
+library(seqLogo)
+source("/home/apa/apa_tools.R")
+
+pwm.depth <- 1E4  # for time's sake: only use up to 10k sequences for PWMs
+pwm.cons <- 0.90  # PWM position conservation >= this gets 1, otherwise 0.
+
+ca <- commandArgs(trailing=TRUE)
+samp <- ca[1]
+outdir <- ca[2]
+fq1 <- paste0("../data/fastq/",samp,"_1.fastq.gz")
+fq2 <- paste0("../data/fastq/",samp,"_2.fastq.gz")
+tab1 <- paste0("../data/output/",samp,"/temp/",samp,"_1.fastq.tab.gz")
+tab2 <- paste0("../data/output/",samp,"/temp/",samp,"_2.fastq.tab.gz")
+
+## Method below not well thought-out yet...
+#if (length(ca)>1) {
+#    ## extra barcodes were specified (force include these, even if % total is < 1%)
+#    extras <- 
+#}
+
+tmp.F25 <- tempfile()
+tmp.F10 <- tempfile()
+tmp.R25 <- tempfile()
+tmp.R10 <- tempfile()
+tmp.FR <- tempfile()
+
+message("Surveying fragment ends...\n")
+system(paste("zcat",tab1,"| cut -f2 | perl -pe 's/^(\\w{25}).*/$1/' >",tmp.F25))
+system(paste("zcat",tab2,"| cut -f2 | perl -pe 's/^(\\w{25}).*/$1/' >",tmp.R25))
+system(paste("cat",tmp.F25,"| perl -pe 's/^(\\w{10}).*/$1/' >",tmp.F10))
+system(paste("cat",tmp.R25,"| perl -pe 's/^(\\w{10}).*/$1/' >",tmp.R10))
+system(paste("paste -d_",tmp.F10,tmp.R10,"| sort | uniq -c | awk '{ print $1\"\\t\"$2 }' | sort -nr | perl -pe 's/_/\\t/' >",tmp.FR))
+
+dat <- read.delim(tmp.FR, as.is=TRUE, header=FALSE)[,c(1,1,2,3)]
+dat[,4] <- rev.comp.vector(dat[,4],TRUE)
+dat[,2] <- round(100*dat[,1]/sum(dat[,1]),2)
+colnames(dat) <- qw(Count,Pct,E1,E2)
+
+dat2 <- dat[dat[,2]>=1,,drop=FALSE]
+nr <- nrow(dat2)
+message(paste0(nrow(dat)," unique barcode pairs | ",nr," pairs are >= 1% | these ",nr," make up ",sum(dat2[,2]),"% of all pairs"))
+#dat2 <- dat[dat[,2]>=1 | (dat[,3]=="CCTGCATTGA" & dat[,4]=="ACTAACTAGT"),,drop=FALSE]  # redo, manually include minigene barcodes
+
+message("Generating barcode consensus sequences...\n")
+dat.10 <- cbind(E1=scan(tmp.F10,what="",sep="\n"), E2=rev.comp.vector(scan(tmp.R10,what="",sep="\n"),TRUE))
+dat.25 <- cbind(E1=scan(tmp.F25,what="",sep="\n"), E2=rev.comp.vector(scan(tmp.R25,what="",sep="\n"),TRUE))
+
+PWMs <- consensus <- new.list(1:nr)
+for (i in 1:nr) {
+    f <- dat.10[,1]==dat2[i,3]
+    r <- dat.10[,2]==dat2[i,4]
+    fr <- which(f&r)
+    message(i,": ",length(fr))
+    if (length(fr)>pwm.depth) fr <- sample(fr,pwm.depth)
+    s <- apply(dat.25[fr,],1,paste,collapse="")
+    message(" creating PWM...")
+    pwm <- words2PSSM(s)
+    PWMs[[i]] <- pwm  # STORE UNMODIFIED VERSION FIRST!!
+    pwm[pwm>=pwm.cons] <- 1
+    pwm[pwm<1] <- 0
+    pwm[,colSums(pwm)==0] <- 0.25
+    pwm2 <- PSSM.realize(pwm)
+    consensus[[i]] <- do.call(rbind, lapply(strsplit(pwm2[,1],"N+"), function(x) x[c(1,length(x))] ))  # may split into >2: always take first, last
+}
+consensus2 <- cbind(Kmer=1:nr, Name=1:nr, dat2[,1:2], do.call(rbind, consensus))  # you can replace name later
+colnames(consensus2)[5:6] <- c("5' Consensus","3' Consensus")
+names(PWMs) <- sapply(1:nr, function(i) paste0("Kmer ",i,", N=",dat2[i,1],", Pct=",dat2[i,2],"%") )
+
+write.table2(consensus2, paste0(outdir,"/",samp,".find_barcodes.txt"))
+logo.batchpdf(PWMs, paste0(outdir,"/",samp,".find_barcodes.pdf"))
+save.image(paste0(outdir,"/",samp,".find_barcodes.RData"))
+
+
+### LOST MINI-GENE BARCODE HUNTING
+#m10.1 <- mtable(dat.10[,1])
+#m10.1 <- m10.1[rev(order(m10.1[,1])),,drop=FALSE]
+#mini <- m10.1[grep("^CCTG",rownames(m10.1)),,drop=FALSE]
+#mini <- data.frame(First.10bp=rownames(mini), Freq=mini[,1])
+#mini.10 <- dat.10[dat.10[,1]%in%mini[,1],]
+#mini.10 <- mtable(apply(mini.10,1,paste,collapse=":"))
+#mini.10 <- mini.10[rev(order(mini.10[,1])),,drop=FALSE]
+#mini.10.fl <- do.call(rbind, strsplit(rownames(mini.10),":"))
+#mini.10 <- data.frame(First.10bp=mini.10.fl[,1], Last.10bp=mini.10.fl[,2], Freq=mini.10[,1])
+#write.table2(mini, paste0(samp,".find_barcodes.mini1.txt"))
+#write.table2(mini.10, paste0(samp,".find_barcodes.mini2.txt"))
+### SOME PERHAPS HAVE EXTRA BP AT 5' END?
+#mx <- mtable(grep("CCTGCATT",dat.25[,1],val=TRUE))
+#mx <- mx[rev(order(mx[,1])),,drop=FALSE]
+#mx.10 <- mtable(sapply(rownames(mx),substr,1,10))
+#mx.10 <- mx.10[rev(order(mx.10[,1])),,drop=FALSE]
+
+

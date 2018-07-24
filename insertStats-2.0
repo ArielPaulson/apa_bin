@@ -1,0 +1,54 @@
+#!/usr/bin/env Rscript
+
+## Modified from https://www.biostars.org/p/16556/
+
+ca <- commandArgs(trailing=TRUE)
+if (file.exists(ca[1])) {
+    ## no leading args
+    bams <- ca
+    method <- "default"
+    max.ins <- Inf
+} else {
+    bams <- ca[2:length(ca)]
+    args <- strsplit(unlist(strsplit(ca[1],",")),"=")  # list of c(key, value) pairs
+    keys <- sapply(args,"[[",1)
+    values <- sapply(args,"[[",2)
+    max.ins <- grep("max.ins",keys)
+    method <- grep("method",keys)
+    if (length(max.ins)==1) {
+        max.ins <- as.numeric(values[max.ins])
+        if (truthify(max.ins<=0)) stop("Max insert size must be a positive number! (default=Inf)\n")
+    } else {
+        max.ins <- Inf
+    }
+    if (length(method)==1) {
+        method <- values[method]
+    } else {
+        method <- "default"
+    }
+}
+
+B <- length(bams)
+
+if (method=="default") {
+    x <- lapply(bams, function(b){ message(b); as.numeric(system(paste("samtools view",b,"| cut -f9"), intern=TRUE)) })
+} else if (method=="peassembler") {
+    x <- lapply(bams, function(b){ message(b); as.numeric(system(paste("samtools view",b,"| cut -f9,10 | awk '{ print $1-length($2) }'"), intern=TRUE)) })
+} else {
+    stop(paste0("method '",method,"' not supported!  only 'default' (need not specify) and 'peassembler'\n"))
+}
+
+statify <- function(v) {
+    v <- v[v>0 & v<=max.ins]
+    q <- quantile(v, c(0.25,0.5,0.75))
+    s <- sd(v)
+    m <- mean(v)
+    c(length(v), min(v), round(q[1],0), round(q[2],0), round(m,1), round(q[3],0), max(v), round(s,1), round(s/m,3))
+}
+
+y <- lapply(x, statify)
+y[[B+1]] <- statify(unlist(x))
+stats <- do.call(rbind, y)
+
+dimnames(stats) <- list(c(bams,"TOTAL"),c("Pairs","Min","Q1","Median","Mean","Q3","Max","SD","CV"))
+print(stats)

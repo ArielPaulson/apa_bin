@@ -1,0 +1,22 @@
+#!/usr/bin/env perl
+use strict;
+
+## Used for investigating aligned read lengths in a bowtie2 --local bam
+
+my ($inbam, $outtxt) = @ARGV;
+($outtxt = $inbam) =~ s/\.bam$/.bamAlignLength.txt/i unless $outtxt;
+
+open OUT, '>', $outtxt;
+print OUT "Header\tLength\tAlnLen\n";
+open IN, '-|', "samtools view $inbam";
+while (<IN>) {
+    my ($header, $cigar, $seq) = (split /\t/, $_)[0,5,9];
+    my $len = length($seq);
+    my $clip;
+    $clip += $1 while $cigar =~ /(\d+)S/g;
+    print OUT "$header\t$len\t",($len-$clip),"\n";
+}
+close IN;
+close OUT;
+
+

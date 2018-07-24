@@ -1,0 +1,78 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use strict;
+
+## creates Picard-ready refFlat file, protein-coding-transcript-only refFlat file, and IGV.genome-ready refGene file (with undocumented 17th field)
+
+my ($gtf, $outpref) = @ARGV;
+($outpref = $gtf) =~ s/.gtf//i unless $outpref;
+
+my $tmp = "gtf2ref.$$.tmp";
+system "gtfToGenePred $gtf $tmp.gp";
+
+my %types = map {($_=>1)} qw/ exon CDS start_codon stop_codon /;
+my (%tdat, %chrgenes, %generanks);
+
+my $GTF = &open2('R', $gtf, 'Input GTF file');
+my $EXON = &open2('W', "$tmp.exon.bed", 'Temp exon bed');
+my $CDS = &open2('W', "$tmp.CDS.bed", 'Temp CDS bed');
+while (<$GTF>) {
+    chomp;
+    my ($chr, $source, $type, $start, $end, $score, $strand, $phase, $annot) = split /\t/, $_;
+    if ($types{$type}) {
+        my ($gene) = ($annot =~ /gene_id "([^"]+)"/);
+        my ($symb) = ($annot =~ /gene_name "([^"]+)"/);
+        my ($trans) = ($annot =~ /transcript_id "([^"]+)"/);
+        my ($tname) = ($annot =~ /transcript_name "([^"]+)"/);
+        $generanks{$gene} = $chrgenes{$chr}++ unless exists $generanks{$gene};  # Ranks must start at 0; assign first, then increment.  ASSUMES GTF SORTED BY CHR THEN START
+        $symb = $gene unless $symb;
+        $tname = $trans unless $tname;
+        if ($type eq 'CDS') {
+            $tdat{$trans}{PC} = 1;
+            print $CDS "$trans\t$start\t$end\t$.\t$phase\t$strand\n";
+        } elsif ($type eq 'exon') {
+            $tdat{$trans}{NAME} = $tname;
+            $tdat{$trans}{GENE} = $gene;
+            $tdat{$trans}{SYMB} = $symb;
+            $tdat{$trans}{EXON}{$start} = -1;  # initialize as -1; replace later
+            print $EXON "$trans\t$start\t$end\t$.\t1\t$strand\n";
+        } elsif ($type eq 'start_codon') {
+            $tdat{$trans}{START} = 1;
+        } elsif ($type eq 'stop_codon') {
+            $tdat{$trans}{STOP} = 1;
+        }
+    }
+}
+close $_ foreach ($GTF, $EXON, $CDS);
+system "intersectBed -wo -a $tmp.exon.bed -b $tmp.CDS.bed > $tmp.int";
+
+my $INT = &open2('R', "$tmp.int", 'Temp Exon-CDS intersection file');
+while (<$INT>) {
+    chomp;
+    my @data = split /\t/, $_;
+    $tdat{$data[0]}{EXON}{$data[1]} = $data[10];  # per transcript, exon start = corresponding CDS phase (or -1 if no CDS)
+}
+close $INT;
+
+my $GP = &open2('R', "$tmp.gp", 'Temp genePred file');
+my $GENE = &open2('W', "$outpref.refGene.txt", 'refGene output');
+my $FLAT = &open2('W', "$outpref.refFlat.txt", 'refFlat output');
+my $PCFLAT = &open2('W', "$outpref.refFlat_protein_coding.txt", 'protein-coding refFlat output');
+while (<$GP>) {
+    chomp;
+    my ($tID, $chr, $strand, $txStart, $txEnd, $cdStart, $cdEnd, $nExons, $exStarts, $exEnds) = split /\t/, $_;
+    $tID =~ s/\.[0-9]+$// unless exists $tdat{$tID};  # crop version number, which gtfToGenePred MAY append
+    my ($score, $pc, $tName, $gID, $gSymb, $tcStart, $tcEnd) = (0, map {$tdat{$tID}{$_}} qw/ PC NAME GENE SYMB START STOP /);
+    my $startStat = !$pc ? 'unk' : $tcStart ? 'cmpl' : 'incmpl';
+    my $endStat = !$pc ? 'unk' : $tcEnd ? 'cmpl' : 'incmpl';
+    my @exStarts = split /,/, $exStarts;
+    my $phases = join ',', map { $tdat{$tID}{EXON}{$_+1} } @exStarts;  # incoming starts are 0-based now
+    print $GENE join("\t",$generanks{$gID},$tID,$chr,$strand,$txStart,$txEnd,$cdStart,$cdEnd,$nExons,$exStarts,$exEnds,$score,$gSymb,$startStat,$endStat,"$phases,",$gID),"\n";
+    print $FLAT join("\t",$tName,$tID,$chr,$strand,$txStart,$txEnd,$cdStart,$cdEnd,$nExons,$exStarts,$exEnds),"\n";
+    print $PCFLAT join("\t",$tName,$tID,$chr,$strand,$txStart,$txEnd,$cdStart,$cdEnd,$nExons,$exStarts,$exEnds),"\n" if $pc;
+}
+close $_ foreach ($GP,$GENE,$FLAT,$PCFLAT);
+
+system "rm -f $tmp.*";
+print "$0 $gtf complete!\n";
+exit;

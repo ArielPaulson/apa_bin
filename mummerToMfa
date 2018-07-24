@@ -1,0 +1,148 @@
+#!/usr/bin/perl
+require '/home/apa/local/bin/apa_routines.pm';  # blockify
+use strict;
+
+######## UNDER CONSTRUCTION
+## Concept: use mummer to get a first-pass alignment, then refine blocks with blat
+
+my ($mum, $ref_fa, $qry_fa) = @ARGV;
+
+my (@blocks, $refseq, $qryseq);
+open IN, $mum or die;
+while (<IN>) {
+    next if $_ =~ /^Ref/;  # optional header
+    next if $_ =~ /^>/;    # subheader
+    $_ =~ s/[\n\r]+$//;
+    $_ =~ s/^\s+//;
+    push @blocks, [split /\s+/, $_];  # ($ref, $qry, $len, $rgap, $qgap)
+}
+close IN;
+
+open IN, $ref_fa or die;
+while (<IN>) {
+    next if $_ =~ /^>/;
+    $_ =~ s/[\n\r]+$//;
+    $refseq .= $_;
+}
+close IN;
+
+open IN, $qry_fa or die;
+while (<IN>) {
+    next if $_ =~ /^>/;
+    $_ =~ s/[\n\r]+$//;
+    $qryseq .= $_;
+}
+close IN;
+
+my @output;
+my $itmp = "mummerToMfa.$$.in.tmp";
+my $otmp = "mummerToMfa.$$.out.tmp";
+my $rtmp = "mummerToMfa.$$.ref.tmp";
+my $qtmp = "mummerToMfa.$$.qry.tmp";
+my $ptmp = "mummerToMfa.$$.psl.tmp";
+my ($rout, $qout);
+
+foreach my $i (0..$#blocks) {
+    my ($ref, $qry, $len, $rgap, $qgap) = @{ $blocks[$i] };
+    my $rseq1 = substr($refseq, $ref-1, $len);
+    my $qseq1 = substr($qryseq, $qry-1, $len);
+    my ($qseq0, $rseq0);
+    if ($rgap > 1 && $qgap > 1) {
+	my $rseq2A = substr($refseq, $ref+$len-1, $rgap);
+	my $qseq2A = substr($qryseq, $qry+$len-1, $qgap);
+	my $rseq2 = ${ &blockify($rseq2A) };
+	my $qseq2 = ${ &blockify($qseq2A) };
+
+	warn "$i\t".length($qseq2A)."\t".length($rseq2A)."\n";
+#	sleep 1;   # for killability
+
+#	open OUT, "> $itmp";
+#	print OUT ">ref\n$rseq2\n";
+#	print OUT ">qry\n$qseq2\n";
+#	close OUT;
+#	system "muscle -in $itmp -out $otmp";
+#	my (%aligned, $name);
+#	open IN, $otmp or die;
+#	while (<IN>) {
+#	    $_ =~ s/[\n\r]+$//;
+#	    if ($_ =~ /^>(.*)/) {
+#		$name = $1;
+#	    } else {
+#		$aligned{$name} .= $_;
+#	    }
+#	}
+#	close IN;
+#	$rseq0 = $aligned{ref};
+#	$qseq0 = $aligned{qry};
+	
+	open OUT, "> $rtmp$i";
+	print OUT ">ref\n$rseq2\n";
+	close OUT;
+	open OUT, "> $qtmp$i";
+	print OUT ">qry\n$qseq2\n";
+	close OUT;
+	system "/n/local/stage/blat/current/bin/blat -extendThroughN $rtmp$i $qtmp$i $ptmp$i >& /dev/null";
+	
+	open IN, "$ptmp$i" or die;
+	my ($mmax,$strand,$qlen,$qstart,$qlen,$rlen,$rstart,$rend,$nblocks,$blocklens,$qstarts,$rstarts);
+	while (<IN>) {
+	    next if $. < 6;
+	    $_ =~ s/[\n\r]+$//;
+	    my @data = (split /\t/, $_);
+	    next unless $data[0] > $mmax;
+	    $mmax = $data[0];
+	    ($strand,$qlen,$qstart,$qlen,$rlen,$rstart,$rend,$nblocks,$blocklens,$qstarts,$rstarts) = @data[8,10..12,14..20];
+	}
+	close IN;
+	
+	my @blocklens = (split /,/, $blocklens);
+	my @qstarts = (split /,/, $qstarts);
+	my @rstarts = (split /,/, $rstarts);
+	my ($prev_qstart, $prev_rstart);
+	foreach my $i (0..$nblocks-1) {
+	    my $prev_qend = $prev_qstart + $blocklens[$i-1];   # this works for $i=0 because $blocklens[-1] is null (convenient artifact of PSL)
+	    my $prev_rend = $prev_rstart + $blocklens[$i-1];
+	    my $qinsert = $qstarts[$i]-$prev_qend;
+	    my $rinsert = $rstarts[$i]-$prev_rend;
+	    if (!$qinsert && !$rinsert) {
+		# do nothing -- issues with PSL format
+	    } else {
+		my $qadd = $qinsert ? substr($qseq2A, $prev_qend, $qinsert) : '';
+		my $radd = $rinsert ? substr($rseq2A, $prev_rend, $rinsert) : '';
+		my $offset = length($qadd) - length($radd);
+		if ($offset > 0) {
+		    $radd .= '-' x $offset;
+		} elsif ($offset < 0) {
+		    $qadd .= '-' x (-1*$offset);
+		}
+		$rseq0 .= $radd;
+		$qseq0 .= $qadd;
+	    }
+	    $qseq0 .= substr($qseq2A, $qstart, $blocklens[$i]);
+	    $rseq0 .= substr($rseq2A, $rstart, $blocklens[$i]);
+	    ($prev_qstart, $prev_rstart) = ($qstart, $rstart);
+	}
+    } elsif ($qgap == 1) {
+	$qseq0 .= substr($qryseq, $qry+$len-1, $qgap);
+	$rseq0 .= '-';
+    } elsif ($rgap == 1) {
+	$rseq0 .= substr($refseq, $ref+$len-1, $rgap);
+	$qseq0 .= '-';
+    }
+#    $rout .= "$rseq0$rseq1";
+#    $qout .= "$qseq0$qseq1";
+    print ">ref_U$i\n".${ &blockify($rseq0) }."\n"; 
+    print ">qry_U$i\n".${ &blockify($qseq0) }."\n";
+    print ">ref_A$i\n".${ &blockify($rseq1) }."\n";
+    print ">qry_A$i\n".${ &blockify($qseq1) }."\n";
+    
+#    push @output, ">reference_A$i\n$rseq1\n>query_A$i\n$qseq1\n";
+#    push @output, ">reference_U$i\n$rseq2\n>query_U$i\n$qseq2\n" if $rinsert || $qinsert;
+#    my $eq1 = $rseq1 eq $qseq1 ? 1 : 0;
+#    my $eq2 = $rseq2 eq $qseq2 ? 1 : 0;
+#    print join("\t",($i,$ref,$qry,$len,$rinsert,$qinsert,length($rseq1),length($qseq1),length($rseq2),length($qseq2),$eq1,"$eq2\n"));
+}
+
+#system "rm -f mummerToMfa.$$.*.tmp";
+#print ">reference\n".${ &blockify($rout) }."\n";
+#print ">query\n".${ &blockify($qout) }."\n";

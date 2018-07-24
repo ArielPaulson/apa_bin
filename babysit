@@ -1,0 +1,102 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+# 'Babysits' a collection of processes, and will not exit until the list is empty.
+# Useful for holding up pipelines with batches of parallel procs running in background.
+# 
+# Two modes: 'watch' (-w) and 'ignore' (-i), both restricted to procs owned by the user running 'babysit':
+# '-w' watches a specified list of process names and/or PIDs given by @ARGV.
+# '-i' ignores the list of names/PIDs given by @ARGV, and 'watches' everything else...
+#   Use of '-i' comes with some additional default 'ignores', like ps, top, sshd, etc., but this is obviously a fragile mode.
+# 
+# Otherwise:
+# '-t <time> gives the latency (in seconds) between checks; default 60.
+# '-v <verbosity> is 0-2, indicating how much (if any) it should report to screen every -t seconds:
+#   0: silence (default).
+#   1: report the number of procs still running.
+#   2: 1, and also report name and PID of each proc.
+#
+
+my @default_ignores = qw/ CMD ps sshd bash tcsh screen top htop emacs vim nano /;   # default ignore list: common non-pipeline processes
+
+my $time = 60;   # seconds between checks
+my ($ignore, $watch, $verbose);
+GetOptions("i" => \$ignore, "w" => \$watch, "t=i" => \$time, "v=i" => \$verbose);
+
+die "Wait time of '$time' is less than the 1 second minimum!\n" if $time < 1;
+die "Must specify one of '-i' or '-w'!\n" unless ($ignore || $watch);
+die "Cannot specify both '-i' and '-w'!\n" if ($ignore && $watch);
+my $action = $ignore ? 'ignore' : 'watch';
+die "No processes to $action were given!  Nothing to do.\n" unless @ARGV;
+
+chomp(my $me = `whoami`);
+die "Cannot run in 'ignore' mode if user is root!\n" if ($ignore && $me eq 'root');  # 'root' will have tons of other, unforeseeable procs running
+print "$0 Running: PID=$$: ", `date`;
+
+my (%names, %pids);
+foreach (@ARGV) {
+    if ($_ =~ /\D/) {
+	$names{$_} = 1;  # alpha: must be proc NAME, as seen on 'ps'
+    } else {
+	$pids{$_} = 1;   # numeric: must be proc PID
+    }
+}
+
+
+if ($ignore) {  # "ignore-only-these" (and the defaults) mode
+
+    $names{$_} = 1 foreach @default_ignores;
+    $pids{$$} = 1;  # ignore self PID, at least
+    
+    my $iters;
+    {
+	sleep $time;
+	$iters++;
+	my $procs;
+	foreach (split /\n/, `ps -u $me`) {
+	    my @data = split /\s+/, $_;
+	    my ($pid, $name);
+	    if ($#data == 4) {
+		($pid, $name) = @data[1,4];
+	    } elsif ($#data == 3) {
+		($pid, $name) = @data[0,3];
+	    }
+	    next if $pids{$pid} || $names{$name};
+	    print "$iters: $pid $name\n" if $verbose == 2;
+	    $procs++;
+	}
+	if ($procs) {
+	    print "$iters: $procs processes running.\n" if $verbose;
+	    redo;
+	}
+    }
+    
+} elsif ($watch) {  # "watch-only-these" mode
+    
+    my $iters;
+    {
+	sleep $time;
+	$iters++;
+	my $procs;
+	foreach (split /\n/, `ps -u $me`) {
+	    my @data = split /\s+/, $_;
+	    my ($pid, $name);
+	    if ($#data == 4) {
+		($pid, $name) = @data[1,4];   # has whitespace offset between PID and beginning-of-line
+	    } elsif ($#data == 3) {
+		($pid, $name) = @data[0,3];   # no offset
+	    }
+	    $procs++ if $pids{$pid} || $names{$name};
+	    print "$iters: $pid $name\n" if $verbose == 2;
+	}
+	if ($procs) {
+	    print "$iters: $procs processes running.\n" if $verbose;
+	    redo;
+	}
+    }
+
+}
+print "$0 Complete: ", `date`;
+exit;

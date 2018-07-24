@@ -1,0 +1,141 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+# TO DO: Add gap column to track which bins have gaps / are all gap
+
+# Deps: binGenomeBed, coverageBed, bigWigAverageOverBed, (rm)
+
+## Inputs
+my $bwbam;    # input BW or BAM file to quantitate (BW = approx read counts; BAM = exact)
+my $genome;   # UCSC genome name, or BAM file to get chr names/sizes from header
+my $bin;      # genome bin size, in bp
+my $usechr;   # restrict to only this chromosome
+my $readlen;  # read length for BW read-count approximation (assumes all reads are same length!!)
+my $outfile;  # output file
+my $keep;     # keep intermediate datasets? (default no)
+my ($help, $man, $version);
+
+my $coverageBed ='/n/local/stage/bedtools/bedtools2-2.19.0/bin/coverageBed';
+
+GetOptions(
+    "i=s" => \$bwbam,
+    "g=s" => \$genome,
+    "b=i" => \$bin,
+    "c=s" => \$usechr,
+    "r=i" => \$readlen,
+    "o=s" => \$outfile,
+    "keep" => \$keep,
+    "help" => \$help,
+    "man" => \$man,
+    "version" => \$version
+    );
+
+die "$0: No input specified!\n" unless $bwbam;
+die "$0: No bin size given!\n" unless $bin;
+unless ($outfile) {
+    $outfile = $usechr ? "$bwbam.$usechr.bin$bin.txt" : "$bwbam.bin$bin.txt";
+}
+
+## Files and Paths
+my $bed;   # genome bins bed
+my $out;   # coverageBed output
+my $bam2;  # chr-specific bam 
+
+
+## Main
+
+## process bam or bw
+if ($bwbam =~ /\.bam$/i) {
+    
+    # filenames
+    $bed = $usechr ? "$bwbam.$usechr.$bin.bed" : "$bwbam.$bin.bed";
+    $out = $usechr ? "$bwbam.$usechr.$bin.out" : "$bwbam.$bin.out";
+    
+    # generate genome-bin bed
+    if ($usechr) {
+	system "/home/apa/local/bin/binGenomeBed -b $bwbam -w $bin -c $usechr > $bed";
+    } else {
+	system "/home/apa/local/bin/binGenomeBed -b $bwbam -w $bin > $bed";
+    }
+    
+    # bam coverage on intervals -- unfortunately double-counts reads overlapping the breaks
+    my $bam2 = $bwbam;
+    if ($usechr) {
+	$bam2 = "$bwbam.$usechr.bam";
+	system "samtools view -b $bwbam $usechr > $bam2";
+    }
+    system "$coverageBed -counts -split -abam $bam2 -b $bed > $out";
+    
+    my @chrs;   # ordered chrs
+    my %counts; # read counts
+    
+    # read coverageBed output (unsorted -- bad output)
+    open my $IN1, '<', $out;
+    while (my $line = <$IN1>) {
+	chomp($line);
+	my ($chr, $start, $end, $name, $count) = split /\t/, $line;
+	push @chrs, $chr unless exists $counts{$chr};  # input order
+	$counts{$chr}{$start} = "$chr\t$start\t$end\t$count\n";
+    }
+    close $IN1;
+    
+    # sort it correctly and re-output
+    open my $OUT1, '>', $outfile;
+    print $OUT1 "Chr\tStart\tEnd\tReads\n";
+    foreach my $chr (@chrs) {
+	foreach my $start (sort {$a <=> $b} keys %{ $counts{$chr} }) {
+	    print $OUT1 $counts{$chr}{$start};
+	}
+    }
+    close $OUT1;
+    
+} elsif ($bwbam =~ /\.bw$/i) {
+    
+    die "$0: No genome specified!\n" unless $genome;
+    die "$0: No read length given!\n" unless $readlen;
+    
+    # filenames
+    $bed = $usechr ? "$genome.$usechr.$bin.bed" : "$genome.$bin.bed";
+    $out = $usechr ? "$genome.$usechr.$bin.out" : "$genome.$bin.out";
+    
+    # generate genome-bin bed
+    if ($usechr) {
+	system "/home/apa/local/bin/binGenomeBed -g $genome -w $bin -c $usechr > $bed";
+    } else {
+	system "/home/apa/local/bin/binGenomeBed -g $genome -w $bin > $bed";
+    }
+    
+    # bigWig coverage sum on intervals
+    system "bigWigAverageOverBed $bwbam $bed $out";
+    
+    # read bigWigAverageOverBed output, convert sum to estimated N reads, re-output
+    open my $OUT2, '>', $outfile or die "$0: Cannot write to output '$outfile': $!\n";
+    print $OUT2 "Chr\tStart\tEnd\tSize\tCovPos\tSumPos\tAllPosMean\tCovPosMean\tApproxReads\n";
+    open my $IN2, '<', $out or die "$0: Cannot read coverageBed output '$out': $!\n";
+    while (my $line = <$IN2>) {
+	chomp($line);
+	my ($name, $else) = split /\t/, $line, 2;
+	my ($size, $covered, $sum, $mean0, $mean) = split /\t/, $else;
+	my ($chr, $start, $end) = split /[:-]/, $name;
+	printf $OUT2 "$chr\t$start\t$end\t$else\t%0.2f\n", $sum/$readlen;
+    }
+    close $IN2;
+    close $OUT2;
+    
+} else {
+    
+    die "Unrecognized file format for input '$bwbam': not .bam or .bw!\n";
+    
+}
+
+## Exit
+unless ($keep) {
+    system "rm -f $out";
+    system "rm -f $bed";
+    system "rm -f $bam2" if (-e $bam2 && $bam2 ne $bwbam);
+}
+print "$0 $bwbam $bin Complete!\n";
+exit;
+

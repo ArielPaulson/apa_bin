@@ -1,0 +1,142 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## http://genomewiki.ucsc.edu/index.php/LiftOver_Howto
+## http://genomewiki.ucsc.edu/index.php/Minimal_Steps_For_LiftOver
+
+
+
+## Dependencies
+my $twoBitInfo = 'twoBitInfo';
+my $axtChain = 'axtChain';
+my $chainMergeSort = 'chainMergeSort';
+my $chainSplit = 'chainSplit';
+my $chainSort = 'chainSort';
+my $chainNet = 'chainNet';
+my $netChainSubset = 'netChainSubset';
+my $pslHeader = '/home/apa/local/bin/scriptutils/header.psl';
+
+
+
+## Inputs
+my $map;      # file containing Provider1->Provider2 coord mapping data
+my $format;   # format of $map; currently must be 'UCSC' (ctgPos.txt format) or 'Dovetail' (table.txt format)
+my $p1_2bit;  # Provider1 .2bit file
+my $p2_2bit;  # Provider2 .2bit file
+my $LO_pref;  # name prefix for liftOver file, e.g. 'mm9Tomm10'
+my $keep;     # keep intermediate data?
+
+
+
+## Get, test inputs
+GetOptions("m=s"=>\$map, "f=s"=>\$format, "b1=s"=>\$p1_2bit, "b2=s"=>\$p2_2bit, "p=s"=>\$LO_pref, "keep"=>\$keep);
+
+my %okFormats = map {($_=>1)} qw/ UCSC Dovetail /;
+
+die "Format '$format' not a known format!" unless $okFormats{$format};
+die "$0: Failed to process provider-1 2bit file '$p1_2bit': $!\n" unless -e $p1_2bit;
+die "$0: Failed to process provider-2 2bit file '$p2_2bit': $!\n" unless -e $p2_2bit;
+
+
+
+## Temp location etc
+my $tmp = "/tmp/map2chain.$$";
+system "mkdir -p $tmp/chainMerge";
+system "$twoBitInfo $p1_2bit $tmp/p1.chromInfo";
+system "$twoBitInfo $p2_2bit $tmp/p2.chromInfo";
+
+
+
+## Get chrom sizes
+my %cs;
+open my $CS1, '<', "$tmp/p1.chromInfo" or die;
+while (<$CS1>) {
+    chomp;
+    my ($chr, $len) = (split /\t/, $_)[0,1];
+    $cs{1}{$chr} = $len;
+}
+close $CS1;
+open my $CS2, '<', "$tmp/p2.chromInfo" or die;
+while (<$CS2>) {
+    chomp;
+    my ($chr, $len) = (split /\t/, $_)[0,1];
+    $cs{2}{$chr} = $len;
+}
+close $CS2;
+
+
+
+## Map->liftOver Conversion
+open my $IN, '<', $map or die "$0: Cannot open mapping file '$map': $!\n";
+open my $PSL, '>>', "$tmp/map.psl";
+#Convert file to PSL format
+# match mismatch repmatch Ns qGapN qGapBp tGapN tGapBp strand qName qSize qStart qEnd tName tSize tStart tEnd blockCount blockSizes qStarts tStarts
+
+if ($format eq 'UCSC') {
+    
+#    contig  size  chrom  chromStart  chromEnd
+    while (<$IN>) {
+	chomp;
+	next unless /^\d/;
+	my ($p1chr, $bp, $p2chr, $start, $end) = split /\t/, $_;
+	my $str = $start > $end ? '-' : '+';
+	print $PSL join("\t",$bp,0,0,0,0,0,0,0,$str,$p1chr,$cs{1}{$p1chr},0,$bp,$p2chr,$cs{2}{$p2chr},$start,$end,1,$bp,"0,","$start,"),"\n";
+    }
+    
+} elsif ($format eq 'Dovetail') {
+    
+#    Hirise_scaf_id  input_scaf_id  input_start  input_end  strand  hirise_start  hirise_end
+    while (<$IN>) {
+	chomp;
+	next if /^#/;
+	my ($p2chr, $p1chr, $p1start, $p1end, $str, $p2start, $p2end) = split /\t/, $_;
+	my $bp = $p1end-$p1start;
+	print $PSL join("\t",$bp,0,0,0,0,0,0,0,$str,$p1chr,$cs{1}{$p1chr},$p1start,$p1end,$p2chr,$cs{2}{$p2chr},$p2start,$p2end,1,$bp,"$p1start,","$p2start,"),"\n";
+    }
+    
+    
+} else {
+    
+    die "Format '$format' must be 'UCSC' or 'Dovetail'\n";
+    
+}
+close $PSL;
+close $IN;
+
+#Sort PSL correctly and headerize
+system "sort -k10,10d -k14,14d $tmp/map.psl > $tmp/x";
+system "cat $pslHeader $tmp/x > $tmp/map.psl";
+
+#Translate psl files to chains in the directory chain:
+system "axtChain -linearGap=medium -psl $tmp/map.psl $p2_2bit $p1_2bit $tmp/map.chain 2> $tmp/axtChain.log";
+
+#Merge short chains into longer ones into the directory chainMerge:
+system "chainMergeSort $tmp/map.chain | chainSplit $tmp/chainMerge stdin -lump=50 2> $tmp/chainMergeSort.log";
+
+#concat and sort the chains:
+system "cat $tmp/chainMerge/*.chain > $tmp/all.chain";
+system "chainSort $tmp/all.chain $tmp/all.sorted.chain 2> $tmp/chainSort.log";
+
+#Netting: identify alignable regions from chains:
+system "chainNet $tmp/all.sorted.chain $tmp/p2.chromInfo $tmp/p1.chromInfo $tmp/all.net /dev/null 2> $tmp/chainNet.log";
+
+#Finally, select the right alignable regions using the nets, creating a "liftOver" file:
+system "netChainSubset $tmp/all.net $tmp/all.chain $tmp/all.over.chain 2> $tmp/netChainsubset.log";
+system "yes | cp $tmp/all.over.chain $LO_pref.over.chain";
+
+
+## Exit
+if ($keep) {
+    (my $tmp2 = $tmp) =~ s/^\/tmp/./;
+    system "mv $tmp $tmp2";
+    print STDERR "Temp files in $tmp2\n";
+} else {
+    system "rm -rf $tmp";
+}
+exit;
+
+
+
+

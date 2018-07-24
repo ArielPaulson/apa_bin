@@ -1,0 +1,56 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my ($RPM, $APM, $output);
+GetOptions("RPM"=>\$RPM, "APM"=>\$APM, "o=s"=>\$output);
+
+die "Must specify one of --RPM or --APM !\n" unless $RPM || $APM;
+die "Cannot specify both --RPM and --APM !\n" if $RPM && $APM;
+
+my @bams = @ARGV;
+my (@lost, %data, $sum);
+
+foreach my $bam (@bams) {
+    unless (open IN, $bam) {
+	print STDERR "$0: Cannot open '$bam'!\n";
+	push @lost, $bam;
+    }
+}
+close IN;
+die "$0: Some bam files are not accessible; stopping.\n" if @lost;
+
+foreach my $bam (@bams) {
+    if ($RPM) {
+	print "Counting unique reads (this will take a while...)\n";
+	chomp(my $M = `samtools view $bam | cut -f1 | sort -u | wc -l`);
+	$data{$bam}{COUNT} = $M;
+	$sum += $M;
+    } elsif ($APM) {
+	print "Counting alignments...\n";
+	chomp(my $M = `samtools view $bam | wc -l`);
+	$data{$bam}{COUNT} = $M;
+	$sum += $M;
+    }
+}
+
+my $N = scalar @bams;
+my $mean = $sum / $N;
+
+my $label = $RPM ? 'Reads' : 'Alignments';
+
+open my $OUT, '>', $output or die "$0: Cannot write to '$output': $!\n";
+print $OUT "Bam\t$label\tScaling\n";
+
+foreach my $bam (@bams) {
+    $data{$bam}{SCALE} = $mean / $data{$bam}{COUNT};
+    my $line = "$bam\t$data{$bam}{COUNT}\t$data{$bam}{SCALE}\n";
+    print $line;
+    print $OUT $line;
+}
+close $OUT;
+
+print "$0 Complete!\n";
+exit;
+

@@ -1,0 +1,103 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+# TO DO: single/double unmapped handling, orphans handling, treat-PE-as-SE mode
+
+# Deps: samtools, (rm)
+
+
+## Inputs
+my $fastq1;   # End 1 fastq to extract reads from 
+my $fastq2;   # End 2 fastq to extract reads from (OPTIONAL)
+my $bam;      # SAM/BAM (from $fastq) to identify which reads were mapped
+my $prefix;   # output fastq prefix
+
+GetOptions("fq1=s"=>\$fastq1, "fq2=s"=>\$fastq2, "b=s"=>\$bam, "p=s"=>\$prefix);
+
+die "$0: Must specify output file prefix!\n" unless $prefix;
+
+
+## Globals
+my %aligned;   # aligned headers from bam
+my %counts;    # stats
+my %files;     # output files
+my %records;   # fastq records
+
+
+## Main
+
+open BAM, "samtools view $bam | cut -f1-2 |";
+while (<BAM>) {
+    chomp;
+    my ($header, $flags) = split;
+    my $end = $flags & 128 ? 2 : 1;
+    $aligned{$header}{$end} = 1;
+    $counts{"E${end}A"}++;
+}
+close BAM;
+
+$counts{HEADERS} = scalar keys %aligned;
+$counts{ALIGNS} = $counts{E1} + $counts{E2};
+
+$files{1}{IN} = $fastq1;
+$files{2}{IN} = $fastq2;
+$files{1}{OUT} = "${prefix}_1.fastq.gz";
+$files{2}{OUT} = "${prefix}_2.fastq.gz";
+$files{1}{ORF} = "${prefix}_1_orphans.fastq.gz";
+$files{2}{ORF} = "${prefix}_2_orphans.fastq.gz";
+
+foreach my $i (1,2) {
+    
+    my $IN = &open2('R', $files{$i}{IN}, "End $i fastq");
+    my $OUT = &open2('W', $files{$i}{OUT}, "End $i filtered fastq");
+    my $ORF = &open2('W', $files{$i}{ORF}, "End $i orphans fastq");
+    my $otheri = $i == 1 ? 2 : 1;
+    
+    my ($i, $header, @rec);
+    while (<$IN>) {
+	$i++;
+	push @rec, $_;
+	if ($i == 1) {
+	    ($header = $_) =~ s/^@//;
+	    $header = (split /\s+/, $header)[0];
+	} elsif ($i == 4) {
+	    if ($aligned{$header}{$i}) {
+		## fully aligned; ignore
+		$counts{PAIRA}++;
+	    } elsif ($aligned{$header}{$otheri}) {
+		## aligned other end only
+		print $ORF @rec;
+		$counts{ORF}{$i}++;
+		$counts{"ONLY$i"}++;
+		$counts{"E${i}H"}++;
+	    } else {
+		## fully unaligned
+		print $OUT @rec;
+		$counts{OUT}{$i}++;
+		$counts{PAIRU}++;
+	    }
+	    $i = 0;
+	    @rec = ();
+	}
+
+    }
+    close $IN;
+    close $OUT;
+    close $ORF;
+    
+    system "rm -f $files{$i}{OUT}" unless $counts{OUT}{$i};
+    system "rm -f $files{$i}{ORF}" unless $counts{ORF}{$i};
+    
+}
+
+print STDERR "BAM $bam\n";
+print STDERR "$counts{HEADERS} headers | $counts{E1H} E1 aligned | $counts{E2H} E2 aligned | $counts{PAIRA} both aligned\n";
+print STDERR "$counts{ONLY2} E1 orphaned | $counts{ONLY1} E2 orphaned | $counts{PAIRU} both unaligned\n";
+print STDERR "$counts{ALIGNS} alignments | $counts{E1A} E1 aligns | $counts{E2A} E2 aligns\n";
+print STDERR "$0 $bam complete!\n";
+exit;
+

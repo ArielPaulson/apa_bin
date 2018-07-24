@@ -1,0 +1,55 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## Inputs
+my $queryfa;    # query fasta
+my $subjfa;     # blast db fasta (if not using 'nt' or 'nr')
+my $output;     # an output file
+my $keeptmp;    # keep temp files?
+
+my $cores = 1;         # number of processors to use for blast
+my $blastdb = 'nt';    # blast db, passed to blast as "-d $db"
+my $blastprog = 'megablast';  # blastall sub-program, e.g. 'blastn', 'blastp', 'blastx', ...
+my $annotdb = 'nucleotide';   # NCBI database to get annotations from ("none" to turn off annotation)
+
+GetOptions("q=s" => \$queryfa, "o=s" => \$output, "d=s" => \$blastdb, "s=s" => \$subjfa, "p=s" => \$blastprog, "c=i" => \$cores, "a=s" => \$annotdb, "keep" => \$keeptmp);
+
+$output = "$queryfa.blastMaster" unless $output;
+$blastdb = $subjfa if $subjfa;
+
+## Globals;
+my $bin = '/home/apa/local/bin';
+my $blastpath = '/n/site/inst/Linux-x86_64/bioinfo/ncbi/toolbox/current/bin';
+my $parameters = "-a $cores -m 8 -F F -i $queryfa -d $blastdb";
+my $temp = "$output.$blastprog.$$.tmp";
+
+chomp(my $start = `date`);
+
+## Run blast
+my $blastcmd = $blastprog eq 'megablast' ? "$blastpath/$blastprog" : "$blastpath/blastall -p $blastprog";
+my $cmd = "$blastcmd $parameters > $temp";
+print "$cmd\n"; system $cmd;
+
+## Extend blast results
+my $subj_flag = $subjfa ? "-s $subjfa" : '';
+my $cmd = "$bin/filterAligns -f $temp -t blast -q $queryfa $subj_flag --more --best --lost";
+print "$cmd\n"; system $cmd;
+
+## Annotate blast
+if ($annotdb =~ /^none$/i) {
+    print "Skipping annotation step...\n";
+    my $cmd = "mv $temp.best $output";
+    print "$cmd\n"; system $cmd;
+} else {
+    my $cmd = "$bin/annotateBlast -b $temp.best -d $annotdb -o $output";
+    print "$cmd\n"; system $cmd;
+}
+
+system "rm -f $temp* $output.lost" unless $keeptmp;   # the latter file from annotateBlast (= unqueriable GI numbers)
+
+chomp(my $end = `date`);
+print "Start: $start\nEnd  : $end\nblastMaster $queryfa complete!\n";
+exit;
+

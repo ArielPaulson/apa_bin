@@ -1,0 +1,17 @@
+#!/bin/bash
+
+outdir=$1
+fqs1=$2
+fqs2=$3
+ribofa=$4
+
+## Input: paired-end DNAseq fastqs
+## Input: fasta of ribosome pieces (e.g. NCBI or Silva sequences)
+## Output: assembled ribosomal repeat, if possible
+
+## Approach:
+## Step 1: align reads to ribosome sequences
+## Step 2: assemble all aligned pairs -> add contigs to ribosome sequences
+## Step 3: loop until contig growth in bp falls below some threshold (ideally, walks off the repeat)
+## Step 4: annotate contigs using known ribosome pieces
+

@@ -1,0 +1,76 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+# Deps: complementBed, sortBedCoord, (rm)
+
+my $bin = '/home/apa/local/bin';
+
+my ($genes, $chrsizes, $stranded);
+
+GetOptions("g=s" => \$genes, "c=s" => \$chrsizes, "s" => \$stranded);
+
+my $temp = "tmp.$$.bed";
+my (%starts, %ends, %str_starts, %str_ends, %bystrand);
+
+open my $IN1, '<', $genes or die "$0: Failed to open genes bed '$genes': $!\n";
+while (<$IN1>) {
+    $_ =~ s/[\n\r]+$//;
+    my ($chr, $start, $end, $gene, $score, $strand) = split /\t/, $_;
+    push @{ $starts{$chr}{$start}{$strand} }, $gene;
+    push @{ $ends{$chr}{$end}{$strand} }, $gene;
+    if ($stranded) {
+	die "$0: unknown strand type '$strand' declared at $genes line $.!\n" unless ($strand eq '+' || $strand eq '-');
+	push @{ $bystrand{$strand} }, "$_\n";
+	push @{ $str_starts{$strand}{$chr}{$start}{$strand} }, $gene;  # yes, $strand is keyed twice
+	push @{ $str_ends{$strand}{$chr}{$end}{$strand} }, $gene;
+    }
+}
+close $IN1;
+
+open my $OUT, '>', $temp;
+if ($stranded) {
+    foreach my $strand ('+','-') {
+	open my $OUT, '>', "str.$$.bed" or die "$0: Cannot write to temp bed 'str.$$.bed': $!\n";
+	print $OUT @{ $bystrand{$strand} };
+	close $OUT;
+	open my $IN2, "complementBed -i str.$$.bed -g $chrsizes |";
+	while (my $line = <$IN2>) {
+	    &process($line, $str_starts{$strand}, $str_ends{$strand});
+	}
+	close $IN2;
+    }
+    system "rm -f str.$$.bed";
+} else {
+    open my $IN3, "complementBed -i $genes -g $chrsizes |";
+    while (my $line = <$IN3>) {
+	&process($line, \%starts, \%ends);
+    }
+    close $IN3;
+}
+close $OUT;
+
+system "$bin/sortBedCoord -i $temp";  # this is the final data returned by STDOUT
+system "rm -f $temp";
+exit;
+
+
+sub process {
+    my ($LINE, $STARTS, $ENDS) = @_;
+    chomp($LINE);
+    my ($chr, $start, $end) = split /\t/, $LINE;
+    my ($W5, $C5, $W3, $C3);
+    $W5 = '5:+:' . join(',', @{ $$ENDS{$chr}{$start}{'+'} }) if $$ENDS{$chr}{$start}{'+'};
+    $C5 = '5:-:' . join(',', @{ $$ENDS{$chr}{$start}{'-'} }) if $$ENDS{$chr}{$start}{'-'};
+    $W3 = '3:+:' . join(',', @{ $$STARTS{$chr}{$end}{'+'} }) if $$STARTS{$chr}{$end}{'+'};
+    $C3 = '3:-:' . join(',', @{ $$STARTS{$chr}{$end}{'-'} }) if $$STARTS{$chr}{$end}{'-'};
+    my $all5 = $W5 && $C5 ? "$W5|$C5" : 
+	$W5 ? $W5 : 
+	$C5 ? $C5 : '5::CHROM_START';
+    my $all3 = $W3 && $C3 ? "$W3|$C3" : 
+	$W3 ? $W3 : 
+	$C3 ? $C3 : '3::CHROM_END';
+    print $OUT "$chr\t$start\t$end\t$all5|$all3\n";
+}
+

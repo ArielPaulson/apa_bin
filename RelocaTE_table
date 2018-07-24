@@ -1,0 +1,271 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+## Takes a RelocaTE output directory (populated with TE-wise output dirs) and returns one master table with all insert events, matching genes, etc.
+
+
+
+## Dependencies
+my $intersectBed = 'intersectBed';
+my $sortBedCoord = '/home/apa/local/bin/sortBedCoord';
+
+
+## Inputs
+my $reldir;   # RelocaTE output directory.
+my $TEfa;     # TE fasta used to run RelocaTE.
+my $instype;  # insert type to tabularize (ref|nonref|both); default both.
+my $geno;     # SIMR-indexed genome name, e.g. "mm10", "dm3".
+my $anno;     # Annotation build name for above genome, e.g. "Ens_80".
+my $outpref;  # output prefix (outputs will be $prefix.*), otherwise see %okTypes below for default output prefixes.
+
+
+## Get arguments
+GetOptions("d=s"=>\$reldir, "f=s"=>\$TEfa, "i=s"=>\$instype, "g=s"=>\$geno, "a=s"=>\$anno, "o=s"=>\$outpref);
+
+
+## Test arguments
+die "$0: RelocaTE output dir '$reldir' not found!\n" unless -d $reldir;
+die "$0: TE fasta '$TEfa' not found!\n" unless -s $TEfa;
+
+my %okTypes = ('ref'=>'all_reference_inserts', 'nonref'=>'all_nonref_inserts', 'both'=>'all_inserts');  # type => default output prefix
+$instype = 'both' unless $instype;
+die "$0: Insert type '$instype' must be one of 'ref', 'nonref', or 'both'!\n" unless $okTypes{$instype};
+$outpref = $okTypes{$instype} unless $outpref;
+
+my $gadir = "/n/data1/genomes/indexes/$geno/$anno";
+die "$0: Genome '$geno' / annotation '$anno' combo not found in /n/data1/genomes/indexes!\n" unless -d $gadir;
+
+
+## More globals
+my %idata;   # data per insertion event
+my %tdata;   # data per TE
+my %gdata;   # data per gene
+my %samples; # sample names
+my %stats;   # summary stats
+my $ghead;   # gene data header line
+my $gnull;   # null gene data string
+my $gdat = "$gadir/$geno.$anno.genedata.txt";  # gene data
+my $gbed = "$gadir/$geno.$anno.genes.bed";     # gene bed
+my $ubed = "$gadir/$geno.$anno.uxons.bed";     # gene uxons bed
+my @nonout = glob "$reldir/*/results/*.all_nonref.txt";     # RelocaTE non-ref insert outputs
+my @refout = glob "$reldir/*/results/*.all_reference.txt";  # RelocaTE reference insert outputs
+my $out_master = "$outpref.txt";
+my $out_perte = "$outpref.events_per_TE.txt";
+my $out_pergene = "$outpref.events_per_gene.txt";
+my $out_summary = "$outpref.summary.txt";
+
+
+## Temp files
+my $tmp = "/tmp/RelocaTE_table.$$.tmp";
+system "mkdir -p $tmp";
+my $nonbed = "$tmp/non.bed";  # nonref-inserts bed file
+my $refbed = "$tmp/ref.bed";  # reference-inserts bed file
+my $ng_int = "$tmp/non.gene.int.txt";  # nonref-insert / gene intersections
+my $nu_int = "$tmp/non.uxon.int.txt";  # nonref-insert / uxon intersections
+my $rg_int = "$tmp/ref.gene.int.txt";  # reference-insert / gene intersections
+my $ru_int = "$tmp/ref.uxon.int.txt";  # reference-insert / uxon intersections
+
+
+## Test temps & other dependencies
+die "$0: Failed to create temp dir '$tmp'!\n" unless -d $tmp;
+foreach my $file ($gdat, $gbed, $ubed) {
+    die "$0: Missing or empty required file '$file'!\n" unless -s $file;
+}
+die "$0: expected nonref outputs '$reldir/*/results/*.all_nonref.txt' do not exist!\n" unless @nonout;
+die "$0: expected reference outputs '$reldir/*/results/*.all_reference.txt' do not exist!\n" unless @refout;
+
+
+## Read in non-reference inserts
+print STDERR "Reading non-reference insertions...\n";
+open my $NBED, '>', $nonbed or die "$0: Failed to write non-reference insert bed '$nonbed': $!\n";
+foreach my $nfile (@nonout) {
+    open my $NON, '<', $nfile or die "$0: Failed to read non-reference insert output '$nfile': $!\n";
+    while (<$NON>) {
+	# TE	TSD	Exper	chromosome	insertion_site	strand	combined_read_count	right_flanking_read_count	left_flanking_read_count
+	# DR_FLYBASE_FBgn0000004_17.6	insufficient_data	149rep1_L9015	chr3L	710835..710838	-	T:2	R:2	L:0
+	next if $. == 1;
+	s/[\n\r]+$//;
+	my ($te, $tsd, $sample, $chrom, $site, $strand, $crc, $rfrc, $lfrc) = split /\t/, $_;
+	my ($start, $end) = split /\.\./, $site;
+	my $uid = "$te:$sample:N:$.";
+	$crc =~ s/^T://;
+	$rfrc =~ s/^R://;
+	$lfrc =~ s/^L://;
+	$idata{$te}{SAMPLE}{$sample}{NON}{$uid}{INS} = [$., $tsd, "$chrom\t$start\t$end\t$strand", "$crc\t$rfrc\t$lfrc\tNA"];  # last 4: total reads, right reads, left reads, insert size
+	print $NBED "$chrom\t$start\t$end\t$uid\n";
+	$samples{$sample} = 1;
+    }
+    close $NON;
+}
+close $NBED;
+
+
+## Read in reference inserts
+print STDERR "Reading reference insertions...\n";
+open my $RBED, '>', $refbed or die "$0: Failed to write reference insert bed '$refbed': $!\n";
+foreach my $rfile (@refout) {
+    open my $REF, '<', $rfile or die "$0: Failed to read reference insert output '$rfile': $!\n";
+    while (<$REF>) {
+	# strain	TE	existingTE_coor	reads_align_2_start	reads_align_2_end	align_size(bp)
+	# 149rep1_L9015	DR_FLYBASE_FBgn0000004_17.6	chr2R:1789718..1797219	0	0	7502
+	next if $. == 1;
+	s/[\n\r]+$//;
+	my ($sample, $te, $coords, $startrds, $endrds, $size) = split /\t/, $_;
+	my ($chrom, $start, $end) = split /[:.]+/, $coords;
+	my $uid = "$te:$sample:R:$.";
+	my $totrds = $startrds + $endrds;
+	$idata{$te}{SAMPLE}{$sample}{REF}{$uid}{INS} = [$., "$chrom\t$start\t$end\t.", "$totrds\t$startrds\t$endrds\t$size"];  # last 4: total reads, right reads, left reads, insert size
+	print $RBED "$chrom\t$start\t$end\t$uid\n";
+	$samples{$sample} = 1;
+    }
+    close $REF;
+}
+close $RBED;
+
+
+## Read in gene data
+print STDERR "Reading gene data...\n";
+open my $GDAT, '<', $gdat or die "$0: cannot read gene data file '$gdat': $!\n";
+while (<$GDAT>) {
+    s/[\n\r]+$//;
+    my ($gene, $else) = split /\t/, $_, 2;
+    if ($. == 1) {
+	$ghead = $else;
+	$gnull = join("\t", map {''} split /\t/, $else);  # blank line to fill in for events that did not hit genes
+	next;
+    }
+    $gdata{$gene}{DAT} = $else;
+    foreach my $sample (keys %samples) {
+	$gdata{$gene}{INS}{$sample}{$_} = [0, 0] foreach qw/ NON REF /;  # N gene insertions, N exonic insertions
+    }
+}
+close $GDAT;
+
+
+## Read in fasta
+print STDERR "Reading TE data...\n";
+my $TE;
+open my $FA, '<', $TEfa or die "$0: cannot read TE fasta '$TEfa': $!\n";
+while (<$FA>) {
+    s/[\n\r]+$//;
+    if (/^>(.*) TSD=(.{4})/) {
+	$TE = $1;
+	$tdata{$TE}{TSD} = $2;
+	foreach my $sample (keys %samples) {
+	    $tdata{$TE}{INS}{$sample}{$_} = [0, 0] foreach qw/ NON REF /;  # N gene insertions, N exonic insertions
+	}
+    } else {
+	$tdata{$TE}{SEQ} .= $_;
+    }
+}
+close $FA;
+
+
+## Match inserts to genes/uxons
+print STDERR "Matching insertions to genes...\n";
+system "$sortBedCoord -i $nonbed --overwrite";
+system "$sortBedCoord -i $refbed --overwrite";
+system "$intersectBed -wo -a $nonbed -b $gbed > $ng_int";
+system "$intersectBed -wo -a $nonbed -b $ubed > $nu_int";
+system "$intersectBed -wo -a $refbed -b $gbed > $rg_int";
+system "$intersectBed -wo -a $refbed -b $ubed > $ru_int";
+
+
+## Read in match data
+my %m = (
+    'ng' => ['NON', 'GENE', $ng_int],
+    'nu' => ['NON', 'UXON', $nu_int],
+    'rg' => ['REF', 'GENE', $rg_int],
+    'ru' => ['REF', 'UXON', $ru_int]
+    );
+
+foreach my $set (keys %m) {
+    my ($NR, $GU, $int) = @{ $m{$set} };
+    open my $INT, '<', $int or die "$0: Failed to read intersection file '$int': $!\n";
+    while (<$INT>) {
+	s/[\n\r]+$//;
+	my ($chrom, $start, $end, $uid, $fchrom, $fstart, $fend, $fid, $fscore, $fstr, $overlap) = split /\t/, $_;
+	my ($te, $sample, $etc) = ($uid =~ /^(.*):([^:]+):([NR]:\d+)$/);
+	if ($GU eq 'GENE') {
+	    $idata{$te}{SAMPLE}{$sample}{$NR}{$uid}{GENE}{$fid} = [$overlap, 0];  # gene overlap, exonic overlap
+	    $gdata{$fid}{INS}{$sample}{$NR}->[0]++;
+	    $tdata{$te}{INS}{$sample}{$NR}->[0]++;
+#	    $stats{$gene}{$NR}->[0]++;
+	} else {
+	    my ($gene, $x) = split /:/, $fid;
+	    $idata{$te}{SAMPLE}{$sample}{$NR}{$uid}{GENE}{$gene}->[1] = $overlap;
+	    $gdata{$gene}{INS}{$sample}{$NR}->[1]++;
+	    $tdata{$te}{INS}{$sample}{$NR}->[1]++;
+	}
+    }
+    close $INT;
+}
+
+
+## Write outputs
+print STDERR "Writing outputs...\n";
+open my $OUTM, '>', $out_master or die "$0: Cannot write master output table '$out_master': $!\n";
+print $OUTM "Sample\tInsNum\tTE\tTSD\tChrom\tStart\tEnd\tStrand\tTotRds\t5'Rds\t3'Rds\tInsBp\tGene\tGeneOlBp\tExonOlBp\t$ghead\n";
+foreach my $te (sort keys %tdata) {
+    foreach my $sample (sort keys %samples) {
+	foreach my $NR (qw/ REF NON /) {
+	    foreach my $uid (sort keys %{ $idata{$te}{SAMPLE}{$sample}{$NR} }) {
+		my ($n, $tsd, $coords, $counts) = @{ $idata{$te}{SAMPLE}{$sample}{$NR}{$uid}{INS} };   # [$N, $TSD, "$chrom\t$start\t$end\t$starnd", "$totrds\t$startrds\t$endrds\t$size"]
+		my $outstr = join("\t", $sample, $n, $te, $tsd, $coords, $counts);
+		if (exists $idata{$te}{SAMPLE}{$sample}{$NR}{$uid}{GENE}) {
+		    foreach my $gene (sort keys %{ $idata{$te}{SAMPLE}{$sample}{$NR}{$uid}{GENE} }) {
+			my ($gbp, $ubp) = @{ $idata{$te}{SAMPLE}{$sample}{$NR}{$uid}{GENE}{$gene} };
+			print $OUTM join("\t", $outstr, $gene, $gbp, $ubp, $gdata{$gene}{DAT}), "\n";
+		    }
+		} else {
+		    print $OUTM join("\t", $outstr, 0, 0, 'INTERGENIC', $gnull), "\n";
+		}
+	    }
+	}
+    }
+}
+close $OUTM;
+
+open my $OUTG, '>', $out_pergene or die "$0: Cannot write per-gene output table '$out_pergene': $!\n";
+print $OUTG "Gene\tSample\tRefInsTot\tRefInsExo\tNonInsTot\tNonInsExo\t$ghead\n";
+foreach my $gene (sort keys %gdata) {
+    foreach my $sample (sort keys %samples) {
+	my ($rg_ins, $ru_ins) = @{ $gdata{$gene}{INS}{$sample}{REF} };
+	my ($ng_ins, $nu_ins) = @{ $gdata{$gene}{INS}{$sample}{NON} };
+	print $OUTG "$gene\t$sample\t$rg_ins\t$ru_ins\t$ng_ins\t$nu_ins\t$gdata{$gene}{DAT}\n";
+    }
+}
+close $OUTG;
+
+open my $OUTT, '>', $out_perte or die "$0: Cannot write per-TE output table '$out_perte': $!\n";
+print $OUTT "TE\tTSD\tLength\tSample\tRefInsTot\tRefInsExo\tNonInsTot\tNonInsExo\n";
+foreach my $te (sort keys %tdata) {
+    my ($tsd, $len) = ($tdata{$te}{TSD}, length($tdata{$te}{SEQ}));
+    foreach my $sample (sort keys %samples) {
+	my ($rg_ins, $ru_ins) = @{ $tdata{$te}{INS}{$sample}{REF} };
+	my ($ng_ins, $nu_ins) = @{ $tdata{$te}{INS}{$sample}{NON} };
+	print $OUTT "$te\t$tsd\t$len\t$sample\t$rg_ins\t$ru_ins\t$ng_ins\t$nu_ins\n";
+    }
+}
+close $OUTT;
+
+#open my $OUTS, '>', $out_summary or die "$0: Cannot write summary table '$out_summary': $!\n";
+#print $OUTS "TE\tSample\tRefInsTot\tRefInsExo\tNonInsTot\tNonInsExo\n";
+#foreach my $te (sort keys %tdata) {
+#    foreach my $sample (sort keys %samples) {
+#	my ($rg_ins, $ru_ins) = @{ $gdata{$gene}{INS}{$sample}{REF} };
+#	my ($ng_ins, $nu_ins) = @{ $gdata{$gene}{INS}{$sample}{NON} };
+#	print $OUTT "$gene\t$sample\t$rg_ins\t$ru_ins\t$ng_ins\t$nu_ins\t$gdata{$gene}{DAT}\n";
+#    }
+#}
+#close $OUTS;
+
+
+## Exit
+system "rm -rf $tmp";
+print STDERR "$0 '$reldir' complete!\n";
+exit;
+

@@ -1,0 +1,7 @@
+#!/bin/bash
+
+input=$1
+output=$2
+
+sort -k1,1d -k2,2n -k3,3nr $input > $output
+

@@ -1,0 +1,106 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use strict;
+
+## sorts a VCF by chr, pos, ref, alt, in that order.
+## avoids "sort -k1,1d", which will run all day, even on small VCFs.
+## aims for low mem impact, since sorting all in memory can choke some servers.
+## chr order is given by header, if exists, else basic lexico sort of chr names.
+## also can use preferred chr ordering of a given genome build, if the genome label is given as the second argument.
+
+my ($input, @args) = @ARGV;
+my $stdio = $input eq '-' ? 1 : 0;
+
+my ($geno, @chrord, $IN);
+foreach my $arg (@args) {
+    if (-d "/n/data1/genomes/indexes/$arg") {
+        die "$0: two genomes specified, '$geno' and '$arg': can't decide!\n" if $geno;
+        $geno = $arg;
+    } else {
+        die "$0: unrecognized argument '$arg'!  Not a genome build either.\n";
+    }
+}
+
+die "$0: input file '$ARGV[0]' does not exist!\n" unless $stdio || -e $input;
+if ($geno) {
+    my $chrsz = "/n/data1/genomes/indexes/$geno/$geno.chrom.sizes";
+    die "$0: required chrom.sizes file '$chrsz' does not exist!\n" unless -e $chrsz;
+    chomp(@chrord = `cut -f1 $chrsz`);
+}
+my $tmp = "vcfSort.$$.tmp";
+system "mkdir $tmp";
+
+if ($stdio) {
+    open $IN, '<-';
+} else {
+    my ($comp, $err, $rcmd, $wcmd) = @{ &is_compressed($ARGV[0], 1) };
+    if ($err && !$rcmd) {
+        die "$0: file '$ARGV[0]' had compression errors:\n$err\n";
+    } else {
+        open $IN, '-|', "$rcmd $ARGV[0]";
+    }
+}
+my $prev = '';
+my @bychr;
+while (<$IN>) {
+    my $chr = /^#/ ? '_' : (split /\t/, $_)[0];  # header 'chromosome" is just '_'
+    &write_tmp($prev) if $prev && $chr ne $prev;
+    push @bychr, $_;
+    $prev = $chr;
+}
+&write_tmp($prev);
+close $IN;
+
+## Either of these will populate @chrord
+&get_chrord_from_header unless @chrord;
+&get_chrord_from_files unless @chrord;
+
+my $novel = -1;
+system "cat $tmp/_" if -e "$tmp/_";  # print (unsorted!) header to STDOUT, basically (if exists; may not)
+&sort_print($_) foreach @chrord;     # sort remaining chr-wise datasets and print to STDOUT
+system "rm -rf $tmp";
+print STDERR "$0 complete!\n";
+## END
+
+
+sub write_tmp {
+    my $CHR = shift;
+    @bychr = @{ &vcf_orderheader(\@bychr, $geno) } if $CHR eq '_';
+    open OUT, '>>', "$tmp/$CHR";
+    print OUT @bychr;
+    close OUT;
+    @bychr = ();
+}
+
+sub sort_print {
+    my $CHR = shift;
+    my %bypos;
+    open TMP, '<', "$tmp/$CHR";
+    while (<TMP>) {
+        my ($pos, $ref, $alt) = (split /\t/, $_, 6)[1,3,4];
+        push @{ $bypos{$pos}{$ref}{$alt} }, $_;
+    }
+    close TMP;
+    foreach my $pos (sort {$a <=> $b} keys %bypos) {
+        foreach my $ref (sort keys %{ $bypos{$pos} }) {
+            foreach my $alt (sort keys %{ $bypos{$pos}{$ref} }) {
+                print STDOUT @{ $bypos{$pos}{$ref}{$alt} };
+            }
+        }
+    }
+}
+
+sub get_chrord_from_header {
+    open TMP, '<', "$tmp/_";
+    while (<TMP>) {
+        push @chrord, $1 if /^##contig=<ID=([^,]+),length=\d+>/;
+    }
+    close TMP;
+}
+
+sub get_chrord_from_files {
+    foreach my $chr (split /\n/, `ls $tmp/*`) {
+        $chr =~ s/^$tmp\///;
+        push @chrord, $chr unless $chr eq '_';
+    }
+}

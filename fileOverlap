@@ -1,0 +1,41 @@
+#!/usr/bin/perl
+use Getopt::Long;
+use strict;
+
+my (%file, $count);
+my %key = map {($_=>1)} (1,2);
+GetOptions("f1=s" => \$file{1}, "f2=s" => \$file{2}, "k1=i" => \$key{1}, "k2=i" => \$key{2}, "count" => \$count);
+
+$key{$_}-- foreach (1,2);  # 0-based
+
+my (%nlines, %ukeys, %nkeys, %ndups, @overlap);
+
+foreach my $i (1,2) {
+    $nkeys{$i} = $ndups{$i} = 0;  # ensure printable values
+    open IN, $file{$i} or die "Cannot read file $i '$file{$i}': $!\n";
+    while (<IN>) {
+	$_ =~ s/[\n\r]+$//;
+	my @data = split /\t/, $_;
+	$ukeys{$i}{ $data[$key{$i}] }++;
+    }
+    $nlines{$i} = $.;
+    close IN;
+}
+
+foreach my $i (1,2) {
+    $nkeys{$i} = scalar keys %{ $ukeys{$i} };
+    foreach my $entry (keys %{ $ukeys{$i} }) {
+	$ndups{$i}++ if $ukeys{$i}{$entry} > 1;
+	push @overlap, $entry if ($i == 1 && exists $ukeys{2}{$entry});  # only count overlaps once!
+    }
+}
+
+if ($count) {
+    print "File $_ | $nlines{$_} lines | $nkeys{$_} keys | $ndups{$_} present > once\n" foreach (1,2);
+    print scalar @overlap;
+    print " keys found in both files\n";
+} else {
+    print "$_\n" foreach @overlap;
+}
+exit;
+

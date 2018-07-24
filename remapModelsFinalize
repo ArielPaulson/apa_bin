@@ -1,0 +1,302 @@
+#!/usr/bin/env perl
+require '/home/apa/local/bin/apa_routines.pm';
+use Getopt::Long;
+use File::Spec;
+use Pod::Usage;
+use strict;
+
+
+my $skip;
+#$skip = 1;
+
+
+## Intended to map known genes into new genomes, a la UCSC.
+## Inputs: old genome fasta, old genome GTF, new genome fasta.
+## Outputs: new genome GTF.
+## Basically this is a wrapper for targeted Exonerate jobs.
+## For each gene:
+## 1. Blats unspliced whole-gene sequence into new genome.
+## 2. Decides best location(s) for gene.
+## 3. Exonerates spliced model(s) for gene into best location(s).
+
+
+## Dependencies
+my $bin = '/home/apa/local/bin';
+my $filterAligns = "$bin/filterAligns";
+my $fastaDistribute = "$bin/fastaDistribute";
+my $fastaExplode = "$bin/fastaExplode";
+my $exonerate2gtf = "$bin/exonerate2gtf";
+my $gtf2beds = "$bin/gtf2beds";
+my $gtf2fa = "$bin/gtf2fa";
+my $fasta2tab = "$bin/fasta2tab";
+my $tab2fasta = "$bin/tab2fasta";
+my $fastaFromBed = 'fastaFromBed';
+my $blat = 'blat';
+my $pblat = "/home/apa/local/install/pblat/icebert-pblat-1.6-0-ged0ac17-CentOS6/pblat";
+my $exonerate = 'exonerate';
+
+
+## Inputs
+my $outdir;      # output location
+my $clobber;     # output location, if clobbering allowed
+my $oldgenome;   # old genome toplevel fasta
+my $newgenome;   # new genome toplevel fasta
+my $oldgtf;      # gene models GTF for old genome, ** OR **:
+my $samechr;     # 2 IN 1 ARG: a tab-sep file with 1 header line and 3 cols: old genome chr name, new genome chr name, and new genome chr length.  IF PROVIDED, models from each old genome chr will be searched ONLY on the equivalent new genome chr, IF ANY.
+my $deploy = 'lepus';  # cluster or queued server to deploy on, if parallelizing
+my $cores = 8;         # N cores for pblat
+my $batchsize = 1000;  # N genes per pblat batch
+
+
+## Get and Test Arguments
+GetOptions("o=s"=>\$outdir, "oc=s"=>\$clobber, "fo=s"=>\$oldgenome, "fn=s"=>\$newgenome, "g=s"=>\$oldgtf, "d=s"=>\$deploy, "b=i"=>\$batchsize, "s=s"=>\$samechr);   #  "c=i"=>\$cores,
+
+die "$0: Old-genome fasta '$oldgenome' does not exist!\n" unless -e $oldgenome;
+die "$0: New-genome fasta '$newgenome' does not exist!\n" unless -e $newgenome;
+die "$0: Old-genome GTF '$oldgtf' does not exist!\n" if $oldgtf && ! -e $oldgtf;
+die "$0: Old-genome genes bed file '$oldgbed' does not exist!\n" if $oldgbed && ! -e $oldgbed;
+die "$0: Spliced-transcript fasta '$transfasta' does not exist!\n" if $transfasta && ! -e $transfasta;
+die "$0: 'deploy' must be a either 'aspen' or 'lepus'!\n" if $deploy ne 'aspen' && $deploy ne 'lepus'; 
+
+## Locations, Files and Filehandles
+if ($skip) {
+    $outdir = File::Spec->rel2abs($clobber);
+} else {
+    $outdir = 'remapModels' unless $outdir || $clobber;
+    $outdir = &create_writedir($outdir, $clobber, $0, "Output location");
+}
+my $tmp = "$outdir/intermediate";
+my $chrbatch = "$tmp/chr.batch";
+my $newgrefs = "$tmp/new.gene.refs";
+my $blat_in = "$outdir/blat_in";
+my $blat_out = "$outdir/blat_out";
+my $blat_array = "$outdir/blat.array";
+my $exo_in = "$outdir/exonerate_in";
+my $exo_out = "$outdir/exonerate_out";
+my $exo_array = "$outdir/exonerate.array";
+my $qsub_in = "$outdir/qsub_in";
+my $qsub_out = "$outdir/qsub_out";
+my $qsub_sh_b = "$outdir/qsub.blat.sh";
+my $qsub_sh_e = "$outdir/qsub.exonerate.sh";
+my $batch_array = "$outdir/batch.qsub.array";
+my $batch_err = "$outdir/batch.qsub.err";
+my $batch_out = "$outdir/batch.qsub.out";
+unless ($skip) {
+    &validate('dir', $_) foreach ($tmp, $chrbatch, $newgrefs, $qsub_in, $blat_in, $exo_in, $qsub_out, $blat_out, $exo_out);
+}
+(my $new2bit = $newgenome) =~ s/.f[sta]*$/.2bit/;
+if ($new2bit ne $newgenome && -e $new2bit) {  # extension swap succeeded, and 2bit found
+    print STDERR "New genome 2-bit version found: '$new2bit'.  Will use for blat.\n";
+} else {
+    system "faToTwoBit $newgenome $new2bit";
+}
+system "ln -sf $new2bit $tmp/genome.2bit";
+
+
+## Globals
+my %GT;      # gene and transcript headers; gene-to-transcript mappings
+my %files;   # lookup for various gene- or transcript-related filenames
+my %locus;   # locus-level remappings (blat)
+my %newgtf;  # exon-level remappings (exonerate)
+my %stats;   # some remapping stats
+my %chreq;   # chromosome equivalence table
+
+
+## Pre-processing
+if ($samechr) {
+    my $SC = &open2('R', $samechr, 'Chromosome equivalence file');
+    while (<$SC>) {
+	next if $. == 1;
+	s/[\n\r]+$//;
+	my ($oldchr, $newchr, $newlen) = split /\t/, $_;
+	$chreq{ON}{$oldchr} = $newchr;
+	$chreq{NO}{$newchr} = $oldchr;
+	$chreq{NL}{$newchr} = $newlen;
+    }
+    close $SC;
+}
+
+
+## Process GTF to get sequences and metadata
+print STDERR "Generate genes bed and transcripts fasta: ",`date`;
+&execute("cp $oldgtf $tmp/", 2) unless $skip;
+chomp(my $tmpgtf = `ls $tmp/*.gtf`);  # will only be one
+&execute("$gtf2beds $tmpgtf --writeback", 2) unless $skip;
+chomp($oldgbed = `ls $tmp/*.genes.bed`);  # will only be one
+my $genefasta = "$tmp/genes.fa";
+my $transfasta = "$tmp/transcripts.fa";
+
+## Load transcript-gene mappings
+chomp(my $tmpt2g = `ls $tmp/*.transcript_data.txt`);  # will only be one
+my $T2G = &open2('R', $tmpt2g, 'transcript data file');
+while (<$T2G>) {
+    s/[\n\r]+$//;
+    my ($trans, $gene, $chr) = (split /\t/, $_)[0..2];
+    $GT{T2G}{$trans} = $gene;
+    $GT{G2T}{$gene}{$trans} = 1;
+    $GT{G2C}{$gene} = $chr;
+    $GT{C2G}{$chr}{$gene} = 1;
+}
+close $T2G;
+
+
+unless ($skip) {
+    
+    ## Split gene sequences into batches for pblat
+    print STDERR "Processing genes: ",`date`;
+    
+    &execute("$gtf2fa $oldgenome $oldgtf $transfasta", 2);
+    &execute("$fastaFromBed -name -fi $oldgenome -bed $oldgbed -fo $genefasta", 2);
+    &execute("perl -i -pe 's/(\\w{50})/\$1\\n/g' $genefasta", 2);
+    
+    if ($samechr) {
+	
+	## Separate gene fasta by chromosome, and create batches at chromosome level
+	my (%gseq, $gene);
+	my $GFA = &open2('R', $genefasta, 'gene fasta');
+	while (<$GFA>) {
+	    if (/^>(.*)/) {
+		chomp($gene = $1);
+	    }
+	    $gseq{$gene} .= $_;  # preserve fasta structure
+	}
+	close $GFA;
+	foreach my $chr (keys %{ $GT{C2G} }) {
+	    my $chrfa = "$chrbatch/$chr.fa";
+	    open OUT, "> $chrfa";
+	    print OUT $gseq{$_} foreach keys %{ $GT{C2G}{$chr} };
+	    close OUT;
+	    system "$fastaDistribute $chrfa $batchsize $blat_in/pblat_batch_$chr.";
+	}
+	%gseq = ();
+	
+    } else {
+	
+	system "$fastaDistribute $genefasta $batchsize $blat_in/pblat_batch_ALL.";
+	
+    }
+    
+    ## Write transcript fastas for Exonerate
+    print STDERR "Processing transcripts: ",`date`;
+    system "$fastaExplode -f $transfasta -o $exo_in";
+    foreach my $gene (keys %{ $GT{G2T} }) {
+	foreach my $trans (keys %{ $GT{G2T}{$gene} }) {
+	    system "mv $exo_in/$trans.fa $exo_in/$gene.$trans.fa";
+	}
+    }
+    
+}  # END UNLESS $SKIP
+
+
+
+## Record files and gene identities for batch
+foreach my $batch_in (glob "$blat_in/pblat_batch*") {
+    my ($batch_pref) = ($batch_in =~ /(pblat_batch_\S+\.\d+)/);
+    my ($batchL, $batchN) = ($batch_pref =~ /pblat_batch_(\S+)\.(\d+)$/);  # Level (chr), Number
+    $files{PB}{$batchL}{$batchN}{qsub_in} = "$qsub_in/$batch_pref.sh";
+    $files{PB}{$batchL}{$batchN}{qsub_out} = "$qsub_out/$batch_pref.out";
+    $files{PB}{$batchL}{$batchN}{blat_in} = $batch_in;
+    $files{PB}{$batchL}{$batchN}{blat_out} = "$blat_out/$batch_pref.psl";
+    $files{PB}{$batchL}{$batchN}{blat_err} = "$blat_out/$batch_pref.err";
+    $files{PB}{$batchL}{$batchN}{best_out} = "$blat_out/$batch_pref.psl.best";
+    foreach (split /\n/, `grep "^>" $batch_in | sed 's/>//'`) {
+	chomp;
+	$files{PB}{$batchL}{$batchN}{genes}{$_} = 1;
+    }
+}
+foreach my $gene (keys %{ $GT{G2T} }) {
+    $files{G}{$gene}{new_fa} = "$newgrefs/$gene.fa";
+    foreach my $trans (keys %{ $GT{G2T}{$gene} }) {
+	$files{T}{$trans}{exo_in} = "$exo_in/$gene.$trans.fa";
+	$files{T}{$trans}{exo_pref} = "$exo_out/$gene.$trans.exonerate";
+	$files{T}{$trans}{exo_out} = "$files{T}{$trans}{exo_pref}.out";
+	$files{T}{$trans}{exo_err} = "$files{T}{$trans}{exo_pref}.err";
+	$files{T}{$trans}{exo_gtf} = "$files{T}{$trans}{exo_pref}.gtf";
+	$files{T}{$trans}{exo_fa} = "$files{T}{$trans}{exo_pref}.fa";
+    }
+}
+
+
+
+## Write qsub scripts.
+## There are three stages, each run separately.
+## Stage 1 runs pblat jobs, each containing $batchsize genes, against the new reference.
+##  These coarsely map the gene into the new reference.
+##  If $samechr, then all genes in a batch will come from a single old chromosome, to be pblatted against a single new chromosome.
+## Stage 2 runs exonerate jobs, one per gene, which map all transcripts for that gene.
+##  These finely map the transcripts into the coarsely-mapped gene space.
+## Stage 3 is the aggregator, creating a final GTF, transcript fasta, and old-new comparison report.
+##  FUTURE: convert changes in new into VCF -> snpEff?
+
+print STDERR "Writing qsub scripts: ",`date`;
+my ($blat_batches, $exo_batches);
+
+my $QARR1 = &open2('W', $blat_array, 'Pblat batch array');
+my $QARR2 = &open2('W', $exo_array, 'Exonerate batch array');
+foreach my $batchL (sort keys %{ $files{PB} }) {
+    foreach my $batchN (sort {$a <=> $b} keys %{ $files{PB}{$batchL} }) {
+	$blat_batches++;
+	my $SCR1 = &open2('W', $files{PB}{$batchL}{$batchN}{qsub_in}, 'qsub script');
+	print $QARR1 "$files{PB}{$batchL}{$batchN}{qsub_in}\n";
+	my $blatref = $new2bit;
+	if ($samechr) {
+	    my $newchr = $chreq{ON}{$batchL};
+	    my $newlen = $chreq{NL}{$newchr};
+	    $blatref .= ":$newchr:1-$newlen";
+	}
+	print $SCR "time $pblat -threads=$cores -extendThroughN -maxIntron=10000 -minIdentity=75 $blatref $files{PB}{$batchL}{$batchN}{blat_in} $files{PB}{$batchL}{$batchN}{blat_out} 2> $files{PB}{$batchL}{$batchN}{blat_err}\n";
+	print $SCR "$filterAligns -f $files{PB}{$batchL}{$batchN}{blat_out} -q $files{PB}{$batchL}{$batchN}{blat_in} -t blat --more --best --lost\n";
+	print $SCR "tail -n +6 $files{PB}{$batchL}{$batchN}{best_out} | awk 'BEGIN { OFS=\"\\t\" } { print \$14,\$16,\$17,\$10\".\"\$14\".\"\$16\".\"\$17,\$24,\$9 }' > $files{PB}{$batchL}{$batchN}{best_out}.bed\n";
+	print $SCR "$fastaFromBed -name -fi $newgenome -bed $files{PB}{$batchL}{$batchN}{best_out}.bed -fo $files{PB}{$batchL}{$batchN}{best_out}.fa\n";   ### DO NOT USE -s: NEW SEQUENCE MUST BE GENOMIC 5', NOT REVCOMP
+	print $SCR "perl -i -pe 's/(\\w{50})/\$1\\n/g' $files{PB}{$batchL}{$batchN}{best_out}.fa\n";
+	print $SCR "$fastaExplode -f $files{PB}{$batchL}{$batchN}{best_out}.fa -o $newgrefs\n";
+	print $SCR "exit\n";
+	close $SCR;
+    }
+    foreach my $gene (sort keys %{ $files{PB}{$batchL}{$batchN}{genes} }) {
+	next unless -e $files{G}{$gene}{new_fa};   # some genes may not have blatted
+	$exo_batches++;
+	my $SCR2 = &open2('W', $files{G}{$gene}{qsub_in}, 'qsub script');
+	print $QARR2 "$files{G}{$gene}{qsub_in}\n";
+	print $SCR2 "#!/bin/bash\n\n## Gene $gene\n";
+	chomp(my $newcoord = split /\t/, `grep -P "\t$gene\t" $files{PB}{$batchL}{$batchN}{best_out}.bed | tail -1 | sed "s/\t/,/g"`);   # should produce one string like "chrom,start,end,name,score,strand"
+	foreach my $trans (keys %{ $GT{G2T}{$gene} }) {
+	    print $SCR2 "\n## Transcript $trans\n";
+	    print $SCR2 "time $exonerate -m est2genome -c $cores --exhaustive --revcomp --refine full -bestn 1 --minintron 1 --maxintron 1000000000 --showcigar --showtargetgff -t $files{G}{$gene}{new_fa} -q $files{T}{$trans}{exo_in} > $files{T}{$trans}{exo_out} 2> $files{T}{$trans}{exo_err}\n";
+	    print $SCR2 "$exonerate2gtf -i $files{T}{$trans}{exo_out} -o $files{T}{$trans}{exo_pref} -r $files{G}{$gene}{new_fa} -n $newcoord\n";
+	}
+	close $SCR2;
+    }
+}
+close $QARR1;
+close $QARR2;
+
+
+my $QSHP = &open2('W', $qsub_sh_b, 'pblat qsub launcher');
+print $QSHP "qsub -t 1:$blat_batches-1 -pe mpich $cores -q all.q -b y -cwd -N remapModels.pblat -o $batch_out -e $batch_err '$(sed -n \${SGE_TASK_ID}p $batch_array)'\n";
+close $QSHP;
+
+my $QSHE = &open2('W', $qsub_sh_e, 'exonerate qsub launcher');
+print $QSHE "qsub -t 1:$exo_batches-1 -pe mpich $cores -q all.q -b y -cwd -N remapModels -o $batch_out -e $batch_err '$(sed -n \${SGE_TASK_ID}p $batch_array)'\n";
+close $QSHE;
+
+
+## Exit
+print STDERR "remapModelsPrepare $sge_name complete: ",`date`;
+exit;
+
+
+
+
+
+
+
+
+sub write_seq {
+    
+    my ($HEADER, $SEQ, $FILE) = @_;
+    open my $FA, '>', $FILE or die "$0: Failed to write fasta file '$FILE': $!\n";
+    print $FA ">$HEADER\n",${ &blockify($SEQ) },"\n";
+    close $FA;
+    
+}

@@ -1,0 +1,337 @@
+#!/usr/bin/perl
+use Getopt::Long;
+use strict;
+
+## GetOptions stuff:
+my ($fasta, $writefastas, $noseq, $tracking, $stopnames);  # writefastas produces translated fastas | noseq will not print max ORF seq in master dataset | tracking prints aligned DNA, AA fastas | stopnames prints {opa} not _ in AA fastas
+my ($tmode, $emode) = (6, 2);
+my %kmodes = (1,'+0', 3,'+2', 6,'-2');
+
+GetOptions("f=s" => \$fasta, "t=i" => \$tmode, "e=i" => \$emode, "fastas" => \$writefastas, "noseq" => \$noseq, "tracking" => \$tracking, "stops" => \$stopnames);
+
+die "Fasta file '$fasta' not found!" unless -e $fasta;
+die "Translation mode '$tmode' not one of 1,3,6!" unless exists $kmodes{$tmode};
+die "Coding evaluation mode '$emode' not 1 or 2!\n" unless ($emode == 1 || $emode == 2);
+my $fname = $1 if $fasta =~ /([^\/]+)$/;
+my $lastframe = $kmodes{$tmode};
+
+my (%stopcodons, @framelist, %aminoacids);	# populated in &get_codons
+&get_codons;
+
+my (%data, $header, $seq, $hcount, @headers, $Ototal);
+open IN1, $fasta;
+while (<IN1>) {
+	$_ =~ s/[\n\r]//g;
+	if ($_ =~ /^>(.*)/) {
+		$data{$header}{SEQ} = $seq if $seq;	# so, not on first line
+		($header, $seq) = ($1, '');
+		$hcount++;
+		push @headers, $header;		# keep things in input order
+	} else {
+		$seq .= $_ if ($_ =~ /\S/);	# skip the occasional blank line
+	}
+}
+$data{$header}{SEQ} = $seq;
+close IN1;
+
+&translate($_) foreach @headers;
+
+my @fields1 = qw/ RESIDUES AMBIGS STOPS MAXORF MSG /;
+my @fields2 = qw/ RESIDUES AMBIGS STOPS MAXORF MSG SEQ ORF /;
+my $tabheader0 = "\t";
+my $tabheader1 = "HEADER\tSEQUENCE\tBESTFRAME";
+
+foreach my $frame (@framelist) {
+	$tabheader0 .= "\t\tTRANSLATION_$frame\t\t\t\t\t";
+	$tabheader1 .= "\t${_}_$frame" foreach @fields2;
+	last if $frame eq $lastframe;
+}
+
+my @noseqfields = (0,2,3..7,10..14,17..21,24..28,31..35,38..42);
+if ($noseq) {
+	open OUT, "> translated_$fname.noseq.txt";
+} else {
+	open OUT, "> translated_$fname.txt";
+}
+if ($fasta) {
+	open FAA, "> translated_fullseq_$fname";
+	open FAXT, "> translated_maxorf_$fname";
+	open FAXU, "> untranslated_$fname";
+}
+open ALN, "> translated_aligned_$fname.txt" if $tracking;
+
+$noseq ? (print OUT (join "\t", (split /\t/, $tabheader0)[@noseqfields]), "\n", (join "\t", (split /\t/, $tabheader1)[@noseqfields]), "\n") : (print OUT "$tabheader0\n$tabheader1\n");
+foreach my $header (@headers) {
+    my $outline = "$header\t$data{$header}{SEQ}";
+    print ALN "$header\n" if $tracking;
+    my %trans;
+    if ($emode == 1) {		# ask if a given sequence appears to be full-length coding or not
+	
+	my (%maxdata, @maxframes, %stopdata, $stops, $bestframe, $cnc);
+	# first evaluate frames: 'coding' = no stops or terminal only, else best = fewest stops, tiebreaker = largest orf; failing that, > 1 best
+	foreach my $frame (@framelist) {	
+	    # don't count the terminal stop (unless there are > 1)
+	    $stops = ($data{$header}{$frame}{STOPS} == 1 && $data{$header}{$frame}{SEQ} =~ /_$/) ? 0 : $data{$header}{$frame}{STOPS};
+	    push @{ $stopdata{$stops} }, [$data{$header}{$frame}{MAXORF}, $frame];
+	}
+	my $minstops = (sort {$a <=> $b} keys %stopdata)[0];
+	if (scalar @{ $stopdata{$minstops} } == 1) {
+	    $bestframe = $stopdata{$minstops}->[0][1];
+	} else {
+	    push @{ $maxdata{ $_->[0] } }, $_->[1] foreach @{ $stopdata{$minstops} };
+	    my ($maxorf, $maxorf2) = (sort {$a <=> $b} keys %maxdata)[0,1];
+	    if ($maxorf - $maxorf2 == 1) {	# variance due to frame position
+		@maxframes = (@{ $maxdata{$maxorf} }, @{ $maxdata{$maxorf2} });		# merge the two
+	    } else {
+		@maxframes = @{ $maxdata{$maxorf} };
+	    }
+	    if (scalar @maxframes == 1) {
+		$bestframe = $maxframes[0];
+	    } else {
+		$bestframe = join ',', @maxframes;
+	    }
+	}
+	($minstops == 0) ? ($cnc = 'CODING') : ($cnc = 'NONCODING');
+	$outline .= "\t$cnc:$bestframe";
+	
+    } elsif ($emode == 2) {		# look for orfs >= 100aa
+	
+	my (%likeliest, %nextbest, $bestframe);
+	# first evaluate frames: 'coding' = no stops or terminal only, else best = fewest stops, tiebreaker = largest orf; failing that, > 1 best
+	foreach my $frame (@framelist) {
+	    next if scalar (keys %{ $data{$header}{$frame}{ORF} }) > 1;		# there can be only one.
+	    (my $orfseq = $data{$header}{$frame}{ORF}{1}) =~ s/s^[-=\d]+//;		# clip maxorf header
+	    next unless $orfseq =~ /^M/;	                                        # has to start with M, of course
+	    my $orfthresh = 91 * log( length($data{$header}{SEQ}) ) - 330;          # taken from that Mattick paper (mean+2sd)
+	    my $borderline = 74 * log( length($data{$header}{SEQ}) ) - 330;         # extrapolated mean based on my own testing
+	    if ($data{$header}{$frame}{MAXORF} >= $orfthresh) {
+		$likeliest{ $data{$header}{$frame}{MAXORF} }{$frame} = 1;	# winner
+	    } elsif ($data{$header}{$frame}{MAXORF} >= $borderline) {
+		$nextbest{ $data{$header}{$frame}{MAXORF} }{$frame} = 1;	# 2sd >= x >= mean: borderline case?
+	    } else {
+		# assumed noncoding for first pass
+	    }
+	}
+	if (%likeliest) {
+	    my $max = (sort {$b <=> $a} keys %likeliest)[0];	# allowing for > 1 frame
+	    $trans{$_} = 1 foreach keys %{ $likeliest{$max} };
+	    my $bestframe = join ',', keys %{ $likeliest{$max} };
+	    $outline .= "\tCODING:$bestframe";
+	} elsif (%nextbest) {
+	    my $max = (sort {$b <=> $a} keys %nextbest)[0];	# allowing for > 1 frame
+	    $trans{$_} = 1 foreach keys %{ $nextbest{$max} };
+	    my $bestframe = join ',', keys %{ $nextbest{$max} };
+	    $outline .= "\tPOSSIBLY:$bestframe";
+	} else {
+	    $outline .= "\tNONCODING";
+	}
+	
+    }
+    my $isfaxt;
+    foreach my $frame (@framelist) {	# then print results
+	$outline .= "\t$data{$header}{$frame}{$_}" foreach (@fields1, 'SEQ');
+	$outline .= "\t", (join ' // ', @{ $data{$header}{$frame}{ORF_M} });
+	print ALN "$frame\tINPUT\t$data{$header}{$frame}{ISEQ}\n" if $tracking;
+	print ALN "$frame\tFRAME\t$data{$header}{$frame}{FSEQ}\n" if $tracking;
+	print ALN "$frame\tTRANS\t  $data{$header}{$frame}{ALNSEQ}\n" if $tracking;
+	my $trseq = &blockify($data{$header}{$frame}{SEQ});
+	print FAA ">$header|Frame$frame\n$trseq" if $writefastas;
+	if ($trans{$frame}) {
+	    my $orfseq = blockify($data{$header}{$frame}{ORF}{1});
+	    print FAXT ">$header|maxorf_$frame\n$orfseq" if $writefastas;
+	    $isfaxt = 1;
+	}
+	last if $frame eq $lastframe;
+    }
+    print FAXU ">$header\n", blockify($data{$header}{SEQ}) if ($writefastas && !$isfaxt);
+    print ALN "\n" if $tracking;
+	$noseq ? (print OUT (join "\t", (split /\t/, $outline)[@noseqfields]), "\n") : (print OUT "$outline\n");
+}
+close OUT;
+close ALN if $tracking;
+if ($fasta) {
+	close $_ foreach qw/ FAA FAXT FAXU /;
+}
+
+exit;
+
+#########################################################  SUBROUTINES  #########################################################
+
+
+sub translate {
+
+	my $HEADER = shift;
+
+	my %frameseq;
+	my $mrna = $data{$HEADER}{SEQ};
+	$mrna =~ s/^\s+//;	# clip leading whitespace
+	$mrna =~ s/\s+$//;	# clip trailing whitespace
+	$mrna =~ s/(.*)/\U$1/;	# all caps
+	$mrna =~ s/U/T/g;	# RNA->DNA
+	$frameseq{'+0'} = $mrna;
+	my @jsplit = split //, $mrna;
+	if ($tmode > 1) {
+		$frameseq{'+1'} = join '', @jsplit[1..$#jsplit];
+		$frameseq{'+2'} = join '', @jsplit[2..$#jsplit];
+	}
+	$data{$HEADER}{$_}{ISEQ} = $mrna foreach ('+0', '+1', '+2');
+	if ($tmode == 6) {
+		$frameseq{'-0'} = &revcomp($mrna);
+		my $temp1 = join '', @jsplit[0..$#jsplit-1];
+		my $temp2 = join '', @jsplit[0..$#jsplit-2];
+		$frameseq{'-1'} = &revcomp($temp1);
+		$frameseq{'-2'} = &revcomp($temp2);
+		$data{$HEADER}{$_}{ISEQ} = $frameseq{'-0'} foreach ('-0', '-1', '-2');
+	}
+	
+	foreach my $frame (@framelist) {
+		next unless $frameseq{$frame};
+		$data{$HEADER}{$frame}{FSEQ} = $frameseq{$frame};
+		my $seqlen = length($frameseq{$frame});
+		my $startmax = int($seqlen/3);
+		my (@translation, $stops, $ambigs, $much);
+		foreach my $start (0..$startmax) {  		# one for each codon
+			$start *= 3;
+			if ($start == $seqlen) {
+				# bye
+			} elsif (abs($seqlen-$start) <= 2) {	# reached end of translatable sequence...
+				my $off = abs($seqlen-$start);
+				($seqlen - $start < 0) ? ($much = 'short') : ($much = 'long');
+				my $msg = "Sequence was $off base";
+				$msg .= "s" if ($off > 1);
+				$msg .= " too $much for a full in-frame translation";
+				$data{$HEADER}{$frame}{MSG} = $msg;
+			} else {
+				my $codon = substr($frameseq{$frame}, $start, 3);
+				my $residue = $aminoacids{$codon};
+				$stops++ if $stopcodons{$codon};
+				if ($residue) {
+					push @translation, $residue;
+				} else {		# codon failed to translate: probably due to Ns or use of extended IUPAC alphabet
+#					push @errors, "header $HEADER | residue $residue | codon $codon | start $start | frame $frame | len $seqlen | seq $frameseq{$i}\n";
+					push @translation, 'x';
+					$ambigs++;
+				}
+			}
+		}
+		$data{$HEADER}{$frame}{STOPS} = ($stops || "0");
+		$data{$HEADER}{$frame}{AMBIGS} = ($ambigs || "0");
+		$data{$HEADER}{$frame}{RESIDUES} = scalar @translation;
+		$data{$HEADER}{$frame}{SEQ} = join '', @translation;
+		$data{$HEADER}{$frame}{ALNSEQ} = join '  ', @translation;
+		my @Otest = split /[oap_]+/, $data{$HEADER}{$frame}{SEQ};	# split on stops
+		my (%ORFs, $Omax, $Ocount);
+		$ORFs{ length($_) }{$_} = 1 foreach @Otest;
+		$Omax = [sort {$b <=> $a} keys %ORFs]->[0];	# length of longest ORF
+		$data{$HEADER}{$frame}{MAXORF} = $Omax;
+		my @ORFtemp;
+		foreach my $ORF (keys %{ $ORFs{$Omax} }) {	# allows for > 1 longest ORF
+			$Ocount++;
+			$Ototal = $Ocount if ($Ocount > $Ototal);	# greatest number of max ORFs reported by any translation
+			$data{$HEADER}{$frame}{ORF}{$Ocount} = $ORF;
+			push @ORFtemp, "$Ocount=$ORF";
+		}
+		$data{$HEADER}{$frame}{ORF_M} = \@ORFtemp;
+	}
+}
+
+
+sub blockify {
+	my $SEQ = shift;
+	my ($seqblock, $start);
+	my $blocks = length($SEQ) / 50;
+	$blocks++ if (length($SEQ) % 50 != 0);
+	for (my $i = 1; $i <= $blocks; $i++) {
+		$seqblock .= substr($SEQ, $start, 50)."\n";
+		$start += 50;
+	}
+	return $seqblock;
+}
+
+
+sub revcomp {
+	my $SEQ = shift;
+	## basic
+	$SEQ =~ tr/ACGT/TGCA/;
+	## extended
+	$SEQ =~ s/[^ACGT]/N/g;	# can't translate these anyway
+	return (reverse $SEQ);
+}
+
+
+sub get_codons {	## Stored down here to make things cleaner
+	%stopcodons = ('TAA'=>'o', 'TAG'=>'a', 'TGA'=>'p');
+
+	@framelist = ('+0','+1','+2','-0','-1','-2');
+
+	%aminoacids = (
+		'TTT' => 'F',
+		'TTC' => 'F',
+		'TTA' => 'L',
+		'TTG' => 'L',
+		'TCT' => 'S',
+		'TCC' => 'S',
+		'TCA' => 'S',
+		'TCG' => 'S',
+		'TAT' => 'Y',
+		'TAC' => 'Y',
+		'TAA' => '_',
+		'TAG' => '_',
+		'TGT' => 'C',
+		'TGC' => 'C',
+		'TGA' => '_',
+		'TGG' => 'W',
+		'CTT' => 'L',
+		'CTC' => 'L',
+		'CTA' => 'L',
+		'CTG' => 'L',
+		'CCT' => 'P',
+		'CCC' => 'P',
+		'CCA' => 'P',
+		'CCG' => 'P',
+		'CAT' => 'H',
+		'CAC' => 'H',
+		'CAA' => 'Q',
+		'CAG' => 'Q',
+		'CGT' => 'R',
+		'CGC' => 'R',
+		'CGA' => 'R',
+		'CGG' => 'R',
+		'ATT' => 'I',
+		'ATC' => 'I',
+		'ATA' => 'I',
+		'ATG' => 'M',
+		'ACT' => 'T',
+		'ACC' => 'T',
+		'ACA' => 'T',
+		'ACG' => 'T',
+		'AAT' => 'N',
+		'AAC' => 'N',
+		'AAA' => 'K',
+		'AAG' => 'K',
+		'AGT' => 'S',
+		'AGC' => 'S',
+		'AGA' => 'R',
+		'AGG' => 'R',
+		'GTT' => 'V',
+		'GTC' => 'V',
+		'GTA' => 'V',
+		'GTG' => 'V',
+		'GCT' => 'A',
+		'GCC' => 'A',
+		'GCA' => 'A',
+		'GCG' => 'A',
+		'GAT' => 'D',
+		'GAC' => 'D',
+		'GAA' => 'E',
+		'GAG' => 'E',
+		'GGT' => 'G',
+		'GGC' => 'G',
+		'GGA' => 'G',
+		'GGG' => 'G');
+		
+		if ($stopnames) {
+			$aminoacids{$_} = $stopcodons{$_} foreach keys %stopcodons;
+		}
+}
+

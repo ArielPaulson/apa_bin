@@ -1,0 +1,31 @@
+#!/usr/bin/env perl 
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+# Deps: jellyfish, (mkdir, rm)
+
+my $jellyfish = '/n/site/inst/Linux-x86_64/bioinfo/jellyfish/current/bin/jellyfish';
+
+my ($fasta, $k, $outdir);
+my $threads = 1;
+GetOptions("f=s"=>\$fasta, "k=i"=>\$k, "t=i"=>\$threads, "o=s"=>\$outdir);
+
+die "$0: Fasta '$fasta' not found!\n" unless -e $fasta;
+my ($fname) = ($fasta =~ /([^\/]+)$/);
+
+$outdir = "jellyfish_${fname}_$k" unless $outdir;
+system "mkdir -p $outdir"; 
+die "$0: Failed to create output dir '$outdir': $!\n" unless -d $outdir;
+chdir $outdir;
+
+system "$jellyfish count -o ${k}mers -m $k -t $threads -c 3 -s 10000000 --both-strands $fasta";
+system "$jellyfish merge -o ${k}mer_counts_merged.jf ${k}mers*";
+system "$jellyfish stats -o ${k}mer_stats ${k}mer_counts_merged.jf";
+system "$jellyfish histo -o ${k}mer_histo ${k}mer_counts_merged.jf";
+system "rm -f ${k}mers*";
+print "jellyRun $k $fasta complete!\n";
+exit;
+
+
+

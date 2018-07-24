@@ -1,0 +1,182 @@
+#!/usr/bin/perl
+use strict;
+use Cwd;
+
+## Written 08/04/2012 by Ariel Paulson (apa@stowers.org)
+##
+## Takes a bed file of genes and produces a bed file of intergenes, annotated with flank genes.
+## Intergene construction does not take account of strand, unless you specify so.
+## Example intergene output line: "chr1	4775819	4847776	I00004:ENSMUSG00000033845-ENSMUSG00000033813;ENSMUSG00000062588	71955"
+##  Here we see intergene I00004 is at chr1:4775819-4847776 with width 71955 bp;  5'-gene is ENSMUSG00000033845 and 3'-gene is ENSMUSG00000033813 or ENSMUSG00000062588.
+##  Terminal intergenes get 'CHR.START' or 'CHR.END' as the flank gene.
+##  Flank genes for strand-specific intergenes are arranged by genomic 5'/3', not strand-specific 5'/3'.
+##  Flank genes include ***ALL*** genes found between this and the next intergene, not simply the gene which 'ends' the intergene per se.  So your cis-NATs and intronic snoRNAs will be listed too.
+##
+## INPUTS: 3 args; bed file, chr sizes file (e.g. for wigToBigWig or a .fa.fai file), and optional '1' to make strand-specific intergenes.
+## OUTPUTS: <bedfile>.intergenes
+## DEPENDENCIES: bedtools, perl Cwd module, /home/apa/local/bin/sortBedCoord
+##
+## Input notes: since intergene flanks are given like chr coords, i.e. <id>:<5'genes>-<3'genes>, it makes parsing MUCH EASIER for you if your gene identifiers DO NOT CONTAIN : or - symbols.
+
+my ($bed, $chrsizes, $stranded) = @ARGV;
+
+my %strands = ('W','+', 'C','-');
+my (@output, %chrmax);
+my $wdir = cwd();
+
+my $TEMP = "/tmp/getIntergenes.$$.tmp";
+system "mkdir -p $TEMP";
+die "Failed to create temp directory '$TEMP'\n" unless -d $TEMP;
+system "cp $bed $TEMP/";
+
+open IN, $chrsizes or die "Cannot read chrom sizes file '$chrsizes': $!\n";
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    my @data = split /\t/, $_;
+    $chrmax{$data[0]} = $data[1];
+}
+close IN;
+
+$chrsizes = "$wdir/$chrsizes" unless $chrsizes =~ /^\//;   # prepend full path, unless there already
+chdir $TEMP;
+system "/home/apa/local/bin/sortBedCoord -i $bed > $bed.sorted";
+
+if ($stranded) {
+    
+    ## merge overlapping genes
+    system "mergeBed -nms -s -i $bed.sorted > merged.bed";
+    
+    ## split by strand
+    open IN, "merged.bed";
+    open OUTW, "> merged_W.bed";
+    open OUTC, "> merged_C.bed";
+    while (<IN>) {
+	if ($_ =~ /\t\+[\t\n]/) {
+	    print OUTW $_;
+	} elsif ($_ =~ /\t-[\t\n]/) {
+	    print OUTC $_;
+	}
+    }
+    close $_ foreach qw/ IN OUTW OUTC /;
+    
+    ## process by strand
+    foreach my $WC (qw/ W C /) {
+	my (%coords, %flanks);
+	
+	## create intergenes
+	system "complementBed -i merged_$WC.bed -g $chrsizes > raw-intergenes_$WC.bed";
+	chomp(my $N = `cat raw-intergenes_$WC.bed | wc -l`);
+	my $nch = length($N);
+	
+	## extend to flanks by 1bp (to overlap flank genes)
+	open IN, "raw-intergenes_$WC.bed"; 
+	open OUT, "> exp-intergenes_$WC.bed"; 
+	while (<IN>) { 
+	    chomp;
+	    my @data = split /\t/, $_; 
+	    my $width = $data[2]-$data[1];
+	    $data[1]-- if $data[1];  # don't decrement 0!
+	    $data[2]++ unless $data[2] == $chrmax{$data[0]}; 
+	    my $id = sprintf("$WC%0${nch}i",$.);
+	    $coords{$id} = join "\t", (@data, $id, $width, $strands{$WC});
+	    print OUT "$coords{$id}\n";
+	}
+	close IN;
+	close OUT;
+	
+	## pick up flanking genes
+	system "intersectBed -wao -a exp-intergenes_$WC.bed -b merged_$WC.bed > genes-intergenes_$WC.txt";
+	open IN, "genes-intergenes_$WC.txt";
+	while (<IN>) { 
+	    chomp;
+	    my @data = split /\t/, $_;
+	    if ($data[11] == 0) {
+		$flanks{$data[3]}{3} = $flanks{$data[3]}{5} = '';  # no flanks = no genes on this strand (small random chr?)
+	    } elsif ($data[2]-$data[7]==1) {
+		$flanks{$data[3]}{3} = $data[9];  # 3' neighbor
+	    } elsif ($data[8]-$data[1]==1) {
+		$flanks{$data[3]}{5} = $data[9];  # 5' neighbor
+	    } else {
+		print "Unable to orient intergene flank for line: '$_'\n";
+	    }
+	}
+	close IN;
+	
+	## flatten to one entry per intergene
+	foreach my $itg (keys %flanks) {
+	    my $f5 = $flanks{$itg}{5} || 'CHR.START';
+	    my $f3 = $flanks{$itg}{3} || 'CHR.END';
+	    my @fields = split /\t/, $coords{$itg};
+	    $fields[3] .= ":$f5-$f3";  # extend 'id' field with flank gene IDs
+	    push @output, (join "\t", @fields), "\n";
+	}
+    }
+    
+} else {   # both-strand intergenes
+    
+    ## merge overlapping genes
+    system "mergeBed -nms -i $bed.sorted > merged.bed";
+    
+    ## process
+    my (%coords, %flanks);
+    
+    ## create intergenes
+    system "complementBed -i merged.bed -g $chrsizes > raw-intergenes.bed";
+    chomp(my $N = `cat raw-intergenes.bed | wc -l`);
+    my $nch = length($N);
+    
+    ## extend to flanks by 1bp (to overlap flank genes)
+    open IN, "raw-intergenes.bed"; 
+    open OUT, "> exp-intergenes.bed"; 
+    while (<IN>) { 
+	chomp;
+	my @data = split /\t/, $_; 
+	my $width = $data[2]-$data[1];
+	$data[1]-- if $data[1];  # don't decrement 0!
+	$data[2]++ unless $data[2] == $chrmax{$data[0]}; 
+	my $id = sprintf("I%0${nch}i",$.);
+	$coords{$id} = join "\t", (@data, $id, $width);
+	print OUT "$coords{$id}\n";
+    }
+    close IN;
+    close OUT;
+    
+    ## pick up flanking genes
+    system "intersectBed -wao -a exp-intergenes.bed -b merged.bed > genes-intergenes.txt";
+    open IN, "genes-intergenes.txt";
+    while (<IN>) { 
+	chomp;
+	my @data = split /\t/, $_;
+	if ($data[9] == 0) {
+	    $flanks{$data[3]}{3} = $flanks{$data[3]}{5} = '';  # no flanks = no genes (small random chr?)
+	} elsif ($data[2]-$data[6]==1) {
+	    $flanks{$data[3]}{3} = $data[8];  # 3' neighbor
+	} elsif ($data[7]-$data[1]==1) {
+	    $flanks{$data[3]}{5} = $data[8];  # 5' neighbor
+	} else {
+	    print "Unable to orient intergene flank for line: '$_'\n";
+	}
+    }
+    close IN;
+    
+    ## flatten to one entry per intergene
+    foreach my $itg (keys %flanks) {
+	my $f5 = $flanks{$itg}{5} || 'CHR.START';
+	my $f3 = $flanks{$itg}{3} || 'CHR.END';
+	my @fields = split /\t/, $coords{$itg};
+	$fields[3] .= ":$f5-$f3";  # extend 'id' field with flank gene IDs
+	push @output, (join "\t", @fields), "\n";
+    }
+
+}
+
+open OUT, "> $bed.itg"; 
+print OUT @output;
+close OUT;
+system "/home/apa/local/bin/sortBedCoord -i $bed.itg > $bed.itg.sorted";
+system "cat $bed.itg.sorted";
+chdir $wdir;
+system "rm -Rf $TEMP";
+exit;
+
+

@@ -1,0 +1,45 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## Returns genes from $models with no exonic overlap to objects in $known.
+## Thus, $known must be either a GTF with only exon/CDS/UTR entries, or an exonic BED file.
+## It is assumed that $models is a GTF, not a GFF.
+
+my ($models, $known, $minexons, $output);
+GetOptions("m=s"=>\$models, "k=s"=>\$known, "e=i"=>\$minexons, "o=s"=>\$output);
+
+my (%remove, %exons, @keep);
+
+if ($known) {
+    open my $FLT, '-|', "intersectBed -a $models -b $known | cut -f9 | grep -o -P \"^gene_id [^;]+;\"";
+    while (<$FLT>) {
+	my ($gene) = ($_ =~ /gene_id \"(.*)\";/);
+	$remove{$gene} = 1;  # model genes which overlap known exons by at least 1 bp
+    }
+    close $FLT;
+}
+
+open my $GTF, '<', $models;
+while (<$GTF>) {
+    my @data = split /\t/, $_;
+    my ($gene, $transcript) = ($data[8] =~ /gene_id \"([^"]+)\"; transcript_id \"([^"]+)\";/);
+    $exons{$transcript}++ if $data[2] eq 'exon';  # transcript exon count
+    if ($known) {
+	push @keep, [$transcript, $_] unless $remove{$gene};  # keep remaining lines in input order
+    } else {
+	push @keep, [$transcript, $_];  # no known models?  then just filter for exons
+    }
+}
+close $GTF;
+
+my $OUT;
+if ($output) {
+    open $OUT, '>', $output;
+} else {
+    $OUT = *STDOUT;
+}
+foreach my $line (@keep) {
+    print $OUT $line->[1] if $exons{ $line->[0] } >= $minexons;
+}

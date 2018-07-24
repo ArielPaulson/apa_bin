@@ -1,0 +1,245 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## FIXME: somehow add promoter, tailregion defaults per genome??
+my $promtail = '1000,100';  # dm6
+
+my ($peaks, $bam, $outdir, $clobber, $geno, $anno, $skipto);
+
+GetOptions("b=s"=>\$bam, "p=s"=>\$peaks, "o=s"=>\$outdir, "oc=s"=>\$clobber, "g=s"=>\$geno, "a=s"=>\$anno, "skipto=s"=>\$skipto);
+
+die "$0: Peaks bed file '$peaks' not found!\n" unless -e $peaks;
+die "$0: HiC bam file '$bam' not found!\n" unless -e $bam;
+my $annodir = "/n/data1/genomes/indexes/$geno/$anno";
+die "$0: geno/anno pair '$geno/$anno' does not resolve to a local index location!\n" unless -d $annodir;
+if ($skipto) {
+    $outdir = $clobber if $clobber && !$outdir;
+} else {
+    $outdir = &create_writedir($outdir, $clobber);
+}
+
+my $samtools = 'samtools';
+my $mergeBed = 'mergeBed';
+my $intersectBed = 'intersectBed';
+my $bin = '/home/apa/local/bin';
+my $featureMapper = "$bin/featureMapper-1.1";
+
+my %bams = (1,"$outdir/E1.bam", 2,"$outdir/E2.bam");
+my $fmdir = "$outdir/featureMapper";
+my $rbp = "$outdir/reads_by_peak.txt";
+my $cbed = "$outdir/peak_connections.bed";
+my $mcbed = "$outdir/peak_connections.merge.bed";
+my $mcbed2 = "$outdir/peak_connections.merge-rename.bed";
+my $chrsz = "/n/data1/genomes/bowtie-index/$geno/$geno.chrom.sizes";
+my $gdat = "$annodir/$geno.$anno.genedata.txt";
+
+
+## ## STAGE 0: SPLIT BAM INTO ENDS ## ##
+
+
+unless ($skipto > 0) {
+    
+    print "Splitting ends into separate bams...\n";
+    &execute("$samtools view -h -f 64  $bam | $samtools view -bS - > $bams{1}", 1);
+    &execute("$samtools view -h -f 128 $bam | $samtools view -bS - > $bams{2}", 1);
+    
+}
+
+
+## ## STAGE 1: EXTRACT / ANALYZE READ PAIRS INTERSECTING PEAKS ## ##
+
+
+unless ($skipto > 1) {
+
+    my %filter;
+    foreach my $E (1,2) {
+        print "Matching peaks to end-$E reads...\n";
+        open my $INT, '-|', "$intersectBed -wao -bed -abam $bams{$E} -b $peaks | grep -vP \"\\.\t0\$\"";
+        while (<$INT>) {
+            my ($chr, $start, $end, $header, $peak) = (split /\t/, $_)[0..3,15];
+            $header =~ s/\/\d$//;   # strip end tags "/1", "/2"
+            $filter{$header}{$E} = [$peak, $chr, $start, --$end];
+        }
+        print "$. peak-read intersections read\n";
+        close $INT;
+    }
+
+    print "Writing reads-by-peak report...\n";
+    open my $OUT, '>', $rbp or die;
+    print $OUT "Header\tPeak1\tChr1\tStart1\tEnd1\tPeak2\tChr2\tStart2\tEnd2\tPair\n";
+    foreach my $E (1,2) {
+        my $O = $E == 1 ? 2 : 1;
+        print "Filtering end $E using end $O: ".`date`;
+        my $N = 0;
+        open my $BAM, '-|', "samtools view $bams{$O} | cut -f1,3,4,10" or die;
+        while (<$BAM>) {
+            chomp;
+            my ($header, $ochr, $ostart, $fraglen) = split;
+            $header =~ s/\/\d$//;   # strip end tags "/1", "/2"
+            my $oend = $ostart + 50;
+            if ($filter{$header}{$E}) {
+                my ($peak, $chr, $start, $end) = @{ $filter{$header}{$E} };
+                if ($filter{$header}{$O}) {  # other end in a peak, too
+                    next if $filter{$header}{$O}->[0] eq $peak;  # same peak -- noise alignments
+                    print $OUT "$header\t$peak\t$chr\t$start\t$end\t".$filter{$header}{$O}->[0]."\t$ochr\t$ostart\t$oend\t".++$N."\n";
+                } elsif ($ochr ne '*') {  # if *, other end unaligned; skip
+                    if ($chr eq $ochr) {
+                        ## cis-connected
+                        my ($pos1, $pos2) = (sort {$a <=> $b} ($start, $end, $ostart, $oend))[1,2];
+                        print $OUT "$header\t$peak\t$chr\t$start\t$end\t\t$ochr\t$ostart\t$oend\t".++$N."\n" if $pos2-$pos1-1 > 1000;  # beyond noise levels
+                    } else {
+                        ## trans-connected
+                        ## automatically beyond noise levels
+                        print $OUT "$header\t$peak\t$chr\t$start\t$end\t\t$ochr\t$ostart\t$oend\t".++$N."\n";
+                    }
+                }
+            }
+        }
+        print "$. end-$O reads processed.\n";
+        close $BAM;
+    }
+    close $OUT;
+
+}
+
+
+## ## STAGE 2: FEATUREMAPPER ## ##
+
+
+unless ($skipto > 2) {
+
+    ## Flatten HiC-connected peak coords and analyze
+    print "Finding HiC connections to genomic features...\n";
+    #&execute("cut -f7-10 $rbp | tail -n +2 | sort -k1,1d -k2,2n > $cbed", 1);
+    #&execute("$mergeBed -i $cbed -c 4 -o collapse -delim , > $mcbed", 1);
+    #&execute("cat $mcbed | awk 'BEGIN{OFS=\"\\t\"} {print \$1,\$2,\$3,NR,\"1\",\"+\"}' > $mcbed2", 1);
+    system "rm -rf $fmdir";
+    &execute("$featureMapper -i $mcbed2 -o $fmdir -g $geno -a $anno -p $promtail --keep", 1);
+
+}
+
+## ## STAGE 3: COMPILE REPORT ## ##
+
+
+unless ($skipto > 3) {
+
+    my (%mbed, %reads, %peaks, %feats, %Nfeats, %e2s, %idx2N, %N2idx, %peak2N, %peak2peak);
+
+    chomp(my @allchrs = split /\n/, `cut -f1 $chrsz`);
+
+    print "Reading peak connections bed...\n";
+    open my $MC2, '<', $mcbed or die;
+    while (<$MC2>) {
+        $_ =~ s/[\n\r]+$//;
+        my ($chr, $start, $end, $idxs) = split /\t/, $_;
+        $mbed{$.} = [$chr, $start, $end, 0];
+        foreach my $idx (split /,/, $idxs) {
+            $idx2N{$idx} = $.;
+            #$N2idx{$.}{$idx} = 1;
+            $mbed{$.}->[3]++;  # n reads associated with merge #N (N = $.)
+        }
+    }
+    close $MC2;
+
+    print "Reading read-peak membership table...\n";
+    open my $RBP, '<', $rbp or die;
+    while (<$RBP>) {
+        next if $. == 1;  # header
+        $_ =~ s/[\n\r]+$//;
+        my @data = split /\t/, $_;
+        #    $reads{$data[-1]} = [@data[0..-2]];
+        $peaks{$data[1]} = [@data[2..4],0] unless $peaks{$data[1]};
+        $peaks{$data[1]}->[3]++;  # n reads associated with peak
+        #    $peak2N{$data[1]}{ $idx2N{$data[-1]} }++;
+        $peak2N{$data[1]}{$data[-1]}++;
+        next unless $data[5];
+        $peaks{$data[5]} = [@data[6..8],0] unless $peaks{$data[5]};
+        $peaks{$data[5]}->[3]++;  # n reads associated with peak
+        #    $peak2peak{$data[1]}{$data[5]}{ $idx2N{$data[-1]} } = 1;
+        $peak2peak{$data[1]}{$data[5]}{$data[-1]} = 1;
+    }
+    close $RBP;
+
+    print "Reading featureMapper results...\n";
+    open my $FMF, '<', "$fmdir/featureMapper.full.txt" or die;
+    while (<$FMF>) {
+        $_ =~ s/[\n\r]+$//;
+        my @data = split /\t/, $_;
+        my ($chr, $pos1, $pos2, $strand, $type, $fid, $reads, $genes) = split /\t/, $_;
+        my ($start, $end) = ($pos1 < $pos2) ? ($pos1, $pos2) : ($pos2, $pos1);
+        $feats{$fid} = [$chr, $start, $end, $strand, $type];
+    }
+    close $FMF;
+    open my $FMC, '<', "$fmdir/featureMapper.coord.txt" or die;
+    while (<$FMC>) {
+        $_ =~ s/[\n\r]+$//;
+        my ($chr, $start, $end, $N, $score, $strand, $nbest, $feat, $featIDs) = split /\t/, $_;
+        foreach my $fid (split /;/, $featIDs) {
+            $Nfeats{$N}{$feat}{$fid} = $nbest;
+            $feats{$fid}->[5] += $mbed{$N}->[3];
+        }
+    }
+    close $FMC;
+
+    open my $GD, '<', $gdat or die;
+    while (<$GD>) {
+        my ($ens, $symb, $else) = split /\t/, $_, 3;
+        $e2s{$ens} = $symb;
+    }
+    close $GD;
+
+    print "Writing final peak connection report...\n";
+    open my $OUT2, '>', "$outdir/peak_connection_report.txt";
+    print $OUT2 "Peak\tChr\tStart\tEnd\tType\tFeature\tChr\tStart\tEnd\tStrand\tPeakOnly\tFeatOnly\tShared\tRPK\tMerges\n";
+    foreach my $peak (sort keys %peak2N) {
+        my ($chr, $start, $end, $pkreads) = @{ $peaks{$peak} };
+        foreach my $peak2 (keys %{ $peak2peak{$peak} }) {
+            my ($chr2, $start2, $end2, $nreads2) = @{ $peaks{$peak2} };
+            my @Ns = keys %{ $peak2peak{$peak}{$peak2} };
+            my $merges = join ',', sort {$a <=> $b} @Ns;
+            my $shared; $shared += $mbed{$_}->[3] foreach @Ns;
+            my $density = sprintf "%0.4f", (1E3*$shared) / ($end2-$start2);
+            $density = int($density) if $density >= 10;
+            my $pkonly = $pkreads - $shared;
+            my $ftonly = $peaks{$peak2}->[3] - $shared;
+            print $OUT2 "$peak\t$chr\t$start\t$end\tPEAK\t$peak2\t$chr2\t$start2\t$end2\t+\t$pkonly\t$ftonly\t$shared\t$density\t$merges\n";
+        }
+        my %subfeat;
+        foreach my $N (sort {$a <=> $b} keys %{ $peak2N{$peak} }) {
+            foreach my $feat (sort keys %{ $Nfeats{$N} }) {
+                foreach my $fid (sort keys %{ $Nfeats{$N}{$feat} }) {
+                    my ($chr2, $start2, $end2, $strand2, $type, $ftreads) = @{ $feats{$fid} };
+                    $subfeat{$chr2}{$start2} = [$end2, $strand2, $feat, $fid, $ftreads, 0, 0] unless $subfeat{$chr2}{$start2};
+                    $subfeat{$chr2}{$start2}->[5] += $mbed{$N}->[3];  # n reads
+                    $subfeat{$chr2}{$start2}->[6]++;  # n merges
+                    $subfeat{$chr2}{$start2}->[7] .= ",$N";
+                }
+            }
+        }
+        foreach my $chr2 (@allchrs) {
+            foreach my $start2 (sort {$a <=> $b} keys %{ $subfeat{$chr2} }) {
+                my ($end2, $strand2, $feat, $fid, $ftreads, $shared, $merges, $Ns) = @{ $subfeat{$chr2}{$start2} };
+                $Ns =~ s/^,//;
+                my $pkonly = $pkreads - $shared;
+                my $ftonly = $ftreads - $shared;
+                my $density = sprintf "%0.4f", (1E3*$shared) / ($end2-$start2);
+                $density = int($density) if $density >= 10;
+                (my $fid2 = $fid) =~ s/(ENSMUSG\d{11})/$e2s{$1}/g;
+                if ($feat eq 'ITGC') {
+                    $fid2 =~ s/([53]:[+-]:)//g;
+                    $fid2 =~ s/\|/--/;
+                }
+                $fid2 =~ s/:[IU]+([\d\|]+)/ ($1)/;
+                print $OUT2 "$peak\t$chr\t$start\t$end\t$feat\t$fid2\t$chr2\t$start2\t$end2\t$strand2\t$pkonly\t$ftonly\t$shared\t$density\t$merges\n";
+            }
+        }
+    }
+    close $OUT2;
+    
+}
+
+print "$0 $outdir complete!\n";
+exit;

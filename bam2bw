@@ -1,0 +1,131 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my $bam;    # input BAM
+my $genome; # bowtie-built genome ID, i.e. mm9, dm3
+my $prefix; # output prefix; taken from $bam if not specified
+my $norm;   # normalization method: values can be 'APM', 'RPM', or a numeric multiplier
+my $neg;    # negate values? (e.g. for minus-strand tracks)
+my $negifC; # inputting multiple bams; negate values for those that end with '.C.bam'
+
+GetOptions("b=s" => \$bam, "g=s" => \$genome, "p=s" => \$prefix, "n=s" => \$norm, "neg" => \$neg, "neg-if-C" => \$negifC);
+my @bams = @ARGV;  # alternatively: multiple bams to co-normalize
+
+print "\n";
+my $chrsize = "/n/data1/genomes/bowtie-index/$genome/$genome.chrom.sizes";
+die "Genome '$genome' not valid: file '$chrsize' does not exist!\n" unless -e $chrsize;
+
+@bams = ($bam) if $bam;
+die "No BAM files specified!\n" unless @bams;
+
+my (%bamM, %bamF, $avgM);
+if ($norm =~ /PM$/) {
+    
+    print "Calculating group normalization factor...\n" if $#bams > 0;
+    my $avgM;
+    foreach my $bam (@bams) {
+	$bamM{$bam} = &scale_bam($bam);
+	$avgM += $bamM{$bam};
+    }
+    $avgM /= scalar @bams;
+    $avgM = 1E6 if $#bams == 0;  # [AR]PM if only one bam
+    
+    foreach my $bam (@bams) {
+	if ($norm eq 'RPM') {
+	    $bamF{$bam} = sprintf("%0.6f", $avgM/$bamM{$bam});
+	    print "$bam: Reads=$bamM{$bam}, Scale=$bamF{$bam}\n";
+	} elsif ($norm eq 'APM') {
+	    $bamF{$bam} = sprintf("%0.6f", $avgM/$bamM{$bam});
+	    print "$bam: Alignments=$bamM{$bam}, Scale=$bamF{$bam}\n";
+	}
+    }
+} elsif ($norm) {
+    $bamF{$_} = $norm foreach @bams;
+    print "Scale: $norm\n";
+}
+
+print "Normalizing bams...\n" if $#bams > 0;
+&process_bam($_) foreach @bams;
+exit;
+
+
+
+
+sub process_bam {
+    
+    my $bam = shift;
+    ($prefix = $bam) =~ s/\.bam$//i unless $prefix;
+    my $cg_args = '-bg -split';
+    
+    if ($norm) {
+	$cg_args .= " -scale $bamF{$bam}";
+	$prefix .= $norm =~ /PM$/ ? ".$norm" : '.Scaled';
+    }
+    
+    my $cmd = "genomeCoverageBed $cg_args -ibam $bam -g $chrsize";
+    $cmd .= ' | awk \'{print $1 "\t" $2 "\t" $3 "\t-" $4}\'' if ($neg || ($negifC && $bam =~ /\.C\.bam$/));
+    print "$cmd > $prefix.bg\n";
+    system "$cmd > $prefix.bg";
+    
+    my $cmd = "wigToBigWig $prefix.bg $chrsize $prefix.bw";
+    print "$cmd\n";
+    system $cmd;
+    
+    my $cmd = "rm -f $prefix.bg";
+    print "$cmd\n";
+    system $cmd;
+}
+
+
+sub scale_bam {
+    
+    my $bam = shift;
+    my $M;
+    print "$bam: " if $#bams > 0;
+    if ($norm eq 'RPM') {
+	print "Counting unique reads (this will take a while...)\n";
+	chomp($M = `samtools view $bam | cut -f1 | sort -u | wc -l`);
+    } elsif ($norm eq 'APM') {
+	print "Counting alignments...\n";
+	chomp($M = `samtools view $bam | wc -l`);
+    }
+    return $M;
+}
+
+
+
+
+##### For stranded BW pairs -- add later
+
+#	genomeCoverageBed -split -bg -ibam $prefix.bam -g $fai > $prefix.bg
+#	if [ $str == 'C' ]
+#	then
+#	    mv $prefix.bg x
+#	    awk '{print $1 "\t" $2 "\t" $3 "\t-" $4}' x > $prefix.bg
+#	    rm x
+#	fi
+#	bedGraphToBigWig $prefix.bg $fai $prefix.bw
+#	rm -f $prefix.bg
+
+
+##### For BW header generation -- add later
+
+#foreach my $file (@BW) {
+#    my ($prefix) = ($file =~ /([^\/]+)\.bw$/);
+#    print "track type=bigWig prefix=$prefix description=\"$prefix\" visibility=full bigDataUrl=http://tracks.stowers.org/microarray/repo/$prefix$file\n";
+#    system("bash","-c","cp $file $prefix$file") if $copy;
+#}
+
+
+
+## Expect (http://www.nist.gov/el/msid/expect.cfm) example:
+#sub copyover {
+#    $scp=Expect->spawn("/usr/bin/scp ${srcpath}/$file $who:${destpath}/$file");
+#    $scp->expect(30,"ssword: ") || die "Never got password prompt from $dest:$!\n";
+#    print $scp 'password' . "\n";
+#    $scp->expect(30,"-re",'$\s') || die "Never got prompt from parent system:$!\n";
+#    $scp->soft_close();
+#    return;
+#}

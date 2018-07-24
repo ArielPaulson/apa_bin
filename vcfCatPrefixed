@@ -1,0 +1,26 @@
+#!/bin/bash
+
+## Identical to the normal vcfCat, but modified for a special use case ONLY with vcfIdentify.
+## The (pathless) filename is added to each row as the first (tab-sep) field.
+## The header is not affected.
+## Intended use case: ./vcfCatPrefixed <files> | ./vcfIdentify --auto-prefix > output.vcf
+
+files=($@)
+
+## print entire first file; assume it has a sufficient header
+fname=${files[0]##*/}
+fname=${fname%.gz}
+fname=${fname%.vcf}
+if [[ ${files[0]} =~ ".gz"$ ]]; then rcmd=zcat; else rcmd=cat; fi
+$rcmd ${files[0]} | awk -v FNAME=$fname '{ if ($0~/^#/) { print $0 } else { print FNAME"\t"$0 } }'
+
+## print headerless files 2-N
+N=${#files[@]}
+((N=$N-1))
+for i in $(seq 1 $N); do
+    fname=${files[$i]##*/}
+    fname=${fname%.gz}
+    fname=${fname%.vcf}
+    if [[ ${files[$i]} =~ ".gz"$ ]]; then rcmd=zcat; else rcmd=cat; fi
+    $rcmd ${files[$i]} | grep -v "^#" | awk -v FNAME=$fname '{ print FNAME"\t"$0 }'
+done

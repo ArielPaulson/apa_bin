@@ -1,0 +1,83 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+# Deps:
+
+## Inputs
+my $key;       # dataset key column (1-based)
+my $val;       # dataset value column
+my $head;      # datasets have $head lines of headers
+my $out;       # output file
+my @inputs;    # list of dataset files (arguments left over from GetOptions)
+my $dirname;   # use dataset file directory for column name? (otherwise, filename as given)
+my $nodirname; # remove dataset file directory from file name to create column name? (otherwise, filename as given)
+my $nosort;    # preserve input file key order as much as possible?  (intended for merging matrices with all identical row orders)
+my $strip;     # any other substring (regexp) to remove from dataset file name during column name conversion
+
+## Inputs with Defaults
+my $keyname = 'KEY';   # output file header name for key column
+
+GetOptions(
+    "k=i" => \$key, 
+    "v=i" => \$val, 
+    "h=i" => \$head, 
+    "kn=s" => \$keyname, 
+    "o=s" => \$out, 
+    "strip=s" => \$strip, 
+    "dirname" => \$dirname, 
+    "nodirname" => \$nodirname,
+    "nosort" => \$nosort
+    );
+
+@inputs = @ARGV;
+
+
+## Globals
+my @names;   # filenames for the header
+my @keys;    # keys, in output order
+my %matrix;  # data matrix
+
+
+## Main
+$key--; # now be 0-based
+$val--;
+
+open my $OUT, '>', $out or die "$0: Cannot write to output file '$out': $!\n";
+
+foreach my $file (@inputs) {
+    
+    # decide on sample name
+    my $name;
+    if ($dirname) {
+	($name) = ($file =~ /([^\/]+)\/[^\/]+$/);  # only the file's parent directory
+    } elsif ($nodirname) {
+	($name) = ($file =~ /([^\/]+)$/);  # only the file's name
+    } else {
+	$name = $file;  # file's path as given
+    }
+    $name =~ s/$strip//;
+    push @names, $name;
+    
+    # read matrix; extract key=>value pairs
+    open my $IN, '<', $file or die "$0: Cannot read matrix file '$file': $!\n";
+    while (<$IN>) {
+	next unless $. > $head;
+	$_ =~ s/[\n\r]+$//;
+	my ($KEY, $VAL) = (split /\t/, $_)[$key,$val];
+	push @keys, $KEY unless exists $matrix{$KEY};
+	$matrix{$KEY}{$name} = $VAL;
+    }
+    close $IN;
+}
+
+@keys = sort @keys unless $nosort;
+
+# write all-sample matrix
+print $OUT join("\t", ($keyname, @names)), "\n";
+foreach my $KEY (@keys) {
+    print $OUT join("\t", ($KEY, map {$matrix{$KEY}{$_}} @names)), "\n";
+}
+close $OUT;
+exit;

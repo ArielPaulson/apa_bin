@@ -1,0 +1,18 @@
+#!/usr/bin/env perl
+use strict;
+
+# converts a bed file into GTF format
+
+open IN, $ARGV[0] or die "exons2gtf: Failed to open '$ARGV[0]' for reading: $!\n";
+open OUT, "> $ARGV[0].gtf" or die "exons2gtf: Failed to open '$ARGV[0].gtf' for writing: $!\n";
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    my ($chr, $start, $end, $id, $score, $strand) = split /\t/, $_;
+    my ($gene, $n) = split /:/, $id;
+    $start++;  # 1-based
+    print OUT "$chr\texons2gtf\texon\t$start\t$end\t$score\t$strand\t.\tgene_id \"$gene\"; transcript_id \"$gene.1\";\n";
+}
+close OUT;
+close IN;
+exit;
+

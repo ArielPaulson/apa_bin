@@ -1,0 +1,353 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+## Author: Ariel Paulson (apa@stowers.org).
+## Takes a BAM file and converts it to various track formats
+## Can write multiple output formats with one call
+
+
+##### HUGE SPEEDUPS:
+## Mandate sorted/indexed beforehand
+## PE filter (splitBam) becomes single-pass, also obviates resorting
+## also, use temp dir not just prefix
+
+
+## Dependencies
+my $idxroot = '/n/data1/genomes/indexes';
+my $bin = $ENV{SIMR_APA_BIN};
+$bin = '/home/apa/local/bin' unless $bin;
+my $sortBedCoord = "$bin/sortBedCoord";
+my $bedToBigBed = "$bin/scriptutils/bedToBigBed";
+my $splitBam = "$bin/splitBam";
+my $sort_u = "$bin/sort_u";
+my $genomeCoverageBed = 'genomeCoverageBed';
+my $wigToBigWig = 'wigToBigWig';
+my $samtools = 'samtools';
+my $java = 'java';
+my $igvtools = '/n/local/stage/igvtools/current/igvtools.jar';
+$igvtools = '/n/apps/CentOS7/bin/igvtools.jar' unless -e $igvtools;
+
+
+## Inputs
+my $inbam;     # input BAM
+my $genome;    # bowtie-built genome ID, i.e. mm9, dm3
+my $chrsize;   # specify chrom.sizes, .fai, or equivalent file, if custom genome
+my $prefix;    # output prefix; taken from $inbam if not specified
+my $norm;      # normalization method: values can be 'APM', 'RPM', or a scale factor (numeric multiplier)
+my $M;         # only if $norm is 'APM' or 'RPM'; this is 'M' (default: 1E6)
+my $neg;       # negate values? (e.g. for minus-strand tracks)
+my $primary;   # use only BAM alignments flagged as primary?
+my $color;     # ONLY IF $BED OR $BB: apply this color to all intervals?  (OR, if value is 'strand', then +=red and -=blue)
+my $stranded;  # extract +, - strand reads into two separate tracks (and negate the minus strand values)
+my $switch;    # switch strand assignment (mainly for $stranded, but also affects bigBed read colors)
+my ($PE, $threads, $ram); # ONLY IF $stranded -- args for $splitBam -- are reads paired ; also threads and RAM (e.g. 20, 50G) for samtools sort *ONLY IF $PE*)
+my ($BED, $BB, $WIG, $BG, $BG0, $BG1, $BG10, $BW, $TDF);  # output formats | for $BG* see below
+
+
+## Explanation of $BG* options:
+## $BG   : standard bedGraph, one interval per contiguous run of bases at same height, intervals with zero height not reported.
+## $BG0  : $BG, including zero-height intervals.
+## $BG1  : 1-bp-resolution bedGraph (one interval per bp, zero-based), not including zeroes.
+## $BG10 : $BG1, including zero-height bp (DOES NOT RETURN one line per bp in genome; only goes up to the last nonzero bp on each chromosome).
+
+
+## Get args
+GetOptions("b=s" => \$inbam, "g=s" => \$genome, "c=s" => \$chrsize, "p=s" => \$prefix, "n=s" => \$norm, "Mval=i" => \$M, "neg" => \$neg, "BED" => \$BED, "WIG" => \$WIG, "BG" => \$BG, "BG0" => \$BG0, "BG1" => \$BG1, "BG10" => \$BG10, "BW" => \$BW, "BB" => \$BB, "TDF" => \$TDF, "primary" => \$primary, "stranded"=>\$stranded, "switch"=>\$switch, "PE"=>\$PE, "t=i"=>\$threads, "r=s"=>\$ram, "color=s" => \$color, "no-log"=>\$nolog);
+
+
+## Test args
+my $anyBG = $BG || $BG0 || $BG1 || $BG10;      ## any bedGraph formats specified?
+my $allBG = $BG + $BG0 + $BG1 + $BG10;         ## how many specified?  (should only be one)
+my $BEDstyle = $BED || $BB;                    ## all track formats should be accounted for
+my $WIGstyle = $WIG || $anyBG || $BW || $TDF;  ##   by one of these two meta-format switches.
+
+die "$0: No input BAM specified!\n" unless $inbam;
+die "$0: No output track format specified!\n" unless $BEDstyle || $WIGstyle;
+die "$0: bedGraph and WIG are the same format, do not specify both!\n" if $BG && $WIG;
+die "$0: specify only one of the $BG* formats!\n" if $allBG > 1;
+
+
+## Set up more params
+$M = 1E6 unless $M;
+($prefix = $inbam) =~ s/\.bam$//i unless $prefix;
+
+if ($genome && $chrsize) {
+    print STDERR "$0: '-g' and '-c' are redundant!  Ignoring '-g'...\n";
+} elsif ($genome && !$chrsize) {
+    $chrsize = "/n/data1/genomes/indexes/$genome/$genome.fa.fai";
+    die "$0: Cannot locate chrom sizes file '$chrsize'!  Bad genome label?\n" unless -e $chrsize;
+} elsif ($chrsize && !-e $chrsize) {
+    die "$0: Cannot find chrom sizes file '$chrsize'!\n";
+} elsif (!$genome && !$chrsize) {
+    die "$0: Must specify one of '-g' or '-c'!\n";
+}
+
+
+## Globals
+my @bams;  # may have 1 or 2 bams to process, depending on $stranded -- so keep in array
+my @scales;  # likewise, may have 1 or 2 scaling factors
+my $tmp = "bam2track.$$.tmp";
+my %strcols;   # if $BEDstyle: strand color hash
+my %other_strand = ('+','-', '-','+');  # strand-switching hash
+
+
+## Color prep
+if ($color eq 'strand') {
+    %strcols = ('+'=>'255,0,0', '-'=>'0,0,255', '.'=>'0,0,0');  # default strand color: + red, - blue, . black (. here for formality; will not exist in BAM files)
+} elsif ($color && $color ne 'strand') {
+    my ($R, $G, $B) = ($color =~ /^(\d{1,3}),(\d{1,3}),(\d{1,3})$/);
+    my $RGBok = (defined $R && $R >= 0 && $R <= 255) && (defined $G && $G >= 0 && $G <= 255) && (defined $B && $B >= 0 && $B <= 255) ? 1 : 0;
+    die "$0: 'color' value must be 'strand', or have format 'R,G,B' where R,G,B are integers from 0-255\n" unless $RGBok;
+}
+
+
+
+
+
+## MAIN ##
+
+
+
+
+
+## Logfile
+## Open FH for &execute calls below
+my $log = "$inbam.bam2track.log";
+open my $LOG, '>', $log or die "$0: Cannot write to log file '$log': $!\n";
+
+
+## BAM prep
+print "\n";  # push off prompt, in case running in background
+if ($primary) {
+    print "Filtering for primary alignments...\n";
+    &execute("$samtools view -h -F 256 $inbam | $samtools view -bS - > $tmp.bam", 1, $LOG);
+} else {
+    ## If no filtering, then symlink input to working temp
+    &execute("ln -sf $inbam $tmp.bam", 1, $LOG);
+    &execute("ln -sf $inbam.bai $tmp.bam.bai", 1, $LOG) if -e "$inbam.bai";
+}
+&execute("samtools index $tmp.bam", 1, $LOG) unless -e "$tmp.bam.bai";
+
+
+## Split bam if needed
+if ($stranded) {
+    my $blurb = $switch ? ' (and switching strands)' : '';
+    $threads = 1 unless $threads;
+    $ram = '10G' unless $ram;
+    my $args = '--switch';
+    $args .= $PE ? " --PE --cores=$threads --mem=$ram" : '';
+    print "Splitting BAM by strand$blurb...\n";
+    &execute("$splitBam $args $tmp.bam", 1, $LOG);
+    @bams = ("$tmp.plus.bam", "$tmp.minus.bam");
+} else {
+    @bams = ("$tmp.bam");
+}
+
+
+## Operations for $BED, $BB
+
+foreach my $bam (@bams) {
+    
+    
+    ## Stranded genomeCoverageBed / Awk-filter param setup
+    
+    ## This block is the same for all bams
+    my $gcb_args = $WIG||$BG||$BW ? '-bg' : $BG0 ? '-bga' : $BG1 ? '-dz' : $BG10 ? '-d' : '';
+    $gcb_args .= " -split -g $chrsize";
+    my $awk_pos3 = $WIG||$BG||$BW ? '$3' : $BG0 ? '$3' : $BG1 ? '$2' : $BG10 ? '$2' : '';
+    my $awk_pos4 = $WIG||$BG||$BW ? '$4' : $BG0 ? '$4' : $BG1 ? '$3' : $BG10 ? '$3' : '';
+    my $gcb_awk_pre = "awk '{ print " . '$1"\t"$2' . ($BG10 ? '-1' : '') . '"\t"' . $awk_pos3 . ($BG1 ? '+1' : '') . '"\t#"' . "$awk_pos4 }'";   # is this +1 actually correct?
+    (my $gcb_awk_pos = $gcb_awk_pre) =~ s/#//;
+    (my $gcb_awk_neg = $gcb_awk_pre) =~ s/#/-/;
+    
+    ## This block will vary by bam
+    my $this_prefix = $prefix;
+    my $this_gcb_args = $gcb_args;
+    my $this_gcb_awk;
+    if ($stranded && $bam =~ /\.(plus|minus)\.bam$/) {
+        $this_prefix .= ".$1";
+        $this_gcb_awk = $1 eq 'minus' ? $gcb_awk_neg : $gcb_awk_pos;
+        #	$neg = $1 eq 'minus' ? 1 : 0;  ## automatically negate minus bam if splitting by strand
+    } else {
+        $this_gcb_awk = $neg ? $gcb_awk_neg : $gcb_awk_pos;
+    }
+    
+    
+    print "Processing $bam...\n";
+    
+    
+    ## Common operations for bed-type output formats
+    
+    if ($BEDstyle) {
+        
+        ## BAM->BED
+        print "Converting to BED format...\n";
+        open my $OUT, '>', "$bam.bed" or die "Cannot write to '$bam.bed': $!\n";
+        open my $IN, '-|', "$samtools view $bam | cut -f2-6,10" or die "Cannot read from bam file '$bam': $!\n";
+        while (<$IN>) {
+            chomp;
+            my ($flags, $chr, $start, $mapq, $cigar, $seq) = split;
+            my $strand = $flags & 16 ? '-' : '+';
+            $strand = $other_strand{$strand} if $switch;
+            my $end = $start + length($seq) - 1;
+            if ($cigar =~ /^(\d+)S/) {
+                $end -= $1;
+            }
+            if ($cigar =~ /(\d+)S$/) {
+                $end -= $1;
+            }
+            if (%strcols) {
+                print $OUT "$chr\t$start\t$end\t$.\t$mapq\t$strand\t$start\t$end\t$strcols{$strand}\n";
+            } elsif ($color) {
+                print $OUT "$chr\t$start\t$end\t$.\t$mapq\t$strand\t$start\t$end\t$color\n";
+            } else {
+                print $OUT "$chr\t$start\t$end\t$.\t$mapq\t$strand\n";
+            }
+        }
+        close $IN;
+        close $OUT;
+        
+        &execute("$sortBedCoord -i $bam.bed --overwrite", 1, $LOG);
+        
+        if ($BB) {
+            my $N = $color ? 9 : 6;
+            &execute("$bedToBigBed -tab -type=bed$N $bam.bed $chrsize $this_prefix.bb", 1, $LOG);
+        }
+        
+        if ($BED) {
+            ## Run this last, after all BED-requiring commands have completed!!
+            &execute("mv $bam.bed $this_prefix.bed", 1, $LOG);
+        } 
+    }
+    
+    
+    ## Operations for $WIG, $BG*, $BW, $TDF
+    
+    if ($WIGstyle) {
+        
+        if ($norm) {
+            
+            ## Generate normalization factor
+            
+            print "Counting alignments...\n";
+            my $Rcmd = "bash -c 'paste -s -d+ <($samtools idxstats $bam | grep -vP \"^\\*\" | cut -f3) | bc'";
+            print "$Rcmd\n";         # not using &execute here,
+            chomp(my $R = `$Rcmd`);  #  since we need to capture $R
+            print "R: $R\n";
+            
+            if ($norm eq 'RPM') {
+                
+                ## Reads-per-million scaling factor; requires counting unique read headers (slow)
+                
+                if (!$primary) {
+                    ## recalculate $R...
+                    print "Counting unique reads (this may take a while...)\n";
+                    my $Rcmd2 = "$samtools view $bam | cut -f1 | $sort_u | wc -l";  # uses $sort_u, an extremely fast Perl implementation of 'sort -u'
+                    print "$Rcmd2\n";          # again not using &execute here,
+                    chomp($R = `$Rcmd2`);      #  since we need to capture $R
+                    print "corrected R: $R\n";
+                }
+                
+                my $F = sprintf("%0.6f", $M/$R);
+                print "Reads=$R, Scale=$F\n";
+                $this_gcb_args .= " -scale $F";
+                $this_prefix .= '.RPM';
+                
+            } elsif ($norm eq 'APM') {
+                
+                ## Alignments-per-million scaling factor; only requires counting alignments (fast)
+                
+                my $F = sprintf("%0.6f", $M/$R);
+                print "Alignments=$R, Scale=$F\n";
+                $this_gcb_args .= " -scale $F";
+                $this_prefix .= '.APM';
+                
+            } else {
+                
+                ## Other scaling factor
+                
+                print "SCALE: $norm\n";
+                $this_gcb_args .= " -scale $3";
+                $this_prefix .= '.Scaled';
+                
+            }
+            
+        }
+        
+        ## Get bedGraph from BAM (basis for all remaining formats)
+        &execute("$genomeCoverageBed $this_gcb_args -ibam $bam | $this_gcb_awk > $bam.bg", 1, $LOG);
+        
+        ## Generate specific formats
+        &execute("$wigToBigWig $bam.bg $chrsize $this_prefix.bw", 1, $LOG) if $BW;
+        if ($anyBG) {
+            &execute("mv $bam.bg $this_prefix.bg", 1, $LOG);
+            &execute("ln -sf $this_prefix.bg $this_prefix.wig", 1, $LOG) if $WIG;
+        } elsif ($WIG) {
+            &execute("mv $bam.bg $this_prefix.wig", 1, $LOG);
+        }
+        if ($TDF) {
+            my $input;   # TDF creation command requires '.wig' extension, for whatever reason
+            if (-e "$this_prefix.wig") {
+                $input = "$this_prefix.wig";
+            } else {
+                ## Run this only AFTER all bedGraph-requiring commands have completed!!
+                &execute("mv $bam.bg $bam.wig", 1, $LOG);
+                $input = "$bam.wig";
+            }
+            &execute("$java -Xmx5000m -jar $igvtools toTDF $input $this_prefix.tdf $chrsize", 1, $LOG);
+        }
+        
+    }
+    
+}
+
+
+system "rm -f $tmp.*";  # BAM, BED, BG temp files may exist
+close $LOG;
+exit;
+
+
+
+
+sub execute {
+    
+    ## Runs command and maybe prints to STDOUT/ERR and/or logfile
+    
+    my ($cmd, $out, $logfh) = @_;
+    
+    my $FH = $out==1 ? *STDOUT : $out==2 ? *STDERR : undef;
+    print $FH "$cmd\n" if $FH;
+    print $logfh "$cmd\n" if $logfh;
+    system $cmd;
+    
+}
+
+
+
+
+##########  FUTURE ADDITIONS BELOW  ##########
+
+
+##### For BW header generation -- add later
+
+#foreach my $file (@BW) {
+#    my ($this_prefix) = ($file =~ /([^\/]+)\.bw$/);
+#    print "track type=bigWig name=$this_prefix description=\"$this_prefix\" visibility=full bigDataUrl=http://tracks.stowers.org/microarray/repo/$this_prefix$file\n";
+#    system("bash","-c","cp $file $this_prefix$file") if $copy;
+#}
+
+
+
+## Expect (http://www.nist.gov/el/msid/expect.cfm) example:
+#sub copyover {
+#    $scp=Expect->spawn("/usr/bin/scp ${srcpath}/$file $who:${destpath}/$file");
+#    $scp->expect(30,"ssword: ") || die "Never got password prompt from $dest:$!\n";
+#    print $scp 'password' . "\n";
+#    $scp->expect(30,"-re",'$\s') || die "Never got prompt from parent system:$!\n";
+#    $scp->soft_close();
+#    return;
+#}
+

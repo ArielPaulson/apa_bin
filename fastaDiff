@@ -1,0 +1,324 @@
+#!/usr/bin/env perl
+use strict;
+
+## Compare the sequences of two fasta files (may have multiple sequences)
+## Fastas expected to have the same headers -- <header> from fasta1 gets compared to <header> from fasta2.
+## Smith-Waterman implementation modified from Andrea Telatin: http://genomics.cribi.unipd.it/~telatin/go/teaching-smith-waterman
+## For each header, report N positions w/ same case, diff case, diff base, gap
+
+my ($fa1, $fa2, $mode, @target_headers) = @ARGV;
+
+my %okModes = map {($_=>1)} qw/ fast superfast muscle blat sw /;
+die "Mode '$mode' not recognized!\n" unless $okModes{$mode};
+## Superfast: bash-based 
+## Fast: requires sequences to have same length, then compares pos-by-pos on raw sequences.
+## Muscle: multialignment in muscle, then compares pos-by-pos.
+## Full: does Smith-Waterman, then compares pos-by-pos.
+
+my $fasta2tab = '/home/apa/local/bin/fasta2tab';
+
+my ($header, %headers, %seq);
+
+if ($mode eq 'superfast') {
+    
+    open IN, "bash -c 'comm <($fasta2tab $fa1 | sort) <($fasta2tab $fa2 | sort)' |";
+    print "Header\tLength\tSame/Case/Diff/Gap/Ignore/Indels\tError\n";
+    while (<IN>) {
+	chomp;
+	my @data = split /\t/, $_;
+	my $len = length($data[-1]);
+	$headers{$data[-2]}{W}{$#data} = $len;
+#	$headers{$data[-2]}{L}{$len} = 1;
+    }
+    close IN;
+    
+    foreach my $header (sort keys %headers) {
+	my ($len, $comp, $blurb);
+	if (scalar(keys %{ $headers{$header}{W} })>1) {
+	    my ($len1, $len2) = (values %{ $headers{$header}{W} });
+	    $len = $len1 == $len2 ? $len1 : "$len1,$len2";
+	    $blurb = "Different in Both";
+	} else {
+	    my $which = (keys %{ $headers{$header}{W} })[0];
+	    $len = (values %{ $headers{$header}{W} })[0];
+	    $blurb = $which < 3 ? "Fasta $which Only" : "Same In Both";
+	}
+	print join("\t", $header, $len, '.', $blurb),"\n";
+    }
+    
+} elsif ($mode eq 'blat') {
+    
+    ####### NOT READY YET #######    
+    
+    open IN, "eba1.merged.A-B.psl";  # still under construction
+    while (<IN>) {
+	chomp;
+	my ($match, $mis, $rep, $N, $qgaps, $qgapbp, $tgaps, $tgapbp, $str, $qname, $qlen, $qstart, $qend, $tname, $tlen, $tstart, $tend, $blen, $qbstarts, $tbstarts) = split /\t/, $_;
+	$qname =~ s/__A$//;
+	$tname =~ s/__B$//;
+	next unless $qname eq $tname;
+#	$header{$qname}{};
+    }
+    close IN;
+    
+    print "Header\tLength\tSame/Case/Diff/Gap/Ignore/Indels\tError\n";
+    foreach my $header (sort keys %headers) {
+	my ($len, $comp, $blurb);
+	if (scalar(keys %{ $headers{$header}{W} })>1) {
+	    my ($len1, $len2) = (values %{ $headers{$header}{W} });
+	    $len = $len1 == $len2 ? $len1 : "$len1,$len2";
+	    $blurb = "Different in Both";
+	} else {
+	    my $which = (keys %{ $headers{$header}{W} })[0];
+	    $len = (values %{ $headers{$header}{W} })[0];
+	    $blurb = $which < 3 ? "Fasta $which Only" : "Same In Both";
+	}
+	print join("\t", $header, $len, '.', $blurb),"\n";
+    }
+    
+} else {
+    
+    open my $IN1, '<', $fa1 or die "Cannot read fasta 1 '$fa1': $!\n";
+    open my $IN2, '<', $fa2 or die "Cannot read fasta 2 '$fa2': $!\n";
+    
+    while (<$IN1>) {
+	s/[\n\r]+$//;
+	if (/^>(.*)/) {
+	    $header = $1;
+	    $headers{$header} = 1;
+	} else {
+	    $seq{1}{$header} .= $_;
+	}
+    }
+    close $IN1;
+#    print STDERR scalar(keys %{ $seq{1} })," headers 1\n";
+    
+    while (<$IN2>) {
+	s/[\n\r]+$//;
+	if (/^>(.*)/) {
+	    $header = $1;
+	    $headers{$header} = 1;
+	} else {
+	    $seq{2}{$header} .= $_;
+	}
+    }
+    close $IN2;
+#    print STDERR scalar(keys %{ $seq{1} })," headers 1\n";
+#    print STDERR scalar(keys %headers)," total headers\n";
+    
+    my @use_headers = @target_headers ? @target_headers : (sort keys %headers);
+    
+    print "Header\tLength\tSame/Case/Diff/Gap/Ignore/Indels\tError\n";
+    foreach my $header (@use_headers) {
+	
+	my $len1 = length($seq{1}{$header}) || 0;
+	my $len2 = length($seq{2}{$header}) || 0;
+	my $len = $len1 == $len2 ? $len1 : "$len1,$len2";
+	
+	if ($len1 > 0 && $len2 > 0) {
+	    if ($mode eq 'fast' || $mode eq 'muscle') {
+		if ($len1 == $len2) {
+		    my ($same, $case, $diff, $gap, $ignore, $gap_events) = @{ &fast(\$seq{1}{$header}, \$seq{2}{$header}) };
+		    print "$header\t$len\t$same/$case/$diff/$gap/$ignore/$gap_events\t.\n";
+		} elsif ($mode eq 'muscle') {
+		    my ($same, $case, $diff, $gap, $ignore, $gap_events) = @{ &muscle(\$seq{1}{$header}, \$seq{2}{$header}) };
+		    print "$header\t$len\t$same/$case/$diff/$gap/$ignore/$gap_events\t.\n";
+		} else {
+		    print "$header\t$len\t.\tIncomparable: sequence lengths differ\n";
+		}
+#    	    } elsif ($mode eq 'sw') {
+#	        my ($same, $case, $diff, $gap, $ignore, $gap_events) = @{ &smithwaterman(\$seq{1}{$header}, \$seq{2}{$header}) };
+#	        print STDERR "$seq{1}{$header}\n$seq{2}{$header}\n\n$align1\n$align2\n";
+#	        (my $gapless1 = $align1) =~ s/-//g;
+#	        (my $gapless2 = $align2) =~ s/-//g;
+#	        $gap += $len1-length($gapless1);  # dangling end 1 considered gap
+#	        $gap += $len2-length($gapless2);  # dangling end 2 considered gap
+#	        print "$header\t$len\t$same/$case/$diff/$gap/$ignore/$gap_events\t.\n";
+	    }
+	} elsif ($len1 > 0) {
+	    print "$header\t$len1\t.\tFasta 1 only\n";
+	} elsif ($len2 > 0) {
+	    print "$header\t$len2\t.\tFasta 2 only\n";
+	} else {
+	    print "$header\t$len\t.\tNo Sequence!\n";
+	}
+    }
+}
+exit;
+
+
+
+
+
+sub fast {
+    
+    my ($seq1, $seq2) = @_;
+    
+    my $gaps1 = scalar split /[^-]+/, $$seq1;
+    my $gaps2 = scalar split /[^-]+/, $$seq2;
+    my $gap_events = $gaps1+$gaps2;
+    
+    my @chars1 = split //, $$seq1;
+    my @chars2 = split //, $$seq2;
+    
+    my ($same, $case, $diff, $gap, $ignore) = (0, 0, 0, 0, 0);
+    foreach my $i (0..$#chars1) {
+	if ($chars1[$i] eq '-' || $chars2[$i] eq '-') {
+	    $gap++;
+	} elsif ($chars1[$i] eq '-' && $chars2[$i] eq '-') {
+	    $ignore++;
+	} elsif ($chars1[$i] eq $chars2[$i]) {
+	    $same++;
+	} elsif (uc($chars1[$i]) eq uc($chars2[$i])) {
+	    $case++;
+	} else {
+	    $diff++;
+	}
+    }
+    
+    return [$same, $case, $diff, $gap, $ignore, $gap_events];
+}
+
+
+
+
+sub muscle {
+    
+    my ($seq1, $seq2) = @_;
+    
+    my $tmpin = "fastaDiff.in.$$.tmp";
+    my $tmpout = "fastaDiff.out.$$.tmp";
+    
+    my ($header, %aligned);
+    open my $OUT, '>', $tmpin or die "Cannot write temp input file '$tmpin': $!";
+    print $OUT ">Seq1\n$$seq1\n>Seq2\n$$seq2\n";
+    close $OUT;
+    
+    system "muscle -in $tmpin -out $tmpout 2> /dev/null";
+    
+    open my $IN, '<', $tmpout or die "Cannot read temp output file '$tmpout': $!";
+    while (<$IN>) {
+	s/[\n\r]+$//;
+	if (/^>(.*)/) {
+	    $header = $1;
+	} else {
+	    $aligned{$header} .= $_;
+	}
+    }
+    close $IN;
+    system "rm -f $tmpin $tmpout";
+    
+    return &fast(\$aligned{Seq1}, \$aligned{Seq2});
+}
+
+
+
+
+sub smithwaterman {
+    
+    my ($seq1, $seq2) = @_;
+    
+    my ($LS1, $LS2) = (length($$seq1), length($$seq2));
+    my @bases1 = split //, uc($$seq1);
+    my @bases2 = split //, uc($$seq2);
+    
+    # scoring scheme
+    my $MATCH    =  1; # +1 for letters that match
+    my $MISMATCH = -1; # -1 for letters that mismatch
+    my $GAP      = -1; # -1 for any gap
+
+    # initialization
+    my @matrix;
+    $matrix[0][0]{score}   = 0;
+    $matrix[0][0]{pointer} = "none";
+    for(my $j = 1; $j <= $LS1; $j++) {
+	$matrix[0][$j]{score}   = 0;
+	$matrix[0][$j]{pointer} = "none";
+    }
+    for (my $i = 1; $i <= $LS2; $i++) {
+	$matrix[$i][0]{score}   = 0;
+	$matrix[$i][0]{pointer} = "none";
+    }
+
+    # fill
+    my $max_i     = 0;
+    my $max_j     = 0;
+    my $max_score = 0;
+    
+    for(my $i = 1; $i <= $LS2; $i++) {
+	for(my $j = 1; $j <= $LS1; $j++) {
+	    my ($diagonal_score, $left_score, $up_score);
+	    
+	    # calculate match score
+	    if ($bases1[$j-1] eq $bases2[$i-1]) {
+		$diagonal_score = $matrix[$i-1][$j-1]{score} + $MATCH;
+	    } else {
+		$diagonal_score = $matrix[$i-1][$j-1]{score} + $MISMATCH;
+	    }
+	    
+	    # calculate gap scores
+	    $up_score   = $matrix[$i-1][$j]{score} + $GAP;
+	    $left_score = $matrix[$i][$j-1]{score} + $GAP;
+	    
+	    if ($diagonal_score <= 0 and $up_score <= 0 and $left_score <= 0) {
+		$matrix[$i][$j]{score}   = 0;
+		$matrix[$i][$j]{pointer} = "none";
+		next; # terminate this iteration of the loop
+	    }
+
+	    # choose best score
+	    if ($diagonal_score >= $up_score) {
+		if ($diagonal_score >= $left_score) {
+		    $matrix[$i][$j]{score}   = $diagonal_score;
+		    $matrix[$i][$j]{pointer} = "diagonal";
+		} else {
+		    $matrix[$i][$j]{score}   = $left_score;
+		    $matrix[$i][$j]{pointer} = "left";
+		}
+	    } else {
+		if ($up_score >= $left_score) {
+		    $matrix[$i][$j]{score}   = $up_score;
+		    $matrix[$i][$j]{pointer} = "up";
+		} else {
+		    $matrix[$i][$j]{score}   = $left_score;
+		    $matrix[$i][$j]{pointer} = "left";
+		}
+	    }
+	    
+	    # set maximum score
+	    if ($matrix[$i][$j]{score} > $max_score) {
+		$max_i     = $i;
+		$max_j     = $j;
+		$max_score = $matrix[$i][$j]{score};
+	    }
+	}
+    }
+
+    # trace-back
+    my $align1 = "";
+    my $align2 = "";
+    my $j = $max_j;
+    my $i = $max_i;
+
+    while (1) {
+	last if $matrix[$i][$j]{pointer} eq "none";
+	
+	if ($matrix[$i][$j]{pointer} eq "diagonal") {
+	    $align1 .= $bases1[$j-1];
+	    $align2 .= $bases2[$i-1];
+	    $i--; $j--;
+	} elsif ($matrix[$i][$j]{pointer} eq "left") {
+	    $align1 .= $bases1[$j-1];
+	    $align2 .= "-";
+	    $j--;
+	} elsif ($matrix[$i][$j]{pointer} eq "up") {
+	    $align1 .= "-";
+	    $align2 .= $bases2[$i-1];
+	    $i--;
+	}  
+    }
+
+    $align1 = reverse $align1;
+    $align2 = reverse $align2;
+    return [$align1, $align2];
+}

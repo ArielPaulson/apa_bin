@@ -1,0 +1,879 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use strict;
+
+my @types = qw/ blast wublast blat exonerate sam transfac miranda /;
+my %types = map {($_=>1)} @types;
+my $mnames = join ', ', @types;
+my $returnN = 1;
+my ($alignfile, $queryfa, $subjfa, $type, $more, $self, $qlen, $slen, $lost, $outprefix, $tabular);
+my ($bystrand, $noanti, $best, $gapless);  # filters
+my ($gaptestlast, $leastgaps, $mostgaps);  # $best-activated generic gap filters
+my ($AQMinIdt, $TQMinIdt, $QMinLen, $QMinBp, $QMaxGaps, $QMaxGapBp, $QMinGaps, $QMinGapBp);  # query filters
+my ($ASMinIdt, $TSMinIdt, $SMinLen, $SMinBp, $SMaxGaps, $SMaxGapBp, $SMinGaps, $SMinGapBp);  # subject filters
+my ($AMinGaps, $AMinGapBp, $AMaxGaps, $AMaxGapBp);  # combined gap filters
+
+GetOptions(   
+
+    "f=s"=>\$alignfile,       # alignment output; blast must use '-m 8'; wublast must use '-mformat 2'; exonerate must use '--est2genome'.  Transfac ignores everything except -t, -q, -o.
+    "q=s"=>\$queryfa,         # blast query fasta
+    "s=s"=>\$subjfa,          # blast subject fasta (optional)
+    "t=s"=>\$type,            # type of alignment: see @types above
+    "o=s"=>\$outprefix,       # prefix for output files ($outprefix.filtered, $outprefix.lost, etc).  Default = '$alignfile'
+    "n=s"=>\$returnN,         # only if using --best: return results for N best scores per query (default 1)
+    
+    "more"=>\$more,           # output more alignment stats (appended to each input line)
+    "self"=>\$self,           # this was a self-blast (query.fa vs query.fa) so ignore self-self alignments
+    "qlen"=>\$qlen,           # queries have length as final header field (saves a bit of calculating, esp. if query.fa is not available)
+    "slen"=>\$slen,           # subjects have length as final header field (saves a bit of calculating, esp. if subject.fa is not available)
+    "bystrand"=>\$bystrand,   ############# not implemented yet: keeps best alignment for each strand, not just one absolute best alignment
+    "noanti"=>\$noanti,       # ignore antisense alignments
+    "gapless"=>\$gapless,     # ignore alignments with any gaps (query or subject)
+    "best"=>\$best,           # do not simply filter alignments: return ONLY the best alignment(s) for each query.  See definition of 'best' below.
+    "lost"=>\$lost,           # return a fasta file of unaligned queries to $outprefix.lost
+    "tabular"=>\$tabular,     # FOR MIRANDA: if using filter only (not best), return tabular output instead of raw // FOR TRANSFAC: return tabular output instead of raw
+    
+    "gaptestlast"=>\$gaptestlast, # only if $best: apply gap tests post-filter instead of in-line.  See definition of 'best' below.
+    "leastgaps"=>\$leastgaps,     # only if $best: if multiple top-scoring alignments, prefer those with least gaps
+    "mostgaps"=>\$mostgaps,       # only if $best: if multiple top-scoring alignments, prefer those with most gaps
+    
+    "AQMinIdt=f"=>\$AQMinIdt,    # minimum alignment identity percent (WRT query)         |  percent on [0,1]
+    "TQMinIdt=f"=>\$TQMinIdt,    # minimum total identity percent (over entire query)     |  percent on [0,1]
+    "QMinLen=f"=>\$QMinLen,      # minimum alignment length percent (over entire query)   |  percent on [0,1]
+    "QMinBp=i"=>\$QMinBp,        # minimum alignment length (WRT query)                   |  positive integer
+    
+    "ASMinIdt=f"=>\$ASMinIdt,    # minimum alignment identity percent (WRT subject)       |  percent on [0,1]
+    "TSMinIdt=f"=>\$TSMinIdt,    # minimum total identity percent (over entire subject)   |  percent on [0,1]
+    "SMinLen=f"=>\$SMinLen,      # minimum alignment length percent (over entire subject) |  percent on [0,1]
+    "SMinBp=i"=>\$SMinBp,        # minimum alignment length (WRT subject)                 |  positive integer
+    
+    "QMinGaps=i"=>\$QMinGaps,    # minimum number of gaps allowed in query                |  positive integer
+    "QMaxGaps=i"=>\$QMaxGaps,    # maximum number of gaps allowed in query                |  positive integer
+    "QMinGapBp=i"=>\$QMinGapBp,  # minimum width of all gaps allowed in query             |  positive integer
+    "QMaxGapBp=i"=>\$QMaxGapBp,  # maximum width of all gaps allowed in query             |  positive integer
+    
+    "SMinGaps=i"=>\$SMinGaps,    # minimum number of gaps allowed in subject              |  positive integer
+    "SMaxGaps=i"=>\$SMaxGaps,    # maximum number of gaps allowed in subject              |  positive integer
+    "SMinGapBp=i"=>\$SMinGapBp,  # minimum width of all gaps allowed in subject           |  positive integer
+    "SMaxGapBp=i"=>\$SMaxGapBp,  # maximum width of all gaps allowed in subject           |  positive integer
+    
+    "AMinGaps=i"=>\$AMinGaps,    # minimum number of ALL gaps allowed for alignment       |  positive integer
+    "AMaxGaps=i"=>\$AMaxGaps,    # maximum number of ALL gaps allowed for alignment       |  positive integer
+    "AMinGapBp=i"=>\$AMinGapBp,  # minimum width of ALL gaps allowed for alignment        |  positive integer
+    "AMaxGapBp=i"=>\$AMaxGapBp   # maximum width of ALL gaps allowed for alignment        |  positive integer
+    
+    );
+
+### THE DEFINITION OF '$best':
+###
+### Currently, 'best' alignments are calculated as follows:
+### 1. All filters are applied in-line.
+### 2. For each query, all alignments are stored by 'score'.  For blast this is score, for wublast this is rawscore, and for the others it is the number of identities.
+### 3. For each query, all alignments with the highest 'score' are returned.
+###
+### Gap handling changes with '$gaptestlast', which is OFF by default:
+### 1. The idea is whether alignments which should be ignored, due to unacceptable gaps, should still be allowed to compete for "best" status.
+### 2. If "on", the ONLY gap tests applied in-line are for gaplessness.  Thus if $gapless==1 (e.g.) all gapped alignments are barred from consideration.
+###    The remainder of gap tests are applied AFTER top-score selection.  This way, if the BEST alignment still fails gap filtering, then NO alignments will be reported.
+### 3. If "off", gap tests are applied in-line, and the top-scoring alignments are taken from the alignments which pass.
+###    This fails fewer queries, but in some cases the "best" alignments you get will be weak, because the *real* best alignments were ignored, due to gaps; instead you get the "best of the rest".  
+
+die "Unsupported format '$type': must be one of '$mnames'\n" unless $types{$type};
+
+$outprefix = $alignfile unless $outprefix;
+#print "\$outprefix: $outprefix\n";
+$QMaxGaps = $QMaxGapBp = $SMaxGaps = $SMaxGapBp = 0 if $gapless;
+die "Cannot specify both 'mostgaps' and 'leastgaps'!\n" if $mostgaps && $leastgaps;
+
+my ($header, @qheaders, @sheaders, %blocks, %lengths, %status, %queryNs, $qheaderflag, $sheaderflag);
+my ($qrycount, $aligns, $usecount, $outheader, @blatheader, %scored, $bestaln);
+
+if ($queryfa) {
+    open INQ, $queryfa or die "Can't read from '$queryfa': $!\n";
+    while (<INQ>) {
+	if ($_ =~ /^>(.*)/) {
+#	    $header = $1;
+	    $header = (split /\s+/, $1)[0];  # this is how blast sees it
+	    push @qheaders, $header;
+	    $status{Q}{$header} = 0;
+	} else {
+	    $blocks{Q}{$header} .= $_;
+	}    
+    }
+    close INQ;
+    $qheaderflag = 1;
+    foreach my $query (@qheaders) {
+	(my $seq = $blocks{Q}{$query}) =~ s/[\n\r]//g;
+	$lengths{Q}{$query} = length($seq);
+	$queryNs{$query}++ while $seq =~ /N/ig;
+    }
+}
+
+if ($self) {
+    $lengths{S} = $lengths{Q};
+    @sheaders = @qheaders;
+} elsif ($subjfa) {
+    open INS, $subjfa or die "Can't read from '$subjfa': $!\n";
+    while (<INS>) {
+	$_ =~ s/[\n\r]+$//;
+	if ($_ =~ /^>(.*)/) {
+#	    $header = $1;
+	    $header = (split /\s+/, $1)[0];  # this is how blast sees it
+	    push @sheaders, $header;
+	    $status{S}{$header} = 0;
+	} else {
+	    $lengths{S}{$header} .= $_;
+	}    
+    }
+    close INS;
+    $sheaderflag = 1;
+    %{ $lengths{S} } = map {($_=>length($lengths{S}{$_}))} keys %{ $lengths{S} };    # replace sequence with length 
+}
+
+open IN, $alignfile or die "Can't read from '$alignfile': $!\n";
+unless ($best) {
+    open OUT, "> $outprefix.filtered" or die "Can't write to '$outprefix.filtered': $!\n";
+}
+
+if ($type eq 'blast') {
+    
+    if ($QMinGaps) {
+	print "WARNING: Query min gaps can only be 0/1 if using NCBI-blast: converting to 1\n" if $QMinGaps > 1;
+	$QMinGaps = 1;  #### CONVERT TO BINARY -- ALL WE CAN CONSISTENTLY TEST
+    }
+    if ($SMinGaps) {
+	print "WARNING: Subject min gaps can only be 0/1 if using NCBI-blast: converting to 1\n" if $SMinGaps > 1;
+	$SMinGaps = 1;  #### CONVERT TO BINARY -- ALL WE CAN CONSISTENTLY TEST
+    }
+    if ($QMaxGaps) {
+	print "WARNING: Query max gaps can only be 0/1 if using NCBI-blast: converting to 1\n" if $QMaxGaps > 1;
+	$QMaxGaps = 1;  #### CONVERT TO BINARY -- ALL WE CAN CONSISTENTLY TEST
+    }
+    if ($SMaxGaps) {
+	print "WARNING: Subject max gaps can only be 0/1 if using NCBI-blast: converting to 1\n" if $SMaxGaps > 1;
+	$SMaxGaps = 1;  #### CONVERT TO BINARY -- ALL WE CAN CONSISTENTLY TEST
+    }
+    
+    $outheader = "Query\tSubject\tIdtPct\tAlnLen\tMismatch\tGaps\tQStart\tQEnd\tSStart\tSEnd\tEval\tScore";
+    $outheader .= "\tStrand\tIdtBp\tQLen\tQLenPct\tAQIdtPct\tTQIdtPct\tSLen\tSLenPct\tASIdtPct\tTSIdtPct" if $more;
+    print OUT "$outheader\n" unless $best;
+    
+    while (<IN>) {
+	(my $line = $_) =~ s/[\n\r]+$//g;
+	next unless $line;
+	my ($query, $subj, $idt, $mlen, $mms, $Ngaps, $qpos1, $qpos2, $spos1, $spos2, $eval, $score) = split /\t/, $line;
+	push @qheaders, $query unless $qheaderflag || $status{Q}{$query};  # maintain input order
+	push @sheaders, $subj unless $sheaderflag || $status{S}{$subj};  # maintain input order
+	$status{Q}{$query} = 1;
+	$status{S}{$subj} = 1;
+	next if ($self && $query eq $subj);
+	my $strand = $spos1 < $spos2 ? '+' : '-';
+	next if ($noanti && $strand eq '-');
+	my ($qrange, $srange) = (abs($qpos2-$qpos1)+1, abs($spos2-$spos1)+1);
+	next if ($QMinBp && $qrange < $QMinBp);
+	next if ($SMinBp && $srange < $SMinBp);
+	my $identbp = sprintf("%0.0f", $idt*$mlen/100);	
+	my $qgapbp = $mlen-$qrange;
+	my $sgapbp = $mlen-$srange;
+	my $qgaps = $mlen > $qrange ? 1 : 0;  #### UNFORTUNATELY, CANNOT ALWAYS RECOVER NUMBER OF GAPS - CONVERT TO PRESENCE/ABSENCE ONLY
+	my $sgaps = $mlen > $srange ? 1 : 0;
+	next if (defined $QMaxGaps && $QMaxGaps == 0 && $qgaps);  # inline filter for gapless alignments is ok
+	next if (defined $SMaxGaps && $SMaxGaps == 0 && $sgaps);  # inline filter for gapless alignments is ok
+	unless ($gaptestlast) {
+	    next if ($QMinGaps && $qgaps < $QMinGaps);
+	    next if ($QMinGapBp && $qgapbp < $QMinGapBp);
+	    next if ($SMinGaps && $sgaps < $SMinGaps);
+	    next if ($SMinGapBp && $sgapbp < $SMinGapBp);
+	    next if ($AMinGaps && $Ngaps < $AMinGaps);
+	    next if ($AMinGapBp && $qgapbp+$sgapbp < $AMinGapBp);
+	    next if (defined $QMaxGaps && $qgaps > $QMaxGaps);
+	    next if (defined $QMaxGapBp && $qgapbp > $QMaxGapBp);
+	    next if (defined $SMaxGaps && $sgaps > $SMaxGaps);
+	    next if (defined $SMaxGapBp && $sgapbp > $SMaxGapBp);
+	    next if (defined $AMaxGaps && $Ngaps > $AMaxGaps);
+	    next if (defined $AMaxGapBp && $qgapbp+$sgapbp > $AMaxGapBp);
+	}
+	my ($querylen) = $qlen ? ($query =~ /(\d+)$/) : $lengths{Q}{$query};
+	my ($subjlen) = $slen ? ($subj =~ /(\d+)$/) : $lengths{S}{$subj};
+	my ($aqidtpct, $qlenpct, $tqidtpct, $asidtpct, $slenpct, $tsidtpct);
+	if ($querylen) {
+	    $aqidtpct = $qrange ? $identbp/$qrange : 0;
+	    $tqidtpct = $identbp/$querylen;
+	    $qlenpct = $qrange/$querylen;
+	    ## test first
+	    next if ($AQMinIdt && $aqidtpct < $AQMinIdt);
+	    next if ($TQMinIdt && $tqidtpct < $TQMinIdt);
+	    next if ($QMinLen && $qlenpct < $QMinLen);
+	}
+	if ($subjlen) {
+	    $asidtpct = $srange ? $identbp/$srange : 0;
+	    $tsidtpct = $identbp/$subjlen;
+	    $slenpct = $srange/$subjlen;
+	    ## test first
+	    next if ($ASMinIdt && $asidtpct < $ASMinIdt);
+	    next if ($TSMinIdt && $tsidtpct < $TSMinIdt);
+	    next if ($SMinLen && $slenpct < $SMinLen);
+	}
+	if ($more) {
+	    if ($querylen) {
+		## tidy for printing
+		$aqidtpct = sprintf("%0.2f", 100*$aqidtpct);
+		$tqidtpct = sprintf("%0.2f", 100*$tqidtpct);
+		$qlenpct = sprintf("%0.2f", 100*$qlenpct);
+	    } else {
+		$aqidtpct = $qlenpct = $tqidtpct = 'NA';
+	    }	    
+	    if ($subjlen) {
+		$asidtpct = sprintf("%0.2f", 100*$asidtpct);
+		$tsidtpct = sprintf("%0.2f", 100*$tsidtpct);
+		$slenpct = sprintf("%0.2f", 100*$slenpct);
+	    } else {
+		$asidtpct = $slenpct = $tsidtpct = 'NA';
+	    }	    
+	    $line .= join "\t", ('', $strand, $identbp, $querylen, $qlenpct, $aqidtpct, $tqidtpct, $subjlen, $slenpct, $asidtpct, $tsidtpct);   # lead '' results in leading \t
+	}
+	$status{Q}{$query} = 2;
+	$status{S}{$subj} = 2;
+	if ($best) {
+	    $scored{$query}{$score}{$line} = [$qgaps, $qgapbp, $sgaps, $sgapbp, $subj];
+	} else {
+	    print OUT "$line\n";
+	    $bestaln++;
+	}
+    }
+    $aligns = $.;
+
+} elsif ($type eq 'wublast') {
+
+    $outheader = "Query\tSubject\tE-Val\tNscores\tNormScore\tRawScore\tAlnLen\tIdentBp\tPositive\tMismatch\tIdtPct\tPosPct\tQGaps\tQGapBp\tSGaps\tSGapBp\tQFrame\tQStart\tQEnd\tSFrame\tSStart\tSEnd";
+    $outheader .= "\tStrand\tQLen\tQLenPct\tAQIdtPct\tTQIdtPct\tSLen\tSLenPct\tASIdtPct\tTSIdtPct" if $more;
+    print OUT "$outheader\n" unless $best;
+    
+    while (<IN>) {
+	(my $line = $_) =~ s/[\n\r]+$//g;
+	next unless $line;
+	my ($query, $subj, $eval, $nscores, $normscore, $rawscore, $mlen, $identbp, $npos, $mms, $idtpct, $pospct, $qgaps, $qgapbp, $sgaps, $sgapbp, $qframe, $qpos1, $qpos2, $sframe, $spos1, $spos2) = split /\t/, $line;
+	push @qheaders, $query unless $qheaderflag || $status{Q}{$query};  # maintain input order
+	push @sheaders, $subj unless $sheaderflag || $status{S}{$subj};  # maintain input order
+	$status{Q}{$query} = 1;
+	$status{S}{$subj} = 1;
+	next if ($self && $query eq $subj);
+	next if (defined $QMaxGaps && $QMaxGaps == 0 && $qgaps);  # inline filter for gapless alignments is ok
+	next if (defined $SMaxGaps && $SMaxGaps == 0 && $sgaps);  # inline filter for gapless alignments is ok
+	unless ($gaptestlast) {
+	    next if ($QMinGaps && $qgaps < $QMinGaps);
+	    next if ($QMinGapBp && $qgapbp < $QMinGapBp);
+	    next if ($SMinGaps && $sgaps < $SMinGaps);
+	    next if ($SMinGapBp && $sgapbp < $SMinGapBp);
+	    next if ($AMinGaps && $qgaps+$sgaps < $AMinGaps);
+	    next if ($AMinGapBp && $qgapbp+$sgapbp < $AMinGapBp);
+	    next if (defined $QMaxGaps && $qgaps > $QMaxGaps);
+	    next if (defined $QMaxGapBp && $qgapbp > $QMaxGapBp);
+	    next if (defined $SMaxGaps && $sgaps > $SMaxGaps);
+	    next if (defined $SMaxGapBp && $sgapbp > $SMaxGapBp);
+	    next if (defined $AMaxGaps && $qgaps+$sgaps > $AMaxGaps);
+	    next if (defined $AMaxGapBp && $qgapbp+$sgapbp > $AMaxGapBp);
+	}
+	my ($qrange, $srange) = (abs($qpos2-$qpos1)+1, abs($spos2-$spos1)+1);
+	next if ($QMinBp && $qrange < $QMinBp);
+	next if ($SMinBp && $srange < $SMinBp);
+	my $strand = $qpos1 < $qpos2 ? '+' : '-';
+	next if ($noanti && $strand eq '-');
+	my ($querylen) = $qlen ? ($query =~ /(\d+)$/) : $lengths{Q}{$query};
+	my ($subjlen) = $slen ? ($subj =~ /(\d+)$/) : $lengths{S}{$subj};
+	my ($aqidtpct, $qlenpct, $tqidtpct, $asidtpct, $slenpct, $tsidtpct);
+	if ($querylen) {
+	    $aqidtpct = $qrange ? $identbp/$qrange : 0;
+	    $tqidtpct = $identbp/$querylen;
+	    $qlenpct = $qrange/$querylen;
+	    ## test first
+	    next if ($AQMinIdt && $aqidtpct < $AQMinIdt);
+	    next if ($TQMinIdt && $tqidtpct < $TQMinIdt);
+	    next if ($QMinLen && $qlenpct < $QMinLen);
+	}
+	if ($subjlen) {
+	    $asidtpct = $srange ? $identbp/$srange : 0;
+	    $tsidtpct = $identbp/$subjlen;
+	    $slenpct = $srange/$subjlen;
+	    ## test first
+	    next if ($ASMinIdt && $asidtpct < $ASMinIdt);
+	    next if ($TSMinIdt && $tsidtpct < $TSMinIdt);
+	    next if ($SMinLen && $slenpct < $SMinLen);
+	}
+	if ($more) {
+	    if ($querylen) {
+		## tidy for printing
+		$aqidtpct = sprintf("%0.2f", 100*$aqidtpct);
+		$tqidtpct = sprintf("%0.2f", 100*$tqidtpct);
+		$qlenpct = sprintf("%0.2f", 100*$qlenpct);
+	    } else {
+		$aqidtpct = $qlenpct = $tqidtpct = 'NA';
+	    }	    
+	    if ($subjlen) {
+		$asidtpct = sprintf("%0.2f", 100*$asidtpct);
+		$tsidtpct = sprintf("%0.2f", 100*$tsidtpct);
+		$slenpct = sprintf("%0.2f", 100*$slenpct);
+	    } else {
+		$asidtpct = $slenpct = $tsidtpct = 'NA';
+	    }	    
+	    $line .= join "\t", ('', $strand, $querylen, $qlenpct, $aqidtpct, $tqidtpct, $subjlen, $slenpct, $asidtpct, $tsidtpct);   # lead '' results in leading \t
+	}
+	$status{Q}{$query} = 2;
+	$status{S}{$subj} = 2;
+	if ($best) {
+	    $scored{$query}{$rawscore}{$line} = [$qgaps, $qgapbp, $sgaps, $sgapbp, $subj];
+	} else {
+	    print OUT "$line\n";
+	    $bestaln++;
+	}
+    }
+    $aligns = $.;
+
+} elsif ($type eq 'blat') {
+    
+    while (<IN>) {
+	(my $line = $_) =~ s/[\n\r]+$//g;
+	if ($. < 6) {  # HEADERS
+	    push @blatheader, $line;
+	    next;
+	} elsif ($. == 6) {  # FIRST ALIGNMENT LINE -- ORGANIZE HEADERS BEFORE CONTINUING
+	    if ($more) {
+		my $extra = "\tQLenPct\tAQIdtPct\tTQIdtPct\tSLenPct\tASIdtPct\tTSIdtPct";
+		$blatheader[2] .= $extra;
+		$blatheader[4] .= '-' x length($extra);  # will be short due to tab expansions, but whatever
+	    }
+	    $outheader = join "\n", @blatheader;
+	    print OUT "$outheader\n" unless $best;
+	}
+	next unless $line;
+	my ($ident, $mismatch, $reps, $Ns, $qgaps, $qgapbp, $sgaps, $sgapbp, $strand, $query, $querylen, $qpos1, $qpos2, $subj, $subjlen, $spos1, $spos2, $blocks, $blocksizes, $qstarts, $tstarts) = split /\t/, $line;
+	push @qheaders, $query unless $qheaderflag || $status{Q}{$query};  # maintain input order
+	push @sheaders, $subj unless $sheaderflag || $status{S}{$subj};  # maintain input order
+	$status{Q}{$query} = 1;
+	$status{S}{$subj} = 1;
+	next if ($self && $query eq $subj);
+	next if ($noanti && $strand eq '-');
+	next if (defined $QMaxGaps && $qgaps > $QMaxGaps);	# 'defined' because $maxgaps could be 0
+	next if (defined $SMaxGaps && $sgaps > $SMaxGaps);	# 'defined' because $maxgaps could be 0
+	unless ($gaptestlast) {
+	    next if ($QMinGaps && $qgaps < $QMinGaps);
+	    next if ($QMinGapBp && $qgapbp < $QMinGapBp);
+	    next if ($SMinGaps && $sgaps < $SMinGaps);
+	    next if ($SMinGapBp && $sgapbp < $SMinGapBp);
+	    next if ($AMinGaps && $qgaps+$sgaps < $AMinGaps);
+	    next if ($AMinGapBp && $qgapbp+$sgapbp < $AMinGapBp);
+	    next if (defined $QMaxGaps && $qgaps > $QMaxGaps);
+	    next if (defined $QMaxGapBp && $qgapbp > $QMaxGapBp);
+	    next if (defined $SMaxGaps && $sgaps > $SMaxGaps);
+	    next if (defined $SMaxGapBp && $sgapbp > $SMaxGapBp);
+	    next if (defined $AMaxGaps && $qgaps+$sgaps > $AMaxGaps);
+	    next if (defined $AMaxGapBp && $qgapbp+$sgapbp > $AMaxGapBp);
+	}
+	my ($qrange, $srange) = (abs($qpos2-$qpos1), abs($spos2-$spos1));   # blat uses 0-based coords
+	next if ($QMinBp && $qrange < $QMinBp);
+	next if ($SMinBp && $srange < $SMinBp);
+	my $identbp = $ident + $reps;
+	my $aqidtpct = $qrange ? $identbp/$qrange : 0;
+	next if ($AQMinIdt && $aqidtpct < $AQMinIdt);
+	my $tqidtpct = $identbp/$querylen;
+	next if ($TQMinIdt && $tqidtpct < $TQMinIdt);
+	my $qlenpct = $qrange/$querylen;
+	next if ($QMinLen && $qlenpct < $QMinLen);
+	my $asidtpct = $srange ? $identbp/$srange : 0;
+	next if ($ASMinIdt && $asidtpct < $ASMinIdt);
+	my $tsidtpct = $identbp/$subjlen;
+	next if ($TSMinIdt && $tsidtpct < $TSMinIdt);
+	my $slenpct = $srange/$subjlen;
+	next if ($SMinLen && $slenpct < $SMinLen);
+	if ($more) {	    ## tidy for printing
+	    $aqidtpct = sprintf("%0.2f", 100*$aqidtpct);
+	    $tqidtpct = sprintf("%0.2f", 100*$tqidtpct);
+	    $qlenpct = sprintf("%0.2f", 100*$qlenpct);
+	    $asidtpct = sprintf("%0.2f", 100*$asidtpct);
+	    $tsidtpct = sprintf("%0.2f", 100*$tsidtpct);
+	    $slenpct = sprintf("%0.2f", 100*$slenpct);
+	    $line .= join "\t", ('', $qlenpct, $aqidtpct, $tqidtpct, $slenpct, $asidtpct, $tsidtpct);   # lead '' results in leading \t
+	}
+	$status{Q}{$query} = 2;
+	$status{S}{$subj} = 2;
+	if ($best) {
+	    $scored{$query}{$identbp}{$line} = [$qgaps, $qgapbp, $sgaps, $sgapbp, $subj];
+	} else {
+	    print OUT "$line\n";
+	    $bestaln++;
+	}
+    }
+    $aligns = $.-5;
+    
+} elsif ($type eq 'exonerate') {
+    
+    my $Sfilters = ($ASMinIdt || $TSMinIdt || $SMinLen || $SMinBp || $SMinGaps || $SMinGapBp || defined $SMaxGaps || defined $SMaxGapBp) ? 1 : 0;
+    print "Subject-similarity filters are ignored for Exonerate '-m est2genome' parsing, since the subject is the genome...\n" if $Sfilters;
+    
+    $outheader = "Query\tSubject\tIdent\tMismatch\tQGaps\tQGapBp\tSGaps\tSGapBp\tQLen\tSLen\tQStart\tQEnd\tSStart\tSEnd\tStrand\tScore\tQLenPct\tAQIdtPct\tTQIdtPct\tBlocks\tBlockSizes\tQueryStarts\tSubjStarts";
+    print OUT "$outheader\n";
+    
+    my ($gap, $query, $offset, $linelen, %alndat);
+    while (<IN>) {
+	$_ =~ s/[\n\r]+$//g;
+	if ($_ =~ /\s+Query: (.*)/) {   # begin new alignment
+	    $query = $1;
+	    $aligns++;
+	    $gap = 0;
+	    %alndat = ();
+	    push @qheaders, $query unless $qheaderflag || $status{Q}{$query};  # maintain input order
+	    $status{Q}{$query} = 1;
+	} elsif ($_ !~ /\S/) {   # blank line
+	    $gap = 1;
+	} elsif ($_ =~ /^(\s*\d+ : )(.*) : \d+/) {   # alignment blocks
+	    if ($gap) {   # starting new triplet
+		$offset = length($1);   # length(largest_position)+4
+		$linelen = length($2);  # usually 56 ?
+		$alndat{1} .= $2;
+	    } else {      # terminating triplet
+		$alndat{3} .= $2;
+	    }
+	    $gap = 0;
+	} elsif ($_ =~ /^\s+\|/) {   # alignment block middle line
+	    $alndat{2} .= substr($_, $offset-1, $linelen);
+	    $gap = 0;
+	} elsif ($_ =~ /^cigar: (.*)/) {   # cigar line
+	    my ($query1, $qpos1, $qpos2, $qstr, $subj, $spos1, $spos2, $strand, $score, $cigar) = split /\s+/, $1, 10;
+	    push @sheaders, $subj unless $sheaderflag || $status{S}{$subj};  # maintain input order
+	    $status{S}{$subj} = 1;
+	    print "$.: $query != $query1!\n" unless $query eq $query1;  # hopefully all lines are in order?
+	    $gap = 0;
+	    my ($qstart, $qend) = ($qpos1 < $qpos2) ? ($qpos1, $qpos2) : ($qpos2, $qpos1);
+	    my ($sstart, $send) = ($spos1 < $spos2) ? ($spos1, $spos2) : ($spos2, $spos1);
+	    my $qrange = $qend-$qstart;   # exonerate uses 0-based coords
+	    my $srange = $send-$sstart;   # exonerate uses 0-based coords
+	    next if ($QMinBp && $qrange < $QMinBp);
+	    next if ($SMinBp && $srange < $SMinBp);
+	    my ($querylen) = $qlen ? ($query =~ /(\d+)$/) : $lengths{Q}{$query};
+	    my ($subjlen) = $slen ? ($subj =~ /(\d+)$/) : $lengths{S}{$subj};
+	    my ($identbp, $introns, $intronbp, $sgapbp, $qgapbp);
+	    $identbp++ while $alndat{2} =~ /\|/g;
+	    my ($aqidtpct, $qlenpct, $tqidtpct, $asidtpct, $slenpct, $tsidtpct);
+	    if ($querylen) {
+		$aqidtpct = $qrange ? $identbp/$qrange : 0;
+		$tqidtpct = $identbp/$querylen;
+		$qlenpct = $qrange/$querylen;
+		## test first
+		next if ($AQMinIdt && $aqidtpct < $AQMinIdt);
+		next if ($TQMinIdt && $tqidtpct < $TQMinIdt);
+		next if ($QMinLen && $qlenpct < $QMinLen);
+	    }
+	    if ($subjlen) {
+		$asidtpct = $srange ? $identbp/$srange : 0;
+		$tsidtpct = $identbp/$subjlen;
+		$slenpct = $srange/$subjlen;
+		## test first
+		next if ($ASMinIdt && $asidtpct < $ASMinIdt);
+		next if ($TSMinIdt && $tsidtpct < $TSMinIdt);
+		next if ($SMinLen && $slenpct < $SMinLen);
+	    }
+	    $aqidtpct = sprintf("%0.2f", 100*$aqidtpct);
+	    $tqidtpct = sprintf("%0.2f", 100*$tqidtpct);
+	    $qlenpct = sprintf("%0.2f", 100*$qlenpct);
+	    $introns++ while $alndat{1} =~ /Intron/g;
+	    $intronbp += $& while $alndat{2} =~ /\d+/g;
+	    my @qgaps = split /[\w.]+/, $alndat{3};     ## GAPS WRT QUERY, = GAPS IN SUBJECT ??????  Trying to copy blat...
+	    my @sgaps = split /[\w.\s>]+/, $alndat{1};  ## GAPS WRT SUBJECT, = GAPS IN QUERY ??????  Trying to copy blat...
+	    my $qgaps = scalar @qgaps;
+	    my $sgaps = scalar @sgaps;
+	    next if (defined $QMaxGaps && $qgaps > $QMaxGaps);	# 'defined' because $maxgaps could be 0
+	    next if (defined $SMaxGaps && $sgaps > $SMaxGaps);	# 'defined' because $maxgaps could be 0
+	    unless ($gaptestlast) {
+		next if ($QMinGaps && $qgaps < $QMinGaps);
+		next if ($QMinGapBp && $qgapbp < $QMinGapBp);
+		next if ($SMinGaps && $sgaps < $SMinGaps);
+		next if ($SMinGapBp && $sgapbp < $SMinGapBp);
+		next if ($AMinGaps && $qgaps+$sgaps < $AMinGaps);
+		next if ($AMinGapBp && $qgapbp+$sgapbp < $AMinGapBp);
+		next if (defined $QMaxGaps && $qgaps > $QMaxGaps);
+		next if (defined $QMaxGapBp && $qgapbp > $QMaxGapBp);
+		next if (defined $SMaxGaps && $sgaps > $SMaxGaps);
+		next if (defined $SMaxGapBp && $sgapbp > $SMaxGapBp);
+		next if (defined $AMaxGaps && $qgaps+$sgaps > $AMaxGaps);
+		next if (defined $AMaxGapBp && $qgapbp+$sgapbp > $AMaxGapBp);
+	    }
+	    $qgapbp += length($_) foreach @qgaps;
+	    $sgapbp += length($_) foreach @sgaps;
+	    my $mismatch = $qrange-$identbp-$qgapbp;
+	    my $blocks = $introns+1;
+	    (my $gapless = $alndat{1}) =~ s/-//g;
+	    my @blocks = split /  >>>> Target Intron \d+ >>>>  /, $gapless;
+	    my @blocksizes = map { length($_) } @blocks;
+	    my @qstarts = ($qstart);
+	    my @sstarts = ($sstart);
+	    foreach my $i (0..$#blocksizes) {
+		push @qstarts, $qstarts[$i]+$blocksizes[$i];
+		push @sstarts, $sstarts[$i]+$blocksizes[$i];
+	    }
+	    my $qblockend = shift @qstarts;
+	    my $sblockend = shift @sstarts;
+	    print "$.: Query block end $qblockend != query align end $qend!\n" if $qblockend != $qend;
+	    print "$.: Subject block end $sblockend != subject align end $send!\n" if $sblockend != $send;
+	    my $blocksizes = join ',', @blocksizes;
+	    my $qstarts = join ',', @qstarts;
+	    my $sstarts = join ',', @sstarts;
+	    my $line = join "\t", ($query, $subj, $identbp, $mismatch, $qgaps, $qgapbp, $sgaps, $sgapbp, $querylen, $subjlen, $qstart, $qend, $sstart, $send, $strand, $score, $qlenpct, $aqidtpct, $tqidtpct, $blocks, $blocksizes, $qstarts, $sstarts);
+	    $status{Q}{$query} = 2;
+	    $status{S}{$subj} = 2;
+	    if ($best) {
+		$scored{$query}{$identbp}{$line} = [$qgaps, $qgapbp, $sgaps, $sgapbp, $subj];
+	    } else {
+		print OUT "$line\n";
+		$bestaln++;
+	    }
+	}
+    }
+    
+} elsif ($type eq 'sam') {
+    
+    $outheader = "Header\tFlags\tChrom\tSStart\tMateStart\tCigar1\tMateChr\t.\t.\tSequence\tQuality\t.\t.\t.\t.\t.\t.\t.\tCigar2\t.";
+    $outheader .= "\tStrand\tIdtBp\tMismatch\tNs\tQLen\tQStart\tQEnd\tQGaps\tQGapBp\tQLenPct\tAQIdtPct\tTQIdtPct\tSLen\tSEnd\tSGaps\tSGapBp\tSLenPct\tASIdtPct\tTSIdtPct" if $more;
+    print OUT "$outheader\n";
+    
+    my @samheaders;
+    while (<IN>) {
+	(my $line = $_) =~ s/[\n\r]+$//;
+	next unless $line;
+	if ($_ =~ /^@/) {
+	    push @samheaders, "$_\n";   # currently, nothing is done with these SAM header lines....
+	    next;
+	}
+	my @data = split /\t/, $_;
+	my ($query, $flags, $subj, $sstart, $mstart, $cigar1, $msubj, $X, $Y, $seq, $cigar2) = @data[0..9,18];
+	push @qheaders, $query unless $qheaderflag || $status{Q}{$query};  # maintain input order
+	push @sheaders, $subj unless $sheaderflag || $status{S}{$subj};  # maintain input order
+	$status{Q}{$query} = 1;
+	$status{S}{$subj} = 1;
+	next if ($self && $query eq $subj);
+	next if $subj eq '*';
+	my $strand = $flags & 16 ? '-' : '+';
+	next if ($noanti && $strand eq '-');
+	my $querylen = length($seq);
+	my ($subjlen) = $slen ? ($subj =~ /(\d+)$/) : $lengths{S}{$subj};
+	my ($alnbp, $skipped, $qstart, $qend, $Ns, $qgaps, $sgaps, $qgapbp, $sgapbp) = (0, 0, 0, 0, 0, 0, 0, 0, 0);
+	$cigar2 =~ s/^MD:Z://;     # strip field header
+	$cigar2 =~ s/\^[A-Z]+//g;  # strip all deletion markers
+	my $mismatches = scalar (split /\d+/, $cigar2);
+	$Ns++ while $seq =~ /N/ig;
+	my @fields = split /(?<=[A-Z])/, $cigar1;
+	pop @fields unless $fields[-1];  # drop last element if null; artifact of splitting on look-behinds
+	foreach my $i (0..$#fields) {
+	    my ($bp, $class) = ($fields[$i] =~ /^(\d+)([A-Z])$/);
+	    if ($class eq 'M') {   # match
+		$alnbp += $bp;
+	    } elsif ($class eq 'I') {  # insertion (INSERTION IN QUERY / DELETION IN SUBJECT)
+		$sgaps++;
+		$sgapbp += $bp;
+	    } elsif ($class eq 'D') {  # deletion (DELETION IN QUERY / INSERTION IN SUBJECT)
+		$qgaps++;
+		$qgapbp += $bp;
+	    } elsif ($class eq 'N') {  # Non-aligned gap (e.g. splice junction)
+		$qgaps++;
+		$qgapbp += $bp;
+	    } elsif ($class eq 'S') {  # skipped bases (not involved in alignment -- should occur ONLY on query flanks)
+		$skipped += $bp;
+		if ($i == 0) {  # leading skip
+		    $qstart = $bp+1;
+		} elsif ($i == $#fields) {  # trailing skip
+		    $qend = $querylen - $bp;
+		} else {
+		    print "Internal skip event!  $cigar1\n";
+		}
+	    } elsif ($class) {
+		print "Don't know what to do with cigar class '$class'!  Alignment stats may be inaccurate.\n";
+	    }
+	}
+	next if (defined $QMaxGaps && $QMaxGaps == 0 && $qgaps);  # inline filter for gapless alignments is ok
+	next if (defined $SMaxGaps && $SMaxGaps == 0 && $sgaps);  # inline filter for gapless alignments is ok
+	unless ($gaptestlast) {
+	    next if ($QMinGaps && $qgaps < $QMinGaps);
+	    next if ($QMinGapBp && $qgapbp < $QMinGapBp);
+	    next if ($SMinGaps && $sgaps < $SMinGaps);
+	    next if ($SMinGapBp && $sgapbp < $SMinGapBp);
+	    next if ($AMinGaps && $qgaps+$sgaps < $AMinGaps);
+	    next if ($AMinGapBp && $qgapbp+$sgapbp < $AMinGapBp);
+	    next if (defined $QMaxGaps && $qgaps > $QMaxGaps);
+	    next if (defined $QMaxGapBp && $qgapbp > $QMaxGapBp);
+	    next if (defined $SMaxGaps && $sgaps > $SMaxGaps);
+	    next if (defined $SMaxGapBp && $sgapbp > $SMaxGapBp);
+	    next if (defined $AMaxGaps && $qgaps+$sgaps > $AMaxGaps);
+	    next if (defined $AMaxGapBp && $qgapbp+$sgapbp > $AMaxGapBp);
+	}
+	my ($qrange, $srange, $identbp) = ($alnbp+$sgapbp, $alnbp+$qgapbp, $alnbp-$mismatches);
+	next if ($QMinBp && $qrange < $QMinBp);
+	next if ($SMinBp && $srange < $SMinBp);
+	$qstart = 1 unless $qstart;
+	$qend = $querylen unless $qend;
+	my $qrange2 = $qend-$qstart+1;
+	print "Query range ${qrange}bp does not match positions $qstart-$qend (${qrange2}bp) | $querylen, $cigar1!\n" unless $qrange == $qrange2;
+	my $send = $sstart ? $sstart+$srange-1 : 0;
+	my ($aqidtpct, $tqidtpct, $qlenpct, $asidtpct, $tsidtpct, $slenpct);
+	if ($querylen) {
+	    $aqidtpct = $qrange ? $identbp/$qrange : 0;
+	    $tqidtpct = $identbp/$querylen;
+	    $qlenpct = $qrange/$querylen;
+	    ## test first
+	    next if ($AQMinIdt && $aqidtpct < $AQMinIdt);
+	    next if ($TQMinIdt && $tqidtpct < $TQMinIdt);
+	    next if ($QMinLen && $qlenpct < $QMinLen);
+	}
+	if ($subjlen) {
+	    $asidtpct = $srange ? $identbp/$srange : 0;
+	    $tsidtpct = $identbp/$subjlen;
+	    $slenpct = $srange/$subjlen;
+	    ## test first
+	    next if ($ASMinIdt && $asidtpct < $ASMinIdt);
+	    next if ($TSMinIdt && $tsidtpct < $TSMinIdt);
+	    next if ($SMinLen && $slenpct < $SMinLen);
+	}
+	if ($more) {
+	    if ($querylen) {
+		## tidy for printing
+		$aqidtpct = sprintf("%0.2f", 100*$aqidtpct);
+		$tqidtpct = sprintf("%0.2f", 100*$tqidtpct);
+		$qlenpct = sprintf("%0.2f", 100*$qlenpct);
+	    } else {
+		$aqidtpct = $qlenpct = $tqidtpct = 'NA';
+	    }	    
+	    if ($subjlen) {
+		$asidtpct = sprintf("%0.2f", 100*$asidtpct);
+		$tsidtpct = sprintf("%0.2f", 100*$tsidtpct);
+		$slenpct = sprintf("%0.2f", 100*$slenpct);
+	    } else {
+		$asidtpct = $slenpct = $tsidtpct = 'NA';
+	    }	    
+	    $line .= join "\t", ('', $strand, $identbp, $mismatches, $Ns, $querylen, $qstart, $qend, $qgaps, $qgapbp, $qlenpct, $aqidtpct, $tqidtpct, $subjlen, $send, $sgaps, $sgapbp, $slenpct, $asidtpct, $tsidtpct);   # lead '' results in leading \t
+	}
+	$status{Q}{$query} = 2;
+	$status{S}{$subj} = 2;
+	if ($best) {
+	    $scored{$query}{$identbp}{$line} = [$qgaps, $qgapbp, $sgaps, $sgapbp, $subj];
+	} else {
+	    print OUT "$line\n";
+	    $bestaln++;
+	}
+    }
+    $aligns = $.;
+    
+} elsif ($type eq 'transfac') {
+    
+    my $query;
+    while (<IN>) {
+	my $qline;
+	if ($_ =~ /^Inspecting sequence ID\s+(.*)/) {
+	    $query = $1;
+	    push @qheaders, $query unless $qheaderflag || $status{Q}{$query};  # maintain input order
+	    $status{Q}{$query} = 1;
+	    $qline = 1;
+	}
+	my @data = (split /[\s\|]+/, $_)[1..6];  # drop blank first element
+	my ($subj, $cscore, $mscore) = @data[0,3,4];
+	push @sheaders, $subj unless $sheaderflag || $status{S}{$subj};  # maintain input order
+	$status{S}{$subj} = 1;
+	next if ($cscore > 1 || $mscore > 1);   # junk alignments
+	$status{Q}{$query} = 2;
+	$status{S}{$subj} = 2;
+	if ($tabular) {
+	    $data[2] =~ s/[\(\)]//g;
+	    print OUT (join "\t", ($query, @data)), "\n" unless ($. < 4 || $qline || $_ !~ /\S/);   # skip query deflines and blank lines
+	} else {
+	    print OUT $_;
+	}
+	$bestaln++;
+    }
+    
+} elsif ($type eq 'miranda') {
+    
+    $outheader = "Subject\tQuery\tScore\tEnergy\tUnknown1\tUnknown2\tQStart\tQEnd\tSStart\tSEnd\tAlnLen\tIdtPct\tSimPct";
+    
+    if ($best) {
+	
+	my $capture;
+	while (<IN>) {
+	    $_ =~ s/[\n\r]+$//;
+	    if ($capture && $_ =~ /^>([^>].*)/) {  # > NOT >>
+		(my $line = $1) =~ s/\s+/\t/g;
+		my ($subj, $query, $score, $energy, $blah1, $blah2, $qstart, $qend, $sstart, $send, $mlen, $idtpct, $simpct) = split /\t/, $line;
+		$aligns++;
+		push @qheaders, $query unless $qheaderflag || $status{Q}{$query};  # maintain input order
+		push @sheaders, $subj unless $sheaderflag || $status{S}{$subj};    # maintain input order
+		$status{Q}{$query} = 1;
+		$status{S}{$subj} = 1;
+		next if ($ASMinIdt && $idtpct < $ASMinIdt);   # $ASMinIdt tests identity %
+		next if ($TSMinIdt && $simpct < $TSMinIdt);   # $TSMinIdt tests alignable % (not only identities)
+		my $slenpct = $mlen/$lengths{S}{$subj};
+		next if ($SMinLen && $slenpct < $SMinLen);
+		$status{Q}{$query} = 2;
+		$status{S}{$subj} = 2;
+		$scored{$query}{$score}{$line} = [0, 0, 0, 0, $subj];   # gap stats = 0 since, for the most part, gaps are guaranteed, and also meaningless.
+		$capture = 0;
+	    } else {
+		$capture = $_ eq 'Scores for this hit:' ? 1 : 0;  # activate capture for next line?
+	    }
+	}
+	
+    } else {
+	
+	print OUT "$outheader\n" if $tabular;
+	
+	my (@block, @flatlines, $ok, $query, $subj);
+	while (<IN>) {
+	    push @block, $_;
+	    $_ =~ s/[\n\r]+$//;
+	    if ($_ =~ /^Read Sequence:/) {
+		$ok = 0;
+		@block = ($block[-1]);  # start with last line pushed, which was this line
+		@flatlines = ();
+	    } elsif ($_ =~ /^>([^>].*)/) {  # > NOT >>
+		(my $line = $1) =~ s/\s+/\t/g;
+		$aligns++;
+		my ($subj, $query, $score, $energy, $blah1, $blah2, $qstart, $qend, $sstart, $send, $mlen, $idtpct, $simpct) = split /\t/, $line;
+		push @qheaders, $query unless $qheaderflag || $status{Q}{$query};  # maintain input order
+		push @sheaders, $subj unless $sheaderflag || $status{S}{$subj};    # maintain input order
+		$status{Q}{$query} = 1;
+		$status{S}{$subj} = 1;
+		next if ($ASMinIdt && $idtpct < $ASMinIdt);   # $ASMinIdt tests identity %
+		next if ($TSMinIdt && $simpct < $TSMinIdt);   # $TSMinIdt tests alignable % (not only identities)
+		my $slenpct = $mlen/$lengths{S}{$subj};
+		next if ($SMinLen && $slenpct < $SMinLen);
+		$status{Q}{$query} = 2;
+		$status{S}{$subj} = 2;
+		$bestaln++;
+		push @flatlines, $line if $tabular;
+		$ok = 1;
+	    } elsif ($_ eq 'Complete') {
+		next unless $ok;
+		if ($tabular) {
+		    print OUT "$_\n" foreach @flatlines;
+		} else {
+		    print OUT @block, "\n";  # extra newline for break, which would be on the next line
+		}
+	    }
+	}
+	
+    }
+
+}
+
+close IN;
+
+
+
+############# FILTERING FOR BEST HITS #############
+
+
+
+my %bestS;
+if ($best) {
+    
+    open OUT, "> $outprefix.best" or die "Can't write to '$outprefix.best': $!\n";
+    print OUT "$outheader\n";
+
+    if ($lost) {
+	open LOST, "> $outprefix.lost" or die "Can't write to '$outprefix.lost': $!\n";
+    }
+    
+    foreach my $query (@qheaders) {
+	
+	if ($scored{$query}) {
+
+	    my @topscores = (sort {$b <=> $a} keys %{ $scored{$query} })[0..$returnN-1];
+	    
+	    foreach my $topscore (@topscores) {
+		
+		if ($gaptestlast) {     # $gaptestlast means: filter gaps here, not in-line, because if best alignment is still unacceptable, then we can't ignore it until here
+		    
+		    my %bestgaps;
+		    foreach my $line (keys %{ $scored{$query}{$topscore} }) {
+			my ($qgaps, $qgapbp, $sgaps, $sgapbp, $subj) = @{ $scored{$query}{$topscore}{$line} };
+			next if ($QMinGaps && $qgaps < $QMinGaps);
+			next if ($QMinGapBp && $qgapbp < $QMinGapBp);
+			next if ($SMinGaps && $sgaps < $SMinGaps);
+			next if ($SMinGapBp && $sgapbp < $SMinGapBp);
+			next if ($AMinGaps && $qgaps+$sgaps < $AMinGaps);
+			next if ($AMinGapBp && $qgapbp+$sgapbp < $AMinGapBp);
+			next if (defined $QMaxGaps && $qgaps > $QMaxGaps);
+			next if (defined $QMaxGapBp && $qgapbp > $QMaxGapBp);
+			next if (defined $SMaxGaps && $sgaps > $SMaxGaps);
+			next if (defined $SMaxGapBp && $sgapbp > $SMaxGapBp);
+			next if (defined $AMaxGaps && $qgaps+$sgaps > $AMaxGaps);
+			next if (defined $AMaxGapBp && $qgapbp+$sgapbp > $AMaxGapBp);
+			if ($mostgaps || $leastgaps) {
+			    my $agapbp = $qgapbp+$sgapbp;
+			    $bestgaps{$agapbp}{$line} = $subj;
+			} else {
+			    $bestgaps{$line} = $subj;
+			}
+		    }
+		    
+		    ## after gap filtering, choose the least/most-gapped alignments among the candidates (or not)
+		    
+		    if ($leastgaps) {
+			my $minGapBp = (sort {$a <=> $b} keys %bestgaps)[0];
+			foreach my $line (keys %{ $bestgaps{$minGapBp} }) {
+			    print OUT "$line\n";
+			    $bestS{ $bestgaps{$minGapBp}{$line} } = 1;   # best-alignment subjects
+			    $bestaln++;
+			}
+		    } elsif ($mostgaps) {
+			my $maxGapBp = (sort {$b <=> $a} keys %bestgaps)[0];
+			foreach my $line (keys %{ $bestgaps{$maxGapBp} }) {
+			    print OUT "$line\n";
+			    $bestS{ $bestgaps{$maxGapBp}{$line} } = 1;   # best-alignment subjects
+			    $bestaln++;
+			}
+		    } else {
+			foreach my $line (keys %bestgaps) {
+			    print OUT "$line\n";
+			    $bestS{ $bestgaps{$line} } = 1;   # best-alignment subjects
+			    $bestaln++;
+			}
+		    }
+		} else {
+		    foreach my $line (keys %{ $scored{$query}{$topscore} }) {
+			print OUT "$line\n";
+			$bestS{ $scored{$query}{$topscore}{$line}->[4] } = 1;   # best-alignment subjects
+			$bestaln++;
+		    }
+		}
+	    }
+	    
+	} elsif ($lost) {
+	    print LOST ">$query\n$blocks{Q}{$query}";
+	}
+    }
+    close OUT;
+    close LOST if $lost;
+
+    my $scoredQ = scalar keys %scored;
+#    print "\n$scoredQ scored";
+    
+} else {
+    
+    if ($lost) {
+	open LOST, "> $outprefix.lost" or die "Can't write to '$outprefix.lost': $!\n";
+	foreach my $query (@qheaders) {
+	    print LOST ">$query\n$blocks{Q}{$query}" unless $status{Q}{$query};
+	}
+	close LOST;
+    }
+}
+
+my %N;
+$N{Q}{0} = $N{S}{0} = 0;  # ensure printable
+$N{Q}{ $status{Q}{$_} }++ foreach @qheaders;
+$N{S}{ $status{S}{$_} }++ foreach @sheaders;
+$N{$_}{A} = $N{$_}{1} + $N{$_}{2} foreach qw/ Q S /;
+my $NQ = scalar @qheaders;
+my $NS = scalar @sheaders;
+my ($NbestS, $blurb) = $best ? (scalar (keys %bestS), 'best') : ($N{S}{2}, 'filtered');
+my $subjtype = $type eq 'transfac' ? 'motifs' : 'subjects';
+print "\n$NQ queries | $N{Q}{A} aligned | $N{Q}{2} aligned postfilter | $N{Q}{0} unaligned\n";
+print "$NS $subjtype | $N{S}{A} aligned | $N{S}{2} aligned postfilter | $N{S}{0} unaligned\n";
+print "$aligns total alignments | $bestaln $blurb to $N{Q}{2} queries / $NbestS $subjtype\n<Enter> to exit.\n";
+exit;

@@ -1,0 +1,299 @@
+#!/usr/bin/env perl
+require '/home/apa/local/bin/apa_routines.pm';  # for blockify()
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+### GFF NOT YET READY
+
+my ($input, $output, $format, $length, $level, $allN, $anyN, $verbose, $strings, $grep, $ci, $noseq, $fastq, $include, $exclude, $destruct, $firstfield);
+
+GetOptions("i=s"=>\$input, "o=s"=>\$output, "f=s"=>\$format, "l=s"=>\$length, "v=s"=>\$level, "allN"=>\$allN, "anyN"=>\$anyN, "s=s"=>\$strings, "grep"=>\$grep, "ci"=>\$ci, "verbose"=>\$verbose, "noseq"=>\$noseq, "include"=>\$include, "exclude"=>\$exclude, "destructive"=>\$destruct, "first-field"=>\$firstfield);
+
+die "$0: Must specify either 'include' or 'exclude'!\n" unless $include || $exclude;
+die "$0: Cannot specify both 'include' or 'exclude'!\n" if $include && $exclude;
+
+if ($input =~ /\.f[asta]{1,4}(.gz)?$/) {
+    $format = 'fasta';
+} elsif ($input =~ /\.f[astq]{1,4}(.gz)?$/) {
+    $format = 'fastq';
+} elsif ($input =~ /\.gtf\d*(.gz)?$/) {
+    $format = 'gtf';
+} elsif ($input =~ /\.gff\d*(.gz)?$/) {
+    $format = 'gff';
+} elsif ($format) {
+    ## undetectable but specified
+} else {
+    die "$0: Input file format not detectable and not given!\n";
+}
+
+die "$0: GFF filtering not yet ready!\n" if $format eq 'gff';
+
+if ($format eq 'gtf' || $format eq 'gff') {
+    die "$0: If format is gtf or gff, '-v gene' or '-v transcript' must be specified!\n" unless $level eq 'transcript' || $level eq 'gene';
+}
+print STDERR "FORMAT: $format\n";
+
+my (@headers, @lenrange, %already, %strings, %seq, %qual, %match, %transgene, $header);
+my ($S, $Sm, $H, $Hm);
+
+if ($length) {
+    if ($length =~ /(\d+)-(\d+)/) {
+	@lenrange = ($1, $2);    # range min, max
+    } elsif ($length =~ /^>=(\d+)/) {
+	@lenrange = ($1, 9E9);   # assuming you will never have a sequence larger than 9 billion bp
+    } elsif ($length =~ /^>(\d+)/) {
+	@lenrange = ($1+0.1, 9E9);  # assuming you will never have a sequence larger than 9 billion bp
+    } elsif ($length =~ /^<=(\d+)/) {
+	@lenrange = (1, $1);     # disallowing "sequences" of length 0
+    } elsif ($length =~ /^<(\d+)/) {
+	@lenrange = (1, $1-0.1);    # disallowing "sequences" of length 0
+    } else {
+	@lenrange = ($length, $length); # this exact length
+    }
+}
+
+if ($strings) {
+    print STDERR "Reading strings...\n";
+    if (-e $strings) {
+	open my $IN1, '<', $strings or die "$0: Cannot open strings file '$strings': $!\n";
+	while (<$IN1>) {
+	    s/[\n\r]+$//;
+	    $strings{$_} = 1;
+	}
+	close $IN1;
+    } else {
+	%strings = map {($_=>1)} split /,/, $strings;
+    }
+    $S = scalar(keys %strings);
+    print STDERR "$S filter strings found.\n";
+}
+
+my $IN2;
+if ($input =~ /.gz$/) {
+    open $IN2, '-|', "gunzip -c $input" or die "$0: Cannot read file '$input': $!\n";
+} else {
+    open $IN2, '<', $input or die "$0: Cannot read file '$input': $!\n";
+}
+my $OUT;
+if ($output =~ /.gz$/) {
+    open $OUT, '|-', "gzip > $output" or die "$0: Cannot write file '$output': $!\n";
+} elsif ($output) {
+    open $OUT, '>', $output or die "$0: Cannot write input file '$output': $!\n";
+} else {
+    $OUT = *STDOUT;
+}
+
+
+print STDERR "Reading input...\n";
+if ($format eq 'fasta') {
+    
+    while (<$IN2>) {
+	$_ =~ s/[\n\r]+$//;
+	if ($_ =~ /^>(.*)/) {
+	    $header = $1;
+	    $header = (split /\s+/, $header)[0] if $firstfield;
+	    push @headers, $header;
+	} else {
+	    $seq{$header} .= $_;
+	}
+    }
+    
+} elsif ($format eq 'fastq') {
+    
+    my $i;
+    while (<$IN2>) {
+	$i++;
+	$_ =~ s/[\n\r]+$//;
+	if ($i == 1) {
+	    ($header = $_) =~ s/^@//;
+	    $header = (split /\s+/, $header)[0] if $firstfield;
+	    push @headers, $header;
+	} elsif ($i == 2) {
+	    $seq{$header} .= $_;
+	} elsif ($i == 3) {
+	    # do nothing
+	} elsif ($i == 4) {
+	    $qual{$header} .= $_;
+	    $i = 0;
+	}
+    }
+    
+} elsif ($format eq 'gtf') {
+    
+    while (my $line = <$IN2>) {
+	my @data = split /\t/, $line;
+	if ($level eq 'gene') {
+	    ($header) = ($data[8] =~ /gene_id "([^"]+)"/);
+	} elsif ($level eq 'transcript') {
+	    ($header) = ($data[8] =~ /transcript_id "([^"]+)"/);
+	}
+	push @headers, $header unless $already{$header};
+	$already{$header} = 1;
+	$seq{$header} .= $line;
+    }
+    
+} elsif ($format eq 'gff') {
+    
+    my (@genes, @trans);
+    while (my $line = <$IN2>) {
+	my @data = split /\t/, $line;
+	my $feat = $data[2];
+	my ($id) = ($data[8] =~ /Id=([^;]+)/);
+	my ($parent) = ($data[8] =~ /Parent=([^;]+)/);
+	if ($feat eq 'gene') {
+	    push @genes, $id unless $already{g}{$id};
+	    $transgene{g}{$id} = 1;
+	} elsif ($feat =~ /RNA/) {
+	    push @trans, $id unless $already{t}{$id};
+	    $transgene{t}{$id} = 1;
+	    $transgene{g}{$parent} = 1;
+	    $transgene{t2g}{$id} = $parent;
+	    $transgene{g2t}{$parent}{$id} = 1;
+	} else {
+	    if (exists $transgene{g}{$parent}) {
+		## feature annotated to gene but by way of a transcript?
+		$seq{g}{$parent} .= $line;
+	    } elsif (exists $transgene{t}{$parent}) {
+		## feature annotated to transcript
+		$seq{t}{$parent} .= $line;
+	    } else {
+		chomp($line);
+		print STDERR "Line $. not attributable to any observed genes or transcripts!  Is your GFF unsorted?\n  Line: '$line'\n";
+	    }
+	}
+    }
+    
+    if ($level eq 'gene') {
+	@headers = @genes;
+    } elsif ($level eq 'transcript') {
+	@headers = @trans;
+    }
+    
+}
+close $IN2;
+
+$H = scalar(keys %seq);
+print STDERR "$H sequences read.\n";
+
+print STDERR "Filtering...\n";
+my $h;
+foreach my $header (@headers) {
+    $h++;
+    print STDERR " $h/$H\n" if $verbose && $h % 1000 == 0;
+    
+    ## Match on length, N criteria
+    $match{H}{$header} = 1 if $length && (length($seq{$header}) >= $lenrange[0] && length($seq{$header}) <= $lenrange[1]);
+    $match{H}{$header} = 1 if $anyN && $seq{$header} =~ /[Nn]/;
+    $match{H}{$header} = 1 if $allN && $seq{$header} =~ /[^Nn]/;
+    
+    if ($strings) {
+	
+	if ($grep) {
+	    
+	    ## Grep strings in headers
+	    foreach my $str (keys %strings) {
+		if ($ci) {
+		    if ($header =~ /$str/i) {
+			$match{H}{$header} = 1;
+			$match{S}{$str} = 1;
+			delete $strings{$str} if $destruct;
+			last;  # only need one match
+		    }
+		} else {
+		    if ($header =~ /$str/) {
+			$match{H}{$header} = 1;
+			$match{S}{$str} = 1;
+			delete $strings{$str} if $destruct;
+			last;  # only need one match
+		    }
+		}
+	    }
+	    
+	} else {
+	    
+	    ## Find headers identical to strings
+	    if (defined $strings{$header}) {
+		
+		$match{H}{$header} = 1;
+		$match{S}{$header} = 1;
+		delete $strings{$header} if $destruct;
+	    }
+	    
+	}
+	
+    } elsif ($noseq && ($seq{$header} =~ /Sequence unavailable/i || length($seq{$header}) == 0)) {
+	## Match sequenceless headers
+	$match{H}{$header} = 1;
+    }
+    
+}
+$Hm = scalar(keys %{ $match{H} });
+print STDERR "$Hm/$H headers matched.\n";
+if ($strings) {
+    $Sm = scalar(keys %{ $match{S} });
+    print STDERR "$Sm/$S strings matched.\n";
+}
+
+
+print STDERR "Writing...\n";
+if ($format eq 'fasta') {
+    
+    foreach my $header (@headers) {
+	if (defined $match{H}{$header}) {
+	    if ($include) {
+		my $block = ${ blockify($seq{$header}) };
+		print $OUT ">$header\n$block\n";
+	    } elsif ($exclude) {
+		print STDERR "$0: removed $header from $input\n" if $verbose;
+	    }
+	} else {
+	    if ($exclude) {
+		my $block = ${ blockify($seq{$header}) };
+		print $OUT ">$header\n$block\n";
+	    } elsif ($include) {
+		print STDERR "$0: removed $header from $input\n" if $verbose;
+	    }
+	}
+    }
+    
+} elsif ($format eq 'fastq') {
+    
+    foreach my $header (@headers) {
+	if (defined $match{H}{$header}) {
+	    if ($include) {
+		print $OUT "\@$header\n$seq{$header}\n+\n$qual{$header}\n";
+	    } elsif ($exclude) {
+		print STDERR "$0: removed $header from $input\n" if $verbose;
+	    }
+	} else {
+	    if ($exclude) {
+		print $OUT "\@$header\n$seq{$header}\n+\n$qual{$header}\n";
+	    } elsif ($include) {
+		print STDERR "$0: removed $header from $input\n" if $verbose;
+	    }
+	}
+    }
+    
+} else {
+    
+    foreach my $header (@headers) {
+	if (defined $match{H}{$header}) {
+	    if ($include) {
+		print $OUT $seq{$header};
+	    } elsif ($exclude) {
+		print STDERR "$0: removed $header from $input\n" if $verbose;
+	    }
+	} else {
+	    if ($exclude) {
+		print $OUT $seq{$header};
+	    } elsif ($include) {
+		print STDERR "$0: removed $header from $input\n" if $verbose;
+	    }
+	}
+    }
+    
+}
+print STDERR "$0 complete!\n";
+system "kill $$";
+

@@ -1,0 +1,94 @@
+#!/usr/bin/env perl
+require '/home/apa/local/bin/apa_routines.pm';  # chrsort
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+# Deps: apa_routines.pm, fetchChromSizes, samtools
+
+## Inputs
+my $genome;  # UCSC genome name to get chr names/sizes from
+my $bam;     # -OR- SAM/BAM/VCF to get chr names/sizes from (in header)
+my $usechr;  # bin only this chromosome
+my $window;  # binning window, in bp
+my ($help, $man, $version);
+
+GetOptions(
+    "g=s" => \$genome,
+    "b=s" => \$bam,
+    "c=s" => \$usechr,
+    "w=s" => \$window,
+    "help" => \$help,
+    "man" => \$man,
+    "version" => \$version
+    );
+
+die "$0: May specify only one of '-g' or '-b'!\n" if $genome && $bam;
+
+## Globals
+my $IN;      # filehandle
+my %chrLens; # chrom lengths
+my @chrOrd;  # sorted chrom names
+
+
+## Main
+
+if ($bam) {
+    if ($bam =~ /\.bam$/i) {
+	open $IN, "samtools view -H $bam |";
+	while (<$IN>) { 
+	    chomp;
+	    my ($chr, $len) = ($_ =~ /^\@SQ\tSN:(\S+)\tLN:(\d+)/);
+	    $chrLens{$chr} = $len;
+	}
+    } elsif ($bam =~ /\.sam$/i) {
+	open $IN, '<', $bam;
+	while (<$IN>) { 
+	    chomp;
+	    my ($chr, $len) = ($_ =~ /^\@SQ\tSN:(\S+)\tLN:(\d+)/);
+	    $chrLens{$chr} = $len;
+	    last if $_ !~ /^\@/;  # end of header
+	}
+    } elsif ($bam =~ /\.bcf$/i) {
+	open $IN, "bcftools view $bam |";
+	while (<$IN>) { 
+	    chomp;
+	    my ($chr, $len) = ($_ =~ /^##contig=<ID=([^,]+),length=(\d+)>/);
+	    $chrLens{$chr} = $len;
+	    last if $_ !~ /^##/;  # end of header
+	}
+    } elsif ($bam =~ /\.vcf$/i) {
+	open $IN, '<', $bam;
+	while (<$IN>) { 
+	    chomp;
+	    my ($chr, $len) = ($_ =~ /^##contig=<ID=([^,]+),length=(\d+)>/);
+	    $chrLens{$chr} = $len;
+	    last if $_ !~ /^##/;  # end of header
+	}
+    }
+} elsif ($genome) {
+    open $IN, "fetchChromSizes $genome |";
+    while (<$IN>) { 
+	chomp;
+	my ($chr, $len) = split /\t/, $_;
+	$chrLens{$chr} = $len;
+    }
+} else {
+    die "$0: Must specify '-g' or '-b'!\n";
+}
+close $IN;
+
+my @chrOrd = @{ chrsort([keys %chrLens]) };
+foreach my $chr (@chrOrd) {
+    next if $usechr && $chr ne $usechr;
+    my $N = $chrLens{$chr}/$window;
+    $N = int($N)+1 if int($N) != $N;
+    my $start = 0;
+    foreach my $i (1..$N) {
+	my $end = $start + $window;
+	$end = $chrLens{$chr} if $end > $chrLens{$chr};
+	print join("\t", ($chr, $start, $end, "$chr:$start-$end\n"));
+	$start += $window;
+    }
+}
+

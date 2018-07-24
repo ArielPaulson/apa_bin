@@ -1,0 +1,1753 @@
+#!/usr/bin/env perl
+
+#$Id$
+
+# Copyright © 2009, Stowers Institute for Medical Research.  All rights reserved.
+
+# c.f. attached LICENSE
+
+
+
+
+## TO DO:
+## 
+## Add term-tree intersection matrices: input list of N terms, get NxN matrix where cells indicate any of: { child progeny parent ancestor } overlap, or other-list-member-containment
+## 
+## Fix --rootpaths; currently --flatmap IS --rootpaths
+## 
+## WANT TO FIND A WAY TO FILTER OUT NON-SPECIES TERMS!!!!!!!!!!!!!!!
+##  -- except, it seems not even geneontology.org can do this completely.
+##     still, there at least must be a way to eliminate ectopic plant/fungal terms from vertebrate searches?  hardcoded grep lists?
+
+
+
+=pod
+
+=head1 SYNOPSIS
+
+GO_Tools is a set of high-level GO database queries on the command-line.
+
+=head1 OPTIONS
+
+=over
+
+=item B<--showdbs [-h hostname] [-f output_file]>
+
+Show a list of canonically-named GO databases (go_yyyymm) on the specified host (default  = mysql-dev).
+
+=item B<--showtaxa [-f output_file] [--sprintf]>
+
+Show a list of the NCBI taxa ids for the most common model organisms.
+
+=item B<--orgstats [-o Genus.species] [-d db_name] [-h host_name] [-f output_file] [--novirus]>
+
+Input your genus and species separated by a period to see all NCBI taxa ids for that organism.  Genus must be Capitalized.  Use "Genus." to query all 
+species within a genus.  This uses approximate species matching: string queried is "species*".  Returned is a table with taxon ID, scientific name, and 
+three database parameters for the taxon id: gene count, gene label count, and GO term count.  Use "--novirus" to block viral results, i.e. any taxa 
+containing the string "virus" (there can be lots...)
+
+=item B<--showxrefs [-x taxon_id(s)] [-d db_name] [-h host_name] [-f output_file] [--noPDB] [--sprintf]>
+
+Show all xref identifier databases for each org(s) and the first 5 IDs for each, as well as the number of IDs in each vs number of genes for org.  "-x" can be one taxon ID, or a CSV list of them.
+
+=item B<--getdbids [-x taxon_id] [-d db_name] [-h host_name] [-i id_list_file] [-f output_file] [--clean] [--long]>
+
+Get a table of all mappable gene identifiers AND their mapped terms for a specified organism.  Use "--clean" flag to discard all mappings to generic terms, 
+e.g. "biological process" or "biological process unknown".  Use "--long" to output one line per term, instead of one line per gene.  Use "-i <file>" to report results for only these identifiers (uses exact match against Symbol, Name, Xref).
+
+=item B<--findterms [-a GO_accession_list] [-d db_name] [-h host_name] [-f output_file]>
+
+Identify which GO DB a given accession (or file containing multiple accessions) came from.  Returns 3 cols: 1=database, 2=accession, 3=name.
+
+=item B<--termtable [-x taxon_id] [-d db_name] [-h host_name] [-f output_file] [-g grep] [--noimputed]>
+
+In-depth reporting for each GO term for the specified organism, either annotated directly or imputed by hierarchical relationships.  Includes accession, 
+name, level(s), numbers of parents, children, total downstream IDs, and annotated genes, etc.  Use --noimputed to restrict terms to only those with direct 
+gene annotations (this will probably return an incomplete hierarchy).  Use -g to restrict results based on a grep against term name.
+
+=item B<--slimmap [-a slim_list] [-x taxon_id] [-d db_name] [-h host_name] [-f output_file] [--stats]>
+
+Given a slim list (column 1 = GO accession(s); any other columns ignored), returns one of two things.  If the --stats flag is used, returns mapping statistics: number of terms mapped to each slim term, number of overlaps between terms, parent/child relationships among slim terms, and number of terms which are unmappable to the slim list.  If --stats is not used, then a 4-column slim map is returned: cols 1-2 = mapped acc, name; cols 3-4 = slim acc, name.
+
+=item B<--slimtree [-a GO_accession(s)] [-x taxon_id] [-d db_name] [-h host_name] [-f output_file] [--genes]>
+
+This option returns the downstream terms of a given GO accession (or CSV string of accessions), useful e.g. when using a slim list 
+and you want to know what terms map to a particular slim term.  Using --genes adds, for each output term, the list of all genes mapping to that term.
+
+=item B<--fulltree [-x taxon_id] [-d db_name] [-h host_name] [-f output_file]>
+
+Designed for building custom MeV annotation files.  This option gives a 5-column list (GO type, child acc, child name, parent acc, parent name) of all 
+terms with one degree of separation.  Results are constrained to the given organism.  The list contains the minimal information required to construct the
+entire GO graph for that organism.
+
+=item B<--children [-a GO_accession(s) or file] [-x taxon_id] [-d db_name] [-h host_name] [-f output_file]>
+
+Finds the immediate child terms for a GO accession or list of accessions.  List may be a file or a comma-delimited string of GO 
+accessions.
+
+=item B<--parents [-a GO_accession(s) or file] [-x taxon_id] [-d db_name] [-h host_name] [-f output_file]>
+
+Finds the immediate parent terms for a GO accession or list of accessions.  List may be a file or a comma-delimited string of GO 
+accessions.
+
+=item B<--allparents [-a GO_accession] [-x taxon_id] [-d db_name] [-h host_name] [-f output_file] [--genes]>
+
+UNDER CONSTRUCTION.  Sort of the opposite of --slimtree: this option returns all parents for the given term.
+
+=item B<--rootpaths [-a GO_accession] [-x taxon_id] [-d db_name] [-h host_name] [-f output_file] [--genes]>
+
+UNDER CONSTRUCTION.  The ordered version of --allparents: all parents for a given term, organized into paths leading back to the root.
+
+=item B<--nca [-a GO_accession(s) or file] [-x taxon_id] [-d db_name] [-h host_name] [-f output_file]>
+
+Finds the nearest common ancestor term for a list of GO accessions.  List may be a file or a comma-delimited string of GO accessions.
+
+=item B<--cache [-d db_name]>
+
+Create default GO_Tools / FatiClone cache files for a new GO database (only done once, at DB install time)
+
+=item B<--help>
+
+Display command line usage with options.
+
+=item B<--man>
+
+Display complete manual page and exit.
+
+=item B<--version> 
+
+Display the scripts version number and exit.
+
+=back
+
+
+=head1 EXAMPLES
+
+=over
+
+=item C< GO_Tools --man >
+
+print a manpage.
+
+=item C< GO_Tools --showtaxa >
+
+show the NCBI taxa numbers for the most common model organisms.
+
+=item C< GO_Tools --orgstats Bacillus.subtilis -d go_201001>
+
+show all NCBI taxa numbers associated with Bacillus subtilis* from database 'go_201001', and their associated DB statistics.
+
+=item C< GO_Tools --showdbs -h rho >
+
+show any GO databases (with name format go_yyyymm) on host rho.
+
+=back
+
+=head1 VERSION
+
+$Revision:  1.0$
+
+=head1 AUTHOR
+
+Ariel Paulson (apa@stowers.org)
+
+=head1 DEPENDENCIES
+
+perl
+
+=head1 AVAILABILITY
+
+Download at will.
+
+=cut
+
+require '/home/apa/apa_routines.pm';
+use DBI;
+use Cwd;
+use Storable (qw/ nstore retrieve /);
+use File::Path;
+use Data::Dumper;
+use Getopt::Long;
+use Pod::Usage;
+use FindBin;
+use strict;
+no strict 'refs';
+
+#use vars qw($VERSION $VC_DATE);
+
+#BEGIN {
+our $VERSION =  qw$Revision: 1.0 $[-1];
+our $VC_DATE =  qw$Date: $[-2];
+#}
+
+
+
+######################################################################  ACTUAL CODE  ######################################################################
+######################################################################  ACTUAL CODE  ######################################################################
+######################################################################  ACTUAL CODE  ######################################################################
+######################################################################  ACTUAL CODE  ######################################################################
+######################################################################  ACTUAL CODE  ######################################################################
+
+
+
+### Setup
+
+# script parameters
+my ($taxon, $slimtree, $slimmap, $fulltree, $flatmap, $orgstats, $getdbids, $findterms, $termtable, $children, $parents, $allparents, $rootpaths, $nca, $genspec, $slimacc);
+my ($cache, $showdbs, $showtaxa, $showxrefs, $help, $man, $ver, $GOdb, $clean, $genes, $novirus, $noimputed, $do_sprintf, $no_PDB, $idfile, $outfile, $grep, $stats, $long, $full);
+my $dbhost = 'mysql-dev';
+my $cachedir = "/home/apa/local/bin/GO_Tools_DBcache";	# DB cache directory
+
+GetOptions(
+    "x=s" => \$taxon, 
+    "d=s" => \$GOdb,
+    "h=s" => \$dbhost,
+    "o=s" => \$genspec,
+    "a=s" => \$slimacc,
+    "i=s" => \$idfile,
+    "f=s" => \$outfile,
+    "g=s" => \$grep,
+
+    "clean" => \$clean,
+    "long" => \$long,
+    "full" => \$full,
+    "genes" => \$genes,
+    "stats" => \$stats,
+    "novirus" => \$novirus,
+    "noimputed" => \$noimputed,
+    "noPDB" => \$no_PDB,
+    "sprintf" => \$do_sprintf,
+
+    "cache" => \$cache,
+    "showdbs" => \$showdbs,
+    "showtaxa" => \$showtaxa,
+    "showxrefs" => \$showxrefs,
+    "slimtree" => \$slimtree,
+    "slimmap" => \$slimmap,
+    "fulltree" => \$fulltree,
+    "flatmap" => \$flatmap,
+    "getdbids" => \$getdbids,
+    "findterms" => \$findterms,
+    "termtable" => \$termtable,
+    "orgstats" => \$orgstats,
+    "children" => \$children,
+    "parents" => \$parents,
+    "allparents" => \$allparents,
+    "rootpaths" => \$rootpaths,
+    "nca" => \$nca,
+
+    "help|?" => \$help,
+    "man!" => \$man,
+    "version!" => \$ver
+    ) or pod2usage(2);
+
+pod2usage(1) if $help;
+pod2usage(-exitstatus => 0, -verbose => 2) if $man;
+if ($ver) {print "$FindBin::Script: $VERSION\n"; exit(0)};
+
+# declare HERE
+my (%four_names, %slimterms, %slimfound, %ignore, %termlevels, %idtable, %allterms, %inputids);
+my (%accdata, %obsoletes, %levelmap, %relations, %idcounts, %idtrack, %output, %alliters, %write_termgene_already);
+my ($dbh, $FH, $maxlevel, $universal, @reparent); 
+my $cachedir = "/home/apa/local/bin/GO_Tools_DBcache";	# DB cache directory
+
+if ($idfile) {
+    if (open IN, $idfile) {
+        while (<IN>) {
+            $_ =~ s/[\n\r]+$//;
+            $inputids{$.} = [split /;/, $_];   # semicolon-delimited entries allowed, e.g. for microarray probes which target multiple genes.  Downstream handling varies.
+        }
+        close IN;
+    } else {
+        die "$0: id file '$idfile' unreadable: $!\n";
+    }
+}
+
+if ($outfile) {
+    $FH = 'OUT';
+    open $FH, "> $outfile" or die "$0: Cannot open path '$outfile' for writing: $!\n";
+} else {
+    $FH = 'STDOUT';
+}
+
+
+
+
+if ($showtaxa) {
+    
+    
+    
+    #    my @headers = ('Taxon ID', 'Scientific Name', 'Common Name');
+    #    my $width0 = length($headers[0]);
+    #    my $width1 = length($headers[1]);
+    #    my $width2 = length($headers[2]);
+    #    foreach my $id (keys %taxon_ids) {
+    #	my ($sciname, $comname) = @{ $taxon_ids{$id} };
+    #	$width0 = length($id) if length($id) > $width0;
+    #	$width1 = length($sciname) if length($sciname) > $width1;
+    #	$width2 = length($comname) if length($comname) > $width2;
+    #    }
+    #    my $format = "%${width0}s  %-${width1}s  %-${width2}s";
+    #    my $header = sprintf($format, 'Taxon ID', 'Scientific Name', 'Common Name');
+    #    my $commontaxa = join "\n", map { sprintf($format, $_, @{ $taxon_ids{$_} }) } (sort {$taxon_ids{$a}->[0] cmp $taxon_ids{$b}->[0]} keys %taxon_ids);
+    #    print "\n\n" unless $outfile;
+    #    print $FH "Some taxa and their numbers:\n\n$header\n$commontaxa\n";
+    #    print "\n\n" unless $outfile;
+    
+    my $cmd = '/home/apa/local/bin/showTaxa';
+    $cmd .= ' --no-sprintf' unless $do_sprintf;
+    system $cmd;
+    exit;
+    
+    
+    
+} elsif ($showdbs) {
+    
+    
+    
+    my $dbh = DBI->connect("DBI:mysql:host=$dbhost",'anonymous','guy#fawkes',{RaiseError=>1}) or die "$0: Cannot connect to $dbhost: $DBI::err() $DBI::errstr()\n";
+    my $dbquery = $dbh->prepare("SHOW DATABASES");
+    $dbquery->execute();
+    my $ref = $dbquery->fetchall_arrayref();
+    $dbquery->finish();
+    print "\n" unless $outfile;
+    print $FH "GO databases on host $dbhost:\n";
+    foreach (reverse @$ref) {
+        print $FH "$$_[0]\n" if $$_[0] =~ /^go_\d{5,8}$/;
+    }
+    $dbh->disconnect();
+    print "\n" unless $outfile;
+    exit;
+    
+    
+
+} elsif ($showxrefs) {
+    
+    
+
+    my $nIDs = 5;  # show first 5 IDs per xref database
+    my @taxids;
+    if ($taxon) {
+        if ($taxon =~ /,/) {
+            @taxids = split /,/, $taxon;
+        } else {
+            @taxids = ($taxon);
+        }
+    } else {
+        open my $IN, '-|', '/home/apa/local/bin/showTaxa | grep . | tail -n +2 | head -n -1 | sed "s/^ *//" | cut -f1 -d" "';
+        chomp(@taxids = (<$IN>));
+        close $IN;
+    }
+    my $ntaxa = scalar @taxids;
+    $ntaxa = "ALL $ntaxa SIMR" unless $taxon;
+    
+    print STDERR "\nSearching $ntaxa species in database $GOdb...\n";
+    my (%orgname, %xreftable, %symbols);
+    my ($genus, $species) = split /\./, $genspec;
+    my $dbhq = DBI->connect("DBI:mysql:database=$GOdb:host=$dbhost",'anonymous','guy#fawkes',{RaiseError=>1}) or die "$0: Cannot connect to $GOdb on $dbhost: $DBI::err() $DBI::errstr()\n";
+    my $taxidquery = $dbhq->prepare("SELECT id, genus, species FROM species WHERE ncbi_taxa_id = ?");
+    my $qPDB = $dbhq->quote('PDB');
+    my $xrefq1_string = "select distinct d.xref_dbname, g.symbol from dbxref d, gene_product g where d.id = g.dbxref_id";
+    $xrefq1_string .= " and d.xref_dbname != $qPDB" if $no_PDB;
+    $xrefq1_string .= " and g.species_id = ? order by g.symbol";
+    my $xrefquery1 = $dbhq->prepare($xrefq1_string);
+    my $xrefquery2 = $dbhq->prepare("SELECT d.xref_key FROM dbxref d, gene_product g WHERE d.id = g.dbxref_id AND g.species_id = ? AND d.xref_dbname = ? limit $nIDs");
+    foreach my $taxid (@taxids) {
+        $taxidquery->bind_param(1, $taxid);
+        $taxidquery->execute();
+        while ( my ($spid, $genus, $species) = $taxidquery->fetchrow_array() ) {
+            $orgname{$taxid} = "$genus $species";
+            
+            $xrefquery1->bind_param(1, $spid);
+            $xrefquery1->execute();
+            my $prev_symb;
+            while ( my ($xrefdb, $symb) = $xrefquery1->fetchrow_array() ) {
+                next if $xrefdb eq 'PDB' && $no_PDB;
+                $symbols{$taxid}{$symb} = 1;
+                $xreftable{$taxid}{$xrefdb}{N}++ unless $symb eq $prev_symb;
+                $prev_symb = $symb;
+            }
+            $xrefquery1->finish();
+            warn "Error retrieving xrefquery1 data: $xrefquery1->errstr()\n" if $xrefquery1->err();
+            
+            foreach my $xrefdb (keys %{ $xreftable{$taxid} }) {
+                next if $xrefdb eq 'PDB' && $no_PDB;
+                $xrefquery2->bind_param(1, $spid);
+                $xrefquery2->bind_param(2, $xrefdb);
+                $xrefquery2->execute();
+                while ( my ($xrefid) = $xrefquery2->fetchrow_array() ) {
+                    push @{ $xreftable{$taxid}{$xrefdb}{I} }, $xrefid;
+                }
+                warn "Error retrieving xrefquery2 data: $xrefquery2->errstr()\n" if $xrefquery2->err();
+                $xrefquery2->finish();
+            }
+        }
+        $taxidquery->finish();
+        warn "Error retrieving taxidquery data: $taxidquery->errstr()\n" if $taxidquery->err();
+    }
+    
+    my @OUT;
+    push @OUT, [qw/ Taxon Organism Org_Genes Xref_Genes Xref_Gene% Xref_DB Xref_IDs /];
+    foreach my $taxid (@taxids) {
+        my $org = $orgname{$taxid};
+        my $ngpids = scalar keys %{ $symbols{$taxid} };
+        foreach my $xrefdb (sort { $xreftable{$taxid}{$b}{N} <=> $xreftable{$taxid}{$a}{N} } keys %{ $xreftable{$taxid} }) {
+            my $xrefdbn = $xreftable{$taxid}{$xrefdb}{N};
+            my $xrefdbp = sprintf("%3.2f", 100*$xrefdbn/($ngpids||1));
+            my $xrefids = join ',', sort @{ $xreftable{$taxid}{$xrefdb}{I} };
+            push @OUT, [$taxid, $orgname{$taxid}, $ngpids, $xrefdbn, $xrefdbp, $xrefdb, $xrefids];
+        }
+    }
+    &print_table(\@OUT, $do_sprintf);
+    print "\n";
+    exit;
+    
+    
+    
+} elsif ($cache) {
+    
+    
+    
+    die "\n$0: --cache flag MUST be accompanied by a database name, using -d !\n" unless $GOdb;
+    $dbh = DBI->connect("DBI:mysql:database=$GOdb:host=$dbhost",'anonymous','guy#fawkes',{RaiseError=>1}) or die "$0: Cannot connect to $GOdb on $dbhost: $DBI::err() $DBI::errstr()\n";
+    #    $termsname = 'GO';
+
+    my ($maxlevel, %downstreams);
+    my $childquery = $dbh->prepare("SELECT DISTINCT term2_id, distance FROM graph_path WHERE term1_id = ?");
+    my $parentquery = $dbh->prepare("SELECT DISTINCT term1_id, distance FROM graph_path WHERE term2_id = ?");
+    
+    &root_query($dbh);
+    &term_query('ALL', $dbh);
+    
+    ########## have a query to investigate gene_product_count table somewhere....
+    
+    print STDERR "Mapping GO terms to levels...\n";
+    $childquery->bind_param(1, $four_names{all}->[0]);
+    $childquery->execute();
+    while ( my ($tid, $level) = $childquery->fetchrow_array() ) {
+        if ($allterms{I2A}{$tid}) {		# no relationships or obsoletes
+            $termlevels{T2L}{$tid}{$level} = 1;
+            $termlevels{L2T}{$level}{$tid} = 1;
+            $maxlevel = $level if $level > $maxlevel;
+        }
+    }
+    warn "Error retrieving data: $childquery->errstr()\n" if $childquery->err();
+    $childquery->finish();
+    
+    print STDERR "Mapping downstream GO terms to upper levels...\n";
+    foreach my $level (0..$maxlevel) {
+        my $at_this_level = scalar (keys %{ $termlevels{L2T}{$level} });
+        my %downstreams;
+        foreach my $tid (keys %{ $termlevels{L2T}{$level} }) {			# all terms at level $level
+            $childquery->bind_param(1, $tid);
+            $childquery->execute();
+            while ( my ($tid2, $dist) = $childquery->fetchrow_array() ) {
+                if (exists $allterms{I2A}{$tid2}) {				# no relationships or obsoletes
+                    $levelmap{L}{$level}{$tid}{$tid2} = 1 if $dist > 0;	        # for each $tid at level $level, what are its downstream $tids? (NO SELF)
+                    $levelmap{T}{$tid2}{$level}{$tid} = 1;			# for each $tid2, what are its level-$level parental mappings? (NEED SELF)
+                    #print "$tid child = $tid2 @ $dist\n" if $tid == 19;
+		    $relations{P2C}{$tid}{$tid2}{$level} = 1 if $dist == 1;     # $tid is parent, $tid2 is child
+		    $downstreams{$tid2} = 1;
+                }
+            }
+            warn "Error retrieving data: $childquery->errstr()\n" if $childquery->err();
+            $childquery->finish();
+            
+            $parentquery->bind_param(1, $tid);
+            $parentquery->execute();
+            while ( my ($tid2, $dist) = $parentquery->fetchrow_array() ) {
+                if (exists $allterms{I2A}{$tid2} && $tid2 != $tid) {		# no relationships, obsoletes, or self-references
+                    #print "$tid parent = $tid2 @ $dist\n" if $tid == 19;
+		    $relations{C2P}{$tid}{$tid2}{$level} = 1 if $dist == 1;     # $tid is child, $tid2 is parent
+                }
+            }
+            warn "Error retrieving data: $parentquery->errstr()\n" if $parentquery->err();
+            $parentquery->finish();
+        }
+        printf STDERR "Level %2d: %5d terms with %5d children.\n", $level, $at_this_level, scalar (keys %downstreams);
+    }
+    $dbh->disconnect();
+    
+    print STDERR "Storing '$cachedir/${GOdb}_relations_dump.dat' for next time...\n";
+    nstore(\%relations,"$cachedir/${GOdb}_relations_dump.dat") or warn "Cannot store \%relations in file '$cachedir/${GOdb}_relations_dump.dat': $!";
+    print STDERR "Storing '$cachedir/${GOdb}_levelmap_dump.dat' for next time...\n";
+    nstore(\%levelmap,"$cachedir/${GOdb}_levelmap_dump.dat") or warn "Cannot store \%levelmap in file '$cachedir/${GOdb}_levelmap_dump.dat': $!";
+    
+    ## DB caching for Perl-based utilities (like this one) complete.
+    ## Now, cache DB for R-based utilities
+    
+    ## STEPS: 
+    ## 1. write set of 3 tables to tmp dir
+    ## 2. run small R script that converts tables into one RData object
+    
+    my %Routput = (
+        'TERM' => ["Accession\tTerm\tType\tParent.Terms\tChild.Terms\tDownstream.Terms\tDirect.Genes\tDownstream.Genes"],
+        'GENE' => ["Gene\tDirect.BP\tDirect.CC\tDirect.MF\tTotal.BP\tTotal.CC\tTotal.MF"],
+        'T2G'  => ["DB\tAccession\tGene\tDirect"]
+        );
+    
+    ## Termwise ops
+    foreach my $tid (keys %{ $allterms{I2A} }) {
+        my $gpids = scalar (keys %{ $allterms{I2G}{$taxon}{$tid} });
+        next if ($gpids == 0 && $noimputed);
+        my $acc = $allterms{I2A}{$tid};
+        $slimfound{$acc} = $acc if $slimterms{1}{$acc};
+        my $nametype = join "\t", reverse @{ $accdata{$acc} }[0,1];
+        my $alevels = join ',', (sort {$a <=> $b} keys %{ $termlevels{T2L}{$tid} });
+        my $parents = scalar (keys %{ $relations{C2P}{$tid} });
+        my $children = scalar (keys %{ $relations{P2C}{$tid} });
+        my %downstream;   ################# MODIFY THIS FOR T2G TABLE BUILDING
+        foreach my $level (0..$maxlevel) {
+            if ($levelmap{L}{$level}{$tid}) {
+                foreach my $tid2 (keys %{ $levelmap{L}{$level}{$tid} }) {
+                    $downstream{I}{$tid2} = 1;
+                    $downstream{G}{$_} = 1 foreach (keys %{ $allterms{I2G}{$taxon}{$tid2} });
+                }
+            }
+        }
+        my $dsI = scalar (keys %{ $downstream{I} });  # ids
+        my $dsG = scalar (keys %{ $downstream{G} });  # gpids
+        next unless ($gpids || $dsG);	# must have direct or downstream-associated products!  Unfortunately, this is the only way to remove non-species junk from tree...
+        ## acc, name, db, inferred, N parents, N children, N upstream, N downstream, N tot genes, N dir genes]
+        push @{ $Routput{TERM} }, "$acc\t$nametype\t$parents\t$children\t$dsI\t$gpids\t$dsG\n";
+    }
+    
+    ## Genewise ops
+    my @dbids;
+    foreach my $gpid (sort keys %{ $idtable{1}{$taxon} }) {
+        my (%realias, %accframe);
+        foreach my $alias (keys %{ $idtable{1}{$taxon}{$gpid} }) {
+            $realias{ $idtable{1}{$taxon}{$gpid}{$alias} }{$alias} = 1;	# re-key by alias origin (name, symbol, xref)
+        }
+        foreach my $tid (keys %{ $allterms{G2I}{$taxon}{$gpid} }) {
+            next if $ignore{$tid}; 	# removes the generic / unknown GO terms
+            my $acc = $allterms{I2A}{$tid};
+            my $delim = $long ? "\t" : ' ';
+            $accframe{ $accdata{$acc}->[0] }{"$acc$delim$accdata{$acc}->[1]"} = 1;
+        }
+        my $outsymbol = join ' // ', (sort keys %{ $realias{S} });
+        my $outname = join ' // ', (sort keys %{ $realias{N} });
+        my $outxref = join ' // ', (sort keys %{ $realias{X} });
+        my $IDstring = "$outsymbol\t$outname\t$outxref";
+        if ($long) {
+            foreach my $branch (qw/ BP CC MF /) {
+                push @dbids, "$IDstring\t$branch\t$_\n" foreach sort keys %{ $accframe{$branch} };
+            }
+        } else {
+            my $outBP = join ' // ', sort keys %{ $accframe{BP} };
+            my $outCC = join ' // ', sort keys %{ $accframe{CC} };
+            my $outMF = join ' // ', sort keys %{ $accframe{MF} };
+            push @dbids, "$IDstring\t$outBP\t$outCC\t$outMF\n";
+        }
+    }
+    my $outheader = "Symbol\tName\tXref";
+    $outheader .= $long ? "\tDB\tTerm Acc\tTerm Name\n" : "\tBiological Process\tCellular Component\tMolecular Function\n";
+    
+    ## What are these lines doing here?  Mis-pasted??
+    ## #####  PRODUCES DIRECT TERMS ONLY  #####
+    ## print $FH $outheader,@dbids;
+    
+    exit;
+    
+    
+    
+} elsif ($findterms) {
+    
+    
+    
+    die "\n$0: --findterms flag MUST be accompanied by a GO accession or list file, using -a !\n" unless $slimacc;
+    die "\n$0: --findterms flag MUST be accompanied by a database name, using -d !\n" unless $GOdb;
+    &root_query;
+    &term_query;
+    
+    print $FH "Database\tAccession\tName\n";
+    if ($slimacc =~ /^GO:\d+$/) {   # single-acc input
+        my ($db, $name) = @{ $accdata{$slimacc} }[0,1];
+        print $FH "$db\t$slimacc\t$name\n";
+    } else {    # list-file input
+        foreach my $acc (keys %{ read_list($slimacc) }) {
+            my ($db, $name) = @{ $accdata{$acc} }[0,1];
+            print $FH "$db\t$acc\t$name\n";
+        }
+    }
+    exit;
+    
+    
+
+} elsif ($slimtree) {
+    
+    
+    
+    die "\n$0: --slimtree flag MUST be accompanied by a GO accession, using -a !\n" unless $slimacc;
+    die "\n$0: --slimtree flag MUST be accompanied by a taxon id, using -x !\n" unless $taxon;
+    die "\n$0: --slimtree flag MUST be accompanied by a database name, using -d !\n" unless $GOdb;
+    &GO_queries($taxon);
+    &get_level_mappings;
+    $dbh->disconnect();
+    
+    my (@slimtids, %toplevels, %parentaccs, %kids1, %parents1, %levels, @tree);
+    foreach my $acc (split /,/, $slimacc) {
+        my $tid;
+        if ($accdata{$acc}) {
+            $tid = $accdata{$acc}->[2];
+        } elsif ($obsoletes{A2T}{$acc}) {
+            $tid = $obsoletes{A2T}{$acc};
+            print STDERR "Warning: GO accession $acc is considered obsolete.\n";
+        } else {
+            die "$0: GO accession $acc not found for taxon $taxon!\n";
+        }
+        push @slimtids, $tid;
+        my %tidlevels = map {($_=>1)} keys %{ $termlevels{T2L}{$tid} };  # all levels this $tid may be found at
+        $toplevels{$tid} = (sort {$a <=> $b} keys %tidlevels)[0];        # take highest level (if multiple)
+        foreach my $tid2 (keys %{ $levelmap{L}{ $toplevels{$tid} }{$tid} }) {  # child tids
+            $kids1{$tid2}{$tid} = $toplevels{$tid};  # input $tids will also be $tid2s
+        }
+    }
+    my %slimtids = map {($_=>1)} @slimtids;
+    my @ordkids = @slimtids;	 # init w/ queries: make sure query accessions are first!
+    foreach my $tid (sort keys %kids1) {
+        push @ordkids, $tid unless exists $slimtids{$tid};
+    }
+    foreach my $tid (@ordkids) {
+        my @templev;
+        my $parentmin = (sort {$a <=> $b} values %{ $kids1{$tid} })[0];
+        foreach my $lev (keys %{ $termlevels{T2L}{$tid} }) {
+            push @templev, $lev if $lev > $parentmin;	# levels that child term may be found at; must be below parent (slim) term
+        }
+        my $minlev = (sort {$a <=> $b} @templev)[0];	# take highest level (if multiple)
+        $levels{$tid} = $minlev;  # highest level that child may occur at BELOW the highest parent level (i.e. ignore higher levels coming from alternate parents)
+        foreach my $tid2 (keys %{ $relations{C2P}{$tid} }) {
+            next if $tid eq $tid2;
+            next unless exists $kids1{$tid2};  # parent must also be in under slim term
+            foreach my $level (keys %{ $relations{C2P}{$tid}{$tid2} }) {
+                $parents1{$tid}{$tid2} = 1 if $level >= $minlev;  # so long as C->P relation exists when C is at or below level $minlev, then record parent
+            }
+        }
+    }
+    my %output;
+    sub output_parent_slim {
+        my ($LINE, $TID) =  @_;
+        my @parents = sort map { $allterms{I2A}{$_} } keys %{ $parents1{$TID} };
+        @parents = ('NA') unless @parents;
+        my $parentstr = join(',', sort @parents);
+        if (exists $slimtids{$TID}) {
+            ## query (parent) term
+            $output{"$LINE\t$allterms{I2A}{$TID}\t$parentstr\n"} = 1;
+        } else {
+            ## obligate child term
+            $output{"$LINE\t$allterms{I2A}{$_}\t$parentstr\n"} = 1 foreach keys %{ $kids1{$TID} };
+        }
+    }
+    foreach my $tid (@ordkids) {
+        my $string;
+        if ($allterms{I2G}{$taxon}{$tid}) {
+            ## term has mapped genes
+            foreach my $gpid (keys %{ $allterms{I2G}{$taxon}{$tid} }) {
+                my %idtemp;
+                $idtemp{ $idtable{1}{$taxon}{$gpid}{$_} }{$_} = 1 foreach keys %{ $idtable{1}{$taxon}{$gpid} };
+                my $symbs = join '; ', (sort keys %{ $idtemp{S} });
+                my $names = join '; ', (sort keys %{ $idtemp{N} });
+                my $xrefs = join '; ', (sort keys %{ $idtemp{X} });
+                $string = "$allterms{I2A}{$tid}\t$accdata{ $allterms{I2A}{$tid} }->[1]\t$levels{$tid}";
+                $string = $genes ? "$string\t$xrefs\t$symbs\t$names" : $string;
+                &output_parent_slim($string, $tid);
+            }
+        } else {
+            ## term lacks mapped genes
+            $string = "$allterms{I2A}{$tid}\t$accdata{ $allterms{I2A}{$tid} }->[1]\t$levels{$tid}";
+            $string = $genes ? "$string\t\t\t" : $string;
+            &output_parent_slim($string, $tid);
+        }
+    }
+    my $header = $genes ? "Accession\tTerm\tLevel\tXrefs\tSymbols\tNames\tSlim\tParent(s)\n" : "Accession\tTerm\tLevel\tSlim\tParent(s)\n";
+    print $FH $header;
+    print $FH sort keys %output;
+    exit;
+    
+    
+    
+} elsif ($slimmap) {
+    
+    
+    
+    die "\n$0: --slimmap flag MUST be accompanied by a GO slim map, using -a !\n" unless $slimacc;
+    die "\n$0: --slimmap flag MUST be accompanied by a taxon id, using -x !\n" unless $taxon;
+    die "\n$0: --slimmap flag MUST be accompanied by a database name, using -d !\n" unless $GOdb;
+    &GO_queries($taxon);
+    &get_level_mappings;
+    $dbh->disconnect();
+    my %data = %{ read_list($slimacc) };
+    
+    print STDERR "Arranging slim map...\n";
+    my (@output, %DBN, %slimtids, %lostaccs, %slimmap, %slimcross, %slimstate, %slimtable, %slimhits);
+    
+    ## test GO DB presence; convert accs to tids
+    foreach my $acc (keys %data) {
+        my ($type, $tid) = @{ $accdata{$acc} }[0,2];
+        if ($tid) {
+            $slimtids{$type}{$tid} = 1;
+        } else {
+            print STDERR "$acc not found in GO database!\n";
+            $lostaccs{$type}{$acc} = 1;
+        }
+    }
+    
+    ## build %slimmap
+    foreach my $child (keys %{ $relations{C2P} }) {		# all GO terms 
+        my $type = $accdata{ $allterms{I2A}{$child} }->[0];
+        next unless $slimtids{$type};                           # do not consider terms outside of the slim target DB
+        $DBN{$type}++;                                          # count number of genes for each DB
+        $slimmap{$type}{A2S}{$child}{$child} = 1 if $slimtids{$type}{$child};	# map self
+        foreach my $level (keys %{ $levelmap{T}{$child} }) {		# all levels above term
+            foreach my $parent (keys %{ $levelmap{T}{$child}{$level} }) {	# parental mapping(s) for this level (incl. self)
+                next if $child == $parent;				# no self (got it above)
+                next unless $slimtids{$type}{$parent};			# slim parents only
+                $slimmap{$type}{A2S}{$child}{$parent} = 1;		# {A2S} maps ALL terms to appropriate slim parent(s) (if any)
+                $slimmap{$type}{S2A}{$parent}{$child} = 1;		# {S2A} is reverse
+                next unless $slimtids{$type}{$child};			# now, slim children of slim parents only
+                $slimmap{$type}{P2C}{$parent}{$child} = 1;		# {P2C} lists any slim child terms for each slim parent
+                $slimmap{$type}{C2P}{$child}{$parent} = 1;		# {C2P} lists any slim parent terms for each slim child
+            }
+        }
+    }
+    
+    foreach my $type (keys %slimmap) {
+        ## initial mapped terms per slim
+        foreach my $tid (keys %{ $slimmap{$type}{A2S} }) {
+            $slimhits{$type}{$_}{I}++ foreach keys %{ $slimmap{$type}{A2S}{$tid} };
+        }
+        ## remove any terms from slim parent that also map to slim children, if any (make parent the 'leftovers' term)
+        foreach my $parent (keys %{ $slimmap{$type}{P2C} }) {
+            next unless $slimmap{$type}{P2C}{$parent};   # no slim children
+            foreach my $child (keys %{ $slimmap{$type}{P2C}{$parent} }) {
+                foreach my $tid (keys %{ $slimmap{$type}{S2A}{$parent} }) {
+                    if ($slimmap{$type}{A2S}{$tid}{$child}) {
+                        $slimcross{$type}{$child}{I}{$parent}++;   # initial crosstalk that will be removed
+                        $slimcross{$type}{$parent}{I}{$child}++;   # initial crosstalk that will be removed
+                        delete $slimmap{$type}{A2S}{$tid}{$parent};  # keep lowest-level mapping
+                    }
+                }
+            }
+        }
+        ## final mapped terms per slim
+        foreach my $tid (keys %{ $slimmap{$type}{A2S} }) {
+            $slimhits{$type}{$_}{F}++ foreach keys %{ $slimmap{$type}{A2S}{$tid} };
+        }
+        
+        ## now, remove all mappings involving the root (cause problems for state assignment below)
+        foreach my $root (keys %ignore) {
+            delete $slimmap{$type}{P2C}{$root};
+            delete $slimmap{$type}{C2P}{$root};   # if possible??
+        }
+        foreach my $parent (keys %{ $slimmap{$type}{P2C} }) {
+            delete $slimmap{$type}{P2C}{$parent}{$_} foreach keys %ignore;
+            delete $slimmap{$type}{P2C}{$parent} unless scalar keys %{ $slimmap{$type}{P2C}{$parent} };  # remove if no further associations
+        }
+        foreach my $child (keys %{ $slimmap{$type}{C2P} }) {
+            delete $slimmap{$type}{C2P}{$child}{$_} foreach keys %ignore;
+            delete $slimmap{$type}{C2P}{$child} unless scalar keys %{ $slimmap{$type}{C2P}{$child} };  # remove if no further associations
+        }
+    }
+
+    if ($stats) {
+
+        print STDERR "Calculating slim statistics...\n";
+        my $header1 = "DB\tState\tN Terms\tState Description\n";
+        #	my $header2 = "DB\tSlim Acc\tSlim Name\tState\tInitial Mappings\tFinal Mappings\tMapping Overlaps (Initial; Final)\n";
+        my $header2 = "DB\tSlim Acc\tSlim Name\tState\tInitial Mappings\tFinal Mappings\tCross-Mapping Terms\n";
+        my %statenames = (
+            1 => 'Singular slim term (no non-root parents or children)',
+            2 => 'Parent slim term (has children in the slim list; can\'t be root)',
+            3 => 'Child slim term (has parents in the slim list)',
+            4 => 'Parent+child slim term (has both parents and children in the slim list)',
+            5 => 'Non-slim term, is slim-mappable (the majority)',
+            6 => 'Non-slim term, root-mappable only, not traceable to any slim term (gaps in slim term coverage)',
+            7 => 'Non-slim term, root-mappable only, exists between slim terms and root',
+            8 => 'The root'
+            );
+        
+        foreach my $type (keys %slimmap) {
+            
+            ## apply slim states 0/5
+            foreach my $tid (keys %{ $relations{C2P} }) {  # all GO terms 
+                next unless $type eq $accdata{ $allterms{I2A}{$tid} }->[0];
+                my %candidates = %{ $slimmap{$type}{A2S}{$tid} };
+                delete $candidates{$_} foreach keys %ignore;   # remove root mappings
+                if (%candidates) {
+                    $slimstate{$type}{$tid} = 5;	# state 5: non-root-mappable (default; may get overwritten below)
+                } else {
+                    $slimstate{$type}{$tid} = 6;        # state 6: root-only mappable (trivial mapping; unmapped in slim list)
+                }
+            }
+            ## apply slim states 1-4
+            foreach my $tid (keys %{ $slimtids{$type} }) {		# all slim terms 
+                next if $ignore{$tid};                  # skip roots
+                if ($slimmap{$type}{P2C}{$tid}) {	# slim parent
+                    if ($slimmap{$type}{C2P}{$tid}) {	# also mappable to parent
+                        my @parents = keys %{ $slimmap{$type}{C2P}{$tid} };
+                        $slimstate{$type}{$tid} = 4;   	# state 4: slim parent + slim child
+                    } else {
+                        $slimstate{$type}{$tid} = 2;   	# state 2: slim parent only
+                    }
+                } elsif ($slimmap{$type}{C2P}{$tid}) {     
+                    $slimstate{$type}{$tid} = 3;   	# state 3: slim child of a slim parent
+                } else {
+                    $slimstate{$type}{$tid} = 1;   	# state 1: 'singleton' slim term
+                }
+            }
+            ## apply slim state 7
+            my %pre7;
+            foreach my $tid (keys %{ $slimtids{$type} }) { 
+                ## collect all ancestor terms for all slim terms
+                my %temp = %{ getmyancestors($tid) };
+                $pre7{$_} = 1 foreach keys %temp;
+            }
+            foreach my $tid (keys %pre7) {
+                ## collect all ancestor terms for each %pre7 ancestor term
+                $pre7{$tid} = getmyancestors($tid);  # replace '1' with hash
+            }
+            foreach my $tid (keys %pre7) {
+                ## identify and remove any ancestors mappable to other slim terms
+                my $mappable;
+                foreach my $ancestor (keys %{ $pre7{$tid} }) {
+                    next if $ignore{$ancestor};    # roots don't count
+                    $mappable = 1 if $slimtids{$type}{$ancestor};
+                }
+                delete $pre7{$tid} if $mappable;
+            }
+            foreach my $tid (keys %pre7) {
+                next if $ignore{$tid} || $slimtids{$type}{$tid};      # don't count the roots, or the original inputs
+                $slimstate{$type}{$tid} = 7;         # remainder are state 7: unmappable between slims and root
+            }
+            ## apply slim state 8
+            foreach my $root (keys %ignore) {
+                $slimstate{$type}{$root} = 8 if $ignore{$root} eq $type;   # state 8: the one and only (per db), the root
+            }
+            
+            ## summarize slim states, hits, etc.
+            $slimtable{$type}{$_} = 0 foreach keys %statenames;   # ensure printable values
+            $slimtable{$type}{ $slimstate{$type}{$_} }++ foreach keys %{ $slimstate{$type} };
+            foreach my $tid (keys %{ $slimmap{$type}{A2S} }) {
+                my @mapto = keys %{ $slimmap{$type}{A2S}{$tid} };
+                if ($#mapto > 0) {
+                    foreach my $par1 (@mapto) {
+                        foreach my $par2 (@mapto) {
+                            next if $par1 == $par2;
+                            foreach my $xtype (qw/ I F /) {  # these crosstalks are in both initial and final
+                                $slimcross{$type}{$par1}{$xtype}{$par2}++;
+                                $slimcross{$type}{$par2}{$xtype}{$par1}++;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            my $N = $DBN{$type};
+            my $M = scalar keys %{ $slimstate{$type} };
+            my $lost = $N - $M;
+            my $Nmapped = scalar keys %{ $slimmap{$type}{A2S} };
+            my $Nslim = scalar keys %{ $slimmap{$type}{S2A} };
+            print STDERR "$type: $Nmapped/$N terms mapped to $Nslim slim terms | $M have states\n";
+            
+            push @output, "\n$header1";		# "DB\tState\tN Terms\tState Description\n";
+            push @output, "$type\t$_\t$slimtable{$type}{$_}\t$statenames{$_}\n" foreach sort {$a <=> $b} keys %statenames;
+            push @output, "$type\tTOTAL\t$M\tTerms in $type: $N ($lost lost)\n";
+            push @output, "\n$header2";		# "DB\tSlim Acc\tSlim Name\tState\tInitial Mappings\tFinal Mappings\tCross-Mapping Terms\n";
+            my @termsort;
+            foreach (keys %{ $slimtids{$type} }) {
+                push @termsort, $_ if $ignore{$_};   # root goes first
+            }
+            foreach (sort namecmp keys %{ $slimtids{$type} }) {
+                push @termsort, $_ unless $ignore{$_};   # then everyone else 
+            }
+            push @output, "\t\t\t\t\t";
+            push @output, "\t". $accdata{ $allterms{I2A}{$_} }->[1] foreach @termsort;
+            push @output, "\n";
+            foreach my $i (0..$#termsort) {
+                my $tid = $termsort[$i];
+                my ($acc, $name) = ($allterms{I2A}{$tid}, $accdata{ $allterms{I2A}{$tid} }->[1]);
+                #		my $overi = join '; ', map { "$allterms{I2A}{$_}=$slimcross{$type}{$tid}{I}{$_}" } sort keys %{ $slimcross{$type}{$tid}{I} };
+                #		my $overf = join '; ', map { "$allterms{I2A}{$_}=$slimcross{$type}{$tid}{F}{$_}" } sort keys %{ $slimcross{$type}{$tid}{F} };
+                push @output, "$type\t$acc\t$name\t$slimstate{$type}{$tid}\t$slimhits{$type}{$tid}{I}\t$slimhits{$type}{$tid}{F}";
+                foreach my $j (0..$#termsort) {
+                    my $tid2 = $termsort[$j];
+                    next if $i <= $j;
+                    my $initial = $slimcross{$type}{$tid}{I}{$tid2} || 0;
+                    my $final = $slimcross{$type}{$tid}{F}{$tid2} || 0;
+                    #		    ($final || $initial) ? (push @output, "\t$initial; $final") : (push @output, "\t");
+                    ($final) ? (push @output, "\t$final") : (push @output, "\t");
+                }
+                push @output, "\n";
+            }
+            foreach my $acc (keys %{ $lostaccs{$type} }) {
+                my $name = $accdata{$acc}->[2];
+                push @output, "$type\t$acc\t$name\tNOT IN DB\t\t\t\n";
+            }
+            push @output, "\n";
+        }
+        print OUT @output;
+        
+    } else {
+        
+        foreach my $type (keys %slimmap) {
+            
+            my $N = $DBN{$type};
+            my $Nmapped = scalar keys %{ $slimmap{$type}{A2S} };
+            my $Nslim = scalar keys %{ $slimmap{$type}{S2A} };
+            print STDERR "$type: $Nmapped/$N terms mapped to $Nslim slim terms\n";
+            
+            foreach my $tid (keys %{ $slimmap{$type}{A2S} }) {   # mapped terms
+                my ($acc, $name) = ($allterms{I2A}{$tid}, $accdata{ $allterms{I2A}{$tid} }->[1]);
+                foreach my $tid2 (keys %{ $slimmap{$type}{A2S}{$tid} }) {  # slim terms
+                    my ($pacc, $pname) = ($allterms{I2A}{$tid2}, $accdata{ $allterms{I2A}{$tid2} }->[1]);
+                    push @output, "$type\t$acc\t$name\t$pacc\t$pname\n";
+                }
+            }
+        }
+        print OUT "DB\tAcc\tName\tSlim Acc\tSlim Name\n", @output;
+    }
+    
+    
+    
+} elsif ($fulltree || $flatmap) {
+    
+    
+    
+    die "\n$0: --fulltree flag MUST be accompanied by a taxon id, using -x !\n" unless $taxon;
+    die "\n$0: --fulltree flag MUST be accompanied by a database name, using -d !\n" unless $GOdb;
+    &GO_queries($taxon);
+    &get_level_mappings;
+    $dbh->disconnect();
+    
+    print "Imputing un-annotated parent terms...\n";
+    &impute_parents($_, 0, $fulltree) foreach (keys %{ $relations{C2P} });
+    if (@reparent) {
+        my $iters;
+        {
+            $iters++;
+            my @temp = @reparent;
+            @reparent = ();
+            &impute_parents($_, $iters, $fulltree) foreach @temp;
+            redo if @reparent;	# found more new child terms with parents not annotated to $taxon; iterate again
+        }
+    }
+    
+    if ($fulltree) {
+        #print "$_\t$alliters{$_}\n" foreach (sort {$a <=> $b} keys %alliters);
+        print $FH "Type\tChild Acc\tChild Term\tParent Acc\tParent Term\n";
+        print $FH keys %{ $output{$_} } foreach qw/ BP CC MF /;
+    } elsif ($flatmap) {
+        print "Writing complete gene->term mappings...\n";
+        print $FH "Type\tAccession\tName\tXref\tDirect\n";
+        foreach my $gpid (sort keys %{ $idtable{1}{$taxon} }) {
+            foreach my $type (qw/ BP CC MF /) {  # output terms in this order
+                foreach my $tid (keys %{ $allterms{G2I}{$taxon}{$gpid} }) {
+                    ## Directly-annotated terms
+                    &write_termgene($gpid, $tid, $type, 1);
+                    ## Now, trace all paths back to root
+                    my %parents = map {($_=>1)} keys %{ $relations{C2P}{$tid} };
+                    my %parents_already = ($tid,1);
+                    {
+                        my @temp = keys %parents;
+                        %parents = ();
+                        foreach my $ptid (@temp) {
+                            &write_termgene($gpid, $ptid, $type);
+                            $parents_already{$ptid} = 1;
+                            foreach (keys %{ $relations{C2P}{$ptid} }) {
+                                $parents{$_} = 1 unless $parents_already{$_};
+                            }
+                        }
+                        redo if %parents;   # keep going until all parents have been accounted for
+                    }
+                }
+            }
+            %write_termgene_already = ();  # zap after every gene, just to keep footprint down
+        }
+    }
+    exit;
+    
+    
+    
+} elsif ($getdbids) {
+    
+    
+    
+    die "\n$0: --getdbids flag MUST be accompanied by a taxon id, using -x !\n" unless $taxon;
+    die "\n$0: --getdbids flag MUST be accompanied by a database name, using -d !\n" unless $GOdb;
+    &GO_queries($taxon);
+    my @dbids;
+
+    #    if ($long) {  ## && something else?  This block of code originally intended for extracting "most-specific terms" per gene, given some way to subset the tree
+    #	
+    #	
+    #	
+    #	die "$0: --long not enabled for --getdbids yet!\n";
+    #	
+    #	
+    #	
+    #	foreach my $gpid (sort keys %{ $idtable{1}{$taxon} }) {
+    #	    my (%realias, %accframe, %allaccs, $is_parent);
+    #	    foreach my $alias (keys %{ $idtable{1}{$taxon}{$gpid} }) {
+    #		$realias{ $idtable{1}{$taxon}{$gpid}{$alias} }{$alias} = 1;	# re-key by alias origin (name, symbol, xref)
+    #	    }
+    #	    my $symb = join ' // ', (sort keys %{ $realias{S} });  # allows for > 1 mappable ID, although > 1 never observed.
+    #	    my $name = join ' // ', (sort keys %{ $realias{N} });
+    #	    my $xref = join ' // ', (sort keys %{ $realias{X} });
+    #	    foreach my $tid (keys %{ $allterms{G2I}{$taxon}{$gpid} }) {
+    #		next if ($clean && $ignore{$tid});	# "clean" removes the generic / unknown GO terms
+    #
+    #
+    #		#### PROBLEM: most-specific terms not usefully defined when dealing with entire tree!  Need to subset the tree first.
+    #
+    #
+    #		$allaccs{ $allterms{I2A}{$tid} } = 1;   # first, get a list of all 
+    #	    }
+    #	    foreach my $tid (keys %{ $allterms{G2I}{$taxon}{$gpid} }) {
+    #		next if ($clean && $ignore{$tid});
+    #		my $acc = $allterms{I2A}{$tid};
+    #		$accframe{ $accdata{$acc}->[0] }{"$acc\t$accdata{$acc}->[1]"} = 1;
+    #		foreach my $child (map { $allterms{I2A}{$_} } keys %{ $relations{P2C}{ $accdata{$acc}->[2] } }) {   # %relations uses TIDs
+    #		    $is_parent = 1 if $allaccs{$child};		# this term has a child term 
+    #		}
+    #	    }
+    #	    foreach my $db (qw/ BP CC MF /) {
+    #		push @dbids, "$symb\t$name\t$xref\t$db\t$_\n" foreach sort keys %{ $accframe{$db} };
+    #	    }
+    #	}
+    #	print $FH "Symbol\tName\tXref\tDB\tAccession\tTerm\tMost_Specific\n";
+    #    } else {
+    foreach my $gpid (sort keys %{ $idtable{1}{$taxon} }) {
+        my (%realias, %accframe);
+        foreach my $alias (keys %{ $idtable{1}{$taxon}{$gpid} }) {
+            $realias{ $idtable{1}{$taxon}{$gpid}{$alias} }{$alias} = 1;	# re-key by alias origin (name, symbol, xref)
+        }
+        foreach my $tid (keys %{ $allterms{G2I}{$taxon}{$gpid} }) {
+            next if ($clean && $ignore{$tid});	# "clean" removes the generic / unknown GO terms
+            my $acc = $allterms{I2A}{$tid};
+            my $delim = $long ? "\t" : ' ';
+            $accframe{ $accdata{$acc}->[0] }{"$acc$delim$accdata{$acc}->[1]"} = 1;
+        }
+        my $outsymbol = join ' // ', (sort keys %{ $realias{S} });
+        my $outname = join ' // ', (sort keys %{ $realias{N} });
+        my $outxref = join ' // ', (sort keys %{ $realias{X} });
+        my $IDstring = "$outsymbol\t$outname\t$outxref";
+        if ($long) {
+            foreach my $branch (qw/ BP CC MF /) {
+                push @dbids, "$IDstring\t$branch\t$_\n" foreach sort keys %{ $accframe{$branch} };
+            }
+        } else {
+            my $outBP = join ' // ', sort keys %{ $accframe{BP} };
+            my $outCC = join ' // ', sort keys %{ $accframe{CC} };
+            my $outMF = join ' // ', sort keys %{ $accframe{MF} };
+            push @dbids, "$IDstring\t$outBP\t$outCC\t$outMF\n";
+        }
+    }
+    my $outheader = "Symbol\tName\tXref";
+    $outheader .= $long ? "\tDB\tTerm Acc\tTerm Name\n" : "\tBiological Process\tCellular Component\tMolecular Function\n";
+    print $FH $outheader,@dbids;
+    exit;
+    
+    
+    
+} elsif ($termtable) {
+    
+    
+    
+    die "\n$0: --termtable flag MUST be accompanied by a taxon id, using -x !\n" unless $taxon;
+    die "\n$0: --termtable flag MUST be accompanied by a database name, using -d !\n" unless $GOdb;
+    &GO_queries($taxon);
+    &get_level_mappings;
+    $dbh->disconnect();
+
+    my @output;
+    foreach my $tid (keys %{ $allterms{I2A} }) {
+        my $gpids = scalar (keys %{ $allterms{I2G}{$taxon}{$tid} });
+        next if ($gpids == 0 && $noimputed);
+        my $acc = $allterms{I2A}{$tid};
+        $slimfound{$acc} = $acc if $slimterms{1}{$acc};
+        my $nametype = join "\t", reverse @{ $accdata{$acc} }[0,1];
+        my $alevels = join ',', (sort {$a <=> $b} keys %{ $termlevels{T2L}{$tid} });
+        my $parents = scalar (keys %{ $relations{C2P}{$tid} });
+        my $children = scalar (keys %{ $relations{P2C}{$tid} });
+        my %downstream;
+        foreach my $level (0..$maxlevel) {
+            if ($levelmap{L}{$level}{$tid}) {
+                foreach my $tid2 (keys %{ $levelmap{L}{$level}{$tid} }) {
+                    $downstream{I}{$tid2} = 1;
+                    $downstream{G}{$_} = 1 foreach (keys %{ $allterms{I2G}{$taxon}{$tid2} });
+                }
+            }
+        }
+        my $dsI = scalar (keys %{ $downstream{I} });  # ids
+        my $dsG = scalar (keys %{ $downstream{G} });  # gpids
+        next unless ($gpids || $dsG);	# must have direct or downstream-associated products!  Unfortunately, this is the only way to remove non-species junk from tree...
+        push @output, "$acc\t$nametype\t$alevels\t$parents\t$children\t$dsI\t$gpids\t$dsG\n";
+    }
+    print $FH "Accession\tTerm\tType\tLevels\tParents\tChildren\tDownstream IDs\tGenes\tDownstream Genes\n";
+    if ($grep) {
+        foreach (@output) {
+            print $FH $_ if $_ =~ /$grep/i;
+        }
+    } else {
+        print $FH @output;
+    }
+    exit;
+    
+    
+    
+} elsif ($orgstats) {
+    
+    
+    
+    die "\n$0: --orgstats flag MUST be accompanied by a organism name (\"Genus.\" or \"Genus.species\"), using -o !\n" unless $genspec;
+    die "\n$0: --orgstats flag MUST be accompanied by a database name, using -d !\n" unless $GOdb;
+    
+    print STDERR "\nChecking entries in database $GOdb...\n";
+    my (%taxtable, %ml);
+    my ($genus, $species) = split /\./, $genspec;
+    my $dbhq = DBI->connect("DBI:mysql:database=$GOdb:host=$dbhost",'anonymous','guy#fawkes',{RaiseError=>1}) or die "$0: Cannot connect to $GOdb on $dbhost: $DBI::err() $DBI::errstr()\n";
+    my $qgenus = $dbhq->quote($genus);
+    my ($qspecies, $taxidquery);
+    if ($species eq '*') {
+        $taxidquery = $dbhq->prepare("SELECT ncbi_taxa_id, species FROM species WHERE genus = $qgenus");
+    } else {
+        $qspecies = $dbhq->quote("$species%");
+        $taxidquery = $dbhq->prepare("SELECT ncbi_taxa_id, species FROM species WHERE genus = $qgenus AND species like $qspecies");
+    }
+    $taxidquery->execute();
+    while ( my ($taxon, $spec) = $taxidquery->fetchrow_array() ) {
+        next if ($novirus && $spec =~ /virus/i);	# --novirus eliminates viral results
+        $taxtable{$taxon} = [$spec, $taxon, "$genus $spec", 0, 0, 0];	# last 3 fields will be: gene product count, gpid label count, term count from GO database
+    }
+    $taxidquery->finish();
+    if (scalar (keys %taxtable) == 0) {
+        if ($species eq '') {
+            print STDERR "No entries of genus \"$genus\" were found for any species!\n\n";
+        } else {
+            print STDERR "No entries of genus \"$genus\" were found for any species \"$species*\"!\n\n";
+        }
+        exit;
+    }
+    my $ids = scalar (keys %taxtable) == 1 ? 'id' : 'ids';
+    print STDERR scalar (keys %taxtable)," related taxon $ids found.\nQuerying term/identifier prevalence per taxon...\n";
+    foreach my $taxon (keys %taxtable) {
+        &GO_queries($taxon);
+        my (%labels, %terms);
+        $taxtable{$taxon}->[3] = scalar (keys %{ $idcounts{GPID}{$taxon} });
+        foreach my $labeltype (qw/ SYMB NAME XREF /) {
+            $labels{$_} = 1 foreach (keys %{ $idcounts{$labeltype}{$taxon} });
+        }
+        $taxtable{$taxon}->[4] = scalar (keys %labels);
+        foreach my $gpid (keys %{ $idcounts{GPID}{$taxon} }) {
+            $terms{$_} = 1 foreach (keys %{ $allterms{G2I}{$taxon}{$gpid} });
+        }
+        $taxtable{$taxon}->[5] = scalar (keys %terms);
+    }
+    $dbhq->disconnect;	# disconnect HERE after all &GO_queries are complete
+    $dbh->disconnect;	# disconnect HERE after all &GO_queries are complete
+    my @header = ('Taxon ID', 'Scientific Name', 'Genes', 'Labels', 'Terms');
+    foreach my $i (1..5) {
+        $ml{$i} = length($header[$i-1]) if length($header[$i-1]) > $ml{$i};	# max length for sprintf
+        foreach my $taxon (keys %taxtable) {
+            $ml{$i} = length($taxtable{$taxon}->[$i]) if length($taxtable{$taxon}->[$i]) > $ml{$i};	# ditto
+        }
+    }
+    my $msg = sprintf("%-$ml{1}s  %-$ml{2}s  %-$ml{3}s  %-$ml{4}s  %-$ml{5}s\n", @header);
+    $msg .= sprintf("%$ml{1}d  %-$ml{2}s  %$ml{3}d  %$ml{4}d  %$ml{5}d\n", @{ $taxtable{$_} }[1..5]) foreach (sort { $taxtable{$a}->[0] cmp $taxtable{$b}->[0] } keys %taxtable);
+    print "\n\n" unless $outfile;
+    print $FH $msg;
+    print "\n\n" unless $outfile;
+    exit;
+    
+    
+    
+} elsif ($allparents || $rootpaths) {
+    
+    
+    
+    die "UNDER CONSTRUCTION\n";
+    
+    my $flagname = $allparents ? '--allparents' : '--rootpaths';
+    die "\n$0: $flagname flag MUST be accompanied by a GO accession or accession list, using -a !\n" unless $slimacc;
+    die "\n$0: $flagname flag MUST be accompanied by a taxon id, using -x !\n" unless $taxon;
+    die "\n$0: $flagname flag MUST be accompanied by a database name, using -d !\n" unless $GOdb;
+    &GO_queries($taxon);
+    &get_level_mappings;
+    $dbh->disconnect();
+    
+    my (@slimaccs, %data, $mono);
+    if ($slimacc =~ /^GO:\d+/) {
+        @slimaccs = split /,/, $slimacc;
+        $mono = 1 unless $#slimaccs;   # single-accession entry?
+    } else {
+        %data = %{ read_list($slimacc) };
+        @slimaccs = sort { $data{$a}->[0] <=> $data{$b}->[0] } keys %data;  # sort by input order
+    }
+    
+    my (%parentage, @output);
+    #    push @output, "Input Acc\tInput Name\tParent Acc\tParent Name\n" unless $mono;
+    foreach my $child_acc (@slimaccs) {
+        my ($child_name, $tid) = @{ $accdata{$child_acc} }[1,2];
+        #	my $string;
+        if ($tid) {
+            foreach (keys %{ $relations{C2P}{$tid} }) {
+                $parentage{$child_acc}{ $allterms{I2A}{$_} } = $accdata{ $allterms{I2A}{$_} }->[1];
+                #		my $string = "$allterms{I2A}{$_}\t" . $accdata{ $allterms{I2A}{$_} }->[1];
+                #		$mono ? (push @output, "$string\n") : (push @output, "$child_acc\t$child_name\t$string\n");
+            }
+        } else {
+            $mono ? (push @output, "$child_acc not found!\n") : (push @output, "$child_acc\tnot found!\n");
+        }
+    }
+    print $FH @output;
+    exit;
+    
+    
+    
+} elsif ($parents) {
+    
+    
+    
+    die "\n$0: --parents flag MUST be accompanied by a GO accession or accession list, using -a !\n" unless $slimacc;
+    die "\n$0: --parents flag MUST be accompanied by a taxon id, using -x !\n" unless $taxon;
+    die "\n$0: --parents flag MUST be accompanied by a database name, using -d !\n" unless $GOdb;
+    &GO_queries($taxon);
+    &get_level_mappings;
+    $dbh->disconnect();
+    
+    my (@slimaccs, %data, $mono);
+    if ($slimacc =~ /^GO:\d+/) {
+        @slimaccs = split /,/, $slimacc;
+        $mono = 1 unless $#slimaccs;   # single-accession entry?
+    } else {
+        %data = %{ read_list($slimacc) };
+        @slimaccs = sort { $data{$a}->[0] <=> $data{$b}->[0] } keys %data;  # sort by input order
+    }
+    
+    my @output;
+    push @output, "Input Acc\tInput Name\tParent Acc\tParent Name\n" unless $mono;
+    foreach my $child_acc (@slimaccs) {
+        my ($child_name, $tid) = @{ $accdata{$child_acc} }[1,2];
+        my $string;
+        if ($tid) {
+            foreach (keys %{ $relations{C2P}{$tid} }) {
+                my $string = "$allterms{I2A}{$_}\t" . $accdata{ $allterms{I2A}{$_} }->[1];
+                $mono ? (push @output, "$string\n") : (push @output, "$child_acc\t$child_name\t$string\n");
+            }
+        } else {
+            $mono ? (push @output, "$child_acc not found!\n") : (push @output, "$child_acc\tnot found!\n");
+        }
+    }
+    print $FH @output;
+    exit;
+    
+    
+    
+} elsif ($children) {
+    
+    
+    
+    die "\n$0: --children flag MUST be accompanied by a GO accession or accession list, using -a !\n" unless $slimacc;
+    die "\n$0: --children flag MUST be accompanied by a taxon id, using -x !\n" unless $taxon;
+    die "\n$0: --children flag MUST be accompanied by a database name, using -d !\n" unless $GOdb;
+    &GO_queries($taxon);
+    &get_level_mappings;
+    $dbh->disconnect();
+    
+    my (@slimaccs, %data, $mono);
+    if ($slimacc =~ /^GO:\d+/) {
+        @slimaccs = split /,/, $slimacc;
+        $mono = 1 unless $#slimaccs;   # single-accession entry?
+    } else {
+        %data = %{ read_list($slimacc) };
+        @slimaccs = sort { $data{$a}->[0] <=> $data{$b}->[0] } keys %data;  # sort by input order
+    }
+    
+    my @output;
+    push @output, "Input Acc\tInput Name\tChild Acc\tChild Name\n" unless $mono;
+    foreach my $parent_acc (@slimaccs) {
+        my ($parent_name, $tid) = @{ $accdata{$parent_acc} }[1,2];
+        my $string;
+        if ($tid) {
+            foreach (keys %{ $relations{P2C}{$tid} }) {
+                my $string = "$allterms{I2A}{$_}\t" . $accdata{ $allterms{I2A}{$_} }->[1];
+                $mono ? (push @output, "$string\n") : (push @output, "$parent_acc\t$parent_name\t$string\n");
+            }
+        } else {
+            $mono ? (push @output, "$parent_acc not found!\n") : (push @output, "$parent_acc\tnot found!\n");
+        }
+    }
+    print $FH @output;
+    exit;
+    
+    
+    
+} elsif ($nca) {
+    
+    
+    
+    die "\n$0: --nca flag MUST be accompanied by a GO accession or accession list, using -a !\n" unless $slimacc;
+    die "\n$0: --nca flag MUST be accompanied by a taxon id, using -x !\n" unless $taxon;
+    die "\n$0: --nca flag MUST be accompanied by a database name, using -d !\n" unless $GOdb;
+    &GO_queries($taxon);
+    &get_level_mappings;
+    $dbh->disconnect();
+    
+    my (@slimaccs, %data);
+    if ($slimacc =~ /^GO:\d+/) {
+        @slimaccs = split /,/, $slimacc;
+    } else {
+        %data = %{ read_list($slimacc) };
+        @slimaccs = sort { $data{$a}->[0] <=> $data{$b}->[0] } keys %data;  # sort by input order
+    }
+    
+    my (%ancestry, @NCAs, $i, $prev_n);
+    foreach my $acc (@slimaccs) {
+        my $tid = $accdata{$acc}->[2];
+        next unless $tid;
+        $ancestry{$acc}{$tid} = 1;   # always add self
+        $ancestry{$acc}{$_} = 1 foreach keys %{ $relations{C2P}{$tid} };   # initialize with parents
+        $prev_n += scalar keys %{ $ancestry{$acc} };
+    }
+    {
+        @NCAs = @{ find_nca(\%ancestry) };
+        unless (@NCAs) {  # nothing in common; go up one level
+            $i++;
+            my $n;
+            foreach my $acc (@slimaccs) {
+                foreach my $parent (keys %{ $ancestry{$acc} }) {
+                    #		    print STDERR "$i: $acc: $parent\n";
+                    $ancestry{$acc}{$_} = 1 foreach keys %{ $relations{C2P}{$parent} };  # add more ancestors
+                    $n += scalar keys %{ $ancestry{$acc} };
+                }
+            }
+            #	    print STDERR "$n vs $prev_n\n"; sleep 1;
+            $prev_n = $n;
+            redo;   # keep adding ancestors until all terms have at least one in common.  Returns root, if nothing else.
+        }
+    }
+    print $FH $allterms{I2A}{$_} . "\t" . $accdata{ $allterms{I2A}{$_} }->[1] ."\n" foreach @NCAs;
+    exit;
+    
+    
+    
+} else {
+    
+    
+    
+    die "$0: Unknown flag!\n";
+    
+    
+    
+}
+exit;
+
+
+
+
+
+sub GO_queries {		# primary queries for GO terms and gene identifiers
+
+    my $TAXON = shift;
+
+    ### Create DB connection
+    $dbh = DBI->connect("DBI:mysql:database=$GOdb:host=$dbhost",'anonymous','guy#fawkes',{RaiseError=>1}) or die "$0: Cannot connect to $GOdb on $dbhost: $DBI::err() $DBI::errstr()\n";
+
+    ### Preliminaries
+    &root_query($dbh);
+    &term_query($TAXON, $dbh);
+    
+    ### Create queries
+    my $idquery1_sql = "
+		SELECT	DISTINCT gp.symbol,
+			gp.full_name,
+			gp.id
+		FROM	gene_product gp,
+			species s
+		WHERE	gp.species_id = s.id
+	";
+    my $idquery2_sql = "
+		SELECT	DISTINCT d.xref_key, 
+			gp.id
+		FROM	dbxref d,
+			gene_product gp,
+			species s
+		WHERE	gp.dbxref_id = d.id
+			AND gp.species_id = s.id
+	";
+    my $gp2tquery_sql = "
+		SELECT	gp.id,
+			t.id
+		FROM	gene_product gp,
+			species s,
+			association a,
+			term t
+		WHERE	gp.species_id = s.id
+			AND gp.id = a.gene_product_id
+			AND a.term_id = t.id
+			AND t.is_relation = 0
+			AND t.is_obsolete = 0
+	";
+    
+    if ($TAXON) {
+        my $append = " AND s.ncbi_taxa_id = $TAXON";
+        $idquery1_sql .= $append;
+        $idquery2_sql .= $append;
+        $gp2tquery_sql .= $append;
+    } else {
+        $TAXON = 'ALL';  # need some value, going forward
+    }
+    
+    my $idquery1 = $dbh->prepare($idquery1_sql);
+    my $idquery2 = $dbh->prepare($idquery2_sql);
+    my $gp2tquery = $dbh->prepare($gp2tquery_sql);
+    
+    #    my $termquery = $dbh->prepare("SELECT id, term_type, acc, name, is_obsolete FROM term WHERE is_relation = 0");
+    #
+    #    ### Special handling for level 0,1 terms
+    #    %four_names = (
+    #	"all" => [0, "universal", 'ALL'], 
+    #	"biological_process" => [0, "biological process unknown", 'BP'], 
+    #	"cellular_component" => [0, "cellular component unknown", 'CC'], 
+    #	"molecular_function" => [0, "molecular function unknown", 'MF'] 
+    #	);	# term id, preferred name, short type name
+    #
+    #    foreach my $name (keys %four_names) {
+    #	my $qname = $dbh->quote($name);
+    #	my $tid;
+    #	
+    #	## Get these particular IDs
+    #	my $sth1 = $dbh->prepare("select id from term where name = $qname");
+    #	$sth1->execute();
+    #	while ( ($tid) = $sth1->fetchrow_array() ) {
+    #	    $four_names{$name}->[0] = $tid;
+    #	    $ignore{$tid} = $four_names{$name}->[2];
+    #	}
+    #	warn "Error retrieving data: $sth1->errstr()\n" if $sth1->err();
+    #	$sth1->finish;
+    #    }
+    #    $universal = $four_names{all}->[0];
+    
+    ### Run primary queries
+    print STDERR "Querying all DB identifiers...\n" unless ($orgstats || $getdbids);
+    $idquery1->execute();
+    while ( my ($symbol, $name, $gpid) = $idquery1->fetchrow_array() ) {
+        $idtable{2}{$TAXON}{$symbol} = $gpid;		# $idtable{2}{$TAXON} goes from external ID to internal (gene product) ID
+        $idtable{2}{$TAXON}{$name} = $gpid;
+        $idtable{1}{$TAXON}{$gpid}{$symbol} = 'S';	# $idtable{1}{$TAXON} goes from internal (gene product) ID to external ID
+        $idtable{1}{$TAXON}{$gpid}{$name} = 'N';
+        $idcounts{GPID}{$TAXON}{$gpid} = 1;		#  $gpids from name, symbol associations
+        $idcounts{SYMB}{$TAXON}{$symbol} = 1;
+        $idcounts{NAME}{$TAXON}{$name} = 1;
+        $idtrack{$TAXON}{1}{$gpid} = 1;
+    }
+    warn "Error retrieving data: $idquery1->errstr()\n" if $idquery1->err();
+    $idquery1->finish();
+    
+    $idquery2->execute();
+    while ( my ($xid, $gpid) = $idquery2->fetchrow_array() ) {
+        $idtable{2}{$TAXON}{$xid} = $gpid;
+        $idtable{1}{$TAXON}{$gpid}{$xid} = 'X';
+        $idcounts{GPID}{$TAXON}{$gpid} = 1;		# $gpids from xref associations
+        $idcounts{XREF}{$TAXON}{$xid} = 1;
+        $idtrack{$TAXON}{2}{$gpid} = 1;
+    }
+    warn "Error retrieving data: $idquery2->errstr()\n" if $idquery2->err();
+    $idquery2->finish();
+    
+    #open IDS, "> $wdir/idtable_2_dump.txt" or warn "Cannot create file '$wdir/idtable_2_dump.txt': $!\n";
+    #print IDS Dumper(\%{ $idtable{2}{$TAXON} }),"\n";
+    #close IDS;
+    
+    ### Query all GO terms and assign to known identifiers
+    
+    #    print STDERR "Querying all GO terms...\n" unless ($orgstats || $getdbids);
+    #    $termquery->execute();
+    #    while ( my ($tid, $type, $acc, $name, $obsolete) = $termquery->fetchrow_array() ) {
+    #	if ($obsolete) {
+    #	    $obsoletes{T2A}{$tid}{$acc} = 1;	# for slim lists -- some may have obsolete accessions
+    #	    $obsoletes{A2T}{$acc}{$tid} = 1;	# for slim lists -- some may have obsolete accessions
+    #	} else {
+    #	    $allterms{I2A}{$tid} = $acc;				# NO TAXON specificity -- this is ALL terms
+    #	    $accdata{$acc} = [$four_names{$type}->[2], $name, $tid];	# switching long type name to short type name
+    #	    $idtrack{$TAXON}{3}{$tid} = 1;
+    #	}
+    #    }
+    #    warn "Error retrieving data: $termquery->errstr()\n" if $termquery->err();
+    #    $termquery->finish();
+    
+    print STDERR "Querying gene-term relationships...\n" unless ($orgstats || $getdbids);
+    $gp2tquery->execute();
+    while ( my ($gpid, $tid) = $gp2tquery->fetchrow_array() ) {
+        $allterms{G2I}{$TAXON}{$gpid}{$tid} = 1;
+        $allterms{I2G}{$TAXON}{$tid}{$gpid} = 1;
+        $idtrack{$TAXON}{4}{$gpid} = 1;
+        $idtrack{$TAXON}{5}{$tid} = 1;
+    }
+    warn "Error retrieving data: $gp2tquery->errstr()\n" if $gp2tquery->err();
+    $gp2tquery->finish();
+
+    unless (%termlevels) {
+        my $childquery = $dbh->prepare("SELECT DISTINCT term2_id, distance FROM graph_path WHERE term1_id = ?");
+        print STDERR "Mapping GO terms to levels...\n";
+        $childquery->bind_param(1, $four_names{all}->[0]);
+        $childquery->execute();
+        while ( my ($tid, $level) = $childquery->fetchrow_array() ) {
+            if (exists $allterms{I2A}{$tid}) {		# no relationships or obsoletes
+                $termlevels{T2L}{$tid}{$level} = 1;
+                $termlevels{L2T}{$level}{$tid} = 1;
+                $maxlevel = $level if $level > $maxlevel;
+            }
+        }
+        warn "Error retrieving data: $childquery->errstr()\n" if $childquery->err();
+        $childquery->finish();
+    }
+}
+
+
+sub root_query {
+    
+    my $DBH = shift;
+    
+    my $local_dbh;
+    unless ($DBH) {
+        $DBH = DBI->connect("DBI:mysql:database=$GOdb:host=$dbhost",'anonymous','guy#fawkes',{RaiseError=>1}) or die "$0: Cannot connect to $GOdb on $dbhost: $DBI::err() $DBI::errstr()\n";
+        $local_dbh = 1;
+    }
+    
+    ### Special handling for level 0,1 terms
+    %four_names = (
+        "all" => [0, "universal", 'ALL'], 
+        "biological_process" => [0, "biological process unknown", 'BP'], 
+        "cellular_component" => [0, "cellular component unknown", 'CC'], 
+        "molecular_function" => [0, "molecular function unknown", 'MF'] 
+        );	# term id, preferred name, short type name
+    
+    foreach my $name (keys %four_names) {
+        my $qname = $DBH->quote($name);
+        my $tid;
+        
+        ## Get these particular IDs
+        my $sth1 = $DBH->prepare("select id from term where name = $qname");
+        $sth1->execute();
+        while ( ($tid) = $sth1->fetchrow_array() ) {
+            $four_names{$name}->[0] = $tid;
+            $ignore{$tid} = $four_names{$name}->[2];
+        }
+        warn "Error retrieving data: $sth1->errstr()\n" if $sth1->err();
+        $sth1->finish;
+    }
+    $universal = $four_names{all}->[0];
+    
+    $DBH->disconnect() if $local_dbh;
+}
+
+
+sub term_query {
+    
+    my ($TAXON2, $DBH) = @_;
+    $TAXON2 = '' if $TAXON2 eq 'ALL';
+    
+    my $local_dbh;
+    unless ($DBH) {
+        $DBH = DBI->connect("DBI:mysql:database=$GOdb:host=$dbhost",'anonymous','guy#fawkes',{RaiseError=>1}) or die "$0: Cannot connect to $GOdb on $dbhost: $DBI::err() $DBI::errstr()\n";
+        $local_dbh = 1;
+    }
+    my $termquery = $DBH->prepare("SELECT id, term_type, acc, name, is_obsolete FROM term WHERE is_relation = 0");
+    
+    print STDERR "Querying all GO terms...\n" unless ($orgstats || $getdbids);
+    $termquery->execute();
+    while ( my ($tid, $type, $acc, $name, $obsolete) = $termquery->fetchrow_array() ) {
+        if ($obsolete) {
+            $obsoletes{T2A}{$tid}{$acc} = 1;	# for slim lists -- some may have obsolete accessions
+            $obsoletes{A2T}{$acc}{$tid} = 1;	# for slim lists -- some may have obsolete accessions
+        } else {
+            $allterms{I2A}{$tid} = $acc;				# NO TAXON specificity -- this is ALL terms
+            $accdata{$acc} = [$four_names{$type}->[2], $name, $tid];	# switching long type name to short type name
+            $idtrack{$TAXON2}{3}{$tid} = 1;
+        }
+    }
+    warn "Error retrieving data: $termquery->errstr()\n" if $termquery->err();
+    $termquery->finish();
+    
+    $DBH->disconnect() if $local_dbh;
+}
+
+
+sub get_level_mappings {
+
+    if (-e "$cachedir/${GOdb}_relations_dump.dat" && -e "$cachedir/${GOdb}_levelmap_dump.dat") {
+        my $Rref = retrieve("$cachedir/${GOdb}_relations_dump.dat") or warn "Cannot retrieve \%relations from file '$cachedir/${GOdb}_relations_dump.dat': $!";
+        %relations = %$Rref if $Rref;
+        print STDERR "\%relations regenerated from file '$cachedir/${GOdb}_relations_dump.dat'\n";
+        my $Lref = retrieve("$cachedir/${GOdb}_levelmap_dump.dat") or warn "Cannot retrieve \%levelmap from file '$cachedir/${GOdb}_levelmap_dump.dat': $!";
+        %levelmap = %$Lref if $Lref;
+        print STDERR "\%levelmap regenerated from file '$cachedir/${GOdb}_levelmap_dump.dat'\n";
+    }
+
+    ## Get all IDs and their levels (from root); also get immediate children & parents
+    
+    unless (%relations && %levelmap) {
+
+        my $childquery = $dbh->prepare("SELECT DISTINCT term2_id, distance FROM graph_path WHERE term1_id = ?");
+        my $parentquery = $dbh->prepare("SELECT DISTINCT term1_id, distance FROM graph_path WHERE term2_id = ?");
+        ########## have a query to investigate gene_product_count table somewhere....
+        ########## WHY DO SOME TIDS NOT HAVE PARENTS????   For instance GO:000177[347]
+        print STDERR "Mapping downstream GO terms to upper levels...\n";
+        foreach my $level (0..$maxlevel) {
+            my $at_this_level = scalar (keys %{ $termlevels{L2T}{$level} });
+            my %downstreams;
+            foreach my $tid (keys %{ $termlevels{L2T}{$level} }) {		# all terms at level $level
+                $childquery->bind_param(1, $tid);
+                $childquery->execute();
+                while ( my ($tid2, $dist) = $childquery->fetchrow_array() ) {
+                    if ($allterms{I2A}{$tid2}) {				 # no relationships or obsoletes
+                        $levelmap{L}{$level}{$tid}{$tid2} = 1 if $dist > 0;	 # for each $tid at level $level, what are its downstream $tids? (NO SELF)
+                        $levelmap{T}{$tid2}{$level}{$tid} = 1;			 # for each $tid2, what are its level-$level parental mappings? (NEED SELF)
+                        #print STDERR "$tid child = $tid2 @ $dist\n" if $tid == 19;
+                        $relations{P2C}{$tid}{$tid2}{$level} = 1 if $dist == 1;  # $tid is parent, $tid2 is child
+                        $downstreams{$tid2} = 1;
+                    }
+                }
+                warn "Error retrieving data: $childquery->errstr()\n" if $childquery->err();
+                $childquery->finish();
+                
+                $parentquery->bind_param(1, $tid);
+                $parentquery->execute();
+                while ( my ($tid2, $dist) = $parentquery->fetchrow_array() ) {
+                    if ($allterms{I2A}{$tid2} && $tid2 != $tid) {		  # no relationships, obsoletes, or self-references
+			#print STDERR "$tid parent = $tid2 @ $dist\n" if $tid == 19;
+                        $relations{C2P}{$tid}{$tid2}{$level} = 1 if $dist == 1;   # $tid is child, $tid2 is parent
+                    }
+                }
+                warn "Error retrieving data: $parentquery->errstr()\n" if $parentquery->err();
+                $parentquery->finish();
+            }
+            printf STDERR "Level %2d: %5d terms | %5d children.\n", $level, $at_this_level, scalar (keys %downstreams);
+        }
+        print STDERR "Storing '$cachedir/${GOdb}_relations_dump.dat' for next time...\n";
+        nstore(\%relations,"$cachedir/${GOdb}_relations_dump.dat") or warn "Cannot store \%relations in file '$cachedir/${GOdb}_relations_dump.dat': $!";
+        print STDERR "Storing '$cachedir/${GOdb}_levelmap_dump.dat' for next time...\n";
+        nstore(\%levelmap,"$cachedir/${GOdb}_levelmap_dump.dat") or warn "Cannot store \%levelmap in file '$cachedir/${GOdb}_levelmap_dump.dat': $!";
+    }
+}
+
+
+sub impute_parents {
+    
+    ## Prints all child->parent relations for a term
+    ## Imputes parents for gaps in the graph, i.e., $taxon-annotated children with no $taxon-annotated parents
+    ##  i.e.: child term is annotated to genes from org X, but no parent terms are annotated to any genes from org X.
+    ##        so, rootward path must be imputed from terms which are NOT directly annotated to org X.
+    ##        this is known to be buggy, and can include terms which are biologically unrelated to the organism, like 'leaf development' in mouse, etc.
+    
+    my ($childtid, $iter, $print_CPR) = @_;
+    $alliters{$iter}++;
+    
+    next if $ignore{$childtid};
+    if ($iter == 0) {
+        next unless $allterms{I2G}{$taxon}{$childtid};	# only skip if NOT reparenting
+    }
+    my ($childacc, $childflag);
+    $childflag = 1 if $allterms{I2G}{$taxon}{$childtid};
+    ($allterms{I2A}{$childtid}) ? ($childacc = $allterms{I2A}{$childtid}) : ($childacc = [keys %{ $obsoletes{T2A}{$childtid} }]->[0]);
+    my ($type, $childname) = @{ $accdata{$childacc} }[0,1];
+    foreach my $parenttid (keys %{ $relations{C2P}{$childtid} }) {
+        next if $parenttid == $childtid;
+        unless ($allterms{I2G}{$taxon}{$parenttid}) {
+            ## parent not already annotated to species?  Have to add as new child, then impute its parents.
+            push @reparent, $parenttid;
+            $allterms{I2G}{$taxon}{$parenttid}{'.'} = 1 unless $print_CPR;  # if term mappings object needs to be expanded, then pseudo-annotate parent $tid to $taxon via fake gene ID '.'
+        }
+        my ($parentacc, $parentflag);
+        ($allterms{I2A}{$parenttid}) ? ($parentacc = $allterms{I2A}{$parenttid}) : ($parentacc = [keys %{ $obsoletes{T2A}{$parenttid} }]->[0]);
+        my ($ptype, $parentname) = @{ $accdata{$parentacc} }[0,1];
+        if ($type ne $ptype) {
+            print STDERR "Type mismatch: $childacc $childname ($type) <=> $parentacc $parentname ($ptype)!\n";
+        } elsif ($print_CPR) {
+            ## &impute_parents being run for text output only
+            $output{$type}{"$type\t$childacc\t$childname\t$parentacc\t$parentname\n"} = 1;
+            #$parentflag = 1 if $allterms{I2G}{$taxon}{$parenttid};
+            #$output{$type}{"$type\t$childacc\t$childname\t$childflag\t$parentacc\t$parentname\t$parentflag\n"} = 1;
+        }
+    }
+}
+
+
+sub write_termgene {
+    my ($GPID, $TID, $TYPE, $DIR) = @_;
+    next if $ignore{$TID}; 	# removes the generic / unknown GO terms
+    next if $write_termgene_already{$GPID}{$TID};
+    my $acc = $allterms{I2A}{$TID};
+    my ($type, $name) = @{ $accdata{$acc} }[0,1];
+    next unless $type eq $TYPE;
+    my @xrefs;
+    foreach my $attrib (keys %{ $idtable{1}{$taxon}{$GPID} }) {
+        push @xrefs, $attrib if $idtable{1}{$taxon}{$GPID}{$attrib} eq 'X';
+    }
+    print $FH join("\t", $type, $acc, $name, $_, "$DIR\n") foreach @xrefs;
+    $write_termgene_already{$GPID}{$TID} = 1;
+}
+
+
+sub read_list {
+
+    my $FILE = shift;
+    my %data;
+    open IN, $FILE or die "$0: Could not open file '$FILE': $!\n";
+    while (<IN>) {
+        $_ =~ s/[\n\r]+$//;
+        my ($key, @else) = split /\t/, $_;
+        $data{$key} = [$., @else];   # first value is line number, to preserve input order
+    }
+    close IN;
+    return \%data;
+}
+
+
+sub find_nca {
+    
+    my $ref = shift;
+    my %hash = %$ref;
+    my (%nca, @ncas);
+    my $N = scalar keys %hash;  # number of accs
+    
+    foreach my $acc (keys %hash) {
+        $nca{$_}++ foreach keys %{ $hash{$acc} };
+    }
+    foreach (keys %nca) {
+        push @ncas, $_ if $nca{$_} == $N;  # ancestor term extant for all accessions
+    }
+    return \@ncas;
+}
+
+
+sub getmyancestors {
+    my $TID = shift;
+    my %ANC;
+    my @parents = keys %{ $relations{C2P}{$TID} };  # initialize
+    {
+        my @newparents;
+        foreach my $parent (@parents) {
+            $ANC{$parent} = 1;
+            push @newparents, $_ foreach keys %{ $relations{C2P}{$parent} };
+        }
+        if (@newparents) {
+            @parents = @newparents;
+            redo;
+        }
+    }
+    return \%ANC;
+}
+
+
+sub namecmp {
+    my $A = $accdata{ $allterms{I2A}{$a} }->[1];
+    my $B = $accdata{ $allterms{I2A}{$b} }->[1];
+    $A = "\L$A";
+    $B = "\L$B";
+    my $x = $A cmp $B;
+    #    print "$A, $B, $x\n";
+    return $x;
+}
+

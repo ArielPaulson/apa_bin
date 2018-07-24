@@ -1,0 +1,75 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+die "$0: No inputs specified!\n" unless @ARGV;
+
+## Inputs
+my $out;       # output file
+my @inputs;    # list of dataset files (arguments left over from GetOptions)
+my $dirname;   # use dataset file directory for column name? (otherwise, filename as given)
+my $nodirname; # remove dataset file directory from file name to create column name? (otherwise, filename as given)
+my $strip;     # any other substring (regexp) to remove from dataset file name during column name conversion
+# and @ARGV = list of "samtools idxstats" outputs
+
+
+GetOptions(
+    "o=s" => \$out, 
+    "strip=s" => \$strip, 
+    "dirname" => \$dirname, 
+    "nodirname" => \$nodirname
+    );
+@inputs = @ARGV;
+
+
+## Globals
+my @names;   # filenames (become rownames)
+my %reads;  # reads per chr
+my %lens;   # chr length
+
+
+## Output handles
+my $OUT;
+if ($out) {
+    open $OUT, '>', $out or die "$0: Cannot write to output file '$out': $!\n";
+} else {
+    $OUT = *STDOUT;
+}
+
+
+## Main
+foreach my $i (0..$#inputs) {
+    my $file = $inputs[$i];
+    
+    ## decide on sample name
+    my $name;
+    if ($dirname) {
+	($name) = ($file =~ /([^\/]+)\/[^\/]+$/);  # only the file's parent directory
+    } elsif ($nodirname) {
+	($name) = ($file =~ /([^\/]+)$/);  # only the file's name
+    } else {
+	$name = $file;  # file's path as given
+    }
+    $name =~ s/$strip//;
+    push @names, $name;
+    
+    open my $IN, '<', $file;
+     while (<$IN>) {
+	my ($chr, $length, $mapped, $unmapped) = split /\t/, $_;
+	next if $chr eq '*';
+	$reads{$chr}{$name} = $mapped;
+	$lens{$chr} = $length;
+    }
+    close $IN;
+}
+
+
+## write all-sample matrix
+print $OUT join ("\t", ("Sequence\tLength", @names)), "\n";
+foreach my $chr (sort keys %reads) {
+    print $OUT join ("\t", ("$chr\t$lens{$chr}", map { $reads{$chr}{$_} } @names)), "\n";
+}
+close $OUT;
+exit;
+

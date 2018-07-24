@@ -1,0 +1,936 @@
+#!/usr/bin/env perl
+#$Id$
+
+# Copyright © 2010, Stowers Institute for Medical Research.  All rights reserved.
+
+# c.f. attached LICENSE
+
+=pod
+
+=head1 SYNOPSIS
+
+fimoPlus is a FIMO wrapper.  Given some inputs and parameters, it will use FIMO to find motifs (or grep to find kmers) in a foreground and background, and test enrichments for found motifs.
+
+=head1 OPTIONS
+
+=over
+
+=item S<CORE OPTIONS>
+
+=over
+
+=item B<-f foreground_fasta>
+
+The fasta file of "foreground" sequences, e.g. peaks, promoters, etc.
+
+=item B<-b background_fasta>
+
+The fasta file of "background" sequences, e.g. random peaks, scrambled promoters, etc.
+
+=item B<-o, -oc output_dir>
+
+The directory to write results to.  Will die if directory already exists.  Default 'fimoPlus_out'.  If '-o', will die if directory already exists.  If '-oc', clobbers output dir (overwrites, if already exists).
+
+=item B<-m motif_database(s)>
+
+Either a meme.txt file, or a meme-formatted motif database (e.g. transfac.meme).  If > 1 database, enter a comma-separated string of database paths (no spaces).  Motif IDs must be unique across all databases used, as only one evaluation is made per unique ID.  For reference, MEME IDs will be integers 1-N; Transfac IDs are 'M' followed by 5 digits.
+
+=item B<--more>
+
+Calculate more data columns per motif hit than FIMO normally returns (also compatible with --grep).  Specifically, five new statistics are calculated per match:
+
+=over
+
+=item B<Average Probability>
+
+The mean probability of occurrence for the found word, given the PSSM (or degenerate word).
+
+=item B<Maximum Probability>
+
+The highest probability for any word generatable by the PSSM, for reference.
+
+=item B<Probability Percent (of Maximum)>
+
+The average as a percent of the maximum, basically, normalized to the most-possible word.
+
+=item B<Impossible Positions>
+
+Number of positions in match which are literally impossible given the PSSM, as a percent. For instance, match reporting 'C' at a position where PSSM has C = 0, is considered "impossible".
+
+=item B<Invariant Positions>
+
+Number of invariant positions in the PSSM which were correctly matched, as a percent.
+
+=back
+
+=item B<--keep>
+
+Keep intermediate data; don't delete on exit.
+
+=item B<--visualize>
+
+Experimental option.  Generate seqLogo plots for each found motif, based on the PSSM built from the matches.  If using this option, may want to lower the '-p' p-value to raise the quality of the hits.
+
+=back
+
+=item S<FIMO Options>
+
+=over
+
+=item B<-p p_value_threshold>
+
+Specify the maximum p-value allowed for FIMO motif matches.  Default is FIMO default, 0.0001.
+
+=item B<-p2 p_value_threshold_2>
+
+Causes the fimoPlus script to calculate motif enrichments over the motif match p-value range [p_value, p_value_2]; increments are in powers of 10.  Thus, using -p 0.01 and -p2 0.00001 will evaluate enrichments 4 times, using p = { 0.01 0.001 0.0001 0.00001 }, and only motif instances at or below that p-value will be considered. 
+
+=item B<--calc-q>
+
+Allow FIMO to calculate q-values for motif matches.  RUNTIME WARNING: EVEN FOR MEDIUM-SIZED DATASETS, THIS CAN TAKE HOURS.  Off by default; p-value thresholding is usually sufficient.
+
+=item B<-q q_value_threshold>
+
+If using --calc-q, then specify the maximum q-value allowed for FIMO motif matches.  Default is FIMO default, 1.
+
+=item B<--no-rc>
+
+Motif matches must be on forward strand only (sequence as-is).  Off by default (so revcomp searching is the default).
+
+=back
+
+=item S<Tomtom Options>
+
+=over
+
+=item B<-t tomtom.txt>
+
+If the motif database is actually a MEME run, and Tomtom results for it exist, point '-t' to the pertinent 'tomtom.txt'.  Putative Tomtom identities per motif will be included in final results.
+
+=item B<-td tomtom_motif_database>
+
+If a Tomtom run was specified, the motif database used for that run should also be specified.  Otherwise, Tomtom matches will not be converted motif names.
+
+=back
+
+=item S<Non-FIMO Motif Options>
+
+=over
+
+=item B<--grep>
+
+Indicates to find motif instances via grep instead of FIMO.  Motif regular expressions are used.  This can be preferable when searching for exact words, because FIMO's scoring method allows fixed positions to vary.  If using this option with a PSSM-defined set of motifs, each PSSM will be converted to a degenerate consensus.  Take account of -a and -nw below, as these affect the way in which PSSMs are converted.
+
+=item B<-a alphabet>
+
+Sequence type, default 'DNA'.  Can also be 'RNA' or 'AA'.  Used for defining degenerate letters.
+
+#=item B<-xa max_amino_acid_count>
+#
+#Only if using '-a AA'.  For a given position in the PSSM, this is the max number of residues above the min weight threshold (-nw below) before the position is called 'X'.  
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+
+=item B<-nw min_base_weight>
+
+At each position in the PSSM, this sets minimum weight required for a base to be considered.  Default 0.15.  Thus, if a base has < 15% frequency at a given position, it is considered to be absent.
+
+Basically, degeneracy calling is controlled by -nw.  The following is true for alphabet 'DNA': if all 4 bases are above min weight, position call is N; if only 3 above, call will be from { B V D H }; if only 2, call will be from { R Y M W K S }; if only 1, call will be from { A C G T }.
+
+=back
+
+=item S<OTHERS>
+
+=over
+
+=item B<--help>
+
+Display command line usage with options.
+
+=item B<--man>
+
+Display complete manual page and exit.
+
+=head1 RUNNING
+
+=head1 OUTPUTS
+
+=over
+
+=item B<>
+
+=back
+
+=head1 EXAMPLES
+
+=over
+
+=item C<>
+
+=back
+
+=head1 VERSION
+
+$Revision:  1.0$
+
+=head1 AUTHOR
+
+Ariel Paulson (apa@stowers-institute.org)
+
+=head1 DEPENDENCIES
+
+perl
+
+=head1 AVAILABILITY
+
+Download at will.
+
+=cut
+
+
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+use Cwd;
+
+
+my $wd = cwd();
+#my $fimo = 'fimo_4.8.1';  # sitewide
+my $fimo = 'fimo';  # sitewide
+my $maxscores = 1E12;  # fimo max stored scores (should be effectively limitless)
+my $autop;  # automatically determine p-value threshold (by kill-curves)
+
+my $o = 'fimoPlus_out';
+my $alpha = 'DNA';
+my ($minwt, $maxaa) = (0.15, 6);
+my ($p, $q) = (0.0001, 1);   # fimo p, q defaults; p2 (below) allows enrichment evaluation over the range p-p2 (increments in powers of 10)
+my ($fgfa, $bgfa, $motfile, $norc, $p, $p2, $q, $oc, $tomtom, $tomdb, $collapse, $filter, $more, $calcQ, $grep, $visualize, $keep, $help, $man);
+GetOptions("f=s"=>\$fgfa, "b=s"=>\$bgfa, "m=s"=>\$motfile, "p=s"=>\$p, "p2=f"=>\$p2, "q=f"=>\$q, "o=s"=>\$o, "oc=s"=>\$oc, "a=s"=>\$alpha, "t=s"=>\$tomtom, "td=s"=>\$tomdb, "nw=f"=>\$minwt, "xa=i"=>\$maxaa, "c=s" => \$collapse, "norc"=>\$norc, "filter"=>\$filter, "more"=>\$more, "calc-q"=>\$calcQ, "grep"=>\$grep, "visualize"=>\$visualize, "keep"=>\$keep) or pod2usage(1);
+
+pod2usage(1) if $help;
+pod2usage(-exitstatus => 0, -verbose => 2) if $man;
+
+$o = $oc if $oc;
+if ($p =~ /^auto$/i) {
+    $autop = 1;
+    $p = 0.01;   # initial p-value for FIMO run
+} else {
+    $p2 = $p unless $p2;
+    die "$0: p-value 2 '$p2' cannot be greater than p-value 1 '$p'!\n" if $p2 > $p;
+    if ($grep) {
+	print "P-values not meaningful when using --grep!  Setting to 1.\n" if ($p != 0.0001 || $p2);  # only print if user changed defaults
+	$p = $p2 = 1;
+    }
+}
+
+die "$0: Minimum position weight threshold '$minwt' must be between 0 and 1!\n" unless ($minwt >= 0 && $minwt <= 1);
+die "$0: Foreground fasta '$fgfa' does not exist!\n" unless -e $fgfa;
+die "$0: Background fasta '$bgfa' does not exist!\n" if ($bgfa && !-e $bgfa);
+
+my @motfiles = split /,/, $motfile;
+foreach (@motfiles) {
+    die "$0: Unable to read motif DB '$_': $!\n" unless -e $_;
+    $_ = "$wd/$_" unless $_ =~ /^\//;  # ensure rooted path
+}
+$motfile = join ',', @motfiles;   # regenerate using rooted paths
+
+my $outdir = "$wd/$o";
+my $fgout = "$outdir/fg_fimoplus.txt";
+my $bgout = "$outdir/bg_fimoplus.txt";
+my $tomout = "$outdir/tomtom.txt";
+
+my $temp = "$outdir/tmp";
+my $fgtempdir = "$temp/fg";
+my $bgtempdir = "$temp/bg";
+my $fgtemp = "$fgtempdir/fimo.txt";
+my $bgtemp = "$bgtempdir/fimo.txt";
+
+if ($oc) {
+    system "rm -Rf $o";
+} else {
+    die "$0: Output dir '$o' already exists!  Use -oc to overwrite.\n" if -d $o;
+}
+system "mkdir -p $o";
+die "$0: Failed to create output directory '$o'!\n" unless -d $o;
+
+unless ($grep) {
+    system "mkdir -p $temp";
+    die "$0: Failed to create temp dir '$temp'!\n" unless -d $temp;
+    system "mkdir -p $temp/fg";
+    system "mkdir -p $temp/bg" if $bgfa;
+}
+
+my $pflag = $p ? "--output-pthresh $p" : '';
+my $qflag = $q ? "--output-qthresh $q" : '';
+
+my ($bglf, $motif, $name, $i, %motifData, %collapsable, %freq, @motifs, %tomtoms, %tmnames, $capture, %degen2regex, %alpha2regex, %faseq, %headers);
+my ( $tomtomBlock1, $tomtomBlock2, $collapseBlock1, $collapseBlock2, $collapseBlock3);
+
+my %stdalphas = (
+	'DNA' => [ [qw/ A C G T /], [qw/ T G C A /] ],
+	'RNA' => [ [qw/ A C G U /], [qw/ U G C A /] ],
+	'AA' => [ [qw//], [qw//] ],
+	);
+my @letters = @{ $stdalphas{$alpha}->[0] };
+
+print "Reading motifs... ";
+$| = 1;
+foreach my $file (@motfiles) {
+    open IN, $file or die "$0: Motifs file '$file' not readable: $!\n";
+    while (<IN>) {
+	$_ =~ s/[\n\r]+$//;
+	next unless $_;
+	if ($_ =~ /^Background letter frequencies/) {  # either format
+	    $bglf = 1;
+	} elsif ($bglf) {  # either format
+	    $bglf = 0;
+	    %freq = split /\s+/, $_;
+	} elsif ($_ =~ /^MOTIF\s+(.*)/) {
+	    my $match = $1;
+	    if ($match =~ /^(\d+)\s+/) {   # for meme.txt
+		$motif = $name = $1;
+	    } else {               # for minimal-meme format file
+		($motif, $name) = split /\s+/, $match;
+		$name =~ s/\s*$//;
+	    }
+	    push @motifs, $motif;
+	    $motifData{$motif}{NAME} = $name;
+	    $i = $capture = 0;
+	} elsif ($_ =~ /^letter-probability matrix:/) {  # either format
+	    $capture = 1;
+	} elsif ($capture && $_ =~ /^\s*\d/) {  # either format
+	    my ($core) = ($_ =~ /^\s*(\S+.*\S+)\s*/);  # strip flanking whitespace, if any
+	    my @data = split /\s+/, $core;
+	    $i++;
+	    $motifData{$motif}{PSSM}{$i}{$letters[$_]} = $data[$_] foreach (0..$#data);
+	    my $max = (sort {$b <=> $a} @data)[0];  # most-likely letter
+	    $motifData{$motif}{MAXPR} += $max;  # add most-likely letter value for each pos
+	    $motifData{$motif}{FIXED}++ if $max == 1;  # N fixed positions
+	    $motifData{$motif}{WIDTH}++;
+	} elsif ($_ =~ /^[-]+$/) {  # for meme.txt
+	    $i = $capture = 0;
+	}
+    }
+    close IN;
+}
+
+print scalar(keys %motifData), " motifs read.\n";
+
+if ($collapse) {
+    system "cp $collapse $outdir/collapsed.motifs.txt";   # keep a copy in the output
+    open IN, $collapse or die "Cannot open motif-collapse file '$collapse': $!\n";
+    while (<IN>) {
+	$_ =~ s/[\n\r]+$//;
+	my ($motif, $mergeID) = split /\t/, $_;   # $motif = motif ID from database above; $mergeID = a unique string to identify all motifs in a collapse set (e.g. "ALL_HOX", "ALL_OCT")
+	warn "Collapsable motif '$motif' does not exist in the specified databases!\n" unless exists $motifData{$motif};
+	$collapsable{$mergeID}{$motif} = 1;
+    }
+    close IN;
+}
+
+if ($tomtom) {
+    
+    if ($tomdb) {
+	print "Reading tomtom databases... ";
+	$| = 1;
+	foreach my $db (split /,/, $tomdb) {
+	    open IN, $db or die "$0: Tomtom motifs db '$tomdb' not readable: $!\n";
+	    while (<IN>) {
+		$_ =~ s/[\n\r]+$//;
+		if ($_ =~ /^MOTIF\s+(.*)/) {
+		    ($motif, $name) = split /\s+/, $1;
+		    $name = $motif unless $name;
+		    $tmnames{$motif} = $name;
+		}
+	    }
+	    close IN;
+	}
+	print scalar(keys %tmnames), " motifs read.\n";
+    }
+    
+    print "Reading tomtom results... ";
+    $| = 1;
+    open IN, $tomtom or die "$0: Tomtom file '$tomtom' not readable: $!\n";
+    while (<IN>) {
+	next if $. == 1;
+#	$_ =~ s/[\n\r]+$//;
+	my ($query, $target, $offset, $p, $E, $q, $overlap, $qcons, $tcons, $orient) = split /\t/, $_;
+	my $name = $tmnames{$target} ? $tmnames{$target} : $target;
+	$tomtoms{$query}{$name}++;
+    }
+    my $tomdata = $.-1 ? 'tomtom[match(fres[,1],tomtom[,1]),2]' : 'NA';  # if no non-header lines, don't try to load Tomtom data in R
+    print ($.-1), " records read.\n";
+    close IN;
+    
+    open OUT, "> $tomout" or die "$0: Cannot write tomtom file '$tomout': $!\n";
+    foreach my $motif (sort keys %tomtoms) {
+	my @mnames;
+	foreach my $mot (sort keys %{ $tomtoms{$motif} }) {
+	    push @mnames, "$mot ($tomtoms{$motif}{$mot})";
+	}
+	my $mnames = join '; ', @mnames;
+	print OUT "$motif\t$mnames\n";
+    }
+    close OUT;
+    
+    $tomtomBlock1 = "tomtom <- read.delim(\"$tomout\", header=FALSE, as.is=TRUE)" unless $tomdata eq 'NA';
+    $tomtomBlock2 = "fres <- cbind(fres, TOMTOM=$tomdata)\n";
+    $tomtomBlock2 .= "\tfres[is.na(fres[,ncol(fres)]),ncol(fres)] <- \"\"";
+    
+}
+
+$motifData{$_}{MAXPR} /= (scalar keys %{ $motifData{$_}{PSSM} }) foreach keys %motifData;   # sum -> avg
+
+chomp(my $now = `date`);
+print "$now\nProcessing foreground...\n";
+chomp(my $fgn = `grep ">" $fgfa | wc -l`);
+my $fimobase = "$fimo $pflag $qflag --max-stored-scores $maxscores";
+$fimobase .= ' --norc' if $norc;
+
+if ($grep) {
+    
+    $motifData{$_}{REGEXP} = [&make_regexps($_)] foreach @motifs;
+   
+    my $header;
+    open IN, $fgfa;
+    while (<IN>) {
+	$_ =~ s/[\n\r]+$//;
+	if ($_ =~ /^>(.*)/) {
+	    $header = $1;
+	    push @{ $headers{FG} }, $header;
+	} else {
+	    $faseq{FG}{$header} .= $_;
+	}
+    }
+    close IN;
+    
+    open OUT, "> $fgout";
+    print OUT "Motif\tName\tSequence\tStart\tEnd\tStrand\tMatch";
+    print OUT (join "\t", ('', qw/ avgprob maxprob pctmax zeroes invars /)) if $more;
+    print OUT "\n";
+    &scan_regexp('FG');
+    close OUT;
+    
+} else {
+    
+
+
+
+
+
+
+
+
+
+    ################## REWRITE THIS FOR MULTIPLE MOTIF FILES !!!!!!!!!!!!!!!
+    ################## REWRITE THIS FOR MULTIPLE MOTIF FILES !!!!!!!!!!!!!!!
+    ################## REWRITE THIS FOR MULTIPLE MOTIF FILES !!!!!!!!!!!!!!!
+    ################## REWRITE THIS FOR MULTIPLE MOTIF FILES !!!!!!!!!!!!!!!
+    ################## REWRITE THIS FOR MULTIPLE MOTIF FILES !!!!!!!!!!!!!!!
+    ################## REWRITE THIS FOR MULTIPLE MOTIF FILES !!!!!!!!!!!!!!!
+    ################## REWRITE THIS FOR MULTIPLE MOTIF FILES !!!!!!!!!!!!!!!
+    ################## REWRITE THIS FOR MULTIPLE MOTIF FILES !!!!!!!!!!!!!!!
+    ################## REWRITE THIS FOR MULTIPLE MOTIF FILES !!!!!!!!!!!!!!!
+    ################## REWRITE THIS FOR MULTIPLE MOTIF FILES !!!!!!!!!!!!!!!
+    ################## REWRITE THIS FOR MULTIPLE MOTIF FILES !!!!!!!!!!!!!!!
+    ################## REWRITE THIS FOR MULTIPLE MOTIF FILES !!!!!!!!!!!!!!!
+    ################## REWRITE THIS FOR MULTIPLE MOTIF FILES !!!!!!!!!!!!!!!
+    
+
+
+
+
+
+
+
+
+
+    my $fgcom .= $calcQ ? "$fimobase -oc $temp/fg" : "$fimobase --text";
+    $fgcom .= " $motfile $fgfa";
+    $fgcom .= " > $fgtemp" unless $calcQ;
+    print "Running: '$fgcom'\n";
+    system $fgcom;
+
+    open IN, $fgtemp;
+    open OUT, "> $fgout";
+    $calcQ ? &process_fimo_out_full : &process_fimo_out_text;
+    close $_ foreach qw/ IN OUT /;
+    
+}
+
+if ($bgfa) {
+    
+    chomp(my $now = `date`);
+    print "$now\nProcessing background...\n";
+    chomp(my $bgn = `grep ">" $bgfa | wc -l`);
+    
+    if ($grep) {
+	
+	my $header;
+	open IN, $bgfa;
+	while (<IN>) {
+	    $_ =~ s/[\n\r]+$//;
+	    if ($_ =~ /^>(.*)/) {
+		$header = $1;
+		push @{ $headers{BG} }, $header;
+	    } else {
+		$faseq{BG}{$header} .= $_;
+	    }
+	}
+	close IN;
+	
+	open OUT, "> $bgout";
+	print OUT "Motif\tName\tSequence\tStart\tEnd\tStrand\tMatch";
+	print OUT (join "\t", ('', qw/ avgprob maxprob pctmax zeroes invars /)) if $more;
+	print OUT "\n";
+	&scan_regexp('BG');
+	close OUT;
+	
+    } else {
+	
+
+
+
+
+
+
+
+
+
+	################## REWRITE THIS FOR MULTIPLE MOTIF FILES !!!!!!!!!!!!!!!
+	################## REWRITE THIS FOR MULTIPLE MOTIF FILES !!!!!!!!!!!!!!!
+	################## REWRITE THIS FOR MULTIPLE MOTIF FILES !!!!!!!!!!!!!!!
+	################## REWRITE THIS FOR MULTIPLE MOTIF FILES !!!!!!!!!!!!!!!
+	################## REWRITE THIS FOR MULTIPLE MOTIF FILES !!!!!!!!!!!!!!!
+	################## REWRITE THIS FOR MULTIPLE MOTIF FILES !!!!!!!!!!!!!!!
+	################## REWRITE THIS FOR MULTIPLE MOTIF FILES !!!!!!!!!!!!!!!
+	################## REWRITE THIS FOR MULTIPLE MOTIF FILES !!!!!!!!!!!!!!!
+	################## REWRITE THIS FOR MULTIPLE MOTIF FILES !!!!!!!!!!!!!!!
+	################## REWRITE THIS FOR MULTIPLE MOTIF FILES !!!!!!!!!!!!!!!
+	################## REWRITE THIS FOR MULTIPLE MOTIF FILES !!!!!!!!!!!!!!!
+	################## REWRITE THIS FOR MULTIPLE MOTIF FILES !!!!!!!!!!!!!!!
+	################## REWRITE THIS FOR MULTIPLE MOTIF FILES !!!!!!!!!!!!!!!
+	
+
+
+
+
+
+
+
+
+
+	my $bgcom .= $calcQ ? "$fimobase -oc $temp/bg" : "$fimobase --text";
+	$bgcom .= " $motfile $bgfa";
+	$bgcom .= " > $bgtemp" unless $calcQ;
+	print "Running: '$bgcom'\n";
+	system $bgcom;
+	
+	open IN, $bgtemp;
+	open OUT, "> $bgout";
+	$calcQ ? &process_fimo_out_full : &process_fimo_out_text;
+	close $_ foreach qw/ IN OUT /;
+	
+#        &plot_motifs($bgout, $bgtempdir, $outdir) if $visualize;   # for bkg this could be dangerous!  (enormous filesizes & additional runtime)
+    }
+    if ($autop) {
+	&fisherize_killcurve($fgn, $bgn);
+    } else {
+	&fisherize_range($fgn, $bgn);
+    }
+}
+
+&plot_motifs($fgout, $fgtempdir, $outdir) if $visualize;
+
+unless ($keep) {
+    system "rm -Rf $temp";
+    warn "$0: Couldn't remove temp directory '$temp'!\n" if -d $temp;
+}
+print "$0 complete!\n";
+exit;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+sub process_fimo_out_full {
+    while (<IN>) {
+	chomp;
+	my @data = split /\t/, $_;
+	if ($. == 1) {
+	    print OUT (join "\t", qw/ motif name sequence start stop strand score p-value q-value match /);
+	    print OUT (join "\t", ('', qw/ avgprob maxprob pctmax zeroes invars /)) if $more;
+	    print OUT "\n";
+	} else {
+	    my ($motif, $seq, $start, $end, $score, $pval, $qval, $match) = @data;
+	    my $strand = $start < $end ? '+' : '-';
+	    my ($start, $end) = sort {$a <=> $b} ($start, $end);
+	    print OUT (join "\t", $motif, $motifData{$motif}{NAME}, $seq, $start, $end, $strand, $score, $pval, $qval, $match);
+	    if ($more) {
+		my ($prob, $i, $zeroes, $invars, @probs);
+		my $N = (scalar keys %{ $motifData{$motif}{PSSM} });
+		foreach (split //, "\U$match") {
+		    $i++;
+		    $prob += $motifData{$motif}{PSSM}{$i}{$_};
+		    $zeroes++ unless $motifData{$motif}{PSSM}{$i}{$_};
+		    $invars++ if $motifData{$motif}{PSSM}{$i}{$_} == 1;
+#		    push @probs, "$_|$motifData{$motif}{PSSM}{$i}{$_}";
+		}
+#		my $ps = $prob;
+		$prob /= $N;  # sum -> avg
+#		print "$seq:$start-$end:$strand : @probs, $ps, $prob\n" if $motif eq 'org1';
+		my $zeropct = $zeroes ? $zeroes/$N : '';  # percent 'impossible' positions reported
+		my $invpct = $motifData{$motif}{FIXED} ? $invars/$motifData{$motif}{FIXED} : '';  # percent invariant positions matched
+		print OUT (join "\t", '', $prob, $motifData{$motif}{MAXPR}, $prob/$motifData{$motif}{MAXPR}, $zeropct, $invpct);
+	    }
+	    print OUT "\n";
+	}
+    }
+}
+
+
+sub process_fimo_out_text {
+    while (<IN>) {
+	chomp;
+	my @data = split /\t/, $_;
+	if ($. == 1) {
+	    print OUT (join "\t", qw/ motif name seq start stop strand logodds p-value match /);
+	    print OUT (join "\t", ('', qw/ avgprob maxprob pctmax zeroes invars /)) if $more;
+	    print OUT "\n";
+	} else {
+	    my ($motif, $seq, $start, $end, $strand, $lods, $pval, $match) = @data;
+	    next if $filter && $lods < 0;
+	    print OUT (join "\t", $motif, $motifData{$motif}{NAME}, $seq, $start, $end, $strand, $lods, $pval, $match);
+	    if ($more) {
+		my ($prob, $i, $zeroes, $invars, @probs);
+		my $N = (scalar keys %{ $motifData{$motif}{PSSM} });
+		foreach (split //, "\U$match") {
+		    $i++;
+		    $prob += $motifData{$motif}{PSSM}{$i}{$_};
+		    $zeroes++ unless $motifData{$motif}{PSSM}{$i}{$_};
+		    $invars++ if $motifData{$motif}{PSSM}{$i}{$_} == 1;
+#		    push @probs, "$_|$motifData{$motif}{PSSM}{$i}{$_}";
+		}
+#		my $ps = $prob;
+		$prob /= $N;  # sum -> avg
+#		print "$seq:$start-$end:$strand : @probs, $ps, $prob\n" if $motif eq 'org1';
+		my $zeropct = $zeroes ? $zeroes/$N : '';  # percent 'impossible' positions reported
+		my $invpct = $motifData{$motif}{FIXED} ? $invars/$motifData{$motif}{FIXED} : '';  # percent invariant positions matched
+		print OUT (join "\t", '', $prob, $motifData{$motif}{MAXPR}, $prob/$motifData{$motif}{MAXPR}, $zeropct, $invpct);
+	    }
+	    print OUT "\n";
+	}
+    }
+}
+
+
+sub load_alphas {
+    
+    %stdalphas = (
+	'DNA' => [ [qw/ A C G T /], [qw/ T G C A /] ],
+	'RNA' => [ [qw/ A C G U /], [qw/ U G C A /] ],
+	'AA' => [ [qw//], [qw//] ],
+	);
+    
+    %degen2regex = (
+	'DNA' => {	'A' => ['A', {'A',1}],
+			'C' => ['C', {'C',1}],
+			'G' => ['G', {'G',1}],
+			'T' => ['T', {'T',1}],
+			'R' => ['[AG]', {'R',1, 'A',1, 'G',1}],
+			'Y' => ['[CT]', {'Y',1, 'C',1, 'T',1}],
+			'S' => ['[CG]', {'S',1, 'C',1, 'G',1}],
+			'W' => ['[AT]', {'W',1, 'A',1, 'T',1}],
+			'K' => ['[GT]', {'K',1, 'G',1, 'T',1}],
+			'M' => ['[AC]', {'M',1, 'A',1, 'C',1}],
+			'B' => ['[CGT]', {'B',1, 'C',1, 'G',1, 'T',1}],
+			'D' => ['[AGT]', {'D',1, 'A',1, 'G',1, 'T',1}],
+			'H' => ['[ACT]', {'H',1, 'A',1, 'C',1, 'T',1}],
+			'V' => ['[ACG]', {'V',1, 'A',1, 'C',1, 'G',1}],
+			'N' => ['[ACGT]', {'N',1, 'A',1, 'C',1, 'G',1, 'T',1}]
+	},
+
+	'RNA' => {	'A' => ['A', {'A',1}],
+			'C' => ['C', {'C',1}],
+			'G' => ['G', {'G',1}],
+			'U' => ['U', {'U',1}],
+			'R' => ['[AG]', {'R',1, 'A',1, 'G',1}],
+			'Y' => ['[CU]', {'Y',1, 'C',1, 'U',1}],
+			'S' => ['[CG]', {'S',1, 'C',1, 'G',1}],
+			'W' => ['[AU]', {'W',1, 'A',1, 'U',1}],
+			'K' => ['[GU]', {'K',1, 'G',1, 'U',1}],
+			'M' => ['[AC]', {'M',1, 'A',1, 'C',1}],
+			'B' => ['[CGU]', {'B',1, 'C',1, 'G',1, 'U',1}],
+			'D' => ['[AGU]', {'D',1, 'A',1, 'G',1, 'U',1}],
+			'H' => ['[ACU]', {'H',1, 'A',1, 'C',1, 'U',1}],
+			'V' => ['[ACG]', {'V',1, 'A',1, 'C',1, 'G',1}],
+			'N' => ['[ACGU]', {'N',1, 'A',1, 'C',1, 'G',1, 'U',1}]
+	},
+
+	'AA' => {	'' => '[]',
+			'' => '[]',
+			'' => '[]',
+			'X' => '[]'
+	}
+	);
+}
+
+
+sub make_regexps {
+    
+    my $motif = shift;
+    my ($regex, $revex);
+    
+    foreach my $i (sort {$a <=> $b} keys %{ $motifData{$motif}{PSSM} }) {
+	my %temp;
+	foreach my $c (0..$#letters) {
+	    my $freq = $motifData{$motif}{PSSM}{$i}{$letters[$c]};
+	    $temp{$letters[$c]} = 1 if $freq >= $minwt;
+	}
+	my $str = join '', sort keys %temp;
+	$regex .= "[$str]";
+    }
+    ($revex = reverse $regex) =~ tr/ACGT\]\[/TGCA\[\]/;
+    
+    return ($regex, $revex);
+}
+
+
+sub scan_regexp {
+    
+    my $FB = shift; 
+    
+    foreach my $header (@{ $headers{$FB} }) {
+	my $sequence = $faseq{$FB}{$header};
+	foreach my $motif (@motifs) {
+	    my %nmatches;
+	    my $width = $motifData{$motif}{WIDTH};
+	    while ($sequence =~ /$motifData{$motif}{REGEXP}->[0]/g) {
+		my $pos = pos($sequence)-$width;
+		my $match = substr($sequence, $pos, $width);
+		my ($start, $end) = ($pos+1, $pos+$width);
+		print OUT (join "\t", $motif, $motifData{$motif}{NAME}, $header, $start, $end, '+', $match);
+		$nmatches{W}++;
+		if ($more) {
+		    my ($prob, $i, $zeroes, $invars, @probs);
+		    my $N = (scalar keys %{ $motifData{$motif}{PSSM} });
+		    foreach (split //, "\U$match") {
+			$i++;
+			$prob += $motifData{$motif}{PSSM}{$i}{$_};
+		    }
+		    $prob /= $N;  # sum -> avg
+		    print OUT (join "\t", '', $prob, $motifData{$motif}{MAXPR}, $prob/$motifData{$motif}{MAXPR}, 1, 1);
+		}
+		print OUT "\n";
+	    }
+	    unless ($norc) {
+		while ($sequence =~ /$motifData{$motif}{REGEXP}->[1]/g) {
+		    my $pos = pos($sequence)-$width;
+		    (my $match = reverse substr($sequence, $pos, $width)) =~ tr/ACGT/TGCA/;
+		    my ($start, $end) = ($pos+1, $pos+$width);
+		    print OUT (join "\t", $motif, $motifData{$motif}{NAME}, $header, $start, $end, '-', $match);
+		    $nmatches{C}++;
+		    if ($more) {
+			my ($prob, $i, $zeroes, $invars, @probs);
+			my $N = (scalar keys %{ $motifData{$motif}{PSSM} });
+			foreach (split //, "\U$match") {
+			    $i++;
+			    $prob += $motifData{$motif}{PSSM}{$i}{$_};
+			}
+			$prob /= $N;  # sum -> avg
+			print OUT (join "\t", '', $prob, $motifData{$motif}{MAXPR}, $prob/$motifData{$motif}{MAXPR}, 1, 1);
+		    }
+		    print OUT "\n";
+		}
+	    }
+#	    print "$FB $header ",length($faseq{$FB}{$header})," $motif | $nmatches{W} $nmatches{C} | $motifData{$motif}{REGEXP}->[0] $motifData{$motif}{REGEXP}->[1] \n";
+	}
+    }
+}
+
+
+sub plot_motifs {
+    
+    my ($output, $tempdir, $movedir) = @_;
+    print "Generating images...\n";
+    
+    my $script = <<EOF;
+    library(seqLogo)
+    source("/n/projects/apa/R/apa_tools.R");
+    mot <- read.minimal.meme("$motfile");
+    out <- read.delim("$output", sep="\t", as.is=TRUE);
+    hits <- table(out[,1]);
+    mots <- names(hits);
+    lst <- new.list(mots);
+    for (i in 1:length(lst)) {
+	iout <- out[out[,1]==mots[i],];
+	iout <- iout[order(iout[,7], decreasing=TRUE),]
+	M <- nchar(hits[i]);
+	N <- nrow(iout);
+	W <- ncol(mot[[which(names(mot)==mots[i])]]);
+	tag0 <- paste(mots[i],sprintf(paste("%0",M,"d",sep=""),0),sep=".")
+	png(paste("$tempdir/",tag0,".png",sep=""), 170+60*W, 400);
+	seqLogo.title(mot[[which(names(mot)==mots[i])]], title=mots[i]);
+	dev.off();
+	for (j in 1:N) { 
+	    tag <- paste(mots[i],sprintf(paste("%0",M,"d",sep=""),j),sep=".")
+	    png(paste("$tempdir/",tag,".png",sep=""), 170+60*W, 400);
+	    title <- paste(iout[j,4],"-",iout[j,5],"(",iout[j,6],")",", score ",iout[j,7],", pval ",iout[j,8],sep="");
+	    seqLogo.title(words2PSSM(iout[j,10]), title=title);
+	    dev.off()
+	}
+	system(paste("/home/apa/local/bin/imageWeld -v $tempdir/",mots[i],".*.png",sep=""));
+	system(paste("mv $tempdir/imageWeld.png $movedir/",mots[i],".png",sep=""));
+    }
+EOF
+	
+    open OUT, "> $tempdir/plotmotifs.R";
+    print OUT $script;
+    close OUT;
+    system "R --vanilla < $tempdir/plotmotifs.R > $tempdir/plotmotifs.Rout";
+}
+
+
+sub fisherize_range {
+    
+    my ($fgn, $bgn) = @_;
+    print "Testing enrichments...\n";
+        
+    my $script = <<EOF;
+source("/n/projects/apa/R/apa_tools.R")
+fg <- read.delim("$fgout", as.is=TRUE)
+bg <- read.delim("$bgout", as.is=TRUE)
+$tomtomBlock1
+pr <- 10^seq(log10($p), log10($p2), -1)
+enrich.per.p <- new.list(pr)
+for (i in 1:length(pr)) {
+    fgu <- unique(fg[fg[,8]<=pr[i],1:3])
+    bgu <- unique(bg[bg[,8]<=pr[i],1:3])
+    IM(i, pr[i], nrow(fgu), nrow(bgu))
+    umot <- unique(rbind(fgu[,1:2],bgu[,1:2]))
+    pref <- matrix(0, nrow(umot), 4)
+    ft <- table(fgu[,1])
+    bt <- table(bgu[,1])
+    pref[match(names(ft),umot[,1]),1] <- ft
+    pref[match(names(bt),umot[,1]),3] <- bt
+    $collapseBlock3
+    pref[,2] <- $fgn-pref[,1]
+    pref[,4] <- $bgn-pref[,3]
+    fres <- fisherize(pref, tails=1)
+    fres <- cbind(MOTIF=umot[,1], NAME=umot[,2], fres)
+    $tomtomBlock2
+    enrich.per.p[[i]] <- fres
+    if (i==1) write.table(fres, "$outdir/enrichments.txt", sep="\t", quote=FALSE, row.names=FALSE)
+}
+WriteXLS2(enrich.per.p, "$outdir/enrichments.xls", FreezeRow=1, BoldHeaderRow=TRUE, AdjWidth=TRUE)
+EOF
+	
+    open OUT, "> $outdir/enrichments.R";
+    print OUT $script;
+    close OUT;
+    system "R --vanilla < $outdir/enrichments.R > $outdir/enrichments.Rout";
+}
+
+
+sub fisherize_killcurve {
+    
+    my ($fgn, $bgn) = @_;
+    print "Testing enrichments...\n";
+    
+    if ($collapse) {
+	
+    }
+    
+    my $script = <<EOF;
+source("/n/projects/apa/R/apa_tools.R")
+fg <- read.delim("$fgout", as.is=TRUE)
+bg <- read.delim("$bgout", as.is=TRUE)
+IM(nrow(fg), nrow(bg))
+$tomtomBlock1
+
+umot <- unique(rbind(fg[,1:2],bg[,1:2]))
+kc <- new.list(umot[,2])
+fg.pass <- rep(FALSE, nrow(fg))
+bg.pass <- rep(FALSE, nrow(bg))
+
+for (i in 1:nrow(umot)) {
+  report.index(i, 100)
+  fg.i <- which(fg[,1]==umot[i,1])
+  bg.i <- which(bg[,1]==umot[i,1])
+  kc[[i]] <- motif.killcurve(fg[fg.i,8], bg[bg.i,8])
+  fg.pass[fg.i] <- fg[fg.i,8] <= kc[[i]]\$p
+  bg.pass[bg.i] <- bg[bg.i,8] <= kc[[i]]\$p
+}
+save(kc, file="$outdir/kc.RData")
+sum(is.na(fg.pass)); sum(is.na(fg.pass))/length(fg.pass)
+
+fgu <- unique(fg[falsify(fg.pass),1:3])
+bgu <- unique(bg[falsify(bg.pass),1:3])
+umot <- cbind(umot, p.thresh=unlist(slice.list(kc,"p")))
+IM(nrow(fgu), nrow(bgu))
+
+pref <- matrix(0, nrow(umot), 4)
+ft <- table(fgu[,1])
+bt <- table(bgu[,1])
+pref[match(names(ft),umot[,1]),1] <- ft
+pref[match(names(bt),umot[,1]),3] <- bt
+pref[,2] <- $fgn-pref[,1]
+pref[,4] <- $bgn-pref[,3]
+fres <- fisherize(pref, tails=1)
+fres <- cbind(MOTIF=umot[,1], NAME=umot[,2], fres)
+$tomtomBlock2
+fres <- fres[order(as.numeric(fres[,11])),]
+
+WriteXLS2(list(fres), "$outdir/enrichments.xls", FreezeRow=1, BoldHeaderRow=TRUE, AdjWidth=TRUE)
+write.table(umot, "$outdir/motif.killcurve.pvalues.txt", sep="\\t", quote=FALSE, row.names=FALSE)
+
+sig.enr <- which(as.numeric(fres[,12])<1)
+imgdim <- MA.scatter.plotdim(length(sig.enr), cap.dim=10, wide=FALSE, pixels=300)
+
+png("$outdir/sig.motif.killcurves.png", imgdim[4], imgdim[3])
+par(mar=c(3,5,4,2), mfrow=imgdim[1:2], cex=1.2, las=1)
+for (s in sig.enr) {
+  i <- which(umot[,1]==fres[s,1])
+  lineplot(kc[[i]]\$cdf[2:3,], col=c(2,4), xaxt="n", xlab="-Log10(p)", ylab="Hit Rate", legend=NA, main=umot[i,2])
+  axis(1, kc[[i]]\$axis.seq[c(1,length(kc[[i]]\$axis.seq))], labels=kc[[i]]\$axis.lab[c(1,length(kc[[i]]\$axis.lab))])
+  legend("topright", bty="n", lty=1, col=c(2,4), legend=rownames(kc[[i]]\$cdf)[2:3], cex=0.8)
+  abline(v=kc[[i]]\$p.line, col=8)
+  text(max(kc[[i]]\$axis.seq), max(kc[[i]]\$cdf[2:3,])*0.5, labels=format(kc[[i]]\$p,digits=3), pos=2)
+}
+dev.off()
+EOF
+	
+    open OUT, "> $outdir/enrichments.R";
+    print OUT $script;
+    close OUT;
+    system "R --vanilla < $outdir/enrichments.R > $outdir/enrichments.Rout";
+}
+

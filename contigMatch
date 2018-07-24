@@ -1,0 +1,104 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use strict;
+require '/home/apa/local/bin/apa_routines.pm';  # for blockify()
+
+die;  #### UNDER CONSTRUCTION ####
+
+my $fasta;   # assembled contigs fasta
+my $trans;   # transcriptome fasta
+my $genome;  # genome fasta
+my $ncore;   # N cores for blast
+my $index;   # minimum %idt * %length to consider identified by blast (on (0,1))
+my $contain; # consider identified by blast if either subject or query contained in alignment; regardless of $index
+
+GetOptions("f=s"=>\$fasta, "t=s"=>\$trans, "g=s"=>\$genome, "n=i"=>\$ncore, "i=f"=>\$index, "contain"=>\$contain);
+die "Contig fasta '$fasta' not found!\n" unless -e $fasta;
+die "Transcriptome fasta '$trans' not found!\n" unless -e $trans;
+
+my $blast = "$fasta.blastn";
+my $topblast = "$blast.topscore";
+my $noblast = "$fasta.noblastn";
+
+my $blat = "$noblast.psl";
+my $topblat = "$blat.topscore";
+my $noblat = "$fasta.noblat";
+
+my $exonerate = "$noblast.exonerate";
+my $topexon = "$exonerate.topscore";
+my $noclue = "$fasta.nomodel";
+
+my %fdat = %{ &get_lengths($fasta, 1) };
+my %tdat = %{ &get_lengths($trans, 0) };
+
+system "formatdb -p F -o F $trans -l $trans.log";
+#system "megablast -m 8 -a $ncore -F F -i $fasta -d $trans > $fasta.megablast";
+system "blastall -p blastn -m 8 -a $ncore -F F -i $fasta2 -d $trans > $blast";
+
+my %scored;
+open IN, $blast or die "Cannot open blast output '$blast': $!\n";
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    my ($query, $subj, $idt, $mlen, $mms, $gaps, $qpos1, $qpos2, $spos1, $spos2, $eval, $score) = split /\t/, $_;
+    my $qmlen = abs($qpos1-$qpos2)+1;
+    my $smlen = abs($spos1-$spos2)+1;
+    my $contained;
+    if ($contain) {
+	$contained = 1 if $qmlen <= $fdat{$query}{LEN};
+	$contained = 1 if $smlen <= $tdat{$subj}{LEN};
+    } elsif ($index) {
+	my $lenpct = $qmlen/$fdat{$query}{LEN};
+	my $idtpct = $idt/100;
+	next if ($lenpct*$idtpct<$index && !$contained);
+    }
+    push @{ $scored{$query}{$score} }, "$_\n";
+}
+
+open NOB, "> $noblast" or die "Cannot write '$noblast': $!\n";
+open TOP, "> $topscore" or die "Cannot write '$topscore': $!\n";
+foreach my $query (keys %fdat) {
+    if ($scored{$query}) {
+	my $hiscore = (sort {$b <=> $a} keys %{ $scored{$query} })[0];
+	print TOP @{ $scored{$query}{$hiscore} };
+    } else {
+	my $block = ${ &blockify($fdat{$query}{SEQ}) };
+	print NOB, ">$query\n$block"; 
+    }
+}
+close TOP;
+close NOB;
+
+system "blat $genome $noblast $blat";
+
+system "exonerate -m est2genome -n 10 -q $noblat -t $genome --showcigar --showquerygff > $exonerate";
+
+my %aligned;
+open IN, $exonerate or die "Cannot open exonerate output '$exonerate': $!\n";
+while (<IN>) {
+}
+close IN;
+
+
+
+
+exit;
+
+
+sub get_lengths {
+    my ($FA, $keep) = @_;
+    my ($head, %headers);
+    open IN, $FA or die "Cannot read '$FA': $!\n";
+    while (<IN>) {
+	if ($_ =~ /^(.*)/) {
+	    $head = $1;
+	} else {
+	    $headers{$head}{SEQ} .= $_;
+	}
+    }
+    close IN;
+    foreach (keys %headers) {
+	$headers{$_}{LEN} = length($headers{$_}{SEQ});
+	delete $headers{$_}{SEQ} unless $keep;
+    }
+    return(\%headers);
+}

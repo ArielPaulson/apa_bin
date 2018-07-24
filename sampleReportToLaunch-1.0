@@ -1,0 +1,253 @@
+#!/bin/bash
+set -e
+
+# exit  ## UNDER CONSTRUCTION -- multi-flowcell handling in the works
+
+## TO DO:
+## create single order CSV master which combines flowcells.
+## then run block on master CSV, allowing fq merging to reach across flowcells.
+
+## Must be run from a 'code' directory, i.e. /path/to/cbio.xxx.nnn/code
+## Takes an /n/analysis run directory and creates a job launcher script based on the Sample_Report.csv file
+## May also create a fastq merger script, which must be run before the launcher.
+
+
+lab=$1       # e.g. 'Si'
+user=$2      # e.g. 'zen'
+orders=$3    # e.g. 'MOLNG-1386' or 'MOLNG-1599,MOLNG-1634'
+fcs=$4       # e.g. 'C7UCKANXX' or 'H72MCAFXX,H7W2HAFXX,H7W2WAFXX' or 'NA' for all
+geno=$5      # e.g. 'dm3'
+anno=$6      # e.g. 'Ens_78'
+direc=$7     # 1|0 if directional libraries -- ignored for ChIPseq ops
+cores=$8     # cores for bowtie2m, samtools; default 1
+mem=$9       # mem for samtools sort; default '1G'
+nomerge=${10}   # do not combine fastqs by sample (i.e. one run per flowcell-lane-barcode combination); default: will combine.
+
+if [ -z $direc ]; then direc=0; fi
+if [ -z $cores ]; then cores=1; fi
+if [ -z $mem ]; then mem='1G'; fi
+if [ -z $nomerge ]; then nomerge=0; fi
+if [ $nomerge -eq 0 ]; then combine=1; else combine=0; fi  # transfer $nomerge to $combine; gets rid of double-negatives in tests below
+params="$geno $anno $direc $cores $mem"
+
+fqpath=$(readlink -f ../data/fastq)
+if [ ! -d $fqpath ]; then mkdir $fqpath; fi
+launch=launch.sh
+merge=merge.sh
+rm -f $launch
+rm -f $merge
+
+grepord=$(echo $orders | sed 's/,/\|/g')
+ordlist=($(echo $orders | sed 's/,/ /g'))
+nord=${#ordlist[@]}
+if [ "$fcs" != "NA" ]; then
+    fclist=($(echo $fcs | sed 's/,/ /g'))
+fi
+
+
+for order in ${ordlist[@]}
+do
+    blurb="ORDER: $order" && echo $blurb
+    
+    ## get flowcells for order
+    ordpath=/n/analysis/$lab/$user/$order
+    ordfc1=($(ls -1 $ordpath))
+    ordfc=()
+    
+    ## filter for desired flowcells (if any indicated)
+    if [ "$fcs" == "NA" ]; then
+	ordfc=(${ordfc1[@]})
+    else
+	for expfc in ${fclist[@]}
+	do
+	    for obsfc in ${ordfc1[@]}
+	    do
+		if [[ "$obsfc" =~ "$expfc" ]]; then ordfc+=($obsfc); fi  # ALLOWS PARTIAL MATCHING
+	    done
+	done
+    fi
+    nfc=${#ordfc[@]}
+    
+    allsamples=($(for fc in ${ordfc[@]}; do grep -P ",($grepord)," $ordpath/$fc/Sample_Report.csv | cut -f5 -d,; done | sort -u))    # all samples on all flowcells
+    
+    declare -A bysample1  # associative array for fastqs to merge by sample (end 1)-- may or may not get used
+    declare -A bysample2  # ditto for end 2, if end 2
+    
+    ## process flowcells matching this order
+    for flowcell in ${ordfc[@]}
+    do
+	blurb="ORDER: $order | FLOWCELL: $flowcell" && echo $blurb
+	
+	fcpath=$ordpath/$flowcell
+	csv=$fcpath/Sample_Report.csv
+	fcsv=$flowcell.Sample_Report.csv
+	(head -1 $csv && grep ",$order," $csv) > $fcsv
+	
+	fcsamples=($(grep -P ",($grepord)," $fcsv | cut -f5 -d, | sort -u))
+	
+	ends=($(tail -n +2 $fcsv | cut -f9 -d, | sort -u))
+	if [ -z ${ends[1]} ]; then ends1=1; else ends1=${ends[1]}; fi
+	echo "$blurb | ENDS: ${#ends[@]}: ${ends[@]}"
+	
+	lanes=($(tail -n +2 $fcsv | cut -f4 -d, | sort -u))
+	echo "$blurb | LANES: ${#lanes[@]}: ${lanes[@]}"
+	
+	if [ ${#lanes[@]} -eq 1 ] && [ $nfc -eq 1 ]; then 
+	    single=1  # single-flowcell, single-lane: rename fastqs with sample names, whether $combine or not
+	    echo -e "\nNothing to combine!\n"
+	else 
+	    single=0
+	fi
+	
+	if [ $combine -eq 0 ] || [ $single -eq 1 ]; then
+	    
+	    ## EITHER: do not combine fastqs by sample name
+	    ## OR: combine, but there was only one lane / flowcell of data, so nothing to combine -- just rename
+	    
+	    if [ $ends1 -eq 2 ]; then
+		
+		## PAIRED-END DATA
+		
+		echo -e "BRANCH: 1\nORDER: $order\nFLOWCELL: $flowcell\nCOMBINE: $combine\nSINGLE: $single\nENDS1: $ends1"  # reporter
+		
+		while read line
+		do
+		    ## end number
+		    end=$(echo $line | cut -f9 -d,)
+		    ## sample name
+		    sample=$(echo $line | cut -f5 -d,)
+		    
+		    if [ "$end" == "1" ]; then
+			
+			## end 1 fastq
+			fastq1=$(echo $line | cut -f1 -d,)
+			## set fastq symlink
+			if [ $single -eq 1 ]; then
+			    fqlink1=$fqpath/${sample}_1.fastq.gz
+			else
+			    fqlink1=$fqpath/$fastq1
+			fi
+			## symlink to local fastq directory
+			ln -sf $fcpath/$fastq1 $fqlink1
+			
+		    elif [ "$end" == "2" ]; then
+			
+			## end 2 fastq
+			fastq2=$(echo $line | cut -f1 -d,)
+			## set fastq symlink
+			if [ $single -eq 1 ]; then
+			    fqlink2=$fqpath/${sample}_2.fastq.gz
+			else
+			    fqlink2=$fqpath/$fastq2
+			fi
+			## symlink to local fastq directory
+			ln -sf $fcpath/$fastq2 $fqlink2
+			
+			## confirm fastq pair
+			echo "$sample => $fastq1 , $fastq2"
+			## add pair to launch script
+			echo "./run.sh $sample $fqlink1 $fqlink2 $params &" >> $launch
+		    fi
+		    
+		done < <(tail -n +2 $fcsv)
+		
+	    else
+		
+		## SINGLE-END DATA
+		
+		echo -e "BRANCH: 2\nORDER: $order\nFLOWCELL: $flowcell\nCOMBINE: $combine\nSINGLE: $single\nENDS1: $ends1"  # reporter
+		
+		while read line
+		do
+		    ## sample name
+		    sample=$(echo $line | cut -f5 -d,)
+		    
+		    ## end 1 fastq
+		    fastq=$(echo $line | cut -f1 -d,)
+		    ## set fastq symlink
+		    if [ $single -eq 1 ]; then
+			fqlink=$fqpath/$sample.fastq.gz
+		    else
+			fqlink=$fqpath/$fastq
+		    fi
+		    ## symlink to local fastq directory
+		    ln -sf $fcpath/$fastq $fqlink
+		    
+		    ## confirm fastq
+		    echo "$sample => $fastq"
+		    ## add sample to launch script
+		    echo "./run.sh $sample $fqlink NA $params &" >> $launch
+		    
+		done < <(tail -n +2 $fcsv)
+		
+	    fi
+	    
+	else
+	    
+	    ## combine fastqs by sample name
+	    ## getting here also implies that more than one lane / one flowcell exists
+	    
+	    for sample in ${fcsamples[@]}
+	    do
+		
+		echo -e "BRANCH: 3\nFLOWCELL: $flowcell\nSAMPLE: $sample\nCOMBINE: $combine\nSINGLE: $single\nENDS1: $ends1"  # reporter
+		
+		## get all sample fastqs IN THIS FLOWCELL
+		fqlist1=($(awk -v s=$sample -v p=$fcpath 'BEGIN { FS="," } { if ($5==s && $9==1) print p"/"$1 }' $fcsv))  # end 1 array
+		## confirm fastq pairs
+		echo "$sample END 1 => ${fqlist1[@]}"
+		## add merge sets to sample arrays
+		current1=${bysample1[$sample]}
+		current1="$current1 ${fqlist1[@]}"
+		bysample1[$sample]=$current1
+		
+		if [ $ends1 -eq 2 ]; then
+		    
+		    ## get all sample fastqs IN THIS FLOWCELL
+		    fqlist2=($(awk -v s=$sample -v p=$fcpath 'BEGIN { FS="," } { if ($5==s && $9==2) print p"/"$1 }' $fcsv))  # end 2 array
+		    ## confirm fastq pairs
+		    echo "$sample END 2 => ${fqlist2[@]}"
+		    ## add merge sets to sample arrays
+		    current2=${bysample2[$sample]}
+		    current2="$current2 ${fqlist2[@]}"
+		    bysample2[$sample]=$current2
+		    
+		fi
+		
+	    done  # end sample (merging) loop
+	    
+	fi  # end if to-merge or not-to-merge
+	
+    done   # end flowcell loop
+    
+    if [ $combine -eq 1 ] && [ $single -eq 0 ]; then
+	
+	## fastqs have been collated by flowcell and lane; output here
+	
+	for sample in ${allsamples[@]}
+	do
+	    
+	    if [ $ends1 -eq 2 ]; then
+		fqlink1=$fqpath/${sample}_1.fastq.gz  # paired end suffix
+	    else
+		fqlink1=$fqpath/$sample.fastq.gz  # no suffix
+	    fi
+	    allfq1=${bysample1[$sample]}	
+	    echo "zcat $allfq1 | gzip > $fqlink1" >> $merge
+	    
+	    if [ $ends1 -eq 1 ]; then
+		echo "./run.sh $sample $fqlink1 $params &" >> $launch
+	    else
+		fqlink2=$fqpath/${sample}_2.fastq.gz
+		allfq1=${bysample1[$sample]}
+		echo "zcat $allfq2 | gzip > $fqlink2" >> $merge
+		echo "./run.sh $sample $fqlink1 $fqlink2 $params &" >> $launch
+	    fi
+	    
+	done
+	
+    fi
+    
+done  # end order loop
+
+

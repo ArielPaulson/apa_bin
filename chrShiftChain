@@ -1,0 +1,48 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Getopt::Long;
+use strict;
+
+## Intended to make a liftover for query assembly -> target assembly,
+##  where all chromosomes are 'the same' but not exactly same sequence
+##  (e.g. both assemblies have chr1-chrN, but lengths not identical).
+
+my ($fastaQ, $fastaT, $chr_equiv, $outchain, $cores);
+GetOptions("q=s"=>\$fastaQ, "t=s"=>\$fastaT, "e=s"=>\$chr_equiv, "o=s"=>\$outchain, "c=i"=>\$cores);
+
+die "$0: Query fasta not specified!\n" unless $fastaQ;
+die "$0: Target fasta not specified!\n" unless $fastaT;
+die "$0: Chromosome equivalents not specified!\n" unless $chr_equiv;
+die "$0: Output chain file not specified!\n" unless $outchain;
+$cores = 1 unless $cores;
+
+my $bin = '/home/apa/local/bin';
+my $pblat = "/home/apa/local/install/pblat/icebert-pblat-1.6-0/pblat";
+my $psl2chain = "$bin/psl2chain";
+my $fastaExplode = "$bin/fastaExplode";
+
+my $tmp = "chrShiftChain.$$.tmp";
+system "mkdir -p $tmp/$_" foreach qw/ Q T psl /;
+
+my %chroms;
+my $EQ = &open2('R', $chr_equiv, 'Chromosome name equivalence file');
+while (<$EQ>) {
+    s/[\n\r]+$//;
+    my ($chrQ, $chrT) = split /\t/, $_;
+    if ($chrQ && $chrT) {
+	$chroms{$chrQ} = $chrT;
+    } elsif ($chrQ) {
+	print "Query chromosome '$chrQ' has no equivalent!\n";
+    } elsif ($chrT) {
+	print "Target chromosome '$chrT' has no equivalent!\n";
+    }
+}
+close $EQ;
+
+&execute("$fastaExplode -f $fastaQ $tmp/$Q", 1);
+&execute("$fastaExplode -f $fastaT $tmp/$T", 1);
+
+foreach my $chrQ (sort keys %{ $chroms{$chrQ} }) {
+    &execute("pblat -threads=$cores $tmp/T/$chroms{$chrQ} $tmp/Q/$chrQ $tmp/psl/$chrQ.psl", 1);
+}
+

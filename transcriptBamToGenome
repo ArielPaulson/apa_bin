@@ -1,0 +1,159 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Data::Dumper;
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my ($inbam, $outbam, $geno, $anno, $nomulti, $PE);  ## $nomulti mode not supported yet!
+
+GetOptions("i=s"=>\$inbam, "o=s"=>\$outbam, "g=s"=>\$geno, "a=s"=>\$anno);
+
+my $tlst = "/n/data1/genomes/indexes/$geno/$anno/$geno.$anno.cuff.gtf.index/$geno.$anno.cuff.fa.tlst";
+die "$0: bam file '$inbam' does not exist!\n" unless -e $inbam;
+die "$0: required GTF-index .tlst file '$tlst' does not exist!\n" unless -e $tlst;
+
+my $tmp = "transcriptBamToGenome.$$.tmp";
+
+
+print "Reading annotations...\n"; 
+
+my %x;   # transcript mapping data
+my %nx;  # current-exon-per-transcript tracking
+open TL, '<', $tlst;
+while (<TL>) {
+	my ($i, $name, $chrstr, $exons) = split / /, $_;
+	my ($chr, $str) = ($chrstr =~ /^(.*)(.{1})$/);
+	$x{$i}{D} = [$name, $chr, $str];
+	$nx{$i}{1} = $nx{$i}{2} = 0;  # initialize
+	my $offset = 0;
+	my @exons = split /,/, $exons;
+	foreach my $e (0..$#exons) {
+		my ($gstart, $gend) = split /-/, $exons[$e];
+		my $len = $gend-$gstart+1;
+		my $tstart = $offset+1;
+		my $tend = $offset+$len;
+		my $intronbp = $e == $#exons ? undef : (split /-/, $exons[$e+1])[0]-$gend-1;
+		push @{ $x{$i}{X} }, [$tstart, $tend, $gstart, $gend, $len, $intronbp];
+	}
+}
+close TL;
+
+
+print "Processing BAM: ",`date`;
+
+system "samtools index $inbam" unless -e "$inbam.bai";
+chomp(my $bamlines = `bash -c 'paste -s -d+ <(samtools idxstats $inbam | cut -f3) | bc'`);
+
+my @samheader;
+open SH, '-|', "samtools view -H $inbam";
+while (<SH>) {
+	push @samheader, $_;
+	die "$0: input bam must be sorted by coordinate!\n" if $_ =~ /^\@HD/ && $_ !~ /SO:coordinate/;
+}
+close SH;
+
+open OUT, '|-', "samtools view -bS - > $outbam";
+print OUT @samheader;
+open SAM, '-|', "samtools view -F 4 $inbam";
+while (<SAM>) {
+#	print " $./$bamlines\n" if $. % 100 == 0;
+	my ($header, $flags, $trans, $tastart, $score, $cigar, $else) = split /\t/, $_, 7;
+	print " $.: $header, $flags, $trans, $tastart, $score, $cigar\n";
+	my $taend = $tastart - 1;  # initialize
+	if ($cigar =~ /^(\d+)M$/) {
+		$taend = $tastart+$1-1;
+	} else {
+		$taend += $1 while $cigar =~ /(\d+)[MND]/g;  # alignment end point on ref:  add M, N, D (ignore S, I)
+##		$raend += $1 while $cigar =~ /(\d+)[MI]/g;   # alignment end point on read: add M, I    (ignore S, D, N)
+	}
+	my ($name, $chr, $str) = @{ $x{$trans}{D} };
+	my $xmax = $#{ $x{$trans}{X} };
+	my ($txstart,  $txend,  $gxstart,  $gxend,  $xlen,  $intronbp ) = @{ $x{$trans}{X}->[$nx{$trans}{1}] };
+	my ($txstart2, $txend2, $gxstart2, $gxend2, $xlen2, $intronbp2) = @{ $x{$trans}{X}->[$nx{$trans}{1}] };
+	until ($tastart > $txstart) {
+		## increment $nx{$trans}{1} until we reach exon that contains the read START  (permanent increase)
+		($txstart, $txend, $gxstart, $gxend, $xlen, $intronbp) = @{ $x{$trans}{X}->[++$nx{$trans}{1}] };
+	}
+	$nx{$trans}{2} = $nx{$trans}{1};
+	until ($taend > $txstart2) {
+		## increment $nx{$trans}{2} until we reach exon that contains the read END    (temporary increase)
+		($txstart, $txend, $gxstart, $gxend, $xlen, $intronbp) = @{ $x{$trans}{X}->[++$nx{$trans}{2}] };
+	}
+	## offset $start; flip strand flag if transcript is (-) strand
+	my ($cigar2, $cigar3, $gastart);
+	if ($str eq '-') {
+		if ($flags & 16) {
+			$flags -= 16;
+		} else {
+			$flags += 16;
+		}
+		$gastart = $gxstart + ($txend - $taend);
+		my @revcigar;
+		push @revcigar, $1 while $cigar =~ /(\d+[MINDS])/g;
+		$cigar2 = join '', @revcigar;
+	} else {
+		$gastart = $gxstart + ($tastart - $txstart);
+		$cigar2 = $cigar;
+	}
+	## correct $cigar if transcript is (-) strand, or if junction 
+	my $overshoot = $taend - $txend;
+	my $cross_junc = $overshoot > 0 && $nx{$trans}{1} < $xmax;
+	if ($str eq '-' || $cross_junc) {
+		my ($roffset, $goffset);
+		while ($cigar2 =~ /(\d+)([MIDS])/) {
+			if ($2 eq 'S') {
+				## Soft-clipped
+				$cigar3 .= "$1$2";
+				$roffset += $2;
+				## DO NOT add to $goffset
+			} elsif ($2 eq 'I') {
+				## Insertion (in read)
+				$cigar3 .= "$1$2";
+				$roffset += $2;
+				## DO NOT add to $goffset
+			} elsif ($2 eq 'D') {
+				## Deletion (in read)
+				$cigar3 .= "$1$2";
+				$goffset += $2;
+				## DO NOT add to $roffset
+			} elsif ($2 eq 'N') {
+				## Junction
+				my $gend = $gxstart2 + ($taend - $txstart2);
+				my $glen = $gend - $goffset;
+				$cigar3 .= "${glen}N";
+				$goffset += $glen;
+				## DO NOT add to $roffset
+			} elsif ($roffset+$1 > $txend) {
+				## Match block extends off exon (crosses junction)
+				my $X = $txend - $roffset;
+				my $Y = $1 - $X;
+				$cigar3 .= "$X$2"."${intronbp}N"."$Y$2";
+				$roffset += $2;
+				$goffset += $2 + $intronbp;
+			} else {
+				## Match block contained by exon
+				$cigar3 .= "$1$2";
+				$roffset += $2;
+				$goffset += $2;
+			}
+		}
+	}
+	## write out, replacing $trans with $chr
+	print OUT join("\t", $header, $flags, $chr, $gastart, $score, $cigar3, $else);  # $else has newline
+}
+close OUT;
+close SAM;
+
+print "$0 complete: ",`date`;
+
+
+
+# CIGAR:  7M1I93M
+# READ:   ACACAAGAAAAACAGGCTTTAAAAGAAAGAGAAATAGACGCGAGGATAGAGGGCCTGAGGGCCCAGGAGTGCACCTCAGCAGAGTCCGATCATGCCTAGAG
+# GENOME: ACACAAG AAAACAGGCTTTAAAAGAAAGAGAAATAGACGCGAGGATAGAGGGCCTGAGGGCCCAGGAGTGCACCTCAGCAGAGTCCGATCATGCCTAGAGT
+
+# CIGAR:  7M2D94M
+# READ:   CCCCTAA  TTTGGTTCTCTTACTGTTGAAAGACTAAAAGCATTGATAAATCCAGCCAATGTAACCTTCAAAATCTATGAAGGCATGATGCACAGCTCATGTC
+# GENOME: CCCCTAATGTTTGGTTCTCTTACTGTTGAAAGACTAAAAGCATTGATAAATCCAGCCAATGTAACCTTCAAAATCTATGAAGGCATGATGCACAGCTCATG
+

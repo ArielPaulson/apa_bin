@@ -1,0 +1,23 @@
+#!/usr/bin/env perl
+
+# Runs htseq-count sense and antisense, and returns a STAR-style file with U,S,A counts per gene
+
+die;   ######### UNDER CONSTRUCTION 
+
+
+		my $cmd = "$samtools view $allbam";  ## MUST BE $ALLBAM: critical if counting multireads, no impact on output otherwise
+		$cmd .= " | perl -pe 's/\\s+NH:i:\\d+//'" if $multi_quantitate;  # only affects Tophat results, BUT, that is the only aligner for which HTSeq can detect multiread-ness
+		$cmd .= " | $htseq_count -s SVALUE -a 0 -m intersection-nonempty - $GTF > $outdir/htseq_counts.FNAME.txt";
+		if ($stranded || $smallRNA) {
+			(my $cmdS = $cmd) =~ s/SVALUE/yes/;
+			$cmdS =~ s/FNAME/sense/;
+			(my $cmdA = $cmd) =~ s/SVALUE/reverse/;
+			$cmdA =~ s/FNAME/anti/;
+			&execute("export PYENV_VERSION=$htseq_python && $cmdS", 1, $LOG, 2, 1);  ## REQUIRES BASH
+			&execute("export PYENV_VERSION=$htseq_python && $cmdA", 1, $LOG, 2, 1);  ## REQUIRES BASH
+			&execute("(echo -e \"Gene\\tUnstr\\tSense\\tAnti\" && paste $outdir/htseq_counts.sense.txt $outdir/htseq_counts.anti.txt | awk -F\"\\t\" 'BEGIN { OFS=\"\\t\" } { print \$1,\$2+\$4,\$2,\$4 }') > $outdir/htseq_counts.all.txt", 1, $LOG, 2, 1);  ## REQUIRES BASH
+		} else {
+			(my $cmdU = $cmd) =~ s/SVALUE/no/;
+			$cmdU =~ s/FNAME/unstr/;
+			&execute("export PYENV_VERSION=$htseq_python && $cmdU", 1, $LOG, 2, 1);  ## REQUIRES BASH
+		}

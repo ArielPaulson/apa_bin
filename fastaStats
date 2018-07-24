@@ -1,0 +1,95 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Digest::MD5 qw/ md5_hex /;
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my $fasta = $ARGV[0];
+
+my (%stats, %bases, %misc, @headers, $header);
+my %nondeg  = map {($_=>1)} qw/ A C G T a c g t /;                # ACGT
+my %nondeg2 = map {($_=>1)} qw/ A C G T a c g t N n /;            # ACGT+N
+my @degen = qw/ M R W S Y K V H D B m r w s y k v h d b /;        # IUPAC non-N degen bases
+my %degen = map {($_=>1)} @degen;
+my %iupac = (%nondeg2, %degen);
+
+my $IN = &open2('R', $fasta, 'input fasta');
+while (my $line = <$IN>) {
+    chomp($line);
+    if ($line =~ /^>(.*)/) {
+        $header = $1;
+        push @headers, $header;
+    } else {
+        $stats{$header}{S} .= $line;
+        $bases{$header}{$_}++ foreach split //, $line;
+    }
+}
+close $IN;
+
+chomp($stats{FILE}{MD5sum} = `md5sum $fasta`);
+$stats{FILE}{MD5sum} =~ s/\s+.*$//; 
+
+foreach my $header (@headers) {
+    ## Aggeregate stats
+    $stats{$header}{Length} = length($stats{$header}{S});
+    $stats{$header}{MD5sum} = md5_hex($stats{$header}{S});
+    ## Basewise stats prep
+    foreach my $base (keys %{ $bases{$header} }) {
+        my $count = $bases{$header}{$base};
+        if (exists $iupac{$base}) {
+            if ($base =~ /[A-Z]/) {
+                $stats{$header}{Unmasked} += $count;
+            } elsif ($base =~ /[a-z]/) {
+                $stats{$header}{Masked} += $count;     # record masking
+                $bases{FILE}{ uc($base) } += $count;  # transfer counts to uppercase
+                delete $bases{$header}{$base};         # remove lowercase
+            }
+            if (exists $nondeg{$base}) {
+                $stats{$header}{ACGT} += $count;
+            } elsif (exists $degen{$base}) {
+                $stats{$header}{Degen} += $count;
+            } else {
+                $stats{$header}{N} += $count;
+            }
+        } else {
+            $stats{$header}{NonIUPAC} += $count;  # non-IUPAC count
+            my $mkey = $base =~ /[A-Z]/i ? 'LETTER' : 'NONLET';
+            $misc{$mkey}{$base} = 1;          # record all non-IUPAC chars
+        }
+    }
+    $stats{$header}{GC} += $bases{$header}{$_} foreach qw/ G C S /;  # S = G|C degen base
+}
+
+my @statnames = qw/ Unmasked Masked NonIUPAC ACGT N Degen GC /;
+foreach my $header (@headers) {
+    $stats{FILE}{$_} += $stats{$header}{$_} foreach ('Length', @statnames);  # Assembly totals
+    foreach my $base (keys %{ $bases{$header} }) {
+        $bases{FILE}{$_} += $bases{$header}{$_} foreach keys %{ $bases{$header} };
+    }
+}
+
+my @sortbases = qw/ A C G T N /;  # main bases first
+foreach my $base (@degen) {       # degenerates second, ordered by degree / ACGT membership
+    push @sortbases, $base if exists $bases{FILE}{$base};
+}
+push @sortbases, (sort keys %{ $misc{LETTER} });
+push @sortbases, (sort keys %{ $misc{NONLET} });
+
+print "Header\tMD5sum\tLength";
+print "\t$_" foreach @statnames;
+print "\t$_.%" foreach @statnames;
+print "\t$_" foreach @sortbases;
+print "\t$_.%" foreach @sortbases;
+print "\n";
+
+foreach my $header ('FILE', @headers) {
+    print "$header\t$stats{$header}{MD5sum}";
+    print join("\t", '', map{ $stats{$header}{$_}||0 } ('Length', @statnames));
+    print join("\t", '', map{ sprintf("%0.6f", 100*$stats{$header}{$_}/($stats{$header}{Length}||1)) } @statnames);
+    print join("\t", '', map{ $stats{$header}{$_}||0 } @sortbases);
+    print join("\t", '', map{ sprintf("%0.6f", 100*$stats{$header}{$_}/($stats{$header}{Length}||1)) } @sortbases);
+    print "\n";
+}
+exit;
+

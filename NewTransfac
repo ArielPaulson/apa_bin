@@ -1,0 +1,269 @@
+#!/usr/bin/env perl
+use Data::Dumper;
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+## Author: Ariel Paulson (apa@stowers.org)
+## Given a Transfac version (must be the latest), mirrors it locally, along with TRANSPRO, TRANSCompel, CLC-Bio plugins, etc.
+## Also creates ancillary datasets, like meme-formatted datasets and an R version of matrix.dat.
+## Build script for /n/data1/biobase/.
+
+
+
+## CRITICAL PREREQUISITES:
+## User must have login for Biobase/Qiagen credentials for the SIMR download account, stored in ~/.netrc.
+
+## Output location
+my $base_dir = '/n/data1/biobase';
+
+## Dependencies
+# { gunzip tar wget mv cp rm ln mkdir stty }
+my $bin = '/home/apa/local/bin';
+my $transfac2RData = "$bin/transfac2RData";
+my $transfac2meme = '/n/apps/CentOS7/install/meme-4.11.1/bin/transfac2meme';                       # CENTOS7
+$transfac2meme = '/n/local/stage/meme/meme_4.8.1/scripts/transfac2meme' unless -e $transfac2meme;  # CENTOS6
+die "$0: Required script '$transfac2meme' does not exist!\n" unless -e $transfac2meme;
+
+## Biobase/Qiagen/GeneXplain URLs
+## PRE-QIAGEN
+##my $base_url = 'https://portal.biobase-international.com/download';   
+##my $biobase_url = 'https://portal.biobase-international.com/cgi-bin/build_ghptywl_o/idb/1.0/pageview.cgi?view=MatrixReport&matrix_acc=';
+## POST-QIAGEN
+my $base_url = 'https://portal.genexplain.com/download';
+my $biobase_url = 'https://portal.genexplain.com/cgi-bin/build_ghptywl/idb/1.0/pageview.cgi?view=MatrixReport&matrix_acc=';
+
+## Args
+my ($version, $clobber, $nodownload, $no_rm);
+GetOptions(
+    "v=s" => \$version, 
+    "clobber" => \$clobber,
+    "no-download" => \$nodownload, # files already downloaded; skip this and proceed to MEME/R steps
+    "no-rm" => \$no_rm              # do not remove downloaded files
+    );
+
+## Version must have expected format
+die "$0: Version '$version' does not have format 'yyyy.r'\n" unless $version =~ /^\d{4}\.\d$/;
+
+## Directory setup
+my $fac_dir  = "$base_dir/transfac/$version";
+my $pro_dir  = "$base_dir/transpro/$version";
+my $comp_dir = "$base_dir/transcompel/$version";
+my $clc_dir  = "$base_dir/clc_plugin/$version";
+chomp(my $wdir = `pwd`);
+
+## Download all accessible datasets
+unless ($nodownload) {
+
+    ## Global issue tracking...
+    my @failed;
+    
+    ## Location prep
+    ## Will not clobber by default
+    if ($clobber) {
+        system "rm -Rf $fac_dir";
+        system "rm -Rf $pro_dir";
+        system "rm -Rf $comp_dir";
+        system "rm -Rf $clc_dir";
+    } else {
+        my @already;
+        push @already, " $fac_dir\n" if -d $fac_dir;
+        push @already, " $pro_dir\n" if -d $pro_dir;
+        push @already, " $comp_dir\n" if -d $comp_dir;
+        push @already, " $clc_dir\n" if -d $clc_dir;
+        die "$0: The following directories already exist:\n@already" if @already;
+    }
+    
+    system "mkdir $fac_dir";
+    system "mkdir $pro_dir";
+    system "mkdir $comp_dir";
+    system "mkdir $clc_dir";
+
+    die "$0: Failed to create transfac version dir '$fac_dir'!\n" unless -d $fac_dir;
+    die "$0: Failed to create transpro version dir '$pro_dir'!\n" unless -d $pro_dir;
+    die "$0: Failed to create transcompel version dir '$comp_dir'!\n" unless -d $comp_dir;
+    die "$0: Failed to create CLC Workbench plugin version dir '$clc_dir'!\n" unless -d $clc_dir;
+    
+    ## Download CLC plugin
+    ## SKIP -- LAST AVAILABLE WAS 2016.3
+    #foreach my $file ('README.txt', "match.zip") {
+    #    my $outfile = "$clc_dir/$file $base_url/clcbio/$version/$file";
+    #    system "wget -O $outfile";
+    #    push @failed, $outfile unless -s $outfile;
+    #}
+    #chdir $clc_dir;
+    #chdir '..';
+    #system 'rm -f current';
+    #system "ln -sf $version current";
+    
+    ## Download TRANSCompel
+    my $comp_gz = "TRANSCompel_${version}_data.tar.gz";
+    foreach my $file ('README.txt', $comp_gz) {
+        system "wget -O $comp_dir/$file $base_url/transcompel/$version/$file";
+    }
+    chdir $comp_dir;
+    chomp(my $here = `readlink -f .`);
+    die "Failed to change directory!\n" unless $here eq $comp_dir;
+    system "tar -xzf $comp_gz";
+    system "rm -f $comp_gz" unless $no_rm;
+    chdir '..';
+    system 'rm -f current';
+    system "ln -sf $version current";
+    
+    ## Download Transfac
+    my $fac_gz = "TFP_${version}_data.tar.gz";
+    ## generally there is also a plant matrix 'matrix_plant.dat.gz' available, but we will not download it, as it will be re-created below
+    foreach my $file ('README.txt', $fac_gz) {  
+        system "wget -O $fac_dir/$file $base_url/transfac/$version/$file";
+    }
+    chdir $fac_dir;
+    chomp(my $here = `readlink -f .`);
+    die "Failed to change directory!\n" unless $here eq $fac_dir;
+    system "tar -xzf $fac_gz";
+    system "rm -f $fac_gz" unless $no_rm;
+    chdir '..';
+    system 'rm -f current';
+    system "ln -sf $version current";
+    
+    ## Download Transpro
+    my $pro_gz = "TRP_${version}_data.tar.gz";
+    foreach my $file ('README.txt', $pro_gz) {
+        system "wget -O $pro_dir/$file $base_url/transpro/$version/$file";
+    }
+    if (-s "$pro_dir/TRP_${version}_data.tar.gz") {  # may not exist for this version
+        chdir $pro_dir;
+        chomp(my $here = `readlink -f .`);
+        die "Failed to change directory!\n" unless $here eq $pro_dir;
+        system "tar -xzf $pro_gz";
+        system "rm -f $pro_gz" unless $no_rm;
+    }
+    chdir '..';
+    system 'rm -f current';
+    system "ln -sf $version current";
+    
+    ## Return to original working directory after downloads
+    chdir $wdir;
+    
+}  # END NO-DOWNLOAD
+
+
+
+## Create MEME datasets
+## This takes a lot of work
+
+## Output setup
+my $meme_dir = "$fac_dir/meme";
+my $meme_file = "$meme_dir/transfac.all.meme";
+my $matrix = "$fac_dir/dat/matrix.dat";
+system "mkdir -p $meme_dir";
+
+############### RELOCATE TO MEME DIRECTORY ###############
+chdir $meme_dir;
+
+## Make master MEME file
+my $cmd = "$transfac2meme -use_acc -url '${biobase_url}MOTIF_NAME' $matrix > $meme_file";
+print "$cmd\n"; system $cmd;
+## MEME file isn't done yet, motif IDs must still be modified, below.
+
+## Now split out each matrix class into its own set of files
+
+## Objects
+my ($datheader, %acc2id, %matrix, $acc, @output, $line, $class, %classdat, %classaccs);
+my %classname = ('V','vertebrate', 'P','plant', 'F','fungal', 'I','insect', 'N','nematode', 'X','misc');
+
+## Read matrix.dat, get matrix IDs and classes
+open my $DAT, '<', $matrix;
+while (<$DAT>) {
+    if ($. <= 3) {
+        $datheader .= $_;
+    } else {
+        if ($_ =~ /^AC\s+(\S+)/) {
+            $acc = $1;
+        } elsif ($_ =~ /^ID\s+(\S+)/) {
+            my $id = $1;
+            $acc2id{$acc} = $id;
+            my $class = substr($id, 0, 1);
+            $class = 'X' unless exists $classname{$class};
+            push @{ $classaccs{$class} }, $acc;
+        }
+        push @{ $matrix{$acc} }, $_;
+    }
+}
+close $DAT;
+
+## Write a subset of matrix.dat for each class
+foreach my $class (qw/ V P F I N X /) {
+    #next if $class eq 'P' && -s "$fac_dir/dat/matrix_plant.dat";  # plant dat is usually already made separate and downloaded (but we redo it anyway for consistency)
+    my $upperclass = "\U$classname{$class}";
+    my $out_matrix = "matrix_$classname{$class}.dat";
+    (my $classheader = $datheader) =~ s/MATRIX TABLE/MATRIX $upperclass TABLE/;
+    open my $OUT, '>', "$fac_dir/dat/$out_matrix";
+    print $OUT $classheader;
+    print $OUT @{ $matrix{$_} } foreach @{ $classaccs{$class} };
+    close $OUT;
+    system "cp $fac_dir/dat/$out_matrix $fac_dir/match/data/$out_matrix";
+    print "$classname{$class}: wrote ",scalar(@{ $classaccs{$class} })," matrix records\n";
+}
+
+## Change names to matrix IDs in transfac.meme -- #1 for specificity, #2 because Biobase URLs are ID-driven
+## Break out major classes (i.e. biological clades) of motifs into their own files
+if (-e $meme_file) {
+    
+    ## Read master MEME file and modify
+    my $header = 1;  # initialize in header mode
+    open my $IN, '<', $meme_file or die "$0: Cannot open '$meme_file': $!\n";
+    while (<$IN>) {
+        $_ =~ s/[\n\r]+$//;
+        if (my ($M, $fac) = ($_ =~ /^MOTIF\s+(\S+)\s+(\S+)/)) {
+            my $V = $acc2id{$M};
+            $header = 0;  # exit header mode upon first motif def
+            $line = "MOTIF $M $V\n";
+            warn "Motif acc $M not found in matrix.dat!\n" unless $V;
+            $class = substr($V,0,1);
+        } else {
+            $line = "$_\n";
+        }
+        push @output, $line;
+        if ($header) {
+            push @{ $classdat{$_} }, $line foreach qw/ V P F I N X /;
+        } elsif (exists $classdat{$class}) {
+            push @{ $classdat{$class} }, $line;  # for VPFIN, each
+        } else {
+            push @{ $classdat{X} }, $line;  # for ABEM, pooled
+        }
+    }
+    close $IN;
+    
+    ## Write modified master MEME file
+    open my $OUT, '>', $meme_file;  # with version
+    print $OUT @output;
+    close $OUT;
+    system "ln -sf $meme_file $meme_dir/transfac.meme";  # without version
+    
+    ## Write class-specific MEME files
+    foreach my $class (qw/ V P F I N X /) {
+        my $class_file = "$meme_dir/transfac.$classname{$class}.meme";  # with version
+        open my $OUT, '>', $class_file;
+        print $OUT @{ $classdat{$class} };
+        close $OUT;
+    }
+    
+} else {
+    
+    print "$0: Failed to create meme version of transfac matrix.dat!\n";
+    
+}
+
+## Create R version of matrix.dat
+print "Creating R version.\n";
+my $R_dir = "$fac_dir/R";
+system "mkdir -p $R_dir";
+chdir $R_dir;
+system $transfac2RData;
+#system "$transfac2RData $fac_dir/dat/matrix_plant.dat" if -e "$fac_dir/dat/matrix_plant.dat";  # now redundant, given clade breakouts above
+
+## Finished!
+print "$0: Complete!\n";
+exit;
+

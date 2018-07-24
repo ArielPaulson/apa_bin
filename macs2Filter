@@ -1,0 +1,51 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my ($xls, $bam, $noheader);
+my ($hmin, $wmin, $fcmin) = (0, 0, 0);
+my ($hmax, $wmax, $fcmax) = (9E9, 9E9, 9E9);  # impossibly high defaults
+my ($pmax, $qmax) = (1, 10);
+
+GetOptions(
+    "x=s" => \$xls, "b=s" => \$bam, 
+    "hmin=f" => \$hmin, "hmax=f" => \$hmax, 
+    "wmin=f" => \$wmin, "wmax=f" => \$wmax, 
+    "fcmin=f" => \$fcmin, "fcmax=f" => \$fcmax, 
+    "pmax=f" => \$pmax, "qmax=f" => \$qmax,
+    "noheader" => \$noheader
+);
+
+open IN, $xls or die "$0: Failed to open '$xls' for reading: $!\n";
+while (<IN>) {
+#    $_ =~ s/[\n\r]+$//;
+    if ($. < 26) {   # headers
+	print $_ unless $noheader;
+    } elsif ($. == 26) {   # column header
+	print $_;
+    } else {
+	my ($chr, $start, $end, $width, $summit, $height, $pord, $fc, $qord, $name) = split /\t/, $_;
+	if ($height < $hmin || $height > $hmax) {
+#	    print "H: $hmin $height $hmax\n";
+	    next;
+	}
+	if ($width < $wmin || $width > $wmax) {
+#	    print "W: $wmin $width $wmax\n";
+	    next;
+	}
+	if ($fc < $fcmin || $fc > $fcmax) {
+#	    print "FC: $fcmin $fc $fcmax\n";
+	    next;
+	}
+	if (10**(-1*$pord) > $pmax || 10**(-1*$qord) > $qmax) {
+#	    print "PQ: $pord=", 10**(-1*$pord), ", $pmax, $qord=", 10**(-1*$qord), ", $qmax\n";
+	    next;
+	}
+	print $_;
+    }
+#    chomp(my @histo = split /\n/, `bash -c 'samtools depth -r $chr:$start-$end $bam | cut -f3 | sort -u'`);
+#    my $max = (sort {$b <=> $a} @histo)[0];
+#    print "$name | $chr:$start-$end | $height, $max\n" if $max < $height;
+}
+close IN;

@@ -1,0 +1,70 @@
+#!/usr/bin/env perl
+use LWP::UserAgent;
+use strict;
+
+my $org = $ARGV[0];  # KEGG 3-letter org code, e.g. hsa, mmu, dre, dme
+die "No KEGG organism code specified!\n" unless $org;
+die "Org code does not look like a KEGG 3-letter org code!\n" unless length($org) == 3;
+
+chomp(my $date = `date +%Y%m%d`);
+my $outdir = "/n/data1/SPIA/$date";
+my $xmldir = "$outdir/KGML_$org";
+system "mkdir -p $xmldir";
+die "Failed to create output directory '$xmldir'!\n" unless -d $xmldir;
+print "Writing to $xmldir\n";
+
+my $ua = LWP::UserAgent->new;
+my (%paths, %counts, $possible, $found, $notfound, $error);
+
+## Get pathways list
+print "Looking up pathways...\n";
+my $page = "http://www.kegg.jp/kegg/pathway.html";
+my $request = HTTP::Request->new(GET => $page);
+my $response = $ua->request($request);
+if ($response->is_success) {
+    foreach my $line (split /\n/, $response->content) {
+	if ($line =~ /(map|ko|hsa)(\d+)/g) {
+#	    print "  Possible pathway: $org$2\n" unless $paths{"$org$2"};
+	    $paths{"$org$2"} = 1;
+	    $counts{$1}++;
+	}
+    }
+} else {
+    print "Query '$page' failed: ", $response->status_line, "\n";
+}
+$possible = scalar keys %paths;
+print "$possible possible pathways\n";
+print "$_\t$counts{$_}\n" foreach sort keys %counts;
+sleep 1;
+
+## Get pathway KGMLs
+print "Retrieving pathways...\n";
+foreach my $path (sort keys %paths) {
+#    print "  $path... ";
+    $| = 1;
+    my $page = "http://www.kegg.jp/kegg-bin/download?entry=$path&format=kgml";
+    my $request = HTTP::Request->new(GET => $page);
+    my $response = $ua->request($request);
+    if ($response->is_success) {
+#	print "exists\n";
+	if (length($response->content)>1) {
+	    print " $path";
+	    open my $OUT, '>', "$xmldir/$path.xml";
+	    print $OUT $response->content;
+	    close $OUT;
+	    $found++;
+	} else {
+#	    print "does not exist\n";
+	    $notfound++;
+	}
+    } else {
+        print "Page '$page' failed: ", $response->status_line, "\n";
+	$error++;
+    }
+    sleep 1;
+}
+print "\n$org: $possible possible pathways | $found found | $notfound not | $error errors\n";
+
+system("bash","-c","/home/apa/local/bin/scriptutils/NewSPIA.R $xmldir $outdir $org");
+exit;
+

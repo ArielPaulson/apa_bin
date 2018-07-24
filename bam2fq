@@ -1,0 +1,88 @@
+#!/usr/bin/env perl
+use strict;
+
+my ($bam, $outpref, $nosingle) = @ARGV;
+if ($outpref eq '--no-single') {
+    $nosingle = 1;
+    $outpref = undef;
+} elsif ($nosingle eq '--no-single') {
+    $nosingle = 1;
+} elsif ($nosingle) {
+    die "$0: Unexpected third argument: only '--no-single' allowed, not '$nosingle'!\n";
+}
+
+($outpref = $bam) =~ s/\.bam$// unless $outpref;
+print "OUTPREF: $outpref\n";
+my $tmp = "bam2fq.$$.tmp.fq";
+my (%ends, %unps);
+
+## Process paired reads
+open my $FQ1, '|-', "gzip > ${outpref}_1.fastq.gz";
+open my $FQ2, '|-', "gzip > ${outpref}_2.fastq.gz";
+my $cmd = $nosingle ? "samtools bam2fq $bam" : "samtools bam2fq -s $tmp $bam";
+open my $IN1, '-|', $cmd;
+my ($i, $end, @rec);
+while (<$IN1>) {
+    $i++;
+    push @rec, $_;
+    if ($i == 1) {
+        chomp;
+        $_ =~ s!/([12])$!!;
+        $end = $1||1;
+        $ends{$end}++;
+    } elsif ($i == 4) {
+        if ($end == 1) {
+            print $FQ1 @rec;
+        } else {
+            print $FQ2 @rec;
+        }
+        @rec = ();
+        $i = 0;
+    }
+}
+close $_ foreach ($IN1, $FQ1, $FQ2);
+system "rm -f ${outpref}_1.fastq.gz" unless $ends{1};
+system "rm -f ${outpref}_2.fastq.gz" unless $ends{2};
+
+## Process orphanss
+if (-e $tmp) {
+    open my $FQ1, '|-', "gzip > ${outpref}_1_orphans.fastq.gz";
+    open my $FQ2, '|-', "gzip > ${outpref}_2_orphans.fastq.gz";
+    open my $IN1, '<', $tmp;
+    my ($i, $end, @rec);
+    while (<$IN1>) {
+        $i++;
+        push @rec, $_;
+        if ($i == 1) {
+            chomp;
+            $_ =~ s!/([12])$!!;
+            $end = $1;
+            $unps{$end}++;
+        } elsif ($i == 4) {
+            if ($end == 1) {
+                print $FQ1 @rec;
+            } else {
+                print $FQ2 @rec;
+            }
+            @rec = ();
+            $i = 0;
+        }
+    }
+    close $_ foreach ($IN1, $FQ1, $FQ2);
+    
+    system "rm -f ${outpref}_1_orphans.fastq.gz" unless $unps{1};
+    system "rm -f ${outpref}_2_orphans.fastq.gz" unless $unps{2};
+    system "rm -f $tmp";
+}
+
+
+if ($ends{2}) {
+    print "Paired-end fastqs are imbalanced: $ends{1} E1 != $ends{2} E2 !\n" if $ends{2} != $ends{1};
+    print "Paired-end fastqs are balanced: $ends{1} E1 == $ends{2} E2 !\n" if $ends{2} == $ends{1};
+    print "Orphans: $unps{1} E1 | $unps{2} E2\n";
+} else {
+    print "Reads: $ends{1} E1\n";
+}
+
+print "$0 $bam complete!\n";
+exit;

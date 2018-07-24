@@ -1,0 +1,26 @@
+#!/bin/bash
+
+order=$1
+stdout=$2
+
+csv1=$(ls /n/analysis/*/*/$order/*/Sample_Report.csv | head -1)  # any csv will do
+outstring=$(head -1 $csv1)  # initialize with header
+
+for csv in /n/analysis/*/*/$order/*/Sample_Report.csv
+do
+    path=${csv%/*}
+    fc=${path##*/}
+    echo "Flowcell: $fc" 1>&2
+    while read line
+    do
+        outstring="$outstring\n$path/$line"
+    done < <(grep ,$order, $csv)
+done
+
+if [ -z $stdout ]; then
+    outcsv=$order.Sample_Report.csv
+    echo -e $outstring > $outcsv
+    echo "Wrote $outcsv"
+else
+    echo -e $outstring
+fi

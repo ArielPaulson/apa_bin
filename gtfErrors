@@ -1,0 +1,124 @@
+#!/usr/bin/env perl
+use strict;
+
+## Errors currently checked for: 
+## 1. multi-chromosome models
+## 2. multi-strand models
+## ALMOST: 3. gene-less or transcript-less exon or CDS features
+
+my ($gtf, $prefix) = @ARGV;
+($prefix = $gtf) =~ s/\.gtf\d*$//i unless $prefix;
+
+my (%data, %summ, %stats, %any);
+
+open my $IN1, '<', $gtf or die "$0: Cannot open gtf file '$gtf' for reading: $!\n";
+while (<$IN1>) {
+    $data{LINE}{$.} = $_;
+    chomp;
+    my ($chr, $src, $type, $start, $end, $score, $strand, $phase, $annot) = split /\t/, $_;
+    my ($gene) = ($annot =~ /gene_id "([^"]+)"/);
+    my ($trans) = ($annot =~ /transcript_id "([^"]+)"/);
+    push @{ $data{TMAP}{$trans} }, $.;
+    $data{G2T}{$gene}{$trans} = 1;
+    $data{TCHR}{$trans}{$chr}{$strand}++;
+    $data{TSTR}{$trans}{$strand}++;
+#    push @{ $data{NGEX} }, $. if $type eq 'exon' && !$gene;
+#    push @{ $data{NGCD} }, $. if $type eq 'CDS' && !$gene;
+#    push @{ $data{NTEX} }, $. if $type eq 'exon' && !$trans;
+#    push @{ $data{NTCD} }, $. if $type eq 'CDS' && !$trans;
+}
+close $IN1;
+
+my %errdata = (
+    'CS'=>{'NAME'=>"CHROM-STRAND", 'FILE'=>"$prefix.ERR-CHROM-STRAND.gtf"},
+    'CO'=>{'NAME'=>"CHROM-ONLY", 'FILE'=>"$prefix.ERR-CHROM-ONLY.gtf"},
+    'SO'=>{'NAME'=>"STRAND-ONLY", 'FILE'=>"$prefix.ERR-STRAND-ONLY.gtf"},
+    'OK'=>{'NAME'=>"OK", 'FILE'=>"$prefix.OK.gtf"}
+    );
+foreach my $errtype (keys %errdata) {
+    open $errdata{$errtype}{FH}, '>', $errdata{$errtype}{FILE};
+}
+
+foreach my $gene (keys %{ $data{G2T} }) {
+    foreach my $trans (keys %{ $data{G2T}{$gene} }) {
+	my $chrerr = scalar(keys %{ $data{TCHR}{$trans} })>1 ? 1 : 0;
+	my $strerr = scalar(keys %{ $data{TSTR}{$trans} })>1 ? 1 : 0;
+	my (@errstr, $errtype);
+	
+	if ($chrerr && $strerr) {
+	    $errtype = 'CS';
+	    $stats{TCS}{$trans} = 1;
+	    $stats{GCS}{$gene} = 1;
+	    foreach my $chr (sort keys %{ $data{TCHR}{$trans} }) {
+		foreach my $str (sort keys %{ $data{TCHR}{$trans}{$chr} }) {
+		    push @errstr, "$chr($str)";
+		}
+	    }
+	} elsif ($chrerr) {
+	    $errtype = 'CO';
+	    $stats{TCO}{$trans} = 1;
+	    $stats{GCO}{$gene} = 1;
+	    foreach my $chr (sort keys %{ $data{TCHR}{$trans} }) {
+		push @errstr, $chr;
+	    }
+	} elsif ($strerr) {
+	    $errtype = 'SO';
+	    $stats{TSO}{$trans} = 1;
+	    $stats{GSO}{$gene} = 1;
+	    foreach my $str (sort keys %{ $data{TSTR}{$trans} }) {
+		push @errstr, $str;
+	    }
+	} else {
+	    $errtype = 'OK';
+	    $stats{TOK}{$trans} = 1;
+	    $stats{GOK}{$gene} = 1;
+	}
+	
+	$any{$errtype}++;
+	my $FH = $errdata{$errtype}{FH};
+	print $FH $data{LINE}{$_} foreach @{ $data{TMAP}{$trans} };
+	my $errstr = join(' ',@errstr);
+	$summ{$errtype}{$errstr}{$gene}{$trans} = 1;
+    }
+}
+
+open my $ERR, '>', "$prefix.gtfErrors.summary.txt";
+print $ERR "Error_Type\tAssociation\tN_Genes\tGenes\tTranscripts\n";
+foreach my $errtype (qw/ CS CO SO OK /) {
+    close $errdata{$errtype}{FH};
+    if ($any{$errtype}) {
+	unless ($errtype eq 'OK') {
+	    my %ord;
+	    foreach my $pattern (keys %{ $summ{$errtype} }) {
+		my @genes = sort keys %{ $summ{$errtype}{$pattern} };
+		my @trans;
+		push @trans, keys %{ $summ{$errtype}{$pattern}{$_} } foreach @genes;
+		$ord{ scalar(@genes) }{$pattern} = join("\t", $errdata{$errtype}{NAME}, $pattern, scalar(@genes), join('; ',@genes), join('; ',sort @trans));
+	    }
+	    foreach my $ngenes (sort {$b <=> $a} keys %ord) {
+		foreach my $pattern (sort keys %{ $ord{$ngenes} }) {
+		    print $ERR $ord{$ngenes}{$pattern},"\n";
+		}
+	    }
+	}
+    } else {
+	system "rm -f $errdata{$errtype}{FILE}";
+    }
+}
+close $ERR;
+
+open my $LOG, '>', "$prefix.gtfErrors.log";
+print $LOG scalar(keys %{ $stats{GOK} })," genes are consistent for chrom and strand\n";
+print $LOG scalar(keys %{ $stats{GCS} })," genes are both chrom- and strand-inconsistent\n";
+print $LOG scalar(keys %{ $stats{GCO} })," genes are chrom-inconsistent only\n";
+print $LOG scalar(keys %{ $stats{GSO} })," genes are strand-inconsistent only\n";
+print $LOG scalar(keys %{ $stats{TOK} })," transcripts are chrom and strand consistent\n";
+print $LOG scalar(keys %{ $stats{TCS} })," transcripts are both chrom- and strand-inconsistent\n";
+print $LOG scalar(keys %{ $stats{TCO} })," transcripts are chrom-inconsistent only\n";
+print $LOG scalar(keys %{ $stats{TSO} })," transcripts are strand-inconsistent only\n";
+close $LOG;
+
+system "cat $prefix.gtfErrors.log";
+
+print "$0 $gtf complete!\n";
+exit;

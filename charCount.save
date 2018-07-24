@@ -1,0 +1,18 @@
+#!/usr/bin/perl
+use strict;
+
+my %special = ("\t" => '\t', "\n" => '\n', "\r" => '\r', ' ' => 'Space');
+my %chars;
+
+open IN, $ARGV[0] or die "Cannot open '$ARGV[0]': $!\n";
+while (<IN>) {
+    $chars{$_}++ foreach (split //, $_);
+}
+close IN;
+
+print "CHAR\tCOUNT\n";
+foreach (sort keys %chars) {
+    my $label = $special{$_} ? $special{$_} : $_;
+    print "$label\t$chars{$_}\n";
+}
+exit;

@@ -1,0 +1,10 @@
+#!/usr/bin/env perl
+use strict;
+
+print "FILE\tREADS\n";
+foreach my $file (@ARGV) {
+    chomp(my $N = `bash -c 'grep -P "^>" $file | wc -l'`);
+    (my $fname = $file) =~ s/\.(f[ast]{1,4})(\.txt)?$//i;
+    print "$fname\t$N\n";
+}
+exit;

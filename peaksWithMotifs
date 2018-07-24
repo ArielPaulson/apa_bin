@@ -1,0 +1,107 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+## Inputs
+my $fimoPlus;       # fimoPlus output directory
+my $pThresh;        # p-value threshold for including motif hits (or 'auto', if fimoPlus run used kill-curves)
+my $motifs;         # either a motif ID, or a file containing such IDs (single-column) -- must be same IDs as in fimoPlus outputs, column 1
+my $output;         # output file
+my $seqString;      # a regular expression (or 1-col file containing multiple regexps); restrict results to ONLY those sequences whose names match this pattern
+
+GetOptions("f=s" => \$fimoPlus, "p=s" => \$pThresh, "m=s" => \$motifs, "o=s" => \$output, "s=s" => \$seqString);
+
+## Globals
+my %motifData;      # data for motifs 
+my %regexps;        # regexp set for filtering sequence headers
+my $fgfile = "$fimoPlus/fg_fimoplus.txt";  # foreground motif hits file
+
+
+### read motifs
+
+if (-e $motifs) {
+    open IN, $motifs or die "$0: Failed to open motifs file '$motifs': $!\n";
+    while (<IN>) {
+	$_ =~ s/[\n\r]+$//;
+	$motifData{$_} = 1;
+    }
+    close IN;
+} elsif ($motifs) {
+    $motifData{$motifs} = 1;
+} else {
+    die "$0: no motifs specified!\n";
+}
+
+### read seqString regular expressions
+
+if (-e $seqString) {
+    open IN, $seqString or die "$0: Failed to open sequence regexp file '$seqString': $!\n";
+    while (<IN>) {
+	$_ =~ s/[\n\r]+$//;
+	$regexps{$_} = 1;
+    }
+    close IN;
+} elsif ($seqString) {
+    $regexps{$seqString} = 1;
+}
+
+### read p-value thresholds, if any
+
+if ($pThresh eq 'auto') {
+    my $pFile = "$fimoPlus/motif.killcurve.pvalues.txt";
+    open IN, $pFile or die "$0: Failed to open motif p-thresholds file '$pFile': $!\n";
+    while (<IN>) {
+	$_ =~ s/[\n\r]+$//;
+	my ($motif, $name, $p) = split /\t/, $_;
+	$motifData{$motif}{P} = $p if exists $motifData{$motif};
+    }
+    close IN;
+} elsif ($pThresh =~ /^[\d.]$/ && $pThresh > 0 && $pThresh <= 1) {
+    $motifData{$_}{P} = $pThresh foreach keys %motifData;
+} else {
+    die "$0: invalid p-value threshold '$pThresh': must be on [0,1] or 'auto'!\n";
+}
+
+### read/filter motif instances
+
+my $pCol;
+open IN, $fgfile or die "$0: cannot open fimoPlus foreground motif instances file '$fgfile': $!\n";
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    my @fields = split /\t/, $_;
+    if ($. == 1) {
+	foreach my $i (0..$#fields) {
+	    $pCol = $i if $fields[$i] eq 'p-value';
+	}
+    } else {
+	next if $fields[$pCol] > $motifData{$fields[0]}{P};
+	if (%regexps) {
+	    my $pass = 0;
+	    foreach (keys %regexps) {
+		$pass = 1 if $fields[2] =~ /$_/;
+	    }
+	    next unless $pass;
+	}
+	$motifData{$fields[0]}{HITS}{$fields[2]}++;  # $fields[0] = motif ID, $fields[2] = sequence ID
+    }
+}
+close IN;
+
+open OUT, "> $output" or die "$0: Cannot open output file '$output' for reading: $!\n";
+print OUT "Motif\tSequence\tInstances\n";
+print "Motif\tSequences\tInstances\n";
+foreach my $motif (sort keys %motifData) {
+    my ($M, $N);
+    foreach my $seq (sort { $motifData{$motif}{HITS}{$b} <=> $motifData{$motif}{HITS}{$a} } keys %{ $motifData{$motif}{HITS} }) {
+	print OUT "$motif\t$seq\t$motifData{$motif}{HITS}{$seq}\n";
+	$M++;
+	$N += $motifData{$motif}{HITS}{$seq};
+    }
+    print "$motif\t$M\t$N\n";
+}
+close OUT;
+exit;
+
+

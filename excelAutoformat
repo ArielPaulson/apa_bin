@@ -1,0 +1,317 @@
+#!/usr/bin/env perl
+use Excel::Writer::XLSX;
+use Spreadsheet::XLSX;
+use Getopt::Long;
+use Scalar::Util qw/ looks_like_number /;
+use Pod::Usage;
+use strict;
+
+die "$0: under construction!\n";
+
+## Reads an xls/xlsx file and re-writes it as xlsx, with auto-formatting columns
+## Creates README tab
+
+## TO DO: zap zeroes
+
+my ($input, $output);
+my $nheader = 1;
+GetOptions("i=s"=>\$input, "o=s"=>\$output, "h=i"=>\$nheader);
+my @sources = @ARGV;  # strings matching SRC values in %library, indicating that data from these sources are present (in case of a predictable autodetection failure)
+($output = $input) =~ s/\.xlsx?$/.AF.xlsx/ unless $output;
+$nheader--;  # rows start at 0
+
+my %library;
+&load_library;
+
+#use Text::Iconv;
+#my $converter = Text::Iconv -> new ("utf-8", "windows-1251");
+# Text::Iconv is not really required.
+# This can be any object with the convert method. Or nothing.
+my $inbook = Spreadsheet::XLSX->new($input);  # ,$converter);
+my ($outbook, %formats);
+## http://search.cpan.org/~jmcnamara/Excel-Writer-XLSX/lib/Excel/Writer/XLSX.pm#FORMAT_METHODS
+$outbook = Excel::Writer::XLSX->new($excel);
+$formats{undef} = undef;  # THE NULL FORMAT
+
+## Color Formats
+$formats{$_} = $outbook->add_format() foreach qw/ red orange amber olive green ltblue blue purple magenta grey /;
+$formats{red}->set_color('#FF0000');
+$formats{orange}->set_color('#FF7800');
+$formats{amber}->set_color('#E1B400');
+$formats{olive}->set_color('#648C00');
+$formats{green}->set_color('#00AA00');
+$formats{ltblue}->set_color('#00B4FF');
+$formats{blue}->set_color('#0000FF');
+$formats{purple}->set_color('#9900FF');
+$formats{magenta}->set_color('#FF00FF');
+$formats{grey}->set_color('#646464');
+
+## Datatype Formats
+$formats{$_} = $outbook->add_format() foreach qw/ numf num0 num1 num2 num3 num4 num6 pct1 pct2 sci2 link text /;
+$formats{numf}->set_num_format();
+$formats{num0}->set_num_format('0');
+$formats{num1}->set_num_format('0.0');
+$formats{num2}->set_num_format('0.00');
+$formats{num3}->set_num_format('0.000');
+$formats{num4}->set_num_format('0.0000');
+$formats{num6}->set_num_format('0.000000');
+$formats{pct1}->set_num_format('0.0%');
+$formats{pct2}->set_num_format('0.00%');
+$formats{sci2}->set_num_format('0.00E+00');
+$formats{link}->set_color('blue');
+$formats{link}->set_underline();
+
+## Other Display Formats
+$formats{$_} = $outbook->add_format() foreach qw/ bold indent center mcenter /;
+$formats{bold}->set_bold();
+$formats{indent}->set_indent();
+$formats{center}->set_align('center');
+$formats{mcenter}->set_align('center');
+$formats{mcenter}->set_align('vcenter');
+$formats{mcenter}->set_text_wrap();
+
+
+my $readme = $outbook->add_worksheet('README');  # must come first, but can only add data to it at the very end
+$readme->set_tab_color('black');
+$readme->set_first_sheet();
+my (%colnames, %sources);
+
+foreach my $insheet (@{$inbook->{Worksheet}}) {
+    my $sheetname = $insheet->{Name};
+    printf("Sheet: %s\n", $sheetname);
+    my $icol = my $irow = my $ocol = my $orow = 0;
+    my $outsheet = $outbook->add_worksheet($sheetname);
+    $outsheet->activate();
+    $outsheet->freeze_panes(1, 2);    ############################ FIXME: these values are not universally true
+    $insheet->{MaxRow} ||= $insheet->{MinRow};
+    $insheet->{MaxCol} ||= $insheet->{MinCol};
+    
+    ## PROCESS *HEADER* BY ROW
+    if ($nheader > -1) {
+        foreach my $irow ($insheet->{MinRow} .. $nheader) {
+            my @header;
+            foreach my $icol ($insheet->{MinCol} .. $insheet->{MaxCol}) {
+                push @header, $insheet->{Cells}[$irow][$icol]->{Val};
+            }
+            $outsheet->write_row($orow, 0, \@header, $formats{bold});
+            $colnames{$sheetname} = \@header;
+            $orow++;
+        }
+        $sources{$sheetname} = &scan_sources(\@header);
+    }
+    
+    ## PROCESS REMAINING DATA BY COLUMN
+    my $prev_fmt;
+    $datastart = $nheader + 1;
+    foreach my $icol ($insheet->{MinCol} .. $insheet->{MaxCol}) {
+        my @coldat;
+        foreach my $irow ($datastart .. $insheet->{MaxRow}) {
+            push @coldat, $insheet->{Cells}[$irow][$icol]->{Val};
+        }
+        $outsheet->write_col($orow, $ocol, \@coldat);
+        my ($colfmt, $autosize) = &test_format(\@coldat, $header[$ocol], $prev_fmt);
+        $outsheet->set_column($ocol, $ocol, $autosize, $formats{$colfmt});
+        $ocol++;
+        $prev_fmt = $colfmt;
+    }
+}
+
+#	my $url = "http://genome.ucsc.edu/cgi-bin/hgTracks?db=$geno&position=$chr%3A$start-$end";
+# $outsheet->write_url($orow, 0, $url, 'UCSC');  # UCSC link, only in Excel file
+
+$outbook->close();
+print "$0 $inbook complete!\n";
+exit;
+
+
+
+
+
+
+sub test_format {
+    my ($dat, $colname, $pfmt) = @_;
+    my $fmt = 'undef';
+    my $auto = undef;
+    my (%dat, $min, $max, $ndig);
+    foreach (@$dat) {
+        if (looks_like_number($_)) {
+            push @{ $dat{NUM} }, $_;
+        } else {
+            push @{ $dat{STR} }, $_;
+        }
+    }
+    my $datatype;
+    
+    
+    
+    
+    
+    return($fmt, $auto);
+}
+
+
+
+sub scan_sources {
+    
+    ## determine what, if any, sources contributed data to this sheet.
+    ## a column in the sheet will receive formatting from %library if its data source is "identified" (as being present in the data).
+    ## to be identified, a source must have at least a minimum number of column matches in the sheet.  Rules vary by source.
+    ## if a source is identified, then the columns from that source will get the assigned formats from %library.
+    ## if a source is not identified, then any columns that may have come from that source will have no special format applied, beyond autosizing.
+    ## if a source is not identified, identification can be 'forced' by giving the source key name as an argument on the command line.
+    ## *** if ANY source is forced, they ALL must be forced, because forcing turns off source detection.
+    
+    my @header = @{$_[0]};
+
+    
+    if (@sources) {
+        
+        ## use these sources; don't look for others; don't bother to validate if these sources exist, either
+        %sources = map {($_=>1)} @sources;
+        
+    } else {
+        
+        ## no sources given; look for believable hits
+        foreach my $src (keys %library) {
+            my $n;
+            foreach my $obsname (@header) {
+                if (exists $library{$src}{EXACT}) {
+                    foreach my $expname (keys %{ $library{$src}{EXACT} }) {
+                        $n++ if $obsname eq $expname;
+                    }
+                }
+                if (exists $library{$src}{REGEX}) {
+                    foreach my $expname (keys %{ $library{$src}{REGEX} }) {
+                        $library{$src}{REGEX}{CI} = 1 unless defined $library{$src}{REGEX}{CI};
+                        if ($library{$src}{REGEX}{CI} && $obsname =~ /$expname/i) {
+                            $n++;
+                            last;  # only one allowed match per source, to prevent inflating $n
+                        } elsif ($obsname =~ /$expname/) {
+                            $n++;
+                            last;  # only one allowed match per source, to prevent inflating $n
+                        }
+                    }
+                }
+            }
+            if ($n >= $library{$src}{MIN}) {
+                $sources{$src} = 1;  # currently, we assume that any sets of colnames able to match multiple sources are few enough to not affect critical $n value.
+                
+                
+                ## FAIL: if column matches > 1 source, which formatting to use??
+                
+                
+            }
+        }
+        
+    }
+    
+}
+
+
+
+sub load_library {
+    
+    ## column names, by source and by detection method, with special formatting options, if any
+    ## ALSO INCLUDED are definition strings for README tabs, thus column matching must be sufficiently specific to determine the appropriate def str for each matched column.
+    
+    ## column names are either under "EXACT" for exact match, or under "REGEX" for _CASE-INSENSITIVE_ matching
+    
+    ## formatting options may be FMT, SIZE, DROP, ZAP0, ZAPNA, NA2INF, FPCT (force pct, default no), CI (case-insensitive regex match, default yes)
+    
+    ## TO ADD: some of the GO_Tools tables
+    
+    ## Genome index genedata, transdata, exondata, pepdata files (latter 2 not yet formalized, so colnames not yet added)
+    
+    $library{gdat}{MIN} = 10;  # min 10 matches to be 'identified'
+    
+    $library{gdat}{EXACT}{'Chr'}                = {};
+    $library{gdat}{EXACT}{'Strand'}             = {};
+    $library{gdat}{EXACT}{'Status'}             = {};
+    $library{gdat}{EXACT}{'Start'}              = { 'FMT'=>'num0' };
+    $library{gdat}{EXACT}{'End'}                = { 'FMT'=>'num0' };
+    $library{gdat}{EXACT}{'Name'}               = { 'FMT'=>'text' };
+    $library{gdat}{EXACT}{'Symbol'}             = { 'FMT'=>'text' };
+    $library{gdat}{EXACT}{'Description'}        = { 'FMT'=>'text', 'SIZE'=>20 };
+    
+    $library{gdat}{REGEX}{'Biotype'}                               = {};
+    $library{gdat}{REGEX}{'^(Gene|Trans|Exon|Peptide)[\W_]?ID$'}   = {};
+    $library{gdat}{REGEX}{'snpEff[\W_]Codon[\W_]Table'}            = {};
+    $library{gdat}{REGEX}{'Max[\W_]Intron'}                        = { 'FMT'=>'num0' };
+    $library{gdat}{REGEX}{'N[\W_](Trans|Exons)'}                   = { 'FMT'=>'num0' };
+    $library{gdat}{REGEX}{'^(Tot|Uxon|Exonic|cDNA|CDS)[\W_]?Len$'} = { 'FMT'=>'num0' };
+    $library{gdat}{REGEX}{'^(cDNA|CDS).?GC$'}                      = { 'FMT'=>'pct2', 'FPCT'=>1 };
+    $library{gdat}{REGEX}{'^(Genomic|Trans)[\W_]CDS[\W_](Start|End)$'} = { 'FMT'=>'num0' };
+    
+    ## FatiClone output
+    
+    $library{fati}{MIN} = 10;  # min 10 matches to be 'identified'
+    
+    $library{fati}{EXACT}{'DB'}                 = {};
+    $library{fati}{EXACT}{'Enrich'}             = {};
+    $library{fati}{EXACT}{'Map'}                = { 'FMT'=>'text' };
+    $library{fati}{EXACT}{'Cluster'}            = { 'FMT'=>'text' };
+    $library{fati}{EXACT}{'Level'}              = { 'FMT'=>'num0' };
+    $library{fati}{EXACT}{'Odds'}               = { 'FMT'=>'num4' };
+    
+    $library{fati}{REGEX}{'^Term[\W_](Acc|Name)$'}    = {};
+    $library{fati}{REGEX}{'[\W_]Ratio$'}              = { 'FMT'=>'num3', 'NA2INF'=>1 };
+    $library{fati}{REGEX}{'^(Clust|Bkg|DB)[\W_]Term'} = { 'FMT'=>'pct2', 'FPCT'=>1 };
+    $library{fati}{REGEX}{'^(Clust|Bkg|DB)[\W_]With'} = { 'FMT'=>'num0' };
+    $library{fati}{REGEX}{'^0[\W_]95[\W_]CI[\W_]'}    = { 'FMT'=>'num4' };
+    $library{fati}{REGEX}{'^(Raw|Adj)[\W_]P$'}        = { 'FMT'=>'sci2' };
+    $library{fati}{REGEX}{'^Input[\W_](Symbols|Names|Xrefs|Rows)$'} = { 'FMT'=>'text', 'SIZE'=>20, 'DROP'=>1 };
+    $library{fati}{REGEX}{'^Mapped[\W_](Symbols|Names|Xrefs)$'} = { 'FMT'=>'text', 'SIZE'=>20, };
+    
+    $library{fati}{REGEX}{'Row\W#'}             = { 'DROP'=>1 };  # these last 3 are unique to the significant_genelist.txt file
+    $library{fati}{REGEX}{'Gene\WIDs'}          = { 'FMT'=>'text', 'DROP'=>1 };
+    $library{fati}{REGEX}{'Orig\WTerms'}        = { 'FMT'=>'text', 'DROP'=>1 };
+    
+    ## Generic Expression-value / DE columns
+    
+    $library{exde}{MIN} = 1;  # min 1 matches to be 'identified'
+    
+    $library{exde}{REGEX}{'(^|[\W_])(Mean|Avg|Sd|StDev|CVs?)$'} = { 'FMT'=>'num4', 'ZAP0'=>1 };
+    $library{exde}{REGEX}{'^(Mean|Avg|Sd|StDev|CVs?)[\W_]'}     = { 'FMT'=>'num4', 'ZAP0'=>1 };
+    $library{exde}{REGEX}{'(RPKM|FPKM|Cpm|Count)'}              = { 'FMT'=>'num4', 'ZAP0'=>1 };
+    $library{exde}{REGEX}{'(^|[\W_])cts?$'}                     = { 'FMT'=>'num4', 'ZAP0'=>1 };
+    $library{exde}{REGEX}{'[\W_](Rpkm|Cpm)(Avg|Sd)$'}           = { 'FMT'=>'num4', 'ZAP0'=>1 };
+    $library{exde}{REGEX}{'Log2?FC'}                            = { 'FMT'=>'num4' };
+    $library{exde}{REGEX}{'(^|[\W_])L?FC$'}                     = { 'FMT'=>'num4' };
+    $library{exde}{REGEX}{'^L?FC[\W_]'}                         = { 'FMT'=>'num4' };
+    $library{exde}{REGEX}{'(p\W?val|q\W?val|FDR)'}              = { 'FMT'=>'sci2' };
+    $library{exde}{REGEX}{'[\W_][pq]$'}                         = { 'FMT'=>'sci2' };
+    $library{exde}{REGEX}{'^[pq][\W_]'}                         = { 'FMT'=>'sci2' };
+    
+    ## nearest.neighbors() output
+    
+    $library{nnbr}{MIN} = 10;  # min 10 matches to be 'identified'
+    
+    $library{nnbr}{EXACT}{'CHR'}                = {};
+    
+    $library{nnbr}{REGEX}{'STRAND\.[12N]'}      = { 'ZAPNA'=>1, 'CI'=>0 };
+    $library{nnbr}{REGEX}{'START\.[12]'}        = { 'FMT'=>'num0', 'ZAPNA'=>1, 'CI'=>0 };
+    $library{nnbr}{REGEX}{'END\.[12N]'}         = { 'FMT'=>'num0', 'ZAPNA'=>1, 'CI'=>0 };
+    $library{nnbr}{REGEX}{'SCORE\.[12N]'}       = { 'FMT'=>'numf', 'ZAPNA'=>1, 'CI'=>0 };
+    $library{nnbr}{REGEX}{'NAME\.[12N]'}        = { 'FMT'=>'text', 'ZAPNA'=>1, 'CI'=>0 };
+    $library{nnbr}{REGEX}{'SYMB\.[12N]'}        = { 'FMT'=>'text', 'ZAPNA'=>1, 'CI'=>0 };
+    
+    ## SPIA output
+    
+    $library{spia}{MIN} = 14;  # min 14 (all) matches to be 'identified'
+    
+    $library{spia}{EXACT}{'Contrast'}           = {};
+    $library{spia}{EXACT}{'Name'}               = {};
+    $library{spia}{EXACT}{'ID'}                 = {};
+    $library{spia}{EXACT}{'Significant'}        = {};
+    $library{spia}{EXACT}{'Status'}             = {};
+    $library{spia}{EXACT}{'pSize'}              = { 'FMT'=>'num0' };
+    $library{spia}{EXACT}{'NDE'}                = { 'FMT'=>'num0' };
+    $library{spia}{EXACT}{'tA'}                 = { 'FMT'=>'num6' };
+    $library{spia}{EXACT}{'pNDE'}               = { 'FMT'=>'sci2' };
+    $library{spia}{EXACT}{'pPERT'}              = { 'FMT'=>'sci2' };
+    $library{spia}{EXACT}{'pG'}                 = { 'FMT'=>'sci2' };
+    $library{spia}{EXACT}{'pGFdr'}              = { 'FMT'=>'sci2' };
+    $library{spia}{EXACT}{'pGFWER'}             = { 'FMT'=>'sci2' };
+    $library{spia}{EXACT}{'KEGGLINK'}           = { 'FMT'=>'link', 'SIZE'=>20 };
+    
+}

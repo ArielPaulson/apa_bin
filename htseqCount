@@ -1,0 +1,64 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my ($bam, $gtf, $uxonbed, $out, $full, $keep);
+my $mode = 'intersection-nonempty';  # default
+GetOptions("b=s" => \$bam, "g=s" => \$gtf, "u=s" => \$uxonbed, "m=s" => \$mode, "o=s" => \$out, "full" => \$full, "keep" => \$keep);
+
+#exit if -s $out;
+
+$full = 1 if $uxonbed;  # implied
+
+(my $hts = $bam) =~ s/bam$/htseqsort.sam/i;
+(my $tmp1 = $bam) =~ s/bam$/htseqsort.1.tmp/i;
+(my $tmp2 = $bam) =~ s/bam$/htseqsort.2.tmp/i;
+(my $g2e = $bam) =~ s/bam$/gtf2exons.bed/i;
+(my $e2u = $bam) =~ s/bam$/exons2uxons.bed/i;
+
+system("bash","-c","export LC_ALL=POSIX && samtools view $bam | sort -s -k 1,1 > $hts") unless -s $hts;
+system("bash","-c","export LC_ALL=POSIX && htseq-count -s no -m $mode $hts $gtf > $tmp1"); # unless -s $tmp1;  # or intersection-strict, union
+
+my %counts;
+open IN, $tmp1 or die "Could not open temp file 1 '$tmp1': $!\n";
+while (<IN>) {
+    chomp;
+    my ($gene, $uxct) = (split /\t/, $_)[0,1];
+    $counts{$gene}->[0] = $uxct;
+}
+close IN;
+system("bash","-c","rm -f $tmp1");
+
+if ($full) {
+    if ($uxonbed) {
+	system("bash","-c","/home/apa/local/bin/uxonCounts $uxonbed $bam $tmp2") unless -s $tmp2;
+    } else {
+	system("bash","-c","/home/apa/lbin/gtf2exons $gtf > $g2e") unless -s $g2e;
+	system("bash","-c","/home/apa/lbin/exons2uxons $g2e > $e2u") unless -s $e2u;
+	system("bash","-c","/home/apa/local/bin/uxonCounts $e2u $bam $tmp2") unless -s $tmp2;
+	system("bash","-c","rm -f $g2e") unless $keep;
+	system("bash","-c","rm -f $e2u") unless $keep;
+    }
+    open IN, $tmp2 or die "Could not open temp file 2 '$tmp2': $!\n";
+    while (<IN>) {
+	next if $. == 1;
+	chomp;
+	my ($gene, $uxct) = (split /\t/, $_)[0,2];
+	$counts{$gene}->[1] = $uxct;
+    }
+    close IN;
+#    system("bash","-c","rm -f $tmp2");
+}
+
+open OUT, "> $out" or die "Failed to open output file '$out': $!\n";
+print OUT "Gene\tHT-seq Reads";
+print OUT "\tTotal Reads" if $full;
+print OUT "\n";
+foreach my $gene (sort keys %counts) {
+    print OUT "$gene\t$counts{$gene}->[0]";
+    print OUT "\t$counts{$gene}->[1]" if $full;
+    print OUT "\n";
+}
+close OUT;
+exit;

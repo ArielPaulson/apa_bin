@@ -1,0 +1,13 @@
+#!/bin/bash
+
+csv=$1
+
+echo "Sample Index Reads.E1 Reads.E2" | sed 's/ /\t/g'
+
+for sample in $(tail -n +2 $csv | cut -f5 -d, | sort -u)
+do
+    N1=$(paste -s -d"+" <(grep ",$sample," $csv | cut -f9,12 -d, | grep "^1," | cut -f2 -d,) | bc)
+    N2=$(paste -s -d"+" <(grep ",$sample," $csv | cut -f9,12 -d, | grep "^2," | cut -f2 -d,) | bc)
+    idx=$(grep ",$sample," $csv | cut -f7 -d, | sort -u)
+    echo "$sample $idx $N1 $N2" | sed 's/ /\t/g'
+done

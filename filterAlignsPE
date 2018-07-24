@@ -1,0 +1,542 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## This script was cloned from filterAligns on 20160919
+## Filters for a single best pair of alignments, one for each end.
+## Only blat alignments are supported
+
+## PALINDROME FILTER NOT YET READY
+
+my $returnN = 1;
+my ($alignfile1, $alignfile2, $queryfa1, $queryfa2, $subjfa, $type, $more, $self, $qlen, $slen, $lost, $outprefix, $tabular);
+my ($bystrand, $noanti, $best, $pairbest, $gapless, $palindrome);  # filters
+my ($gaptestlast, $leastgaps, $mostgaps);  # $best-activated generic gap filters
+my ($AQMinIdt, $TQMinIdt, $QMinLen, $QMinBp, $QMaxGaps, $QMaxGapBp, $QMinGaps, $QMinGapBp);  # query filters
+my ($ASMinIdt, $TSMinIdt, $SMinLen, $SMinBp, $SMaxGaps, $SMaxGapBp, $SMinGaps, $SMinGapBp);  # subject filters
+my ($AMinGaps, $AMinGapBp, $AMaxGaps, $AMaxGapBp);  # combined gap filters
+
+GetOptions(
+
+    "f1=s"=>\$alignfile1,     # alignment output; blast must use '-m 8'; wublast must use '-mformat 2'; exonerate must use '--est2genome'.  Transfac ignores everything except -t, -q, -o.
+    "f2=s"=>\$alignfile2,     # alignment output; blast must use '-m 8'; wublast must use '-mformat 2'; exonerate must use '--est2genome'.  Transfac ignores everything except -t, -q, -o.
+    "q1=s"=>\$queryfa1,       # blast query fasta
+    "q2=s"=>\$queryfa2,       # blast query fasta
+    "s=s"=>\$subjfa,          # blast subject fasta (optional)
+    "o=s"=>\$outprefix,       # prefix for output files ($outprefix.filtered, $outprefix.lost, etc).  Default = '$alignfile'
+    "n=s"=>\$returnN,         # only if using --best: return results for N best scores per query (default 1)
+    
+    "more"=>\$more,           # output more alignment stats (appended to each input line)
+    "self"=>\$self,           # this was a self-blast (query.fa vs query.fa) so ignore self-self alignments
+    "qlen"=>\$qlen,           # queries have length as final header field (saves a bit of calculating, esp. if query.fa is not available)
+    "slen"=>\$slen,           # subjects have length as final header field (saves a bit of calculating, esp. if subject.fa is not available)
+    "bystrand"=>\$bystrand,   ############# not implemented yet: keeps best alignment for each strand, not just one absolute best alignment
+    "noanti"=>\$noanti,       # ignore antisense alignments
+    "gapless"=>\$gapless,     # ignore alignments with any gaps (query or subject)
+    "best"=>\$best,           # do not simply filter alignments: return ONLY the best alignment(s) for each query.  See definition of 'best' below.
+    "pairbest"=>\$pairbest,   # like 'best', but returns best alignment per query-subject pair
+    "lost"=>\$lost,           # return a fasta file of unaligned queries to $outprefix.lost
+    "tabular"=>\$tabular,     # FOR MIRANDA: if using filter only (not best), return tabular output instead of raw // FOR TRANSFAC: return tabular output instead of raw
+    
+    "palindrome"=>\$palindrome,   # only if $best: if search sequence is a palindrome, return only (+) strand best alignment (ignore the identical (-) best-match)
+    "gaptestlast"=>\$gaptestlast, # only if $best: apply gap tests post-filter instead of in-line.  See definition of 'best' below.
+    "leastgaps"=>\$leastgaps,     # only if $best: if multiple top-scoring alignments, prefer those with least gaps
+    "mostgaps"=>\$mostgaps,       # only if $best: if multiple top-scoring alignments, prefer those with most gaps
+    
+    "AQMinIdt=f"=>\$AQMinIdt,     # minimum alignment identity percent (WRT query)         |  percent on [0,1]
+    "TQMinIdt=f"=>\$TQMinIdt,     # minimum total identity percent (over entire query)     |  percent on [0,1]
+    "QMinLen=f"=>\$QMinLen,       # minimum alignment length percent (over entire query)   |  percent on [0,1]
+    "QMinBp=i"=>\$QMinBp,         # minimum alignment length (WRT query)                   |  positive integer
+    
+    "ASMinIdt=f"=>\$ASMinIdt,     # minimum alignment identity percent (WRT subject)       |  percent on [0,1]
+    "TSMinIdt=f"=>\$TSMinIdt,     # minimum total identity percent (over entire subject)   |  percent on [0,1]
+    "SMinLen=f"=>\$SMinLen,       # minimum alignment length percent (over entire subject) |  percent on [0,1]
+    "SMinBp=i"=>\$SMinBp,         # minimum alignment length (WRT subject)                 |  positive integer
+    
+    "QMinGaps=i"=>\$QMinGaps,     # minimum number of gaps allowed in query                |  positive integer
+    "QMaxGaps=i"=>\$QMaxGaps,     # maximum number of gaps allowed in query                |  positive integer
+    "QMinGapBp=i"=>\$QMinGapBp,   # minimum width of all gaps allowed in query             |  positive integer
+    "QMaxGapBp=i"=>\$QMaxGapBp,   # maximum width of all gaps allowed in query             |  positive integer
+    
+    "SMinGaps=i"=>\$SMinGaps,     # minimum number of gaps allowed in subject              |  positive integer
+    "SMaxGaps=i"=>\$SMaxGaps,     # maximum number of gaps allowed in subject              |  positive integer
+    "SMinGapBp=i"=>\$SMinGapBp,   # minimum width of all gaps allowed in subject           |  positive integer
+    "SMaxGapBp=i"=>\$SMaxGapBp,   # maximum width of all gaps allowed in subject           |  positive integer
+    
+    "AMinGaps=i"=>\$AMinGaps,     # minimum number of ALL gaps allowed for alignment       |  positive integer
+    "AMaxGaps=i"=>\$AMaxGaps,     # maximum number of ALL gaps allowed for alignment       |  positive integer
+    "AMinGapBp=i"=>\$AMinGapBp,   # minimum width of ALL gaps allowed for alignment        |  positive integer
+    "AMaxGapBp=i"=>\$AMaxGapBp    # maximum width of ALL gaps allowed for alignment        |  positive integer
+    
+    );
+
+### THE DEFINITION OF '$best':
+###
+### Currently, 'best' alignments are calculated as follows:
+### 1. Generally, all filters are applied in-line as file is read.  Gap tests may or may not be applied in-line -- see below.
+### 2. For each query, all alignments are stored by 'score'.  For blast this is score, for wublast this is rawscore, and for the others it is the number of identities.
+### 3. For each query, all alignments sharing the highest 'score' are returned.
+###
+### Gap handling changes with '$gaptestlast', which is OFF by default:
+### 1. The idea is whether alignments which should be ignored, due to unacceptable gaps, should still be allowed to compete for "best" status.
+### 2. If "on", the ONLY gap tests applied in-line are for gaplessness.  Thus if $gapless==1 (for instance) all gapped alignments are barred from consideration.
+###    The remainder of gap tests are applied AFTER top-score selection.  This way, if the BEST alignment still fails gap filtering, then NO alignments will be reported.
+### 3. If "off", all gap tests are applied in-line, and the top-scoring alignments are taken from the alignments which pass.
+###    This fails fewer queries, but in some cases the "best" alignments you get will be weak, because the *real* best alignments were ignored, due to gaps.  Instead you are getting the "best of the rest".
+
+$outprefix = $alignfile unless $outprefix;
+#print "\$outprefix: $outprefix\n";
+$QMaxGaps = $QMaxGapBp = $SMaxGaps = $SMaxGapBp = 0 if $gapless;
+die "$0: Cannot specify both 'mostgaps' and 'leastgaps'!\n" if $mostgaps && $leastgaps;
+
+my ($header, @qheaders, @sheaders, %blocks, %lengths, %status, %queryNs, $qheaderflag, $sheaderflag);
+my ($qrycount, $aligns, $usecount, $outheader, @blatheader, %scored, $bestaln);
+
+## AFFECTED: %status, %blocks, %lengths, $queryNs, $qheaderflag
+
+if ($queryfa1) {
+
+    open my $INQ, '<', $queryfa1 or die "$0: Can't read query fasta 1 '$queryfa1': $!\n";
+    while (<$INQ>) {
+	if ($_ =~ /^>(.*)/) {
+	    $header = (split /\s+/, $1)[0];  # this is how aligners see it
+	    push @qheaders, $header;   # ONLY ON FIRST FASTA
+	    $status{Q}{$header}{1} = 0;
+	} else {
+	    $blocks{Q}{$header}{1} .= $_;
+	    $lengths{Q}{$header}{1} += length($_)-1;  # -1 due to retained newline
+	}    
+    }
+    close $INQ;
+    $qheaderflag{1} = 1;
+    foreach my $query (@qheaders) {
+	(my $seq = $blocks{Q}{$query}{1}) =~ s/[\n\r]//g;
+	$queryNs{$query}{1}++ while $seq =~ /N/ig;
+    }
+}
+
+if ($queryfa2) {
+
+    open my $INQ, '<', $queryfa2 or die "$0: Can't read query fasta 2 '$queryfa2': $!\n";
+    while (<$INQ>) {
+	if ($_ =~ /^>(.*)/) {
+	    $header = (split /\s+/, $1)[0];  # this is how aligners see it
+	    $status{Q}{$header}{2} = 0;
+	} else {
+	    $blocks{Q}{$header}{2} .= $_;
+	    $lengths{Q}{$header}{2} += length($_)-1;  # -1 due to retained newline
+	}    
+    }
+    close $INQ;
+    $qheaderflag{2} = 1;
+    foreach my $query (@qheaders) {
+	(my $seq = $blocks{Q}{$query}{2}) =~ s/[\n\r]//g;
+	$queryNs{$query}{2}++ while $seq =~ /N/ig;
+    }
+}
+
+if ($self) {
+
+    $lengths{S}{1} = $lengths{Q}{1};
+    $lengths{S}{2} = $lengths{Q}{2};
+    @sheaders = @qheaders;
+
+} elsif ($subjfa) {
+
+    open my $INS, '<', $subjfa or die "$0: Can't read subject fasta '$subjfa': $!\n";
+    while (<$INS>) {
+	$_ =~ s/[\n\r]+$//;
+	if ($_ =~ /^>(.*)/) {
+	    $header = (split /\s+/, $1)[0];  # this is how aligners see it
+	    push @sheaders, $header;
+	    $status{S}{$header}{1} = 0;
+	} else {
+	    $lengths{S}{$header}{1} += length($_);
+	}    
+    }
+    close $INS;
+    $sheaderflag{1} = 1;
+}
+
+
+
+### PROCESS ALIGNMENTS -- ONLY BLAT SUPPORTED    
+
+
+foreach my $i (1, 2) {
+
+    my $afile = ${"alignfile$i"};
+    open my $IN, '<', $afile or die "$0: Can't read alignment file $i '$alignfile': $!\n";
+    my $OUT;
+    unless ($best || $pairbest) {
+	open $OUT, '>', "$outprefix.filtered.end$i" or die "$0: Can't write to '$outprefix.filtered.end$i': $!\n";
+    }
+
+    my (@blatheader, $outheader);
+    while (<$IN>) {
+	(my $line = $_) =~ s/[\n\r]+$//g;
+	if ($. < 6) {  # HEADERS
+	    push @blatheader, $line;
+	    next;
+	} elsif ($. == 6) {  # FIRST ALIGNMENT LINE -- ORGANIZE HEADERS BEFORE CONTINUING
+	    if ($more) {
+		my $extra = "\tQLenPct\tAQIdtPct\tTQIdtPct\tSLenPct\tASIdtPct\tTSIdtPct";
+		$blatheader[2] .= $extra;
+		$blatheader[4] .= '-' x length($extra);  # will be shorter than desired due to tab expansions, but whatever
+	    }
+	    $outheader = join "\n", @blatheader;
+	    print $OUT "$outheader\n" unless $best || $pairbest;
+	}
+	next unless $line;
+	my ($ident, $mismatch, $reps, $Ns, $qgaps, $qgapbp, $sgaps, $sgapbp, $strand, $query, $querylen, $qpos1, $qpos2, $subj, $subjlen, $spos1, $spos2, $blocks, $blocksizes, $qstarts, $tstarts) = split /\t/, $line;
+	push @{ $qheaders{$i} }, $query unless $qheaderflag{$i} || $status{Q}{$query}{$i};  # maintain input order
+	push @{ $sheaders{$i} }, $subj unless $sheaderflag{$i} || $status{S}{$subj}{$i};    # maintain input order
+	$status{Q}{$query}{$i} = 1 unless $status{Q}{$query}{$i} == 2;
+	$status{S}{$subj}{$i} = 1 unless $status{S}{$subj}{$i} == 2;
+	next if ($self && $query eq $subj);
+	next if ($noanti && $strand eq '-');
+	next if (defined $QMaxGaps && $qgaps > $QMaxGaps);   # 'defined' because $maxgaps could be 0
+	next if (defined $SMaxGaps && $sgaps > $SMaxGaps);   # 'defined' because $maxgaps could be 0
+	unless ($gaptestlast) {
+	    next if ($QMinGaps && $qgaps < $QMinGaps);
+	    next if ($QMinGapBp && $qgapbp < $QMinGapBp);
+	    next if ($SMinGaps && $sgaps < $SMinGaps);
+	    next if ($SMinGapBp && $sgapbp < $SMinGapBp);
+	    next if ($AMinGaps && $qgaps+$sgaps < $AMinGaps);
+	    next if ($AMinGapBp && $qgapbp+$sgapbp < $AMinGapBp);
+	    next if (defined $QMaxGaps && $qgaps > $QMaxGaps);
+	    next if (defined $QMaxGapBp && $qgapbp > $QMaxGapBp);
+	    next if (defined $SMaxGaps && $sgaps > $SMaxGaps);
+	    next if (defined $SMaxGapBp && $sgapbp > $SMaxGapBp);
+	    next if (defined $AMaxGaps && $qgaps+$sgaps > $AMaxGaps);
+	    next if (defined $AMaxGapBp && $qgapbp+$sgapbp > $AMaxGapBp);
+	}
+	my ($qrange, $srange) = (abs($qpos2-$qpos1), abs($spos2-$spos1));   # blat uses 0-based coords
+	next if ($QMinBp && $qrange < $QMinBp);
+	next if ($SMinBp && $srange < $SMinBp);
+	my $identbp = $ident + $reps;
+	my $aqidtpct = $qrange ? $identbp/$qrange : 0;
+	next if ($AQMinIdt && $aqidtpct < $AQMinIdt);
+#	print STDERR "$alignfile $.: $query = $querylen\n" unless $querylen;
+	my $tqidtpct = $identbp/$querylen;
+	next if ($TQMinIdt && $tqidtpct < $TQMinIdt);
+	my $qlenpct = $qrange/$querylen;
+	next if ($QMinLen && $qlenpct < $QMinLen);
+	my $asidtpct = $srange ? $identbp/$srange : 0;
+	next if ($ASMinIdt && $asidtpct < $ASMinIdt);
+#	print STDERR "$alignfile $.: $subj = $subjlen\n" unless $subjlen;
+	my $tsidtpct = $identbp/$subjlen;
+	next if ($TSMinIdt && $tsidtpct < $TSMinIdt);
+	my $slenpct = $srange/$subjlen;
+	next if ($SMinLen && $slenpct < $SMinLen);
+	if ($more) {	    ## tidy for printing
+	    $aqidtpct = sprintf("%0.2f", 100*$aqidtpct);
+	    $tqidtpct = sprintf("%0.2f", 100*$tqidtpct);
+	    $qlenpct = sprintf("%0.2f", 100*$qlenpct);
+	    $asidtpct = sprintf("%0.2f", 100*$asidtpct);
+	    $tsidtpct = sprintf("%0.2f", 100*$tsidtpct);
+	    $slenpct = sprintf("%0.2f", 100*$slenpct);
+	    $line .= join "\t", ('', $qlenpct, $aqidtpct, $tqidtpct, $slenpct, $asidtpct, $tsidtpct);   # lead '' results in leading \t
+	}
+	$status{Q}{$query}{$i} = 2;
+	$status{S}{$subj}{$i} = 2;
+	if ($best) {
+	    $scored{$query}{$i}{$identbp}{$line} = [$qgaps, $qgapbp, $sgaps, $sgapbp, $subj, $strand];
+	} elsif ($pairbest) {
+	    $scored{$query}{$subj}{$i}{$identbp}{$line} = [$qgaps, $qgapbp, $sgaps, $sgapbp, $strand];
+	} else {
+	    print $OUT "$line\n";
+	    $bestaln++;
+	}
+    }
+    $aligns = $.-5;
+    
+}
+
+
+############# FILTERING FOR BEST HITS #############
+
+
+
+my (%bestS, $prebest, %prebest, %postbest);
+my ($OUT1, $OUT2, $LOST1, $LOST2);
+
+if ($lost) {
+    open $LOST1, '>', "$outprefix.lost.end1" or die "Can't write lost queries to '$outprefix.lost.end1': $!\n";
+    open $LOST2, '>', "$outprefix.lost.end2" or die "Can't write lost queries to '$outprefix.lost.end2': $!\n";
+}
+
+if ($best) {
+    
+    open $OUT1, '>', "$outprefix.best.end1" or die "$0: Can't write end 1 best alignments to '$outprefix.best.end1': $!\n";
+    open $OUT2, '>', "$outprefix.best.end2" or die "$0: Can't write end 2 best alignments to '$outprefix.best.end2': $!\n";
+    print $OUT1 "$outheader\n";
+    print $OUT2 "$outheader\n";
+
+    foreach my $query (@qheaders) {
+	if (exists $scored{$query}) {
+	    &process_hash($query);
+	} elsif ($lost) {
+	    print $LOST1 ">$query\n$blocks{Q}{$query}{1}";
+	    print $LOST2 ">$query\n$blocks{Q}{$query}{2}";
+	}
+    }
+    close $OUT;
+
+    my $scoredQ = scalar keys %scored;
+    my $prebestQ = scalar keys %prebest;
+    my $postbestQ = scalar keys %postbest;
+#    print "\n$scoredQ scored -> $prebestQ -> $postbestQ";
+    
+} elsif ($pairbest) {
+    
+    open $OUT, '>', "$outprefix.pairbest.end1" or die "$0: Can't write end 1 pair-best alignments to '$outprefix.pairbest.end1': $!\n";
+    open $OUT, '>', "$outprefix.pairbest.end2" or die "$0: Can't write end 2 pair-best alignments to '$outprefix.pairbest.end2': $!\n";
+    print $OUT1"$outheader\n";
+    print $OUT2 "$outheader\n";
+    
+    foreach my $query (@qheaders) {
+	if (exists $scored{$query}) {
+	    foreach my $subject (sort keys %{ $scored{$query} }) {
+		&process_hash($query, $subject);
+	    }
+	} elsif ($lost) {
+	    print $LOST1 ">$query\n$blocks{Q}{$query}{1}";
+	    print $LOST2 ">$query\n$blocks{Q}{$query}{2}";
+	}
+    }
+    close $OUT;
+
+    my $scoredQ = scalar keys %scored;
+    my $prebestQ = scalar keys %prebest;
+    my $postbestQ = scalar keys %postbest;
+#    print "\n$scoredQ scored -> $prebestQ -> $postbestQ";
+    
+} elsif ($lost) {
+
+    foreach my $query (@qheaders) {
+	print $LOST1 ">$query\n$blocks{Q}{$query}{1}" unless $status{Q}{$query}{1};
+	print $LOST2 ">$query\n$blocks{Q}{$query}{2}" unless $status{Q}{$query}{2};
+    }
+}
+
+if ($lost) {
+    close $LOST1;
+    close $LOST2;
+}
+
+
+#### FIXME: BELOW IS NOT PAIR-READY
+#print "$_: $status{Q}{$_}\n" foreach @qheaders;
+my %N;
+$N{Q}{0} = $N{S}{0} = 0;  # ensure printable
+$N{Q}{ $status{Q}{$_} }++ foreach @qheaders;
+$N{S}{ $status{S}{$_} }++ foreach @sheaders;
+$N{$_}{A} = $N{$_}{1} + $N{$_}{2} foreach qw/ Q S /;
+my $NQ = scalar @qheaders;
+my $NS = scalar @sheaders;
+my ($NbestS, $blurb) = $best ? (scalar (keys %bestS), 'best') : ($N{S}{2}, 'filtered');
+my $subjtype = $type eq 'transfac' ? 'motifs' : 'subjects';
+print "\n$NQ queries | $N{Q}{A} aligned | $N{Q}{2} aligned postfilter | $N{Q}{0} unaligned\n";
+print "$NS $subjtype | $N{S}{A} aligned | $N{S}{2} aligned postfilter | $N{S}{0} unaligned\n";
+print "$aligns total alignments";
+my $pbq = scalar keys %prebest;
+print " | $prebest pre-best" if $best;
+print " | $bestaln $blurb to $N{Q}{2} queries / $NbestS $subjtype\n<Enter> to exit.\n";
+exit;
+
+
+
+
+
+
+sub process_hash {
+
+    my ($query, $subject) = @_;
+    my (%E1, %E2);
+    if ($subject) {
+	%E1 = %{ $scored{$query}{$subject}{1} };
+	%E2 = %{ $scored{$query}{$subject}{2} };
+    } else {
+	%E1 = %{ $scored{$query}{1} };
+	%E2 = %{ $scored{$query}{2} };
+    }
+    my @topscores;
+    foreach my $score1 (keys %E1) {
+	foreach my $score2 (keys %E2) {
+	    push @topscores, [$score1+$score2, $score1, $score2];
+	}
+    }
+    @topscores = (sort {$b <=> $a} );
+    @topscores = @topscores[0..$returnN-1];
+	
+	## WORKING HERE
+
+	
+	
+    
+    my @topscores = (sort {$b <=> $a} keys %x)[0..$returnN-1];
+    warn "No topscores!!  $query\n" unless @topscores;
+    foreach my $topscore (@topscores) {
+	
+	my %palinfilt;  # palindrome filter works on a score-by-score basis, assuming reciprocal matches will get same score
+	
+	if ($gaptestlast) {     # $gaptestlast means: filter gaps here, not in-line, because if best alignment is still unacceptable, then we can't ignore it until here
+	    
+	    my %bestgaps;
+	    foreach my $line (keys %{ $x{$topscore} }) {
+		$prebest{$i}++;
+		$prebest{$query} = 1;
+		my ($qgaps, $qgapbp, $sgaps, $sgapbp, $subj, $strand) = @{ $x{$topscore}{$line} };
+		next if ($QMinGaps && $qgaps < $QMinGaps);
+		next if ($QMinGapBp && $qgapbp < $QMinGapBp);
+		next if ($SMinGaps && $sgaps < $SMinGaps);
+		next if ($SMinGapBp && $sgapbp < $SMinGapBp);
+		next if ($AMinGaps && $qgaps+$sgaps < $AMinGaps);
+		next if ($AMinGapBp && $qgapbp+$sgapbp < $AMinGapBp);
+		next if (defined $QMaxGaps && $qgaps > $QMaxGaps);
+		next if (defined $QMaxGapBp && $qgapbp > $QMaxGapBp);
+		next if (defined $SMaxGaps && $sgaps > $SMaxGaps);
+		next if (defined $SMaxGapBp && $sgapbp > $SMaxGapBp);
+		next if (defined $AMaxGaps && $qgaps+$sgaps > $AMaxGaps);
+		next if (defined $AMaxGapBp && $qgapbp+$sgapbp > $AMaxGapBp);
+		if ($mostgaps || $leastgaps) {
+		    my $agapbp = $qgapbp+$sgapbp;
+		    $bestgaps{$agapbp}{$line} = [$subj, $strand];
+		} else {
+		    $bestgaps{$line} = [$subj, $strand];
+		}
+	    }
+	    
+	    ## after gap filtering, choose the least/most-gapped alignments among the candidates (or not)
+	    
+	    if ($leastgaps) {
+		my $minGapBp = (sort {$a <=> $b} keys %bestgaps)[0];
+		foreach my $line (keys %{ $bestgaps{$minGapBp} }) {
+		    my ($subj, $strand) = @{ $bestgaps{$minGapBp}{$line} };
+		    $bestS{$subj} = 1;   # best-alignment subjects
+		    if ($palindrome) {
+			$palinfilt{$subj}{$strand} = $line;
+		    } else {
+			print $OUT "$line\n";
+			$bestaln++;
+		    }
+		}
+	    } elsif ($mostgaps) {
+		my $maxGapBp = (sort {$b <=> $a} keys %bestgaps)[0];
+		foreach my $line (keys %{ $bestgaps{$maxGapBp} }) {
+		    my ($subj, $strand) = @{ $bestgaps{$maxGapBp}{$line} };
+		    $bestS{$subj} = 1;   # best-alignment subjects
+		    if ($palindrome) {
+                        $palinfilt{$subj}{$strand} = $line;
+                    } else {
+                        print $OUT "$line\n";
+			$bestaln++;
+                    }
+		}
+	    } else {
+		foreach my $line (keys %bestgaps) {
+		    my ($subj, $strand) = @{ $bestgaps{$line} };
+		    $bestS{$subj} = 1;   # best-alignment subjects
+		    if ($palindrome) {
+                        $palinfilt{$subj}{$strand} = $line;
+                    } else {
+                        print $OUT "$line\n";
+			$bestaln++;
+                    }
+		}
+	    }
+	    
+	} else {     #####  NOT using $gaptestlast
+	    
+	    my %bestgaps;
+	    foreach my $line (keys %{ $x{$topscore} }) {
+		$prebest++;
+		$prebest{$query} = 1;
+		my ($qgaps, $qgapbp, $sgaps, $sgapbp, $subj, $strand) = @{ $x{$topscore}{$line} };
+		if ($mostgaps || $leastgaps) {
+		    my $agapbp = $qgapbp+$sgapbp;
+		    $bestgaps{$agapbp}{$line} = [$subj, $strand];
+		} else {
+		    $bestgaps{$line} = [$subj, $strand];
+		}
+	    }
+	    
+	    ## after gap filtering, choose the least/most-gapped alignments among the candidates (or not)
+	    
+	    if ($leastgaps) {
+		my $minGapBp = (sort {$a <=> $b} keys %bestgaps)[0];
+		warn "No alignments left!!  $query, $topscore, $minGapBp\n" unless scalar (keys %{ $bestgaps{$minGapBp} });
+		foreach my $line (keys %{ $bestgaps{$minGapBp} }) {
+		    my ($subj, $strand) = @{ $bestgaps{$minGapBp}{$line} };
+		    $bestS{$subj} = 1;   # best-alignment subjects
+		    if ($palindrome) {
+                        $palinfilt{$subj}{$strand} = $line;
+                    } else {
+                        print $OUT "$line\n";
+			$bestaln++;
+                    }
+		}
+		$postbest{$query} = 1;
+	    } elsif ($mostgaps) {
+		my $maxGapBp = (sort {$b <=> $a} keys %bestgaps)[0];
+		foreach my $line (keys %{ $bestgaps{$maxGapBp} }) {
+		    my ($subj, $strand) = @{ $bestgaps{$maxGapBp}{$line} };
+		    $bestS{$subj} = 1;   # best-alignment subjects
+		    if ($palindrome) {
+                        $palinfilt{$subj}{$strand} = $line;
+                    } else {
+                        print $OUT "$line\n";
+			$bestaln++;
+                    }
+		}
+	    } else {
+		foreach my $line (keys %bestgaps) {
+		    my ($subj, $strand) = @{ $bestgaps{$line} };
+		    $bestS{$subj} = 1;   # best-alignment subjects
+		    if ($palindrome) {
+                        $palinfilt{$subj}{$strand} = $line;
+                    } else {
+                        print $OUT "$line\n";
+			$bestaln++;
+                    }
+		}
+	    }
+#		    foreach my $line (keys %{ $x{$topscore} }) {
+#			print $OUT "$line\n";
+#			$bestS{ $x{$topscore}{$line}->[4] } = 1;   # best-alignment subjects
+#			$bestaln++;
+#		    }
+	}
+	
+	if ($palindrome) {
+	    foreach my $subj (keys %palinfilt) {
+		$bestaln++;
+		my $n = scalar keys %{ $palinfilt{$subj} };
+		if ($n==2) {
+		    ## palindrome match, apparently
+		    if (exists $palinfilt{$subj}{'+'}) {  
+			## hopefully, most plus-strands will be '+'
+			print $OUT $palinfilt{$subj}{'+'},"\n";
+		    } else {  
+			## otherwise, just print one of them
+			print $OUT (values %{ $palinfilt{$subj} })[0],"\n";
+		    }
+		} elsif ($n==1) {
+		    ## no palindrome match, apparently (or, unable to account for strand?)
+		    print $OUT "$_\n" foreach values %{ $palinfilt{$subj} };
+		} else {
+		    ## what?
+		    my $keys = join(',', keys %{ $palinfilt{$subj} });
+		    print STDERR "WARNING: Palindrome filter ($keys) for Query '$query' Subject '$subject'\n";
+		    print $OUT "$_\n" foreach values %{ $palinfilt{$subj} };
+		}
+	    }
+	}
+    }
+}
+
+
+
+

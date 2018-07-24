@@ -1,0 +1,90 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use strict;
+
+my ($cdsfasta, $N, $outfile) = @ARGV;  # $N is the codon multiplicity, 1 for single codons, 2 for dicodons, etc.
+
+print STDERR "Reading fasta...\n";
+my $IN = &open2('R', $cdsfasta, 'Input CDS fasta');
+my @x = &readFasta($IN, 0, 1);   # FH, nochomp, toupper
+close $IN;
+
+my %sequence = %{$x[0]};
+my @headers = @{$x[1]};
+my %seqlen;
+my %allcodons;
+my %seqcodons;
+my $Nc = 3*$N;
+my $Nambigs = 0;
+my $Ntotal = 0;
+my $ambig = 'ambiguous';
+
+print STDERR "Processing sequences...\n";
+my $H = scalar @headers;
+my $h;
+foreach my $header (@headers) {
+    $h++;
+    print STDERR " $h/$H\n" if $h % 1000 == 0;
+    $seqlen{$header} = length($sequence{$header});
+    my $end = $seqlen{$header} - $Nc;  # last start position
+    for (my $i=0; $i<=$end; $i+=3) {
+	my $codon = substr($sequence{$header}, $i, $Nc);
+	if ($codon =~ /N/) {
+	    $codon = $ambig;
+	    $Nambigs++;
+	} else {
+	    $allcodons{$codon} = 1;  # only count 'real' codons
+	}
+	$seqcodons{$header}{$codon}++;
+	$seqcodons{$header}{N}++;
+	$Ntotal++;
+    }
+}
+
+print STDERR "Writing output...\n";
+my $OUT;
+if ($outfile) {
+    $OUT = &open2('W', $outfile, 'Output table');
+} else {
+    $OUT = *STDOUT;
+}
+
+my $obs = scalar keys %allcodons;
+my $exp = 4**$Nc;
+my $opct = sprintf("%0.2f", 100*$obs/$exp);
+my $apct = sprintf("%0.2f", 100*$Nambigs/$Ntotal);
+print STDERR "$Ntotal total observations\n$obs/$exp possible patterns observed ($opct%)\n";
+print STDERR "Not including $Nambigs ambiguous observations ($apct% of total)\n" if $Nambigs;
+
+my @codons = qw/ AAA AAC AAG AAT ACA ACC ACG ACT AGA AGC AGG AGT ATA ATC ATG ATT CAA CAC CAG CAT CCA CCC CCG CCT CGA CGC CGG CGT CTA CTC CTG CTT GAA GAC GAG GAT GCA GCC GCG GCT GGA GGC GGG GGT GTA GTC GTG GTT TAA TAC TAG TAT TCA TCC TCG TCT TGA TGC TGG TGT TTA TTC TTG TTT /;
+
+my (%combin, @sortcodons);
+@{ $combin{$_} } = ($codons[$_]) foreach (0..63);
+
+if ($N > 1) {
+    foreach my $n (2..$N) {
+	my @tmpcodons;
+	push @tmpcodons, @{ $combin{$_} } foreach (0..63);
+	foreach my $i (0..63) {
+	    my @prev = @tmpcodons;
+	    @{ $combin{$i} } = map { $codons[$i].$_ } @prev;
+	}
+	
+    }
+}
+push @sortcodons, @{ $combin{$_} } foreach (0..63);
+push @sortcodons, $ambig;
+
+print $OUT "Sequence\tLength\tCodons";
+print $OUT "\t$_" foreach @sortcodons;
+print $OUT "\n";
+foreach my $header (@headers) {
+    print $OUT "$header\t$seqlen{$header}\t$seqcodons{$header}{N}";
+    print $OUT sprintf("\t%0.4f",$seqcodons{$header}{$_}/$seqcodons{$header}{N}) foreach @sortcodons;
+    print $OUT "\n";
+}
+close $OUT;
+
+print "$0 complete!\n";
+exit;
+

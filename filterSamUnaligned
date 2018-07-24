@@ -1,0 +1,10 @@
+#!/usr/bin/perl
+use strict;
+
+## removes unaligned reads from BAM/SAM (e.g. for bowtie output) and prints to STDOUT
+## cat file and pipe to this script; redirect to new SAM or 'samtools view'
+
+while (<>) {
+    print $_ unless (split /\t/, $_, 3)[1] & 4;   # bitflag & 4 means read is unaligned; shouldn't trigger on header lines
+}
+

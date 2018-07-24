@@ -1,0 +1,197 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## Input some Cuffcompare outputs, a reference GTF, and some annotation
+## Output a modified cuffcompare-gtf (genes, transcripts renamed to nearest models, within limits), and tabular annotation
+
+## GOALS:
+## 1. Compare transcripts
+## 2. Compare genes
+## 3. Confer reference annots on "sufficiently-similar" novels, both at transcript and gene levels
+## 4. Output transcriptwise and genewise comparison tables for novels vs refs
+## 5. Output gtf and bed set for renamed-novels
+## 6. Output tabular annot datasets for renamed-novel transcripts and genes, including a modified 'loci' file
+
+
+## "Sufficiently-similar" Defined in 3 tiers:
+## $_pct1: reciprocal % shared exonic bp to call transcripts 'identical' (unless another transcript has even higher recip %, e.g. 100)
+## $_pct2: reciprocal % shared exonic bp to call transcripts 'similar'
+## $_pct3: reciprocal % shared exonic bp to call transcripts 'closest'
+## where '_' = 'g' for gene-level or 't' for transcript-level
+my ($gpct1, $gpct2, $gpct3) = (90, 70, 51);
+my ($tpct1, $tpct2, $tpct3) = (90, 70, 51);
+
+
+## Reference GTF requires a 5-column tabular annotations file in a particular format:
+## GENE ID, GENE SYMBOL, GENE BIOTYPE, GENE STATUS, GENE DESCRIPTION.
+## Leave columns blank that cannot be filled, but do not leave them out.
+## GENE ID must match with reference GTF.
+## GENE SYMBOL can be whatever, including blank.
+## GENE BIOTYPE should at least reflect coding or noncoding, if nothing else.
+## GENE STATUS should reflect the gene source, if no other status is defined.
+## GENE DESCRIPTION can be whatever, including blank, but this is your last chance to append ANYTHING known about this gene, if you have it.
+
+
+## Inputs
+my $cc_gtf;     # Cuffcompare combined.gtf
+my $cc_loci;    # Cuffcompare loci
+my $ref_gtf;    # Reference GTF(s), preferably the inputs to Cuffcompare.  Cat into single file if > 1.
+my $ref_ann;    # Tabular annotation file for $ref_gtf.  See formatting rules above.
+my $outprefix;  # A prefix for output files
+
+GetOptions("g=s"=>\$cc_gtf, "l=s"=>\$cc_loci, "r=s"=>\$ref_gtf, "a=s"=>\$ref_ann, "p=s"=>\$outprefix);
+
+my $bin = '/home/apa/local/bin';
+my $tmp = "tmp.renameModels.$$";
+mkdir $tmp;
+system "cp $ref_gtf $tmp/";
+chdir $tmp;
+my $cmd = "$bin/gtf2beds $ref_gtf";
+print "$cmd\n"; system $cmd;
+chdir '..';
+(my $tmpref = "$tmp/$ref_gtf") =~ s/.gtf$//;
+
+
+### Acquire Cuffcompare + downstream data
+
+my (%t2g, %g2t, %tdat, %gdat, %gex, %loci);
+
+open my $RGB, '<', "$tmpref.genes.bed" or die;
+while (<$RGB>) {
+    $_ =~ s/[\n\r]+$//;
+    my ($chr, $gstart, $gend, $gene, $score, $strand) = split /\t/, $_;
+    $gdat{$gene} = [$chr, $gstart, $gend, $score, $strand, 0, 0, 0];  # last 3: N trans, N unq exons, N uxons
+}
+close $RGB;
+
+open my $RTG, '<', "$tmpref.transGenes.txt" or die;
+while (<$RTG>) {
+    $_ =~ s/[\n\r]+$//;
+    my ($chr, $tstart, $tend, $trans, $score, $strand, $gene) = split /\t/, $_;
+    $tdat{$trans} = [$chr, $tstart, $tend, $score, $strand, 0];  # last 1: N exons
+    $t2g{$trans} = $gene;
+    $g2t{$gene}{$trans} = 1;
+    $gdat{$gene}->[5]++;
+}
+close $RTG;
+
+open my $RTE, '<', "$tmpref.trans.exons.bed" or die;
+while (<$RTE>) {
+    $_ =~ s/[\n\r]+$//;
+    my ($chr, $start, $end, $id, $score, $strand) = split /\t/, $_;
+    my ($trans, $n) = split /:/, $id;
+    $tdat{$trans}->[5]++;
+    $gex{ $t2g{$trans} }{"$start\t$end"} = 1;
+}
+close $RTE;
+
+$gdat{$_}->[6] = scalar(keys %{ $gex{$_} }) foreach keys %gex;  # N unique exons defs per gene
+
+open my $RGU, '<', "$tmpref.uxons.bed" or die;
+while (<$RGU>) {
+    $_ =~ s/[\n\r]+$//;
+    my ($chr, $start, $end, $id, $score, $strand) = split /\t/, $_;
+    my ($gene, $n) = split /:/, $id;
+    $gdat{$gene}->[7]++;
+}
+close $RGU;
+
+if (0) {
+    open my $RANN, '<', $ref_ann or die;
+    while (<$RANN>) {
+	$_ =~ s/[\n\r]+$//;
+	my ($gene, @else) = split /\t/, $_;  # @else = symbol, biotype, status/source, description
+	push @{ $gdat{$gene} }, @else;
+    }
+    close $RANN;
+}
+
+my $cmd = "$bin/compareModels -a $cc_gtf -b $ref_gtf -o $outprefix.compare.txt";
+print "$cmd\n"; system $cmd;
+
+my (%x, %y, %z, %yg, %zp, %conv);
+open my $IN, '<', "$outprefix.compare.txt" or die;
+open my $OUT, '>', "$outprefix.compare.best.txt" or die;
+while (<$IN>) {
+    chomp;
+    my @data = (split /\t/, $_);
+    if ($. == 1) {
+	print $OUT join("\t", @data[0..1], "Accession", @data[2..12]),"\n";
+	next;
+    }
+    my ($g1, $g2, $bpo, $p1, $p2) = @data[0,1,3,5,6];
+    if (!$g1) {   # non-overlappers
+	next;
+    } elsif (!$g2) {   # non-overlappers
+	$zp{0}++;
+	next;
+    } else {          # novel-ref overlap
+#	$y{$g1}{$p1+$p2}{substr($x{g2},0,2)} = [join("\t", @data[0..1]), join("\t", @data[2..12]), $x{$g2}, $p1, $p2, $bpo];   ## NO %x 
+	$y{$g1}{$p1+$p2}{substr($g2,0,2)} = [join("\t", @data[0..1]), join("\t", @data[2..12]), $g2, $p1, $p2, $bpo];
+	$yg{$g1}{$p1+$p2}{$g2} = 1;
+    }
+}
+close $IN;
+foreach my $novel (sort keys %y) {
+    my $best = (sort {$b <=> $a} keys %{ $y{$novel} })[0];
+    my $Nbest = scalar keys %{ $yg{$novel}{$best} };
+    $z{$Nbest}++;
+    my $acc;
+    if ($y{$novel}{$best}{NM}) {
+	$acc = "NM";
+    } elsif ($y{$novel}{$best}{NR}) {
+	$acc = "NR";
+    } else {
+	$acc = (keys %{ $y{$novel}{$best} })[0];
+    }
+    my $pct = $y{$novel}{$best}{$acc}->[3];
+    my $gene;
+    if ($pct >= 70) {  # there is a bit of a natural break below 70% (test datasets)
+	$zp{">=70"}++;
+	$gene = $y{$novel}{$best}{$acc}->[2];
+    } elsif ($pct >= 50) {
+	$zp{">=50"}++;
+    } elsif ($pct >= 25) {
+	$zp{">=25"}++;
+    } else {
+	$zp{">=1"}++;
+    }
+#    my $gene = $pct >= 70 ? $y{$novel}{$best}{$acc}->[2] : 
+#	$y{$novel}{$best}{$acc}->[5] >= 1000 ? $y{$novel}{$best}{$acc}->[2] : $novel;  # also a natural break below 1kb exonic overlap (test datasets)
+    my ($string1, $string2) = @{ $y{$novel}{$best}{$acc} }[0,1];
+    print $OUT "$string1\t$gene\t$string2\n";
+}
+close $OUT;
+
+print STDERR "N-BEST\tN\@NBEST\n";
+print STDERR "$_\t$z{$_}\n" foreach sort {$a <=> $b} keys %z;
+print STDERR "\n";
+print STDERR "BEST%\tN\@BEST%\n";
+print STDERR "$_\t$zp{$_}\n" foreach sort {$b cmp $a} keys %zp;
+
+open my $AC, "cut -f1,2 $outprefix.compare.best.txt |";
+while (<$AC>) {
+    chomp;
+    my ($old, $new) = split /\t/, $_;
+    $conv{$old} = $new unless $old eq $new;
+}
+close $AC;
+
+open my $IN2, '<', $cc_gtf;
+open my $OUT2, '>', "$outprefix.gtf";
+while (<$IN2>) {
+    my @data = split /\t/, $_;
+    my ($gene) = ($data[8] =~ /gene_id "([^"]+)";/);
+    $data[8] =~ s/$gene/$conv{$gene}/ if $conv{$gene};
+    print $OUT2 join("\t", @data);
+}
+close $IN2;
+close $OUT2;
+
+my $cmd = "$bin/gtf2beds $outprefix.gtf";
+print "$cmd\n"; system $cmd;
+system "rm -rf $tmp*";
+print "$0 complete!\n";
+exit;

@@ -1,0 +1,21 @@
+#!/usr/bin/perl
+
+my ($sql, $tablepath) = @ARGV;
+
+die "Must be run on Linux!\n" unless $^O eq 'linux';
+
+chomp($tablepath = `readlink -f $tablepath`);  # ensure path is rooted
+#die "Cannot resolve table path '$tablepath'!\n" unless -d $tablepath;
+
+($loader = $sql) =~ s/sql$/loader.sql/i;
+open IN, $sql or die "Cannot open SQL file '$sql': $!\n";
+open OUT, "> $loader" or die "Cannot write to loader sql '$loader': $!\n";
+while (<IN>) {
+	if ($_ =~ /CREATE TABLE `(.*?)`/) {
+		print OUT "LOAD DATA LOCAL INFILE '$tablepath/$1.txt' INTO TABLE `$1`;\n";
+	}
+}
+close IN;
+close OUT;
+exit;
+

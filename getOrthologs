@@ -1,0 +1,360 @@
+#!/usr/bin/env Rscript
+
+## gets ortholog data from Ensembl for a single gene
+## runs full bidirectional searches to find any one-way annotations (e.g. ortholog may exist in human->yeast search but not yeast->human)
+## returns ortholog and transcript tables, NT and AA fastas for all sequences of interest
+##
+## command: /home/apa/local/bin/getOrthologs  -i Ensembl_gene_id  -s Genus_species (of gene)  -o Genus_species,Genus_species,... (ortho orgs)  -m mart_name  -d output_dir  --clobber  --self-search  --verbose
+##
+## Note about mart names:
+##  Default is "ensembl" which is for core www.ensembl.org biomart.
+##  If using www.ensemblgenomes.org biomarts, must use mart names like (fungi|metazoa|plants|protists)_mart_(version#), e.g. "fungi_mart_19".
+##  All archival biomarts use name "ENSEMBL_MART_ENSEMBL", also requiring host names like "may2015.archive.ensembl.org".  Use any "View in archive site" link at Ensembl to see versions/dates.
+##
+## Note about --self-search:
+##  By default, bidirectional searches will be performed on all organisms EXCEPT the source organism.  Source org gets 1-way paralog search only.
+##  Otherwise, runtime will probably increase several fold, and you will probably not get any new homologs for the inconvenience.
+##  Use --self-search only if there are known bidirectional paralogy annotation issues WITHIN the source org itself, i.e. X is a paralog of Y but Y is not a paralog of X.
+##
+## Future development:
+## Full genedata.txt-style output for all genes, including target.
+## Screen for more precise homology types and add to master table (ortho|in-para|out-para|homo); keep a master table for confounding paralogs.
+## --exhaustive mode for pulling entire ortho/para network.
+## --matrices switch to run self-blast and generate similarity matrices.
+## Add whole-transcriptome mode *****************
+
+
+
+
+#### setup
+
+## parse command line args
+library(getopt)
+spec <- matrix(c(
+    'gene-id',     'i', 1, 'character', 'a single Ensembl gene ID (required)',
+    'source-org',  's', 1, 'character', '"Genus_species" for above gene ID (required)',
+    'ortho-orgs',  'o', 1, 'character', 'comma-separated list of "Genus_species" for ortholog organisms to search (required)',
+    'mart-name',   'm', 2, 'character', 'name of ensembl mart to use (default "ensembl")',
+    'mart-host',   'h', 2, 'character', 'host of ensembl mart DB to use (default "www.ensembl.org")',
+    'self-search', 'S', 0, 'logical',   'run bidirectional search on source organism itself? (default no)',
+    'outdir',      'd', 2, 'character', 'output directory (default "getOrtholog.<gene>")',
+    'clobber',     'c', 0, 'logical',   'clobber existing output directory? (default no)',
+    'verbose',     'v', 0, 'logical',   'print intermediate datasets to screen in real time? (default no)'
+), byrow=TRUE, ncol=5)
+opt <- getopt(spec)
+if (!is.null(opt$help)) {
+    cat(getopt(spec, usage=TRUE))
+    q(status=1)
+}
+
+## unpack 'opt'
+target <- opt[["gene-id"]]
+mart.name <- ifelse(is.null(opt[["mart-name"]]), "ENSEMBL_MART_ENSEMBL", opt[["mart-name"]])  # as of Ensembl 80, host had to be 'ensembl'.  Now (83), has to be 'ENSEMBL_MART_ENSEMBL'
+mart.host <- ifelse(is.null(opt[["mart-host"]]), "www.ensembl.org", opt[["mart-host"]])       # as of Ensembl 80, host had to be 'www.biomart.org'.  Now (83), has to be 'www.ensembl.org'
+orgs <- gsub("_"," ",c(unlist(strsplit(opt[["ortho-orgs"]],",")),opt[["source-org"]]))
+outdir <- ifelse(is.null(opt$outdir), paste0("getOrthologs.",target), opt$outdir)
+clobber <- ifelse(is.null(opt$clobber), FALSE, TRUE)
+verbose <- ifelse(is.null(opt$verbose), FALSE, TRUE)
+self.search <- ifelse(is.null(opt[["self-search"]]), FALSE, TRUE)
+
+## set up output directory
+if (dir.exists(outdir)) {
+    if (clobber) {
+        message(paste0("Overwriting directory '",outdir,"'."))
+        system(paste("rm -rf",outdir))
+        system(paste("mkdir -p",outdir))
+        if (!dir.exists(outdir)) stop(paste0("Output directory '",outdir,"' could not be re-created!  Stopping."))
+    } else {
+        stop(paste0("Output directory '",outdir,"' already exists!  Stopping."))
+    }
+} else {
+    system(paste("mkdir -p",outdir))
+    if (!dir.exists(outdir)) stop(paste0("Output directory '",outdir,"' could not be created!  Stopping."))
+    message(paste0("Writing to output directory '",outdir,"'"))
+}
+setwd(outdir)
+
+## establish mart connections for each organism mart
+library(biomaRt)
+orgs.ens <- sapply(orgs, function(x) paste0(tolower(substr(x,1,1)),unlist(strsplit(x," "))[2]) )  # ensemblized organism names
+N <- length(orgs)
+M <- N-1  # everything but source org
+marts <- as.list(orgs.ens)
+names(marts) <- orgs.ens
+for (i in 1:N) {
+    marts[[i]] <- useMart(biomart=mart.name, dataset=paste0(orgs.ens[i],"_gene_ensembl"), host=mart.host)  # create mart connections
+    message(paste(orgs[i],"mart successful!"))
+}
+la <- lapply(marts, listAttributes)  # available attributes for each mart
+save.image("session.RData")  # periodic save
+
+
+
+
+
+#### identify pertinent attribute fields to include in dataframe
+## "log_" targeting "(ortho|para|homo)log_" attribute names
+
+## Ensembl always returns the same 13 homology fields.
+## Unfortunately, it doesn't always return them in same order -- must force uniform ordering by matching fields.
+field.ord <- c("ensembl_gene","canonical_transcript_protein","ensembl_peptide","chromosome","chrom_start","chrom_end","logy_type","subtype","logy_confidence","perc_id","perc_id_r1","dn","ds")
+
+## source->else *logy fields
+source2ortho.fields <- lapply(1:N, function(i) {
+    message(paste(i, orgs.ens[i]))
+    x <- grep("log_",grep(orgs.ens[i],la[[N]][,1],value=T),value=T)  # attributes FROM source org mart, for all other orgs including self
+    found.fields <- field.ord
+    if (length(x) != 13) {
+        wlost <- which(sapply(field.ord, function(f) !any(grepl(paste0(f,"$"),x)) ))
+#        if (all(wlost %in% 12:13)) x <- 
+        warning(paste("Number of homology fields returned for",orgs[i],"is",length(x),"not 13!  Data may fail to tabularize."))
+        found.fields <- field.ord[-wlost]
+    }
+    x[sapply(paste0(found.fields,"$"), function(y) grep(y,x) )]  # order as in 'field.ord'
+})
+names(source2ortho.fields) <- orgs.ens
+if (verbose) source2ortho.fields
+
+## else->source *logy fields
+ortho2source.fields <- lapply(1:N, function(i) {  # attributes from ortho-org marts for source org
+    grep("log_",grep(orgs.ens[N],la[[i]][,1],value=T),value=T)  # attributes FOR source org, from all other org marts
+})
+names(ortho2source.fields) <- orgs.ens[1:N]
+if (verbose) ortho2source.fields
+save.image("session.RData")  # periodic save
+
+
+
+
+
+#### exhaustively detect pertinent orthologs, since many ortholog annotations are not bidirectional
+
+## source->else orthologs
+message(paste("Forward-searching on",orgs[N],"genes"))
+source2ortho.genes <- lapply(1:N, function(i) {
+    getBM(attributes=c(source2ortho.fields[[i]][1],"ensembl_gene_id"), filters="ensembl_gene_id", values=target, mart=marts[[N]])
+})
+names(source2ortho.genes) <- orgs.ens
+if (verbose) source2ortho.genes
+
+## else->source orthologs
+ortho2source.genes <- lapply(1:M, function(i) {  # attributes from ortho-org marts for source org
+    x <- getBM(attributes="ensembl_gene_id", filters=paste0("with_homolog_",substr(orgs.ens[N],1,4)), values=TRUE, mart=marts[[i]])  # all genes with any source-org orthology
+    message(paste("Backward-searching on",nrow(x),orgs[i],"genes"))
+    y <- getBM(attributes=c("ensembl_gene_id",ortho2source.fields[[i]][1]), filters="ensembl_gene_id", values=x, mart=marts[[i]])  # gene-ortholog pairs
+    y[y[,2]==target,]  # gene-ortholog pairs where ortholog is the target gene
+})
+names(ortho2source.genes) <- orgs.ens[1:M]
+if (verbose) ortho2source.genes
+
+## else->source where else == source (only run if known to be necessary)
+if (self.search) {
+    x <- getBM(attributes="ensembl_gene_id", filters=paste0("with_paralog_",substr(orgs.ens[N],1,4)), values=TRUE, mart=marts[[N]])  # all genes with any source-org orthology (WHICH WILL BE ALL)
+    message(paste("Backward-searching on:",nrow(x),orgs[N],"genes"))
+    y <- getBM(attributes=c("ensembl_gene_id",ortho2source.fields[[N]][1]), filters="ensembl_gene_id", values=x, mart=marts[[N]])  # gene-ortholog pairs
+    ortho2source.genes[[N]] <- y[y[,2]==target,]  # gene-ortholog pairs where ortholog is the target gene
+    if (verbose) ortho2source.genes[[N]]  # what genes did it find?
+} else {
+    ortho2source.genes[[N]] <- source2ortho.genes[[N]]  # clone annotation from undirectional search -- assume same
+}
+names(ortho2source.genes)[N] <- orgs.ens[N]
+
+## N xlogs detected for target gene for each direction
+if (verbose) { sapply(source2ortho.genes,nrow); t(sapply(source2ortho.genes, function(x) apply(x,2,function(y) length(unique(y))))) }
+if (verbose) { sapply(ortho2source.genes,nrow); t(sapply(ortho2source.genes, function(x) apply(x,2,function(y) length(unique(y))))) }
+
+## any genes which were not bidirectionally annotated?
+unibi <- do.call(rbind, lapply(orgs.ens, function(o) {
+    o2s <- ortho2source.genes[[o]]; colnames(o2s) <- c("homolog","target")
+    s2o <- source2ortho.genes[[o]]; colnames(s2o) <- c("homolog","target")
+    x <- rbind(o2s,s2o)[,2:1]
+    x <- cbind(x, bidirectional=duplicated(x[,1]))
+    is.dup <- x[,1] %in% x[duplicated(x[,1]),1]
+    x[!(is.dup&!x$bidirectional),]
+}))
+if (verbose) unibi
+
+## remove all source2ortho.genes pairs from ortho2source.genes => ortho2source.genes2 (novel entries only)
+ortho2source.genes2 <- ortho2source.genes
+for (i in 1:N) {
+    s2o <- apply(source2ortho.genes[[i]][,1:2],1,paste,collapse=":")
+    o2s <- apply(ortho2source.genes[[i]][,1:2],1,paste,collapse=":")
+    ortho2source.genes2[[i]] <- ortho2source.genes[[i]][!(o2s %in% s2o), ]
+}
+w.uni <- which(sapply(ortho2source.genes2,nrow)>0)
+LU <- length(w.uni)
+ortho2source.genes2 <- ortho2source.genes2[w.uni] # remove empty elements
+message(paste(LU,"organisms have unidirectional annotations"))
+save.image("session.RData")  # periodic save
+
+
+
+
+
+#### create master matrix with all ortholog annotations
+
+## prep
+xlogify <- function(x) unique(gsub("[a-z]+log(y?)_","xlog\\1_",sub("^[^_]+_","",x)))  # convert all (homo|ortho|para)log labels to "xlog", for unified accounting
+cnames1 <- c("Mart.Org","Homolog.Org")  # initial colnames for matrix
+cnames2 <- c("ensembl_gene_id",xlogify(unlist(c(source2ortho.fields,ortho2source.fields))))  # further colnames for matrix -- mart *log field types, with organism prefixes removed.  
+cnames3 <- c("xlog_xlogy_type","xlog_subtype","xlog_xlogy_confidence","xlog_perc_id","xlog_perc_id_r1","xlog_dn xlog_ds")  # data unique to xlogs -- can get the rest from gene-data calls
+
+## data frame rows for source->else matches
+source2ortho.rows <- lapply(1:N, function(i) {
+    message(paste(i,orgs.ens[i]))
+    ## like source2ortho.genes, but returning all orthology fields
+    x <- getBM(attributes=c("ensembl_gene_id",source2ortho.fields[[i]]), filters="ensembl_gene_id", values=target, mart=marts[[N]])
+    ncx <- ncol(x)
+    colnames(x)[2:ncx] <- xlogify(colnames(x)[2:ncx])
+    ok.cols <- match(cnames2,colnames(x))
+    if (any(is.na(ok.cols))) {
+        nok.cols <- which(is.na(ok.cols))
+        ok.cols[is.na(ok.cols)] <- 1
+        x <- x[,ok.cols]  # match to output matrix column order
+        x[,nok.cols] <- NA
+        for (n in nok.cols) mode(x[[n]]) <- "numeric"  # may or may not be, but if these columns in final table are character, they will be recast
+        colnames(x) <- cnames2
+    } else {
+        x <- x[,ok.cols]  # match to output matrix column order
+    }
+    colnames(x)[1:2] <- c("Target.Gene","Homolog.Gene")
+    data.frame(Mart.Org=orgs[N],Homolog.Org=orgs[i],x)
+})
+names(source2ortho.rows) <- orgs.ens
+if (verbose) source2ortho.rows
+
+## data frame rows for NON-BIDIRECTIONAL else->source matches
+if (LU>0) {
+    ortho2source.rows <- lapply(1:LU, function(j) {
+        ## like ortho2source.genes, but returning all orthology fields
+        i <- w.uni[j]
+        x <- getBM(attributes=c("ensembl_gene_id",ortho2source.fields[[i]]), filters="ensembl_gene_id", values=ortho2source.genes2[[j]][,1], mart=marts[[i]])
+        ncx <- ncol(x)
+        colnames(x)[2:ncx] <- xlogify(colnames(x)[2:ncx])
+        ok.cols <- match(cnames2,colnames(x))
+        if (any(is.na(ok.cols))) {
+            nok.cols <- which(is.na(ok.cols))
+            ok.cols[is.na(ok.cols)] <- 1
+            x <- x[,ok.cols]  # match to output matrix column order
+            x[,nok.cols] <- NA
+            for (n in nok.cols) mode(x[[n]]) <- "numeric"  # may or may not be, but if these columns in final table are character, they will be recast
+            colnames(x) <- cnames2
+        } else {
+            x <- x[,ok.cols]  # match to output matrix column order
+        }
+        colnames(x)[1:2] <- c("Homolog.Gene","Target.Gene")
+        x <- x[,c(2:1,3:ncol(x))]
+        data.frame(Mart.Org=orgs[N],Homolog.Org=orgs[i],x)
+    })
+    names(ortho2source.rows) <- names(ortho2source.genes2)
+    if (verbose) ortho2source.rows
+    master <- do.call(rbind, c(source2ortho.rows,ortho2source.rows))
+} else {
+    master <- do.call(rbind, source2ortho.rows)
+}
+
+annot.ord <- c("ensembl_gene_id","external_gene_name","chromosome_name","start_position","end_position","strand","gene_biotype","status","description")
+annot.cn <-  c("Homolog.Gene","Homolog.Symbol","Homolog.Chr","Homolog.Start","Homolog.End","Homolog.Strand","Homolog.Biotype","Homolog.Status","Homolog.Description")
+
+
+## target biotype(s); add to master
+target.annot <- getBM(attributes=c("gene_biotype","external_gene_name"), filters="ensembl_gene_id", values=target, mart=marts[[N]])
+message(paste0("target gene ",target," (",target.annot[,2],") is ",target.annot[,1]))
+#orthotypes <- do.call(rbind, lapply(unique(master$Homolog.Org), function(o) getBM(attributes=c("ensembl_gene_id","gene_biotype"), filters="ensembl_gene_id", values=master$Homolog.Gene[which(master$Homolog.Org==o)], mart=marts[[which(orgs==o)]]) ))
+ortho.annot <- do.call(rbind, lapply(unique(master$Homolog.Org), function(o) getBM(attributes=annot.ord, filters="ensembl_gene_id", values=master$Homolog.Gene[which(master$Homolog.Org==o)], mart=marts[[which(orgs==o)]]) ))
+colnames(ortho.annot) <- annot.cn
+master <- cbind(master[,c(1,3)],Target.Symbol=target.annot[,2],master[,2,drop=FALSE],ortho.annot[match(master$Homolog.Gene,ortho.annot[,1]),],Bidirectional=unibi$bidirectional[match(master$Homolog.Gene,unibi$homolog)],master[,5:ncol(master)])
+
+
+## check for and remove paralogs of target getting into 'master' by way of bidirectional searches
+off.target <- setdiff(unique(master$Target.Gene), target)
+LOT <- length(off.target)
+if (LOT>0) {
+    all.ot <- paste(off.target, collapse=", ")
+    if (LOT==1) {
+        message(paste("There is 1 non-target gene (probably a paralog) competing for ortholog status:",all.ot))
+    } else {
+        message(paste("There are",LOT,"non-target genes (probably paralogs) competing for ortholog status:",all.ot))
+    }
+    off.target.master <- master[master$Target.Gene!=target,]
+    master <- master[master$Target.Gene==target,]
+}
+
+## add annotation for homolog genes to 'master'
+
+## final 'master'
+if (verbose) master
+write.table(master, "homolog_table.txt", sep="\t", quote=FALSE, row.names=FALSE)
+save.image("session.RData")  # periodic save
+
+
+
+
+
+#### Get transcripts per gene, and sequences
+
+## get all candidate homolog transcripts in one table
+all.genes <- rbind(unique(as.matrix(master[,c("Homolog.Org","Homolog.Gene")])),c(orgs[N],target))  # unique org:gene pairs
+all.transcripts <- do.call(rbind, lapply(unique(all.genes[,1]), function(o) {
+    getBM(attributes=c("ensembl_gene_id","ensembl_transcript_id","ensembl_peptide_id","transcript_length","transcript_length","transcript_biotype"), filters="ensembl_gene_id", values=all.genes[all.genes[,1]==o,2], mart=marts[[which(orgs==o)]])
+}))  # download transcript data
+all.transcripts <- cbind(organism=all.genes[match(all.transcripts[,1],all.genes[,2]),1], all.transcripts)  # add organism to table
+all.transcripts <- all.transcripts[all.transcripts$transcript_biotype==biotype,]  # restrict to user-defined biotype
+colnames(all.transcripts)[6] <- "peptide_length"       # second "transcript_length" field => "peptide_length"
+all.transcripts[,6] <- floor(all.transcripts[,6]/3)-1  # peptide length
+save.image("session.RData")  # periodic save
+
+## flag longest transcript(s) per gene
+is.max <- sapply(1:nrow(all.transcripts), function(i) {
+    all.transcripts$transcript_length[i]==max(all.transcripts$transcript_length[all.transcripts$ensembl_gene_id==all.transcripts$ensembl_gene_id[i]])
+})
+longest <- c("","Longest")[is.max+1]
+message(paste(nrow(all.transcripts),biotype,"transcripts found for",nrow(all.genes),"genes;",sum(is.max),"longest."))
+
+## add fasta headers to table
+all.transcripts <- cbind(
+    all.transcripts, is.max,
+    fasta.header.nt=gsub(" ","",sub(" ",".",apply(cbind(all.transcripts[,1:5],longest),1,paste,collapse="|"))),
+    fasta.header.aa=gsub(" ","",sub(" ",".",apply(cbind(all.transcripts[,c(1:4,6)],longest),1,paste,collapse="|")))
+)
+
+## download NT sequence
+all.seq.nt <- do.call(rbind, lapply(unique(all.transcripts$organism), function(o) {
+    ids <- all.transcripts$ensembl_transcript_id[all.transcripts$organism==o]
+    getSequence(id=ids, type="ensembl_transcript_id", seqType="cdna", mart=marts[[which(orgs==o)]])  # all transcript cdnas for these genes
+}))
+
+## download AA sequence
+all.seq.aa <- do.call(rbind, lapply(unique(all.transcripts$organism), function(o) {
+    ids <- all.transcripts$ensembl_transcript_id[all.transcripts$organism==o]
+    getSequence(id=ids, type="ensembl_transcript_id", seqType="peptide", mart=marts[[which(orgs==o)]])  # all transcript cdnas for these genes
+}))
+
+## all in one table
+all.transcripts <- cbind(
+    all.transcripts,
+    sequence.nt=all.seq.nt[match(all.transcripts$ensembl_transcript_id,all.seq.nt[,2]),1],
+    sequence.aa=all.seq.aa[match(all.transcripts$ensembl_transcript_id,all.seq.aa[,2]),1]
+)
+if (verbose) all.transcripts[,1:(ncol(all.transcripts)-4)]  # do not show sequences or fasta headers on screen
+write.table(all.transcripts, "transcript_table.txt", sep="\t", quote=FALSE, row.names=FALSE)
+
+## get write.fasta function
+apa.tools <- "/home/apa/apa_tools.R"
+source(apa.tools)  # write.fasta
+if (exists("write.fasta")) {
+    nt <- all.transcripts$sequence.nt
+    names(nt) <- all.transcripts$fasta.header.nt
+    write.fasta(nt, "nt.fa")
+    aa <- all.transcripts$sequence.aa
+    names(aa) <- all.transcripts$fasta.header.aa
+    write.fasta(aa, "aa.fa")
+    rm(list=setdiff(unlist(apa.names),"write.fasta"))  # delete all apa.tools functions, except for write.fasta
+} else {
+    message(paste0("Could not source function 'write.fasta' from file '",apa.tools,"': fastas will not be written."))
+}
+
+save.image("session.RData")  # final save and exit
+
+
+

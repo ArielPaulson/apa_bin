@@ -1,0 +1,339 @@
+#!/usr/bin/env perl
+#$Id$
+
+# Copyright © 2012, Stowers Institute for Medical Research.  All rights reserved.
+
+# c.f. attached LICENSE
+
+=pod
+
+=head1 SYNOPSIS
+
+colStats generates statistics for piped input, or one column from a file.
+
+=head1 OPTIONS
+
+=over
+
+Input options:
+
+=item B<- (lone dash)>
+
+Indicates that input is being piped in.
+
+=item B<-f file_name>
+
+Read data from this file.
+
+=item B<-c col_num>
+
+If using file, number of column to analyze; only does one at a time.
+
+=item B<-h head_lines>
+
+If using file, number of file header lines to skip, if any.
+
+=item B<-g group_by_col>
+
+Calculate statistics separately for each unique value in this column.
+
+=back
+
+Statistical options:
+
+=over
+
+=item B<--N>
+
+Number of elements.
+
+=item B<--NA>
+
+Number of missing elements.
+
+=item B<--U>
+
+Number of unique elements.
+
+=item B<--sum>
+
+    
+
+=item B<--mean>
+
+    
+
+=item B<--median>
+
+    
+
+=item B<--stdev>
+
+Standard deviation.
+
+=item B<--stderr>
+
+Standard error of the mean, being stdev/sqrt(N).
+
+=item B<--CV>
+
+Coefficient of Variation, being stdev/mean.
+
+=item B<--range>
+
+Min-Max (there are no separate Min or Max options).
+
+=item B<--IQR>
+
+Interquartile range, i.e. Q1-Q3, or middle 50% of data.
+
+=item B<--nz, --nonzero>
+
+The number of nonzero entries.
+
+=item B<--mode>
+
+Value(s) which are present the greatest number of times (T).  If > 1 value is tied for T, all tied values will be returned.
+
+=item B<--antimode>
+
+Value(s) which are present the least number of times (t).  If > 1 value is tied for t, all tied values will be returned.  In practice, t is usually 1, so this option can return a LOT of numbers...
+
+=item B<--all>
+
+Calculate all statistics (except for mode/antimode).
+
+=back
+
+
+=head1 EXAMPLES
+
+=over
+
+=item C<colStats -f myfile -c 3 --N --sum --mean>
+
+=item C<grep "^blah" myfile | cut -f5 | colStats --all>
+
+=back
+
+
+=head1 VERSION
+
+$Revision:  1.0$
+
+=head1 AUTHOR
+
+Ariel Paulson (apa@stowers.org)
+
+=head1 DEPENDENCIES
+
+perl, Getopt::Long module
+
+=head1 AVAILABILITY
+
+Download at will.
+
+=cut
+
+use Scalar::Util qw(looks_like_number);
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my ($file, $col, $head, $group, $sum, $mean, $median, $mode, $antimode, $stdev, $stderr, $CV, $range, $N, $NA, $U, $IQR, $all, $allm, $alla, $help, $man, $nz, $stdio, @piped);
+
+GetOptions("f=s" => \$file, "c=i" => \$col, "h=i" => \$head, "g=i" => \$group, "sum" => \$sum, "mean" => \$mean, "median" => \$median, 
+	   "mode" => \$mode, "antimode" => \$antimode, "stdev" => \$stdev, "stderr" => \$stderr, "CV" => \$CV, "range" => \$range, 
+	   "N" => \$N, "NA" => \$NA, "U" => \$U, "IQR" => \$IQR, "all" => \$all, "nz" => \$nz, "nonzero" => \$nz, "" => \$stdio, 
+	   "help" => \$help, "man" => \$man) or pod2usage(2);
+
+pod2usage(1) if $help;
+pod2usage(-exitstatus => 0, -verbose => 2) if $man;
+
+@piped = (<STDIN>) if $stdio;
+
+if (defined $group) {
+    die "Grouping column number '$group' must be a positive integer!\n" unless ($group > 0 && $group == int($group));
+    $group--;
+}
+if (defined $col) {
+    die "Column number '$col' must be a positive integer!\n" unless ($col > 0 && $col == int($col));
+    $col--;  # 0-based
+} else {
+    $col = 0;  # default = first column
+}
+
+$sum = $mean = $median = $stdev = $stderr = $CV = $range = $N = $NA = $U = $IQR = 1 if ($all || $allm || $alla);
+$mode = 1 if $allm;
+$antimode = 1 if $alla;
+
+my ($tempfile, %values, %sortvalues, %groups, %stats, %totals);
+
+if (@piped) {
+    
+    if (defined $group) {
+	foreach (@piped) {
+	    $_ =~ s/[\n\r]+$//;
+	    next if ($head && $. <= $head);  # skip header
+	    my @data = split /\t/, $_;
+	    my $grp = $data[$group];
+	    my $val = $data[$col];
+	    looks_like_number($val) ? (push @{ $values{$grp} }, $val) : ($stats{$grp}{NA}++);
+	    $stats{$grp}{sum} += $val;
+	}
+    } else {
+	foreach (@piped) {
+	    $_ =~ s/[\n\r]+$//;
+	    next if ($head && $. <= $head);  # skip header
+	    my $val = (split /\t/, $_)[$col];
+	    looks_like_number($val) ? (push @{ $values{1} }, $val) : ($stats{1}{NA}++);
+	    $stats{1}{sum} += $val
+	}
+    }
+    
+} else {
+    
+    open my $IN, '<', $file or die "$0: Could not open file '$file': $!\n";
+    if (defined $group) {
+	while (<$IN>) {
+	    $_ =~ s/[\n\r]+$//;
+	    next if ($head && $. <= $head);  # skip header
+	    my @data = split /\t/, $_;
+	    my $grp = $data[$group];
+	    my $val = $data[$col];
+	    looks_like_number($val) ? (push @{ $values{$grp} }, $val) : ($stats{$grp}{NA}++);
+	    $stats{$grp}{sum} += $val;
+	}
+    } else {
+	while (<$IN>) {
+	    $_ =~ s/[\n\r]+$//;
+	    next if ($head && $. <= $head);  # skip header
+	    my $val = (split /\t/, $_)[$col];
+	    looks_like_number($val) ? (push @{ $values{1} }, $val) : ($stats{1}{NA}++);
+	    $stats{1}{sum} += $val;
+	}
+    }
+    close $IN;
+}
+
+my @grps = sort keys %values;
+my %names = map {($_=>"$_: ")} @grps;
+%names = map {($_=>'')} @grps unless defined $group;  # no grouping = null names
+
+foreach my $grp (@grps) {
+    
+    ## ensure printable values
+    foreach (qw/ NA U nz sum mean median stdev stderr CV range /) {
+	$stats{$grp}{$_} = 0 unless $stats{$grp}{$_};
+    }
+    $stats{$grp}{range} = $stats{$grp}{IQR} = 'NA - NA';
+
+    $stats{$grp}{N} = scalar @{ $values{$grp} };
+    $stats{$grp}{mean} = $stats{$grp}{sum} / $stats{$grp}{N}; # used by several
+    if ($range || $median || $IQR) {
+	@{ $sortvalues{$grp} } = sort {$a <=> $b} @{ $values{$grp} };
+    }
+    if ($mode || $antimode || $U) {
+	$stats{$grp}{ranked}{$_}++ foreach @{ $values{$grp} };
+	if ($mode || $antimode) {
+	    $stats{$grp}{byrank}{ $stats{$grp}{ranked}{$_} }{$_} = 1 foreach @{ $values{$grp} };
+	}
+    }
+    if ($stdev || $stderr || $CV) {
+	$stats{$grp}{sumsqr} += ($_ - $stats{$grp}{mean}) ** 2 foreach @{ $values{$grp} };
+	$stats{$grp}{stdev} = ($stats{$grp}{sumsqr} / $stats{$grp}{N}) ** 0.5;
+    }
+    if ($nz) {
+	foreach (@{ $values{$grp} }) {
+	    $stats{$grp}{nz}++ if $_ != 0;
+	}
+    }
+    $stats{$grp}{mod2N} = $stats{$grp}{N} % 2;
+}
+
+print "\n";
+if ($NA) {
+    print "$names{$_}Missing: $stats{$_}{NA}\n" foreach @grps;
+}
+if ($N) {
+    print "$names{$_}N: $stats{$_}{N}\n" foreach @grps;
+}
+if ($U) {
+    foreach (@grps) {
+	$stats{$_}{U} = scalar keys %{ $stats{$_}{ranked} };
+	print "$names{$_}Unique: $stats{$_}{U}\n";
+    }
+}
+if ($sum) {
+    print "$names{$_}Sum: $stats{$_}{sum}\n" foreach @grps;
+}
+if ($mean) {
+    print "$names{$_}Mean: $stats{$_}{mean}\n" foreach @grps;
+}
+if ($median) {
+    foreach (@grps) {
+	$stats{$_}{median} = &quant_val( int($stats{$_}{N}/2), $stats{$_}{mod2N}, $sortvalues{$_} );
+	print "$names{$_}Median: $stats{$_}{median}\n";
+    }
+}
+if ($stdev) {
+    print "$names{$_}Stdev: $stats{$_}{stdev}\n" foreach @grps;
+}
+if ($stderr) {
+    foreach (@grps) {
+	$stats{$_}{stderr} =  $stats{$_}{stdev} / sqrt($stats{$_}{N}); 
+	print "$names{$_}Stderr: $stats{$_}{stderr}\n";
+    }
+}
+if ($CV) {
+    foreach (@grps) {
+	$stats{$_}{CV} = $stats{$_}{stdev} / $stats{$_}{mean};
+	print "$names{$_}CV: $stats{$_}{CV}\n";
+    }
+}
+if ($range) {
+    foreach (@grps) {
+	$stats{$_}{range} = join ' - ', @{ $sortvalues{$_} }[0,-1];
+	print "$names{$_}Range: $stats{$_}{range}\n";
+    }
+}
+if ($IQR) {
+    foreach (@grps) {
+	my $Q25 = &quant_val( int($stats{$_}{N}/4), $stats{$_}{mod2N}, $sortvalues{$_} );
+	my $Q75 = &quant_val( int(3*$stats{$_}{N}/4), $stats{$_}{mod2N}, $sortvalues{$_} );
+	$stats{$_}{IQR} = "$Q25-$Q75";
+	print "$names{$_}IQR: $stats{$_}{IQR}\n";
+    }
+}
+if ($nz) {
+    print "$names{$_}Nonzero: $stats{$_}{nz}\n" foreach @grps;
+}
+if ($mode) {
+    foreach (@grps) {
+	my $maxrank = (sort {$b <=> $a} keys %{ $stats{$_}{byrank} })[0];
+	$stats{$_}{mode} = join ',', (sort {$a <=> $b} keys %{ $stats{$_}{byrank}{$maxrank} });  # may have > 1 mode
+	print "$names{$_}Mode: {$stats{$_}{mode}} @ ${maxrank}x\n";
+    }
+}
+if ($antimode) {
+    foreach (@grps) {
+	my $minrank = (sort {$a <=> $b} keys %{ $stats{$_}{byrank} })[0];
+	$stats{$_}{antimode} = join ',', (sort {$a <=> $b} keys %{ $stats{$_}{byrank}{$minrank} });  # may have > 1 antimode
+	print "$names{$_}Antimode: {$stats{$_}{antimode}} @ ${minrank}x\n";
+    }
+}
+print "\n";
+exit;
+
+
+sub quant_val {
+    my ($PRE, $MOD, $SORT) = @_;
+    my $VAL;
+    if ($MOD == 0) {
+	my ($targL, $targU) = ($PRE-1, $PRE);    # array indices of target point lower, upper bounds
+	$VAL = ($$SORT[$targL] + $$SORT[$targU]) / 2;
+    } else {
+	$VAL = $$SORT[$PRE];    # array index of target point
+    }
+    return $VAL;
+}

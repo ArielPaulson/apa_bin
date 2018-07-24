@@ -1,0 +1,11 @@
+#!/bin/bash
+
+bam=$1
+out=$2
+
+if [ -z $out ]; then
+    samtools view -H $bam | grep "^@SQ" | cut -f2-3 | perl -pe 's/[SL]N://g'
+else
+    samtools view -H $bam | grep "^@SQ" | cut -f2-3 | perl -pe 's/[SL]N://g' > $out
+fi
+

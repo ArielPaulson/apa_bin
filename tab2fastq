@@ -1,0 +1,9 @@
+#!/usr/bin/env perl
+use strict; 
+
+while (<>) {
+    s/[\n\r]+$//;
+    my ($header, $SEQ, $QUAL) = (split /\t/, $_)[0..2];  # may have other columns, but only taking first three
+    print "\@$header\n$SEQ\n+\n$QUAL\n";
+}
+exit;

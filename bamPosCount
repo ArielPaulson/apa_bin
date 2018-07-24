@@ -1,0 +1,49 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my @bams;  # post-getopt @ARGV
+my $outfile; # optional
+
+GetOptions("o=s"=>\$outfile);
+@bams = @ARGV;
+
+my $tmp = "bamPosCount.$$.tmp";
+system "mkdir $tmp";
+die "Unable to create temp directory '$tmp'!\n" unless -d $tmp;
+
+my $width;
+foreach my $bam (@bams) {
+    $width = length($bam) if length($bam) > $width;
+}
+
+my $OUT;
+if ($outfile) {
+    open $OUT, '>', $outfile or die "$0: Cannot open output file '$outfile': $!\n";
+} else {
+    $OUT = *STDOUT;
+}
+
+my $header = "SAMPLE\tALIGN.POS\tUNIQUE.POS\tUNIQUE.PCT\n";
+print STDERR $header;
+print $OUT $header;
+
+foreach my $bam (@bams) {
+    (my $name = $bam) =~ s/.bam$//;
+    my $idx = -e "$name.idxstats.txt" ? "$name.idxstats.txt" : "$tmp/idxstats.txt";
+    my $ubed = "$tmp/unq_pos.bed";
+    system "samtools index $bam" unless -e "$bam.bai";
+    system "samtools view $bam | cut -f3,4 | uniq > $ubed";
+    system "samtools idxstats $bam > $idx" unless -e $idx;
+    chomp(my $N = `bash -c 'paste -s -d+ <(cut -f3 $idx) | bc'`);
+    chomp(my $U = `bash -c 'cat $ubed | wc -l'`);
+    chomp(my $P = `bash -c 'echo "scale=2; 100*$U/$N" | bc'`);
+    my $line = "$bam\t$N\t$U\t$P\n";
+    print STDERR $line;
+    print $OUT $line;
+    system "rm -f $tmp/*";
+    sleep 1;
+}
+system "rm -rf $tmp";
+exit;

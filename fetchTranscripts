@@ -1,0 +1,95 @@
+#!/usr/bin/env perl
+require '/home/apa/local/bin/apa_routines.pm';
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## UNDER CONSTRUCTION -- at the moment, only return the longest transcript per gene (with $no_pcnc)
+
+## Extracts various sets of transcripts from a transcriptome
+
+## Many selectors to be added -- gene full/simple biotype, trans-bio / gene-bio combo, N exons, length, genomic region, GC%, longest/shortest/neither, etc...
+
+my ($geno, $anno, $outfa, $keep_gfbio, $keep_gsbio, $keep_tfbio, $keep_tsbio, $keep_anylen, $keep_pergenelen, $no_pcnc);
+
+GetOptions("g=s"=>\$geno, "a=s"=>\$anno, "o=s"=>\$outfa);
+
+$no_pcnc = 1;
+
+my $path = "/n/data1/genomes/indexes/$geno/$anno";
+my $gdat = "$path/$geno.$anno.genedata.txt";
+my $tdat = "$path/$geno.$anno.transdata.txt";
+my $tfa  = "$path/$geno.$anno.cuff.gtf.index/$geno.$anno.cuff.fa";
+my $tlst = "$tfa.tlst";
+
+my (%ti, %gt, %gd, %td, %use);
+
+my $ING = &open2('R', $gdat, 'Gene data file');
+my @colnames;
+while (<$ING>) {
+    chomp;
+    my ($gid, @else) = split /\t/, $_;
+    if ($. == 1) {
+        @colnames = @else;
+    } else {
+        $gd{$gid}{$colnames[$_]} = $else[$_] foreach 0..$#else;
+    }
+}
+close $ING;
+
+my $INT = &open2('R', $tdat, 'Trans data file');
+my @colnames;
+while (<$INT>) {
+    chomp;
+    my ($tid, $symb, $gid, @else) = split /\t/, $_;
+    if ($. == 1) {
+        @colnames = (@else, $symb);
+    } else {
+        $gt{$gid}{$tid} = 1;
+        $td{$tid}{$colnames[$_]} = $else[$_] foreach 0..$#else;
+        $td{$tid}{$colnames[$#else+1]} = $symb;
+    }
+}
+close $INT;
+
+open my $INL, "cut -f1,2 -d' ' $tlst |";
+while (<$INL>) {
+    chomp;
+    my ($i, $tid) = split;
+    $ti{$tid} = $i;
+}
+close $INL;
+
+foreach my $gid (keys %gd) {
+    my @longest;
+    foreach my $tid (keys %{ $gt{$gid} }) {
+        next if $no_pcnc && $gd{$gid}{SimpleBiotype} eq 'protein_coding' && $td{$tid}{SimpleBiotype} ne 'protein_coding';
+        my $len = exists $td{$tid}{mRNA_Len} ? $td{$tid}{mRNA_Len} : exists $td{$tid}{cDNA_Len} ? $td{$tid}{cDNA_Len} : undef;
+        if ($len > $longest[0]) {
+            @longest = ($len, $tid);
+        }
+    }
+#    print "$gid: $longest[1] ($ti{$longest[1]}) = $longest[0]bp\n";
+    $use{$ti{$longest[1]}} = "$gid|$longest[1]|$longest[0]|$gd{$gid}{Biotype}";
+}
+
+my $IFA = &open2('R', $tfa, 'Transcript fasta');
+my $OFA = &open2('W', $outfa, 'Output fasta');
+my ($i, $seq);
+while (<$IFA>) {
+    if (/^>(\d+)/) {
+        if ($i && exists $use{$i}) {
+            print $OFA ">$use{$i}\n$seq";
+        }
+        $i = $1;
+        $seq = '';
+    } else {
+        $seq .= $_;
+    }
+}
+close $IFA;
+close $OFA;
+
+print "$0 complete!\n";
+exit;
+

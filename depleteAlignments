@@ -1,0 +1,35 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+### Removes alignments from a bam based on a set of intervals
+
+
+### Dependencies
+my $samtools = 'samtools';
+my $intersectBed = '/n/local/stage/bedtools/bedtools2-2.25.0/bin/intersectBed';
+
+
+### Get, Test Inputs
+my ($inbam, $rmbed, $outbam, $intersectBed_args) = @ARGV;
+$inbam = &validate('file', $inbam, 'Input bam', 1);
+$rmbed = &validate('file', $rmbed, 'Depletion interval bed', 1);
+($outbam = $inbam) =~ s/bam$/depleted.bam/ unless $outbam;
+$intersectBed_args = '-f 0.90' unless defined $intersectBed_args;  # allowing null args, i.e. ''
+## -f 0.9 requires 5bp outside interval for 50bp reads, or 10bp outside for 100bp reads.
+
+
+### Process BAM
+system "$intersectBed -v $intersectBed_args -a $inbam -b $rmbed > $outbam";
+system "samtools index $inbam" unless -e "$inbam.bai";
+system "samtools index $outbam";
+chomp(my $inaln = `bash -c 'paste -s -d+ <(samtools idxstats $inbam | cut -f3) | bc'`);
+chomp(my $outaln = `bash -c 'paste -s -d+ <(samtools idxstats $outbam | cut -f3) | bc'`);
+my $rmaln = $inaln-$outaln;
+my $outpct = sprintf("%0.2f", 100*$outaln/$inaln);
+my $rmpct = sprintf("%0.2f", 100*$rmaln/$inaln);
+print "$inaln alignments in (100.00%) | $outaln alignments out ($outpct%) | $rmaln alignments removed ($rmpct%)\n";
+exit;
+

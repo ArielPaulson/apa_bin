@@ -1,0 +1,87 @@
+#!/usr/bin/env perl
+require '/home/apa/local/bin/apa_routines.pm';   # blockify
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## Inputs
+my $vcf;       # VCF file
+my $bcf;       # BCF file
+my $output;    # output file (fasta)
+my $degen;     # allow calling of degenerate bases?  (rules for this forthcoming)
+my $range;     # specify "chr:start-end" in bp, instead of taking whole sequence
+my ($rchr, $rstart, $rend);  # what $range will become
+
+## Inputs with defaults
+my $minQual = 0;      # min qual at a given position to prevent calling 'N'
+my $minDepth = 1;     # min depth at a given position to prevent calling 'N'
+my $minDepthLC = 10;  # min depth at a given position to output uppercase letters (e.g. 'A' not 'a') 
+
+## Globals
+my $tmp = "vcf2consensus.$$.tmp";   # temp file
+my %bychr;   # consensus sequence by chr
+my @ordchr;  # chromosomes in input order
+my %chrpos;  # sequence start, end positions per chr
+
+GetOptions("v=s" => \$vcf, "b=s" => \$bcf, "r=s" => \$range, "o=s" => \$output, "q=f" => \$minQual, "d=i" => \$minDepth, "l=i" => \$minDepthLC);
+die "Cannot specify both -v and -b!\n" if $vcf && $bcf;
+
+($rchr, $rstart, $rend) = split /[:-]/, $range if $range;
+
+if (-e $bcf) {
+    system "bcftools view $bcf > $tmp";
+    $vcf = $tmp;
+}
+
+my ($prev_chr, $prev_pos, $i);  # used only below
+open IN, $vcf or die "$0: Failed to open '$vcf' for reading: $!\n";
+while (<IN>) {
+    next if $_ =~ /^#/;
+    my @data = split /\t/, $_;
+    my ($chr, $pos, $calls) = @data[0,1,4];
+    my ($depth) = ($data[7] =~ /DP=(\d+)/);
+    my $qual;  # later
+    my $base;
+    next if ($rchr && $chr ne $rchr);
+    next if ($rstart && $pos < $rstart);
+    next if ($rend && $pos > $rend);
+    if ($depth < $minDepth || $qual < $minQual) {
+	$base = 'n';   # little 'n': something there, but not called
+    } elsif ($degen) {
+    } else {
+	$base = substr($calls,0,1);
+    }
+    $base = 'N' if $base =~ /^x$/i;
+    $base = "\L$base" if $depth < $minDepthLC;
+    unless (exists $chrpos{$chr}) {
+	$chrpos{$chr} = [$pos, ''];
+	push @ordchr, $chr;
+    }
+    ($prev_chr, $prev_pos) = ($chr, $pos) if $i == 1;
+    if ($chr eq $prev_chr) {
+	my $gap = $pos-($prev_pos+1);
+	if ($gap) {
+	    push @{ $bychr{$chr} }, 'N' foreach ($prev_pos+1..$pos);   # big 'N': nothing there
+	}
+    } else {
+	$chrpos{$prev_chr}->[1] = $prev_pos;
+    }
+    push @{ $bychr{$chr} }, $base;
+    ($prev_chr, $prev_pos) = ($chr, $pos);
+}
+$chrpos{$prev_chr}->[1] = $prev_pos;
+close IN;
+
+open OUT, "> $output" or die "$0: Failed to open '$output' for writing: $!\n";
+foreach my $chr (@ordchr) {
+    my ($start, $end) = @{ $chrpos{$chr} };
+    my $length = $end-$start+1;
+    my $seq = ${ &blockify( join('', @{ $bychr{$chr} }) ) };
+    print length($seq), "\n";
+    print OUT ">$chr:$start-${end}_${length}bp\n$seq\n";
+}
+close OUT;
+
+system "rm -f $tmp";
+exit;
+

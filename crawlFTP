@@ -1,0 +1,62 @@
+#!/usr/bin/env perl
+use Net::FTP;
+use strict;
+
+die;
+### UNDER CONSTRUCTION
+### Takes FTP paths and recursively descends (if possible) to fetch files with specified extensions
+
+## takes 2 args: 1. ftp host, 2. file containing paths (on host) to download
+
+my $host = $ARGV[0];
+my (%files, %sizes, %complete);
+
+if (-e $ARGV[1]) {  # list file with filenames
+    open IN, $ARGV[1] or die "File list '$ARGV[1]' not readable!\n";
+    while (<IN>) {
+	$_ =~ s/[\n\r]+$//;
+	$files{$_} = $.;	# remove duplicates but maintain rank
+    }
+    close IN;    
+} else {            # single filename
+    $files{$ARGV[1]} = 1;
+}
+
+my $ftp = Net::FTP->new($host) or die "Cannot connect to host '$host': $!\n";
+$ftp->login('anonymous','apa@stowers.org');
+$ftp->binary();
+
+$sizes{$_} = $ftp->size($_) foreach keys %files;
+
+while (scalar (keys %complete) < scalar (keys %files)) {
+    
+    ## this keeps looping in case of timeouts
+    
+    foreach my $file (sort {$files{$a} <=> $files{$b}} keys %files) {
+	(my $path = $file) =~ s/\/[^\/]+$//;
+	my $newfile;
+	unless ($path eq $file) {	# if eq, there was no path
+	    system "mkdir -p $path";
+	    die "Unable to create output path $path!  Stopping.\n" unless -d $path;
+	}
+	chomp(my $now = `date`);
+	if (-e $file) {     # local file already exists
+	    if (-s $file == $sizes{$file}) {    # local file has reached final size 
+		print "Skipping $file: already downloaded.\n";
+		$complete{$file} = 1;   # file has to make it through 'get', THEN be declared complete on second pass
+	    } else {        # local file is still undersized
+		print "Restarting $file: $now\n";
+		my $bytes = -s $file;
+		print " begin at ",$bytes+1,"/$sizes{$file}\n";
+		$ftp->get($file, $file, $bytes);
+	    }
+	} else {            # local file does not exist
+	    print "Getting $file: $now\n";
+	    $ftp->get($file, $file);
+	    # $file should be fully pathed, relative to host, so no cd-ing required
+	    # then file path becomes local write path
+	}
+    }
+}
+$ftp->quit or die "Couldn't close connection cleanly: $!\n";	
+exit;

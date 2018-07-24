@@ -1,0 +1,28 @@
+#!/usr/bin/env perl
+use strict;
+
+## Converts an xml output from an 'esummary.fcgi' call to tabular.
+
+my $file = $ARGV[0];
+
+my (%records, @fields, $rec);
+
+open IN, $file or die "Cannot read input file '$file': $!\n";
+while (<IN>) {
+    if ($_ =~ /^\s*<DocSum>/) {
+	$rec++;
+    } elsif (/^\s*<Id>(.*)<\/Id>/) {
+	$records{$rec}{'Id'} = $1;
+	push @fields, 'Id' if $rec == 1;
+    } elsif (/^\s*<Item Name="(.*?)".*?>(.*)<\/Item>/) {
+	$records{$rec}{$1} = $2;
+	push @fields, $1 if $rec == 1;
+    }
+}
+close IN;
+
+print join ("\t", @fields), "\n";
+foreach my $i (1..$rec) {
+    print join ("\t", map { $records{$i}{$_} } @fields), "\n";
+}
+exit;

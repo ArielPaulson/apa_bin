@@ -1,0 +1,400 @@
+#!/usr/bin/env perl
+require '/home/apa/local/bin/apa_routines.pm';  # numjust
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+## Automatically applies the following corrections to any BED file (single- or multi-track):
+## 1. Ensures starts < ends (also flips strand if end < start)
+## 2. Ensures starts are >= 0 (warns if start was < 0)
+## 3. Converts strands to '+' or '-' where possible (else fails, unless input was explicitly unstranded, i.e. '.' or '*')
+## 4. Ensures first 6 columns are present, or given dummy data if necessary (defaults: name='<trackName>_unnamed_#', score=1, strand='+')
+## 5. Ensures no duplicate names exist; multiple instances get unique numeric suffixes.
+##
+## Additionally makes these corrections, if specified:
+## '--zero':      convert starts from 1-based to 0-based
+## '--score':     inject faux score column (where column is absent -- e.g. "mergeBed -nms -s" output)
+## '--zapscore':  convert all scores to '1'
+## '--math=...':  performs math on score track: give valid perl expression, with 'SCORE' as placeholder, e.g. --math="SCORE+100" or --math='sprintf("%0.2f",1E6*SCORE/$factor)'
+## '--sort':      sorts entries by chromosome, start, end, strand (in that order; all ascending)
+## '--nr':        nonredundant output (merged chr/start/end/strand-redundant entries into one; unique names get concatenated; score becomes 1; columns beyond 6 get dropped)
+##
+## Will also correct GTF files, if argument '--gtf' is used:
+## Performs BED fixes 1-3 and 5, but #5 is applied successively to genes and then transcripts
+## Additional corrections '--math' and '--sort' are the only ones which work with '--gtf'.
+
+my $bin = '/home/apa/local/bin';
+
+## Inputs
+my $input;     # input BED file
+my $zero;      # convert starts to 0-based
+my $score;     # inject faux score column (where absent -- e.g. "mergeBed -nms -s" output)
+my $sort;      # sort bed also
+my $nred;      # nonredundant output (merged chr/start/end/strand-redundant entries into one; names get concatenated; score becomes 1; columns beyond 6 get dropped)
+my $chrsizes;  # if specified, will check for coords past end of chromosome (col1=chrname, col2=length)
+my $domath;    # must 'eval($domath)' to valid perl expression
+my $zapscore;  # convert all scores to '1'
+my $overwrite; # overwrite input file?
+my $gtf;       # GTF not BED?
+my $UCSC_gtf;  # GTF from UCSC?  SUPERSEDES '--GTF'
+my $genebed;   # if GTF gene names must be fixed, a bed file with gene coords must be supplied, so that boundaries for multiple (identially-named) genes can be resolved.
+
+GetOptions("i=s" => \$input, "c=s" => \$chrsizes, "zero" => \$zero, "score" => \$score, "sort" => \$sort, "nr" => \$nred, "math=s" => \$domath, "zapscore" => \$zapscore, "overwrite" => \$overwrite, "gtf" => \$gtf, "UCSC-gtf" => \$UCSC_gtf, "gb=s" => \$genebed);
+
+my %strconv = ('+','+', '1','+', 'W','+', 'w','+', '-','-', '-1','-', 'C','-', 'c','-', '.','.', '*','.');
+
+my ($i, $maxcol, $linesIn, %byCoord, @output, %chrlens, %unames, $totalNames, $collide, %transcopy, %boundaries);
+my $namesUnq = 3;   # gtf uses three levels; bed uses only one
+my ($trackName) = ($input =~ /([^\/]+)$/);
+$trackName =~ s/\.bed\d*$//i;  # remove 'bed' or 'bed##' extension
+
+$gtf = 1 if $UCSC_gtf;
+my $ERR = *STDERR;
+
+if ($chrsizes) {
+    open my $IN0, '<', $chrsizes or die "$0: Cannot open chr sizes file '$chrsizes': $!\n";
+    while (<$IN0>) {
+	$_ =~ s/[\n\r]+$//;
+	my ($chr, $len) = (split /\t/, $_)[0,1];
+	$chrlens{$chr} = $len;
+    }
+    close $IN0;
+}
+
+
+if ($gtf) {
+    
+    ## pre-scan for name uniqueness
+    &gtf_name_uniqueness;
+    
+    ## process input
+    &gtf_process;
+    
+} else {
+    
+    ## pre-scan for name uniqueness
+    &bed_name_uniqueness;
+    
+    ## process input
+    &bed_process;
+    
+    ## remove redundancy
+    if ($nred) {
+	foreach my $coord (keys %byCoord) {
+	    foreach my $strand (keys %{ $byCoord{$coord} }) {
+		my $allnames = join ';', sort keys %{ $byCoord{$coord}{$strand} };
+		push @output, "$coord\t$allnames\t1\t$strand\n";
+	    }
+	}
+    }
+    
+}
+
+
+if ($sort) {
+    my $temp = "$$.tmp";
+    open my $OTMP, '>', $temp;
+    print $OTMP @output;
+    close $OTMP;
+    
+    my $gtfopt = $gtf ? '--gtf' : '';
+    open my $ITMP, "$bin/sortBedCoord -i $temp $gtfopt |";
+    @output = (<$ITMP>);
+    close $ITMP;
+    system "rm -f $temp";
+}
+
+my $linesOut = scalar @output;
+#print $ERR "$linesIn lines in | $linesOut lines out\n";
+
+my $OUT;
+if ($overwrite) {
+    unlink $input;
+    open $OUT, '>', $input;
+} else {
+    $OUT = *STDOUT;
+}
+print $OUT @output;
+exit;
+
+
+
+
+
+
+sub bed_name_uniqueness {
+    
+    open my $IN1A, '<', $input or die "$0: Cannot open input BED '$input' for reading: $!\n";
+    while (<$IN1A>) {
+	$_ =~ s/[\n\r]+$//;
+	my $name = (split /\t/, $_)[3];
+	$unames{$name}{N}++;
+	$namesUnq = 0 if $unames{$name}{N} > 1;
+    }
+    close $IN1A;
+    $totalNames = scalar keys %unames;
+}
+
+
+
+
+
+sub bed_process {
+    
+    my $unnamed;
+    
+    open my $IN1B, '<', $input;
+    while (my $line = <$IN1B>) {
+	
+	if ($line =~ /^track (type|name)/ || $line =~ /^#/) {
+	    push @output, $line;
+	    if ($line =~ /name=(\S+)/) {
+		($trackName = $1) =~ s/\"//g;
+	    }
+	    $i = 0;
+	    next;
+	}
+	
+	$i++;
+	$line =~ s/[\n\r]+$//;
+	my @data = split /\t/, $line;
+	
+	if (%chrlens) {
+	    if ($chrlens{$data[0]}) {
+		if ($data[1] > $chrlens{$data[0]}) {
+		    print $ERR "$trackName line $i: start coord ($data[1]) is > $data[0] end ($chrlens{$data[0]})!\n";
+		    $data[1] = $chrlens{$data[0]};
+		} elsif ($data[2] > $chrlens{$data[0]}) {
+		    print $ERR "$trackName line $i: end coord ($data[2]) is > $data[0] end ($chrlens{$data[0]})!\n";
+		    $data[2] = $chrlens{$data[0]};
+		}
+	    } else {
+		print $ERR "Chromosome '$data[0]' has length 0 or is not found in given chrom sizes file!  Wrong genome build?\n";
+	    }
+	}
+	
+	$data[1]-- if $zero;
+	if ($data[1] < 0) {
+	    print $ERR "$trackName line $i: start coord was '$data[1]'!\n";
+	    $data[1] = 0;
+	}
+	
+	if ($data[3]) {
+	    if ($unames{$data[3]}{N} > 1) {
+		$data[3] = "$data[3]." . &numjust(++$unames{$data[3]}{i},length($unames{$data[3]}{N}));
+	    }
+	} else {
+	    $data[3] = "${trackName}_unnamed_" . &numjust(++$unnamed, $totalNames);
+	}
+	
+	if ($score) {
+	    splice(@data, 4, 0, 1);
+	} elsif ($domath) {
+	    (my $this_domath = $domath) =~ s/SCORE/$data[4]/;
+	    print $ERR "$domath => $this_domath\n";
+	    $data[4] = eval($this_domath);
+	} elsif ($zapscore) {
+	    $data[4] = 1;
+	} else {
+	    $data[4] = 1 unless $data[4] =~ /\d/;
+	}
+	
+	if ($data[1] > $data[2]) {
+	    ($data[1], $data[2]) = ($data[2], $data[1]);
+	    $data[5] = '-';
+	} else {
+	    $data[5] = exists $strconv{$data[5]} ? $strconv{$data[5]} : '+';
+	}
+	
+	if ($nred) {
+	    my $data02 = join("\t",@data[0..2]);
+	    $byCoord{$data02}{$data[5]}{$data[3]} = 1;
+	} else {
+	    my $outline = join("\t",@data)."\n";
+	    push @output, $outline;
+	}
+    }
+    
+    $linesIn = $.;
+    close $IN1B;
+}
+
+
+
+
+
+sub gtf_name_uniqueness {
+    
+    my $guniq = my $tuniq = 1;
+    
+    if ($UCSC_gtf) {
+	
+	my (%pendingTrans, %geneCopies);
+	open my $IN1A, '<', $input or die "$0: Cannot open input GTF '$input' for reading: $!\n";
+	while (my $line = <$IN1A>) {
+	    $line =~ s/[\n\r]+$//;
+	    my @data = split /\t/, $line;
+	    my ($gname) = ($data[8] =~ /gene_id "?([^";]+)/);
+	    my ($tname) = ($data[8] =~ /transcript_id "?([^";]+)/); 
+	    $unames{T}{$tname} = 1;
+	    $unames{G}{$gname}{T}{$tname} = 1;
+	    if ($tname eq $pendingTrans{$gname}->[0] && $data[0] eq $pendingTrans{$gname}->[1]) {  # same trans id, same chr = in current gene copy
+		$boundaries{$gname}{ $geneCopies{$gname} }{START} = $data[3] if $data[3] < $boundaries{$gname}{ $geneCopies{$gname} }{START};
+		$boundaries{$gname}{ $geneCopies{$gname} }{END} = $data[4] if $data[4] > $boundaries{$gname}{ $geneCopies{$gname} }{END};
+	    } else {  # new trans id and/or new chr = new gene copy
+		$pendingTrans{$gname} = [$tname, $data[0]];
+		$boundaries{$gname}{ ++$geneCopies{$gname} } = {'CHR',$data[0], 'START',$data[3], 'END',$data[4], 'STRAND',$data[6], 'TRANS',$tname};
+#		$transcopy{$gname}{ ++$geneCopies{$gname} }{$tname} = 1;
+	    }
+	}
+	close $IN1A;
+	
+	my ($testgene, $testtrans);
+#	($testgene, $testtrans) = ('Gypsy-12-I_NV','Gypsy-12-I_NV');
+	
+	if ($testgene || $testtrans) {
+	    foreach my $gene (keys %boundaries) {
+		foreach my $copy (sort {$a <=> $b} keys %{ $boundaries{$gene} }) {
+		    $boundaries{$gene}{$copy}{COORD} = "$boundaries{$gene}{$copy}{CHR}:$boundaries{$gene}{$copy}{START}-$boundaries{$gene}{$copy}{END}($boundaries{$gene}{$copy}{STRAND})";
+		    print $ERR "$boundaries{$gene}{$copy}{COORD}\n" if ($gene eq $testgene && $boundaries{$gene}{$copy}{TRANS} eq $testtrans);
+		}
+	    }
+	    die;
+	}
+	
+    } else {
+	
+	open my $IN1A, '<', $input or die "$0: Cannot open input GTF '$input' for reading: $!\n";
+	while (my $line = <$IN1A>) {
+	    $line =~ s/[\n\r]+$//;
+	    my $annot = (split /\t/, $line)[8];
+	    my ($gname) = ($annot =~ /gene_id "?([^";]+)/);
+	    my ($tname) = ($annot =~ /transcript_id "?([^";]+)/); 
+	    $unames{T}{$tname} = 1;
+	    $unames{G}{$gname}{T}{$tname} = 1;
+	    $collide = 1 if exists $unames{G}{$tname} || exists $unames{T}{$gname};  # gene-transcript namespace collision
+	}
+	close $IN1A;
+	
+	print $ERR "Gene-transcript namespace collision!\n" if $collide;
+	$totalNames = scalar keys %{ $unames{G} };
+#	$namesUnq = $guniq && $tuniq ? 3 : 
+#	    $guniq ? 2 :
+#	    $tuniq ? 1 : 0;  # 3 = both unique; 2 = only genes unique; 1 = only transcripts unique; 0 = neither unique.
+	
+	if ($genebed) {
+	    my %already;
+	    open my $IN2, '<', $genebed or die "$0: Cannot open gene BED '$genebed' for reading: $!\n";
+	    while (<$IN2>) {
+		$_ =~ s/[\n\r]+$//;
+		my @data = split /\t/, $_;
+		if (exists $unames{G}{$data[3]}) {
+		    $boundaries{$data[3]}{ ++$already{$data[3]} } = {'CHR',$data[0], 'START',$data[1], 'END',$data[2], 'STRAND',$data[5], 'TRANS',$data[3], 'COORD',"$data[0]:$data[1]-$data[2]($data[5])"};
+		} else {
+		    print "Gene-bed name '$data[3]' does not exist in GTF file!\n";
+		}
+	    }
+	    close $IN2;
+	    $totalNames = scalar keys %unames;
+	} else {
+	    print "No gene bed specified: deconvolution of gene namespace will not be performed.\n";
+	}
+	
+    }
+}
+
+
+
+
+
+sub gtf_process {
+    
+    my %unnamed = map {($_=>0)} qw/ G T /;
+    my %GTunnamed = ('i' => 0, 'N' => { map {($_=>scalar(keys %{ $unames{G}{$_}{T} }))} keys %{ $unames{G} } });
+    
+    open my $IN1B, '<', $input;
+    while (my $line = <$IN1B>) {
+	
+	if ($line =~ /^track (type|name)/ || $line =~ /^#/) {
+	    push @output, $line;
+	    if ($line =~ /name=(\S+)/) {
+		($trackName = $1) =~ s/\"//g;
+	    }
+	    $i = 0;
+	    next;
+	}
+	
+	$i++;
+	$line =~ s/[\n\r]+$//;
+	my @data = split /\t/, $line;
+	
+	if (%chrlens) {
+	    if ($chrlens{$data[0]}) {
+		if ($data[3] > $chrlens{$data[0]}) {
+		    print $ERR "$trackName line $i: start coord ($data[3]) is > $data[0] end ($chrlens{$data[0]})!\n";
+		    $data[3] = $chrlens{$data[0]};
+		} elsif ($data[4] > $chrlens{$data[0]}) {
+		    print $ERR "$trackName line $i: end coord ($data[4]) is > $data[0] end ($chrlens{$data[0]})!\n";
+		    $data[4] = $chrlens{$data[0]};
+		}
+	    } else {
+		print $ERR "Chromosome '$data[0]' has length 0 or is not found in given chrom sizes file!  Wrong genome build?\n";
+	    }
+	}
+	
+	if ($data[3] < 0) {
+	    print $ERR "$trackName line $i: start coord was '$data[3]'!\n";
+	    $data[3] = 0;
+	}
+	
+	if ($domath && $data[5] && $data[5] ne '.') {
+	    (my $this_domath = $domath) =~ s/SCORE/$data[5]/;
+	    print $ERR "$domath => $this_domath\n";
+	    $data[5] = eval($this_domath);
+	} else {
+	    $data[5] = '.' unless $data[5];
+	}
+	
+	if ($data[3] > $data[4]) {
+	    ($data[3], $data[4]) = ($data[4], $data[3]);
+	    $data[6] = '-';
+	} else {
+	    $data[6] = exists $strconv{$data[6]} ? $strconv{$data[6]} : '.';
+	}
+	
+	my ($old_gname) = ($data[8] =~ /gene_id "?([^";]+)"?;/);
+	my ($old_tname) = ($data[8] =~ /transcript_id "?([^";]+)"?;/); 
+	my ($new_gname, $new_tname);
+	if ($old_gname) {
+	    my $which_copy;
+	    my $copies = scalar keys %{ $boundaries{$old_gname} };
+	    if ($copies == 1) {
+		$new_gname = $old_gname;  # only copy -- no need to change
+		$new_tname = $old_tname;
+	    } else {
+		foreach my $copy (1..$copies) {   # multiple copies; each has a number -- which copy does this exon belong to?
+		    if ($data[0] eq $boundaries{$old_gname}{$copy}{CHR} && $data[6] eq $boundaries{$old_gname}{$copy}{STRAND}) {
+			if ($data[3] >= $boundaries{$old_gname}{$copy}{START} && $data[4] <= $boundaries{$old_gname}{$copy}{END}) {  # this exon contained by gene copy $copy
+			    $new_gname = "$old_gname." . &numjust($copy,length($copies));  # assign to renamed gene
+			    $new_tname = "$new_gname-1";      # override prior transcript name to aviod further ambiguity
+			}
+		    }
+		}
+		print $ERR "$old_gname FAIL: $line\n" unless $new_gname;
+	    }
+	} else {
+	    $new_gname = "${trackName}_unnamed_" . &numjust(++$unnamed{G}, $totalNames);  # nameless gene -- assign generic name based on track
+	    $new_tname = "$new_gname-1";
+	}
+	$data[8] =~ s/(gene_id "?)[^";]+/$1$new_gname/;       # substitute gene name in GTF defline
+	$data[8] =~ s/(transcript_id "?)[^";]+/$1$new_tname/;
+	
+	my $outline = join("\t",@data)."\n";
+	push @output, $outline;
+    }
+    
+    $linesIn = $.;
+    close $IN1B;
+}
+

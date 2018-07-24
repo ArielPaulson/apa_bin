@@ -1,0 +1,15 @@
+#!/usr/bin/perl
+use Cwd;
+
+# this script does absolutely nothing but descend recursively into a directory tree.  clone it and make it do something additional.
+
+goto_dir(cwd());
+exit;
+
+sub goto_dir {
+    my $dir = shift;
+    foreach my $file (glob "$dir/*") {
+	goto_dir($file) if -d $file;
+    }
+}
+ 

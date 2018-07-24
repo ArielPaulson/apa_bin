@@ -1,0 +1,118 @@
+#!/usr/bin/perl
+use Getopt::Long;
+use Pod::Usage;
+use Data::Dumper;
+use strict;
+
+## Filters high-mismatch alignments out of a Tophat (currently: 2.0.8) or Bowtie2 (currently: 2.1.0) BAM file
+## NOT PE-SENSITIVE.  Treats each alignment independently.  If you want to discard an entire pair if one read is dicarded, you'll have to filter for orphans afterwards.
+
+## Inputs
+my $maxmm;   # maximum mismatches per alignment
+my $inbam;   # input bam
+my $outbam;  # output bam
+my $keep;    # PE only: keep pair if one alignment is OK
+my $drop;    # PE only: drop pair if one alignment is bad
+
+GetOptions("m=i" => \$maxmm, "i=s" => \$inbam, "o=s" => \$outbam, "keep" => \$keep, "drop" => \$drop);
+
+my %ends;
+
+my $normal = $keep || $drop ? 0 : 1;
+my $itemp = "mismatchFilterBam.$$.i.tmp";
+my $otemp = "mismatchFilterBam.$$.o.tmp";
+$outbam =~ s/\.bam//;
+
+if (-e $inbam) {
+    if ($normal) {
+	open IN, "samtools view -h $inbam|";
+    } else {
+	open IN, '-|', "samtools view -h $inbam | samtools sort -n -";
+    }
+    open OUT, "> $otemp" or die "$0: Cannot open temp file '$otemp' for writing: $!\n";
+    if ($normal) {
+	while (<IN>) {
+	    if ($_ =~ /NM:i:(\d+)/) {
+		next if $1 > $maxmm; 
+	    }
+	    print OUT $_;
+	}
+    } else {
+	my (%rtmp, $pending);
+	while (<IN>) {
+	    if ($_ =~ /^@/) {
+		print OUT $_;
+		next;
+	    }
+	    my ($read, $flag, $else) = split /\t/, $_, 3;
+	    my ($mms) = ($else =~ /NM:i:(\d+)/);
+	    my $end = $flag & 64 ? 1 : $flag & 128 ? 2 : 0;
+	    $ends{R}{$end}++;
+#	    print "$.: $_" if $read !~ /\S/;
+	    if ($read eq $pending) {
+		## do nothing
+#		print "$.: $read == $pending\n";
+	    } else {
+		my %pass = %{ &lowpass(\%rtmp) };
+		my $endsIn = scalar keys %rtmp;
+		my $endsOut = scalar keys %pass;
+		$ends{I}{$endsIn}++;
+		$ends{O}{$endsOut}++;
+#		print "$.: $endsIn -> $endsOut\n";
+#		if (0) {   ############################
+		if ($endsIn == 1) {
+		    my $pend = (keys %pass)[0];
+		    print OUT @{ $pass{$pend} } if $endsOut;
+		} elsif ($endsIn == 2) {
+		    if ($endsOut == 2) {
+			print OUT @{ $pass{$_} } foreach keys %pass;
+			$ends{F}{KEEP}++;
+		    } elsif ($endsOut == 1 && $drop) {
+			$ends{F}{DROP}++;
+			## do nothing else 
+		    } elsif ($endsOut == 1 && $keep) {
+			$ends{F}{KEEP}++;
+			foreach my $tend (keys %rtmp) {
+			    if (exists $pass{$tend}) {
+				print OUT @{ $pass{$tend} };
+			    } else {
+				print OUT $rtmp{$tend}{$_}->[1] foreach keys %{ $rtmp{$tend} };
+			    }
+			}
+		    }
+		} else {
+		    print "Invalid endsIn value '$endsIn'!\n",Dumper(\%rtmp),"\n";
+		}
+#		}   ############################
+		%rtmp = ();
+	    }
+	    $rtmp{$end}{$.} = [$mms, $_];
+	    $pending = $read;
+	}
+    }
+    close IN;
+    close OUT;
+} else {
+    print "$0: Cannot locate input BAM file '$inbam'!\n";
+}
+foreach my $set (qw/ R I O F /) {
+    print "$set\t$_\t$ends{$set}{$_}\n" foreach (sort keys %{ $ends{$set} });
+}
+system "samtools view -bS $otemp | samtools sort - $outbam";
+system "rm -f $otemp";
+exit;
+
+
+
+sub lowpass {
+    my %RTMP = %{$_[0]};
+    my %PASS;
+    foreach my $end (keys %RTMP) {
+	foreach my $align (keys %{ $RTMP{$end} }) {
+	    if ($RTMP{$end}{$align}->[0] <= $maxmm) {
+		push @{ $PASS{$end} }, $RTMP{$end}{$align}->[1];
+	    }
+	}
+    }
+    return(\%PASS);
+}

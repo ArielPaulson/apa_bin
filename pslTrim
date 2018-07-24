@@ -1,0 +1,14 @@
+#!/usr/bin/env perl
+use strict;
+
+my $psl = $ARGV[0];
+
+open my $IN, '<', $psl or die "$0: Cannot read psl file '$psl': $!\n";
+while (<$IN>) {
+	s/[\n\r]+$//;
+	my @data = split /\t/, $_;
+	print join("\t", @data[0..20]), "\n";
+}
+close $IN;
+exit;
+

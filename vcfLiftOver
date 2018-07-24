@@ -1,0 +1,166 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use strict;
+
+## UCSC liftOver wrapper which works on VCF files
+## Way, WAY faster than https://www.ncbi.nlm.nih.gov/genome/tools/remap
+
+## To Fix: use chrom_data files to remap chrom names
+
+my ($invcf, $chain, $outvcf) = @ARGV;  # just like liftOver
+
+
+(my $outprefix = $outvcf) =~ s/.vcf(.gz)?$//i;
+my $lost = "$outprefix.liftOver-lost.txt.gz";
+my $fates = "$outprefix.liftOver-fates.txt";
+my $tmp = "liftOverVcf.$$.tmp";
+system "mkdir $tmp";
+my $LOin = "$tmp/vcf.in.bed";
+my $LOout = "$tmp/vcf.out.bed";
+my $LOlost = "$tmp/vcf.lost.txt";
+
+my (@iheader, @oheader, @chrord, %chrlen, %vcf, %chrN, %complaints, $i, %output);
+
+
+## First thing: path $chain
+unless (-e $chain) {
+    my $chain2 = "/n/data1/genomes/liftOver/$chain";
+    die "$0: chain file '$chain' could not be found here, or in the local repository!\n" unless -e $chain2;
+    $chain = $chain2;
+}
+
+
+## Second thing: test if header contains contig lines, and if so, ensure new genome chrom_data exists
+my $cmd = $invcf =~ /\.gz$/ ? 'zcat' : 'cat';
+chomp(my $contigs = `$cmd $invcf | head -1000 | grep "^##contig=" | wc -l`);  # speedup: if you don't have any contig lines in the first 1k lines, then they don't exist
+if ($contigs) {
+    print "Header has contigs.\n";
+    my ($geno, $geno2) = ($chain =~ /(\w+)To(\w+).over.chain$/);  # from, to genome labels
+    $geno2 =~ s/^(.)/\L$1/;
+    my $chrdat = "/n/data1/genomes/indexes/$geno2/$geno2.chrom_data.txt";  # main copy, in published location
+    $chrdat = "/n/projects/apa/stuff/bowtie_building/preps/$geno2/$geno2.chrom_data.txt" unless -e $chrdat;  # backup copy, in prep location (some are not published)
+    die "$0: Failed to locate '$geno2.chrom_data.txt' in published indexes or prep location!\n" unless -e $chrdat;
+    print STDERR "Loading chrom_data file...\n";
+    my $CD = &open2('R', $chrdat, 'Chromosome data file');
+    my ($Uname, $Ulen);
+    while (<$CD>) {
+        my @data = split /\t/, $_;
+        if ($.==1) {
+            foreach my $i (0..$#data) {
+                $Uname = $i if $data[$i] eq 'UCSC.Name';
+                $Ulen = $i if $data[$i] eq 'UCSC.Length';
+            }
+        } else {
+            next unless $data[$Uname];
+            push @chrord, $data[$Uname];
+            $chrlen{ $data[$Uname] } = $data[$Ulen];
+        }
+    }
+    close $CD;
+}
+
+
+## Convert input VCF -> BED; store header
+print STDERR "VCF -> BED: ",`date`;
+my $IN = &open2('R', $invcf, 'Input VCF');
+my $OUT = &open2('W', $LOin, 'liftOver input bed');
+while (<$IN>) {
+    if (/^#/) {
+        push @iheader, $_;
+    } else {
+        my ($chr, $pos, $else) = split /\t/, $_, 3;
+        $vcf{++$i} = $else;
+        print $OUT "$chr\t",($pos-1),"\t$pos\t$i\n";
+        $chrN{$chr}{I}++;
+    }
+}
+close $IN;
+close $OUT;
+
+
+## Convert reference lines in header, if necessary
+if ($contigs) {
+    my $skip;
+    foreach my $line (@iheader) {
+        if ($line =~ /^##contig=/) {
+            ## print none of the input lines; instead print equivalent lines for new (liftOver-to) genome
+            next if $skip;  # already printed replacement
+            push @oheader, "##contig=<ID=$_,length=$chrlen{$_}>\n" foreach sort keys %chrlen;
+            $skip = 1;      # skip all subsequent contig lines
+        } else {
+            push @oheader, $line;
+        }
+    }
+} else {
+    @oheader = @iheader;
+}
+
+
+print STDERR "LiftOver: ",`date`;
+system "liftOver $LOin $chain $LOout $LOlost";
+
+
+print STDERR "Reading liftOver output: ",`date`;
+my $IN2 = &open2('R', $LOout, 'liftOver output bed');
+while (<$IN2>) {
+    chomp;
+    my ($chr, $start, $end, $i) = split /\t/, $_;
+    $chrN{$chr}{O}++;
+    push @{ $output{$chr}{$end} }, $vcf{$i};
+}
+close $IN2;
+
+
+print STDERR "Writing remapped VCF: ",`date`;
+my $OUT2 = &open2('W', $outvcf, 'Output VCF', 1);   # if $outvcf ends with ".gz", extra '1' will use bgzip instead of gzip
+print $OUT2 @oheader;
+foreach my $chr (sort keys %output) {
+    foreach my $end (sort {$a <=> $b} keys %{ $output{$chr} }) {
+        print $OUT2 "$chr\t$end\t$_" foreach @{ $output{$chr}{$end} };  # already has newlines
+    }
+}
+close $OUT2;
+if ($outvcf =~ /\.gz$/) {
+    system "chmod 755 $outvcf";
+    if (-e "$invcf.tbi") {
+        system "tabix -f $outvcf";
+        system "chmod 755 $outvcf.tbi";
+    }
+}
+
+print STDERR "Writing lost records: ",`date`;
+my $IN3 = &open2('R', $LOlost, 'liftOver-lost output');
+my $OUT3 = &open2('W', $lost, 'Lost records file');
+my $reason;
+while (<$IN3>) {
+    chomp;
+    if (/^#/) {
+        $reason = $_;
+    } else {
+        my ($chr, $start, $end, $i) = split /\t/, $_;
+        $chrN{$chr}{L}++;
+        $vcf{$i} =~ s/[\r\n]+$//;
+        print $OUT3 "$chr\t$end\t$vcf{$i}\t$reason\n";
+    }
+}
+close $IN3;
+close $OUT3;
+
+my $wc = (sort {$b<=>$a} map{length($_)} keys %chrN)[0];
+my $wi;
+foreach my $chr (keys %chrN) {
+    $wi = length($chrN{$chr}{I}) if length($chrN{$chr}{I}) > $wi;
+}
+my $fmt = '%'.$wc.'s  %'.$wi.'i  %'.$wi.'i  %'.$wi."i\n";
+(my $hfmt = $fmt) =~ s/i/s/g;
+my $OUT4 = &open2('W', $fates, 'liftOver fates file');
+print $OUT4 sprintf($hfmt, 'Chrom', 'In', 'Out', 'Lost');
+print $OUT4 sprintf($fmt, $_, $chrN{$_}{I}, $chrN{$_}{O}, $chrN{$_}{L}) foreach sort keys %chrN;
+close $OUT4;
+system "cat $fates";  # print to screen
+
+system "chmod 755 $outvcf $lost $fates";
+system "rm -rf $tmp";
+print "$0 $invcf complete! ",`date`;
+exit;
+

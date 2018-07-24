@@ -1,0 +1,110 @@
+#!/usr/bin/env perl
+use LWP::Simple;
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+## Takes a specially formatted fasta of modified transcript fragments and blasts them against an NCBI-downloaded fasta set.
+## Fragments are VCF variants +- 50nt (i.e., transcript seq has been modified to incorporate variant, then variant site + 50bp flanks is extracted).
+## Checks to see if variants are observed in the NCBI references.
+
+
+## Dependencies
+my $blastall = 'blastall';
+
+
+## Inputs
+my $varfasta;   # 
+my $dbdir;      # dir with fastas and blast DBs; if fastas are $name.fa then blast DBs are $name.fa.*
+my $outdir;     # output dir
+my $cores = 1;  # N CPUs for blast
+
+GetOptions("v=s"=>\$varfasta, "d=s"=>\$dbdir, "c=i"=>\$cores, "o=s"=>\$outdir);
+
+die "$0: variant fasta '$varfasta' does not exist!\n" unless -e $varfasta;
+die "$0: reference blast-db dir '$dbdir' does not exist!\n" unless -d $dbdir;
+die "$0: output dir '$outdir' already exists!\n" if -d $dbdir;
+system "mkdir -p $outdir";
+die "$0: failed to create output dir '$outdir'!\n" unless -d $dbdir;
+print "\n";  # in case of running in background, push off prompt
+
+
+
+## Globals
+my %variants;
+my %alignments;
+
+
+## Paths / Files
+my $bin = '/home/apa/local/bin';
+my $tmp = "variantBlast.tmp.$$";
+my $tmpbed = "$tmp.bed";
+my $tmpfa = "$tmp.fa";
+my $blastout = "$tmp.blast";
+
+
+## Blast
+my $blastdb
+print "Blasting variant windows: ".`date`;
+system "$blastn -task megablast -num_threads $cores -outfmt 4 -query $tmpfa -db $taxon_fasta -out $blastout";
+
+print "Reading blast results: ".`date`;
+open my $IN2, $blastout or die "$0: Cannot read blast output '$blastout': $!\n";
+my ($seqline, %alnums, $alnum, $qline, $query, $qstart, $qseq, $qend);
+while (<$IN2>) {
+    $_ =~ s/[\n\r]+$//;
+    
+    ## tally all full-length matches (or above given length% ?)
+    ## test for variant in matched sequences
+    ## per variant, report N matches, N with snp, GIs for each?
+    
+    if ($_ =~ /^Query= (\S+)/) {
+        $query = $1;
+        %alnums = ();
+    } elsif ($_ =~ /^Sequences producing significant alignments:/) {
+        $seqline = $.;
+    } elsif ($seqline && $_ =~ /^\s+(\S+)\s+(\d+)\s+([0-9e.-]+)/) {
+        $alnum++;
+        $alnums{$alnum} = $1;
+        $alignments{$query}{$1}{$alnum}{SCORE} = $2;
+        $alignments{$query}{$1}{$alnum}{EVAL} = $3;
+    } elsif ($_ =~ /^Query_/) {  # query-alignment line
+        ($query, $qstart, $qseq, $qend) = ($_ =~ /^(Query_\d+)\s+(\d+)\s+([ATGCatgc]+)\s+(\d+)/);
+        $qline = $.;
+        $alnum = $seqline = 0;
+    } elsif ($qline && $_ =~ /\S/) {  # companion subject-alignment line
+        my ($subj, $sstart, $sseq, $send) = ($_ =~ /^(\S+)\s+(\d+)\s+([ATGCatgc]+)\s+(\d+)/);
+        $alnum++;
+        my $subj = $alnums{$alnum};
+        $alignments{$query}{$subj}{$alnum}{QALIGN} .= $qseq;
+        $alignments{$query}{$subj}{$alnum}{SALIGN} .= $sseq;
+        $alignments{$query}{$subj}{$alnum}{QSTART} = $qstart unless defined $alignments{$query}{$subj}{$alnum}{QSTART};
+        $alignments{$query}{$subj}{$alnum}{SSTART} = $sstart unless defined $alignments{$query}{$subj}{$alnum}{SSTART};
+        $alignments{$query}{$subj}{$alnum}{QEND} = $qend if $qend > $alignments{$query}{$subj}{$alnum}{QEND};
+        $alignments{$query}{$subj}{$alnum}{SEND} = $send if $send > $alignments{$query}{$subj}{$alnum}{SEND};
+    }
+    $seqline = 0 if (%alnums && $_ !~ /\S/);
+    $qline = 0 if ($qline && $_ !~ /\S/);
+}
+close $IN2;
+
+print "Analyzing blast results: ".`date`;
+#foreach my $query () {
+#    foreach my $subj () {
+#	foreach my $alnum () {
+#	}
+#    }
+#}
+
+print "Writing report: ".`date`;
+open my $OUT2, '>', $outfile or die "$0: Cannot write output file '$outfile': $!\n";
+
+close $OUT2;
+
+###system "rm $tmp.*";
+print "$0 Finished! ".`date`;
+exit;
+
+
+

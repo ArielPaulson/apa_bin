@@ -1,0 +1,154 @@
+#!/usr/bin/env perl
+use strict;
+die;
+
+my ($novel, $compare);
+my ($gtf1, $gtf2, $type, $runmode) = @ARGV;
+die "GTF 1 '$gtf1' does not exist!\n" unless -e $gtf1;
+die "GTF 2 '$gtf2' does not exist!\n" unless -e $gtf2;
+if ($runmode eq 'novel') {
+    $novel = 1;
+} else {
+    $compare = 1;
+}
+
+my $tmp = "compareModels.$$.tmp";
+system "intersectBed -wao -a $gtf1 -b $gtf2 > $tmp";
+
+my (%gtf, %N);
+
+open IN, $gtf1;
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    my @data = split /\t/, $_;
+    my ($gene) = ($data[8] =~ /gene_id \"(.*?)\";/);
+    my $coord = "$data[3]\t$data[4]";
+    $gtf{1}{$gene}{$coord} = ++$N{1}{$gene} unless $gtf{1}{$gene}{$coord};
+}
+close IN;
+
+open IN, $gtf2;
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    my @data = split /\t/, $_;
+    my ($gene) = ($data[8] =~ /gene_id \"(.*?)\";/);
+    my $coord = "$data[3]\t$data[4]";
+    $gtf{2}{$gene}{$coord} = ++$N{2}{$gene} unless $gtf{2}{$gene}{$coord};
+}
+close IN;
+
+my %int;
+open IN, $tmp or die "Failed to open intersection file '$tmp': $!\n";
+while (<IN>) {
+    chomp;
+    my @data = split /\t/, $_;
+    my @data1 = @data[0..8];
+    my @data2 = @data[9..17];
+    my $overlap = $data[18];
+    my ($gene1) = ($data1[8] =~ /gene_id \"(.*?)\"/);
+    my ($gene2) = ($data2[8] =~ /gene_id \"(.*?)\"/);
+    my $len1 = $data1[4]-$data1[3]+1;
+    my $len2 = $data2[4]-$data2[3]+1;
+    
+    if ($novel) {
+	
+	if ($data1[3] < $data2[3] && $data1[4] > $data2[4]) {   # 2 eclipsed by 1
+	    $stats{}{ECLIPSE}{} = 1;
+	} elsif ($data1[3] > $data2[3] && $data1[4] < $data2[4]) {   # 1 eclipsed by 2
+	    $stats{}{ECLIPSE}{} = 1;
+	} elsif ($overlap == $len1) {  # by excluding eclipses, this means exact match
+	    $stats{}{EXACT}{} = 1;
+	} else {  # other overlap
+	    $stats{}{OVER}{} = 1;
+	}
+	
+	$stats{$orf}{ALL} = $fecount;
+	$stats{$orf}{GENES}{$gene} = 1;
+	$stats{$orf}{SHARED}{GENES}{$gene} = 1;
+	$stats{$orf}{SHARED}{COMMON} += $overlap;
+	$stats{$orf}{SHARED}{S} += ($end1-$start1+1);
+	$stats{$orf}{SHARED}{Q} += ($end2-$start2+1);
+	
+    } else {
+
+	$stats{$gene1}{$gene2}{O} += $overlap;
+	
+    }
+}
+close IN;
+
+
+
+
+
+
+
+
+
+open MATCH, 'matched_reord_ens_61_exons.txt_reord_v2r_exons.txt_y_o.txt';
+while (<MATCH>) {
+    $mcount++;
+    next if $mcount == 1;
+    chomp;
+    my ($chr, $str, $start1, $end1, $ens, $matched, $start2, $end2, $fgh, $colon, $overlap, $mtype) = split /\t/, $_;
+    my ($orf, $fexon, $fecount) = split /:/, $fgh;
+    my ($gene, $eexon, $eecount) = split /:/, $ens;
+    warn "No total! $orf" unless $fecount;
+    $stats{$orf}{ALL} = $fecount;
+    $stats{$orf}{EXACT}{$fexon} = 1 if $mtype =~ /^Ex/;
+    $stats{$orf}{ECLIPSE}{$fexon} = 1 if $mtype =~ /^Ec/;
+    $stats{$orf}{OVER}{$fexon} = 1 if $mtype =~ /^Ov/;
+    $stats{$orf}{GENES}{$gene} = 1;
+    $stats{$orf}{SHARED}{GENES}{$gene} = 1;
+    $stats{$orf}{SHARED}{COMMON} += $overlap;
+    $stats{$orf}{SHARED}{S} += ($end1-$start1+1);
+    $stats{$orf}{SHARED}{Q} += ($end2-$start2+1);
+}
+close MATCH;
+
+foreach my $file ('unmatched_reord_ens_61_exons.txt_reord_v2r_exons.txt_y_o.txt', 'incomparable_reord_ens_61_exons.txt_reord_v2r_exons.txt_y_o.txt') {
+    open NOMATCH, $file;
+    while (<NOMATCH>) {
+	$ucount++ if ($_ =~ /^Unmatched/ || $_ =~ /^Incomparable/);	# unmatched for first file, incomparable for second
+	next unless $ucount == 2;	# skip first section of file
+	$mcount2++;
+	next if $mcount2 <= 2;
+	chomp;
+	my ($chr, $str, $start, $end, $fgh) = split /\t/, $_;
+	my ($orf, $fexon, $fecount) = split /:/, $fgh;
+	warn "No total! $orf" unless $fecount;
+	$stats{$orf}{ALL} = $fecount;
+#	$stats{$orf}{NOVEL}{$fexon} = 1;
+    }
+    close NOMATCH;
+}
+
+open OUT, "> NEW_novelty_stats.txt";
+print OUT "ORF\tCOMMONBP\tCOMMON%1\tCOMMON%2\tNOVELTY\tALL\tNOVEL\tEXACT\tECLIPSE\tOVERLAP\tGENEHITS\tHITGENES\n";
+foreach my $orf (sort {$a <=> $b} keys %stats) {
+    my %temp;
+    $temp{$_} = 0 foreach qw/ GENES NOVEL EXACT ECLIPSE OVER /;	# ensure printable values
+    $temp{GENES} = scalar (keys %{ $stats{$orf}{GENES} });
+#   $temp{UNOVEL} = scalar (keys %{ $stats{$orf}{NOVEL} });
+    foreach my $i (1..$stats{$orf}{ALL}) {
+	if ($stats{$orf}{EXACT}{$i}) {
+	    $temp{EXACT}++;
+	} elsif ($stats{$orf}{ECLIPSE}{$i}) {
+	    $temp{ECLIPSE}++;
+	} elsif ($stats{$orf}{OVER}{$i}) {
+	    $temp{OVER}++;
+	} else {
+	    $temp{NOVEL}++;
+	}
+    }
+    my $mgenes = join '; ', sort keys %{ $stats{$orf}{SHARED}{GENES} };
+    my $novelty = $temp{NOVEL} / $stats{$orf}{ALL};
+    my $common = $stats{$orf}{SHARED}{COMMON} || "0";
+    my $accountedS = my $accountedQ = 0;
+    $accountedS = $stats{$orf}{SHARED}{COMMON} / $stats{$orf}{SHARED}{S} if $stats{$orf}{SHARED}{S};
+    $accountedQ = $stats{$orf}{SHARED}{COMMON} / $stats{$orf}{SHARED}{Q} if $stats{$orf}{SHARED}{Q};
+#   my $all2 = $temp{EXACT} + $temp{ECLIPSE} + $temp{OVER} + $temp{NOVEL}; 
+    print OUT "$orf\t$common\t$accountedQ\t$accountedS\t$novelty\t$stats{$orf}{ALL}\t$temp{NOVEL}\t$temp{EXACT}\t$temp{ECLIPSE}\t$temp{OVER}\t$temp{GENES}\t$mgenes\n";
+}
+close OUT;
+exit;

@@ -1,0 +1,77 @@
+#!/bin/bash
+
+## Run: vcfIntersect [--first|--all|--master=<vcf>] output.vcf input1.vcf ... inputN.vcf
+## Any or all VCFs (incl. output) may be gzipped
+## --first prints only the input1.vcf record for each final intersected variant
+## --all prints all input1.vcf..inputN.vcf records, as one tab-concatenated row, for each final intersected variant
+##
+## maybe in the future there will be '--mean' which averages values across all inputs for each record
+
+
+
+## VCF-intersecting options:
+## http://seqanswers.com/forums/showthread.php?t=10162
+## http://bedtools.readthedocs.io/en/latest/content/tools/intersect.html  ***
+## http://vcftools.sourceforge.net/man_latest.html#COMPARISON%20OPTIONS
+## https://github.com/vcflib/vcflib#vcfintersect
+## http://vcftools.sourceforge.net/perl_module.html#vcf-isec
+
+## Will VCF->BED conversion, subsequent intersections, then final VCF filtering be faster than full VCF intersections?
+## Probably not: VCFtools is extremely fast on full VCFs
+
+args=($@)
+mode=${args[0]}        # FIRST ARG: output mode: '--first', '--all', or '--master=<file>"
+out=${args[1]}         # SECOND ARG: output VCF prefix (will write > 1 file)
+VCFs=("${args[@]:2}")  # THIRD-NTH ARGS: VCFs to intersect
+
+if [ "$mode" == "--first" ]; then
+    inter="intersectBed -header";
+elif [ "$mode" == "--all" ]; then
+    inter="intersectBed -header -wo";
+else
+    echo -e "Unknown run mode '$mode' -- the first arg -- must be '--first' or '--all'!\n"
+    exit
+fi
+
+tmp="vcfIntersect.$$.tmp";
+mkdir $tmp;
+
+N=${#VCFs[@]}  # N, not final index
+((M=$N-1))     # final index from 'VCFs'
+echo -e "\nMerging $N VCFs...";
+
+for i in $(seq $M)   # 1..$M
+do
+    
+    ((j=$i-1))
+    vcfB=${VCFs[$i]}
+    if [[ "$vcfB" =~ ".gz"$ ]]; then cmdB=zcat; else cmdB=cat; fi
+    
+    if [ $j -eq 0 ]; then 
+	      ## First merge
+	      vcfA=${VCFs[$j]}
+	      if [[ "$vcfA" =~ ".gz"$ ]]; then cmdA=zcat; else cmdA=cat; fi
+	      blurb="VCF 1 + VCF 2"
+    else
+	      ## Subsequent merges
+	      vcfA=$tmp/merge_$j.vcf
+	      cmdA=cat
+	      ((i1=$i+1))
+	      blurb="Intersection 1-$i + VCF $i1"
+    fi
+    echo "Intersecting: $blurb...";
+    
+#    echo "$inter -a <($cmdA $vcfA) -b <($cmdB $vcfB) > $tmp/merge_$i.vcf"
+    $inter -a <($cmdA $vcfA) -b <($cmdB $vcfB) > $tmp/merge_$i.vcf
+    
+done
+
+if [[ "$out" =~ ".gz"$ ]]; then
+    gzip -cf $tmp/merge_$M.vcf > $out
+else
+    mv -f $tmp/merge_$M.vcf $out
+fi
+
+rm -rf $tmp
+echo -e "vcfIntersect complete!\n"
+

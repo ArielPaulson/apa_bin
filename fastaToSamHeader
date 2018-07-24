@@ -1,0 +1,28 @@
+#!/usr/bin/env perl
+use strict;
+
+my ($file, $sortord) = @ARGV;
+my $sorts = 'unknown, unsorted, queryname, coordinate'; 
+my %SO = map {($_=>1)} split /, /, $sorts;
+die "$0: sort order (arg 2) invalid or unspecified!  Must be one of: $sorts\n" unless $SO{$sortord};
+	
+my $IN;
+chomp(my $line1 = `head -1 $file`);
+if ($line1 =~ /^>/) {
+	## Fasta
+	open $IN, '-|', "/home/apa/local/bin/fastaLengths -f $file";
+}  elsif ($line1 =~ /^\S+\t\d+\b/) {
+	open $IN, '<', $file;
+} else {
+	die "$0: input file format unrecognized! (accepts fasta, fai, and chrom.sizes)\n";
+}
+
+print "\@HD\tVN:1.0\tSO:$sortord\n";
+while (<$IN>) {
+	chomp;
+	my ($name, $len) = split /\t/, $_;
+	print "\@SQ\tSN:$name\tLN:$len\n";
+}
+close $IN;
+exit;
+

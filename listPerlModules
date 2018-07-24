@@ -1,0 +1,28 @@
+#!/usr/bin/env perl
+use ExtUtils::Packlist;
+use ExtUtils::Installed;
+use Data::Dumper;
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my ($libs, $config);  # show Perl library data, config data too?
+GetOptions("libs"=>\$libs, "config"=>\$config);
+
+my $cmd = "which $^X";
+my $perl = $^X eq 'perl' ? (split /\n/, `$cmd`)[1] : $^X;  # USES INSTALLATION FOR WHATEVER INTERPRETER YOU INVOKED
+my ($inst) = ExtUtils::Installed->new();
+my (@modules) = $inst->modules();
+
+print "\nInterpreter:\n $perl\n";
+print "\nModules:\n";
+print " $_\n" foreach @modules;
+
+if ($libs || $config) {
+    print "\n\@INC:\n", Dumper($$inst{':private:'}{INC}), "\n";
+    print "\nLIBDIRS:\n", Dumper($$inst{':private:'}{LIBDIRS}), "\n";
+    print "\nEXTRA:\n", Dumper($$inst{':private:'}{EXTRA}), "\n";
+}
+
+print "\nCONFIG:\n", Dumper($$inst{':private:'}{Config}), "\n" if $config;
+exit;

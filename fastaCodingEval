@@ -1,0 +1,456 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use strict;
+no strict 'refs';
+
+# stopnames: prints {opa} not _ in AA fastas [default no]
+# fudge: if 2 largest orf sizes (in diff. frames) vary by 1 AA due to end-of-seq, take both as largest (e.g. testing incomplete seqs) [default no]
+### fudge is not functional yet
+# minorf: minimum ORF size to bother analyzing [default: 10]
+# minctg: minimum contig (input seq) size to consider (lowers get analysed too, but split out into separate files)
+# noorfs: do not write max-ORF fastas
+# cpsplit: split translated fastas by coding potential
+
+## GetOptions stuff:
+my ($fasta, $fudge, $stopnames, $noorfs, $cpsplit);
+my ($tmode, $minorf, $minctg) = (6, 10, 100);
+my %kmodes = (1,'+0', 3,'+2', 6,'-2');
+
+GetOptions("f=s" => \$fasta, "t=i" => \$tmode, "o=i" => \$minorf, "c=i" => \$minctg, "stops" => \$stopnames, "fudge" => \$fudge, "noorfs" => \$noorfs, "cpsplit" => \$cpsplit);
+
+die "Fasta file '$fasta' not found!" unless -e $fasta;
+die "Translation mode '$tmode' not one of 1,3,6!" unless exists $kmodes{$tmode};
+my ($fname) = ($fasta =~ /([^\/]+)\.f\w{1,4}$/);
+($fname) = ($fasta =~ /([^\/]+)$/) unless $fname;   # unusual extension?
+my $lastframe = $kmodes{$tmode};
+
+chomp(my $now = `date`);
+print "Reading: $now\n";
+my (%stopcodons, @framelist, %aminoacids);	# populated in &get_codons
+&get_codons;
+
+my (%data, $header, $seq, @headers, %tooshort);
+open IN1, $fasta or die "Cannot read '$fasta': $!\n";
+while (<IN1>) {
+    $_ =~ s/[\n\r]//g;
+    if ($_ =~ /^>(.*)/) {
+	$header = $1;
+	push @headers, $header;		# keep things in input order
+	$data{$header}{NAME} = $header;
+    } else {
+	$data{$header}{RAWSEQ} .= $_;
+    }
+}
+close IN1;
+
+chomp(my $now = `date`);
+print "Translating: $now\n";
+my ($tcount, $hcount) = (0, scalar keys %data);
+&translate($_) foreach @headers;
+
+my (%FAF, %FAO, %FAF2, %FAO2);
+if ($cpsplit) {
+    foreach my $i (0..5) {
+	my $FH = 'FAF'.$i;
+	open $FH, "> $fname.frames.cp$i.fa";
+	$FAF{$i} = $FH;
+	if (%tooshort) {
+	    my $FH2 = 'FAF2'.$i;
+	    open $FH2, "> $fname.frames.cp$i.short.fa";
+	    $FAF2{$i} = $FH2;
+	}
+	unless ($noorfs) {
+	    my $FH = 'FAO'.$i;
+	    open $FH, "> $fname.maxorfs.cp$i.fa";
+	    $FAO{$i} = $FH;
+	    if (%tooshort) {
+		my $FH2 = 'FAO2'.$i;
+		open $FH2, "> $fname.maxorfs.cp$i.short.fa";
+		$FAO2{$i} = $FH2;
+	    }
+	}
+    }
+} else {
+    open FAF, "> $fname.allframes.fa";
+    open FAB, "> $fname.bestframes.fa";
+    open FAO, "> $fname.maxorfs.fa" unless $noorfs;
+    if (%tooshort) {
+	open FAF2, "> $fname.allframes.short.fa";
+	open FAB2, "> $fname.bestframes.short.fa";
+	open FAO2, "> $fname.maxorfs.short.fa" unless $noorfs;
+    }
+}
+
+my @HEADER = qw/ NAME SEQ NTLEN NTSEQ MAXORFAA NMAXORF MAXCP BESTFRAMES FRAME /;   # fields per header
+my @FRAME = qw/ NTLEN AALEN AMBIGS STOPS MAXCP MAXORFNT MAXORFAA NMAXORF NTSEQ AASEQ ALNSEQ MSG ORF /;    # fields per frame
+my @MAXORF = qw/ NTLEN AALEN CP M5 T5 T3 AASEQ /;    # fields per max orf (per frame)
+my @repfields = qw/ NTLEN AALEN MAXORFAA NMAXORF BESTFRAMES MAXCP /;
+my $repheader = "NTLEN\tAALEN\tMAXORF\tNMAX\tBESTFRAME\tCP";
+my @frmfields = qw/ NTLEN AALEN AMBIGS STOPS MAXCP MAXORFNT MAXORFAA NMAXORF /;
+my $frmheader = "NTLEN\tAALEN\tAMBIGS\tSTOPS\tMAXORFCP\tMAXORFNT\tMAXORFAA\tNMAXORF";
+my @orffields = qw/ NTLEN AALEN CP M5 T5 T3 /;
+my $orfheader = "NTLEN\tAALEN\tCP\t5'M\t5'TERM\t3'TERM";
+my @sumfields0 = qw/ NAME BESTFRAMES NTLEN AALEN MAXCP /;
+my @sumfields1 = qw/ AALEN AMBIGS STOPS MAXCP MAXORFAA NMAXORF /;
+my $sumheader0 = "\t\t\t\t";
+my $sumheader1 = "HEADER\tBESTFRAME\tNTLEN\tAALEN\tPOTENTIAL";
+foreach my $frame (@framelist) {
+    $sumheader0 .= "\tFRAME_$frame\t\t\t\t\t";
+    $sumheader1 .= "\tAALEN\tAMBIGS\tSTOPS\tMAXORFCP\tMAXORFAA\tNMAXORF";
+}
+
+open SUM, "> $fname.translation_summary.txt";
+print SUM "$sumheader0\n$sumheader1\n";
+open REP, "> $fname.translation_report.txt";
+if (%tooshort) {
+    open SUM2, "> $fname.translation_summary.short.txt";
+    print SUM2 "$sumheader0\n$sumheader1\n";
+    open REP2, "> $fname.translation_report.short.txt";
+}
+
+chomp(my $now = `date`);
+print "Writing: $now\n";
+my $maxorftotal;
+foreach my $header (@headers) {
+    
+    my (%maxdata, %stopdata, @bestframes, $stops, $cnc);
+    # first: rank frames according to number of stops
+    foreach my $frame (@framelist) {	
+	# don't count the terminal stop (unless there are > 1)
+	$stops = ($data{$header}{FRAME}{$frame}{STOPS} == 1 && $data{$header}{FRAME}{$frame}{AASEQ} =~ /_$/) ? 0 : $data{$header}{FRAME}{$frame}{STOPS};
+	push @{ $stopdata{$stops} }, [$data{$header}{FRAME}{$frame}{MAXORFAA}, $frame];
+    }
+    ## second: take orfs with fewest stops; if > 1 take longest (still may be > 1)
+    my $minstops = (sort {$a <=> $b} keys %stopdata)[0];
+    if (scalar @{ $stopdata{$minstops} } == 1) {   # the only frame
+	@bestframes = ($stopdata{$minstops}->[0][1]);
+    } else {    # > 1, find longest
+	push @{ $maxdata{ $_->[0] } }, $_->[1] foreach @{ $stopdata{$minstops} };   # orf size => frame list
+	my ($maxorf, $maxorf2) = (sort {$a <=> $b} keys %maxdata)[0,1];             # first, second largest recorded orf sizes
+	if ($maxorf - $maxorf2 == 1 && $fudge) {   # variance due to frame position: they're probably the same size
+	    my ($frame1, $frame2, $max1, $max2);
+	    my $orf1_t3 = $data{$header}{FRAME}{$frame1}{ORF}{$max1}{T3};
+	    my $orf2_t3 = $data{$header}{FRAME}{$frame2}{ORF}{$max2}{T3};
+	    my $orf1_t5 = $data{$header}{FRAME}{$frame1}{ORF}{$max1}{T5};
+	    my $orf2_t5 = $data{$header}{FRAME}{$frame2}{ORF}{$max2}{T5};
+#	    if ( && ) {
+########### HAVE TO TEST FOR TERMINALITY OF ORF FIRST !!!!!!!!!!!!!!!!!	    
+#	    }
+	    @bestframes = (@{ $maxdata{$maxorf} }, @{ $maxdata{$maxorf2} });	    # take both as largest orf sizes
+	} else {
+	    @bestframes = @{ $maxdata{$maxorf} };  # only one largest orf size
+	}
+    }
+    my %bestframes = map {($_=>1)} @bestframes;
+    my $bestframe = $data{$header}{BESTFRAMES} = join ',', @bestframes;
+    foreach my $frame (@bestframes) {
+	$data{$header}{MAXORFAA} = $data{$header}{FRAME}{$frame}{MAXORFAA} if $data{$header}{FRAME}{$frame}{MAXORFAA} > $data{$header}{MAXORF};
+	$data{$header}{NMAXORF} += scalar (keys %{ $data{$header}{FRAME}{$frame}{ORF} });  # total max ORFs
+    }
+    
+    my ($SUM, $REP, $FAF, $FAB, $FAO);
+    if ($tooshort{$header}) {
+	($SUM, $REP, $FAF, $FAB, $FAO) = ('SUM2','REP2','FAF2','FAB2','FAO2');
+    } else {
+	($SUM, $REP, $FAF, $FAB, $FAO) = ('SUM','REP','FAF','FAB','FAO');
+    }
+    
+    print $SUM join "\t", map { $data{$header}{$_} } @sumfields0;
+    print $REP "ENTRY\tNAME\t$header\n";
+    print $REP "ENTRY\tNTSEQ\t$data{$header}{RAWSEQ}\n";
+    print $REP "ENTRY\tHEAD\t$repheader\n";
+    print $REP "ENTRY\tDATA\t",(join "\t", map { $data{$header}{$_} } @repfields),"\n";
+    foreach my $frame (@framelist) {	# then print results
+	print $SUM join "\t", map { $data{$header}{FRAME}{$frame}{$_} } ('', @sumfields1);  # leading '' creates leading tab, effectively
+	print $REP "FRAME$frame\tHEAD\t$frmheader\n";
+	print $REP "FRAME$frame\tDATA\t",(join "\t", map { $data{$header}{FRAME}{$frame}{$_} } @frmfields),"\n";
+	print $REP "FRAME$frame\tNTSEQ\t$data{$header}{FRAME}{$frame}{NTSEQ}\n";
+	print $REP "FRAME$frame\tAASEQ\t  $data{$header}{FRAME}{$frame}{ALNSEQ}\n";  # 2 lead spaces are important
+	foreach my $maxorf (sort {$a <=> $b} keys %{ $data{$header}{FRAME}{$frame}{ORF} }) {
+	    print $REP "ORF$frame\t#$maxorf\t  $data{$header}{FRAME}{$frame}{ORF}{$maxorf}{ALNSEQ}\n";  # 2 lead spaces are important
+	}
+	foreach my $maxorf (sort {$a <=> $b} keys %{ $data{$header}{FRAME}{$frame}{ORF} }) {
+	    print $REP "ORF$frame\tHEAD.$maxorf\t$orfheader\n";
+	    print $REP "ORF$frame\tDATA.$maxorf\t",(join "\t", map { $data{$header}{FRAME}{$frame}{ORF}{$maxorf}{$_} } @orffields),"\n";
+	}
+	my $trseq = &blockify($data{$header}{FRAME}{$frame}{AASEQ});
+	if ($cpsplit) {
+	    my $framecp = $data{$header}{FRAME}{$frame}{MAXCP};
+	    my $FH = $tooshort{$header} ? $FAF2{$framecp} : $FAF{$framecp};
+	    print $FH ">$header|Frame$frame|$data{$header}{FRAME}{$frame}{AALEN}\n$trseq";
+	    unless ($noorfs) {
+		foreach my $maxorf (sort {$a <=> $b} keys %{ $data{$header}{FRAME}{$frame}{ORF} }) {
+		    my $orfcp = $data{$header}{FRAME}{$frame}{ORF}{$maxorf}{CP};
+		    my $orfseq = &blockify($data{$header}{FRAME}{$frame}{ORF}{$maxorf}{AASEQ});
+		    my $FH = $tooshort{$header} ? $FAO2{$orfcp} : $FAO{$orfcp};
+		    print $FH ">$header|Frame$frame|MaxOrf$maxorf|$data{$header}{FRAME}{$frame}{ORF}{$maxorf}{AALEN}\n$orfseq";
+		}
+	    }
+	} else {
+	    print $FAF ">$header|Frame$frame|$data{$header}{FRAME}{$frame}{AALEN}\n$trseq";
+	    print $FAB ">$header|Frame$frame|$data{$header}{FRAME}{$frame}{AALEN}\n$trseq" if $bestframes{$frame};
+	    unless ($noorfs) {
+		foreach my $maxorf (sort {$a <=> $b} keys %{ $data{$header}{FRAME}{$frame}{ORF} }) {
+		    my $orfseq = &blockify($data{$header}{FRAME}{$frame}{ORF}{$maxorf}{AASEQ});
+		    print $FAO ">$header|Frame$frame|MaxOrf$maxorf|$data{$header}{FRAME}{$frame}{ORF}{$maxorf}{AALEN}\n$orfseq";
+		}
+	    }
+	}
+    }
+    print $SUM "\n";
+    print $REP "\n//\n\n";
+}
+#close $_ foreach ($SUM,$REP);
+#if ($cpsplit) {
+#    close $FAF{$_} foreach (0..5);
+#    unless ($noorfs) {
+#	close $FAO{$_} foreach (0..5);
+#    }
+#} else {
+#    close $_ foreach qw/ FAF FAB /;
+#    close FAO unless $noorfs;
+#}
+chomp(my $now = `date`);
+print "Complete! $now\n";
+exit;
+
+
+#########################################################  SUBROUTINES  #########################################################
+
+
+sub translate {
+
+    my $HEADER = shift;
+    $tcount++;
+    print OUT " $tcount/$hcount\n" if $tcount % 1000 == 0;
+
+    my %frameseq;
+    my $mrna = $data{$HEADER}{RAWSEQ};
+    $mrna =~ s/^\s+//;	# clip leading whitespace
+    $mrna =~ s/\s+$//;	# clip trailing whitespace
+    $mrna =~ s/(.*)/\U$1/;	# all caps
+    $mrna =~ s/U/T/g;	# RNA->DNA
+    $frameseq{'+0'} = $mrna;
+    my @jsplit = split //, $mrna;
+    if ($tmode > 1) {
+	$frameseq{'+1'} = join '', @jsplit[1..$#jsplit];
+	$frameseq{'+2'} = join '', @jsplit[2..$#jsplit];
+    }
+    $data{$HEADER}{NTSEQ} = $mrna;
+    $data{$HEADER}{NTLEN} = length($mrna);
+    $data{$HEADER}{AALEN} = int(length($mrna)/3);
+    $tooshort{$HEADER} = 1 if $data{$HEADER}{NTLEN} < $minctg;
+    if ($tmode == 6) {
+	$frameseq{'-0'} = &revcomp($mrna);
+	my $temp1 = join '', @jsplit[0..$#jsplit-1];
+	my $temp2 = join '', @jsplit[0..$#jsplit-2];
+	$frameseq{'-1'} = &revcomp($temp1);
+	$frameseq{'-2'} = &revcomp($temp2);
+    }
+    
+    foreach my $frame (@framelist) {
+	$data{$HEADER}{FRAME}{$frame}{NTSEQ} = $frameseq{$frame};
+	$data{$HEADER}{FRAME}{$frame}{NTLEN} = length($frameseq{$frame});
+	my $seqlen = length($frameseq{$frame});
+	my $startmax = int($seqlen/3);
+	my (@translation, $stops, $ambigs, $much);
+	foreach my $start (0..$startmax) {  		# one for each codon
+	    $start *= 3;
+	    if ($start == $seqlen) {
+		# bye
+	    } elsif (abs($seqlen-$start) <= 2) {	# reached end of translatable sequence...
+		my $off = abs($seqlen-$start);
+		($seqlen - $start < 0) ? ($much = 'short') : ($much = 'long');
+		my $msg = "Sequence was $off base";
+		$msg .= "s" if ($off > 1);
+		$msg .= " too $much for a full in-frame translation";
+		$data{$HEADER}{FRAME}{$frame}{MSG} = $msg;
+	    } else {
+		my $codon = substr($frameseq{$frame}, $start, 3);
+		my $residue = $aminoacids{$codon};
+		$stops++ if $stopcodons{$codon};
+		if ($residue) {
+		    push @translation, $residue;
+		} else {		# codon failed to translate: probably due to Ns or use of extended IUPAC alphabet
+#		    push @errors, "header $HEADER | residue $residue | codon $codon | start $start | frame $frame | len $seqlen | seq $frameseq{$i}\n";
+		    push @translation, 'x';
+		    $ambigs++;
+		}
+	    }
+	}
+	$data{$HEADER}{FRAME}{$frame}{STOPS} = ($stops || "0");
+	$data{$HEADER}{FRAME}{$frame}{AMBIGS} = ($ambigs || "0");
+	$data{$HEADER}{FRAME}{$frame}{AALEN} = scalar @translation;
+	$data{$HEADER}{FRAME}{$frame}{AASEQ} = join '', @translation;
+	$data{$HEADER}{FRAME}{$frame}{ALNSEQ} = join '  ', @translation;
+	
+	my $termstop = $data{$HEADER}{FRAME}{$frame}{AASEQ} =~ /[oap_]$/;        # does translation end with a stop?
+	my @orftest = split /[oap_]+/, $data{$HEADER}{FRAME}{$frame}{AASEQ};	# split on stops
+	my (%orflens, $orfmax, $maxorfcount);
+	$orflens{ length($_) }{$_} = 1 foreach @orftest;
+	$orfmax = [sort {$b <=> $a} keys %orflens]->[0];	# length of longest ORF
+	$data{$HEADER}{FRAME}{$frame}{MAXORFAA} = $orfmax;
+	$data{$HEADER}{FRAME}{$frame}{MAXORFNT} = $orfmax*3;
+	$data{$HEADER}{FRAME}{$frame}{NMAXORF} = scalar keys %{ $orflens{$orfmax} };
+	if ($minorf && $orfmax < $minorf) {          # no ORFs are large enough to consider
+	    $data{$HEADER}{FRAME}{$frame}{MAXCP} = 0 if 0 >= $data{$HEADER}{FRAME}{$frame}{MAXCP};
+	    $data{$HEADER}{MAXCP} = 0 if 0 >= $data{$HEADER}{MAXCP};
+	    next;
+	}
+	
+	foreach my $orfseq (keys %{ $orflens{$orfmax} }) {	# allows for > 1 longest ORF
+	    $maxorfcount++;
+	    $maxorftotal = $maxorfcount if ($maxorfcount > $maxorftotal);	# greatest number of max ORFs reported by any translation
+	    ## gather some basic stats
+	    $data{$HEADER}{FRAME}{$frame}{ORF}{$maxorfcount}{AASEQ} = $orfseq;
+	    $data{$HEADER}{FRAME}{$frame}{ORF}{$maxorfcount}{AALEN} = $data{$HEADER}{FRAME}{$frame}{MAXORFAA};
+	    $data{$HEADER}{FRAME}{$frame}{ORF}{$maxorfcount}{NTLEN} = $data{$HEADER}{FRAME}{$frame}{MAXORFNT};
+	    $data{$HEADER}{FRAME}{$frame}{ORF}{$maxorfcount}{M5} = $orfseq =~ /^M/ ? 1 : 0;  # ORF starts with an M?
+	    if ($orfseq eq $orftest[-1]) {  # is this ORF 3'-terminal?
+		$data{$HEADER}{FRAME}{$frame}{ORF}{$maxorfcount}{T3} = $termstop ? 2 : 1;   # 1 = terminal; 2 = terminal AND terminated by a stop
+	    } else {
+		$data{$HEADER}{FRAME}{$frame}{ORF}{$maxorfcount}{T3} = 0;
+	    }
+	    $data{$HEADER}{FRAME}{$frame}{ORF}{$maxorfcount}{T5} = $orfseq eq $orftest[0] ? 1 : 0;  # is this ORF 5'-terminal?
+	    ## from Dinger et al. "Differentiating Protein-Coding and Noncoding RNA: Challenges and Ambiguities" PLoS Comp Bio 2008
+	    ## using their empirical ORF/mRNA length function (in bp) to estimate if ORF of given size is by chance; higher number = less random
+	    my $highconf = 91 * log($data{$HEADER}{NTLEN}) - 330;        # empirical mean+2sd line
+	    my $medconf = 72 * log($data{$HEADER}{NTLEN}) - 330;         # extrapolated mean line based on my own testing
+	    my $lowconf = 53 * log($data{$HEADER}{NTLEN}) - 330;         # extrapolated mean-2sd line based on my own testing
+	    my $cp;
+	    my $orfdiff = $data{$HEADER}{FRAME}{$frame}{AALEN} - $data{$HEADER}{FRAME}{$frame}{MAXORFAA};
+	    if ($orfdiff == 0 || ($orfdiff == 1 && $termstop)) {
+		$cp = 5;   # highest confidence; total ORF
+	    } elsif ($data{$HEADER}{FRAME}{$frame}{MAXORFNT} >= $highconf) {
+		$cp = 4;
+	    } elsif ($data{$HEADER}{FRAME}{$frame}{MAXORFNT} >= $medconf) {
+		$cp = 3;
+	    } elsif ($data{$HEADER}{FRAME}{$frame}{MAXORFNT} >= $lowconf) {
+		$cp = 2;
+	    } else {
+		$cp = 1;  # lowest confidence -- less than Dinger's mean-2sd line
+	    }
+	    $data{$HEADER}{FRAME}{$frame}{ORF}{$maxorfcount}{CP} = $cp;
+	    $data{$HEADER}{FRAME}{$frame}{MAXCP} = $cp if $cp > $data{$HEADER}{FRAME}{$frame}{MAXCP};
+	    $data{$HEADER}{MAXCP} = $cp if $cp > $data{$HEADER}{MAXCP};
+	    ## locate ORF in translation and create masked sequence for aligned report
+	    my $offset = 0;
+	    foreach my $orf (@orftest) {
+		if ($orf eq $orfseq) {
+		    my @subtrans = @translation;
+		    my $terminus = $offset + length($orf);
+		    $subtrans[$_] = ' ' foreach (0..$offset-1,$terminus..$#subtrans);   # blank out non-ORF residues
+		    $data{$HEADER}{FRAME}{$frame}{ORF}{$maxorfcount}{ALNSEQ} = join '  ', @subtrans;
+		}
+		$offset += length($orf) + 1;  # add 1 for each stop removed by split()
+	    }
+	}
+    }
+}
+
+
+sub blockify {
+    my $SEQ = shift;
+    my ($seqblock, $start);
+    my $blocks = length($SEQ) / 50;
+    $blocks++ if (length($SEQ) % 50 != 0);
+    for (my $i = 1; $i <= $blocks; $i++) {
+	$seqblock .= substr($SEQ, $start, 50)."\n";
+	$start += 50;
+    }
+    return $seqblock;
+}
+
+
+sub revcomp {
+    my $SEQ = shift;
+    ## basic
+    $SEQ =~ tr/ACGT/TGCA/;
+    ## extended
+    $SEQ =~ s/[^ACGT]/N/g;	# can't translate these anyway
+    return (reverse $SEQ);
+}
+
+
+sub get_codons {	## Stored down here to make things cleaner
+    %stopcodons = ('TAA'=>'o', 'TAG'=>'a', 'TGA'=>'p');
+
+    if ($tmode == 1) {
+	@framelist = ('+0');
+    } elsif ($tmode == 3) {
+	@framelist = ('+0','+1','+2');
+    } elsif ($tmode == 6) {
+	@framelist = ('+0','+1','+2','-0','-1','-2');
+    }
+    
+    %aminoacids = (
+	'TTT' => 'F',
+	'TTC' => 'F',
+	'TTA' => 'L',
+	'TTG' => 'L',
+	'TCT' => 'S',
+	'TCC' => 'S',
+	'TCA' => 'S',
+	'TCG' => 'S',
+	'TAT' => 'Y',
+	'TAC' => 'Y',
+	'TAA' => '_',
+	'TAG' => '_',
+	'TGT' => 'C',
+	'TGC' => 'C',
+	'TGA' => '_',
+	'TGG' => 'W',
+	'CTT' => 'L',
+	'CTC' => 'L',
+	'CTA' => 'L',
+	'CTG' => 'L',
+	'CCT' => 'P',
+	'CCC' => 'P',
+	'CCA' => 'P',
+	'CCG' => 'P',
+	'CAT' => 'H',
+	'CAC' => 'H',
+	'CAA' => 'Q',
+	'CAG' => 'Q',
+	'CGT' => 'R',
+	'CGC' => 'R',
+	'CGA' => 'R',
+	'CGG' => 'R',
+	'ATT' => 'I',
+	'ATC' => 'I',
+	'ATA' => 'I',
+	'ATG' => 'M',
+	'ACT' => 'T',
+	'ACC' => 'T',
+	'ACA' => 'T',
+	'ACG' => 'T',
+	'AAT' => 'N',
+	'AAC' => 'N',
+	'AAA' => 'K',
+	'AAG' => 'K',
+	'AGT' => 'S',
+	'AGC' => 'S',
+	'AGA' => 'R',
+	'AGG' => 'R',
+	'GTT' => 'V',
+	'GTC' => 'V',
+	'GTA' => 'V',
+	'GTG' => 'V',
+	'GCT' => 'A',
+	'GCC' => 'A',
+	'GCA' => 'A',
+	'GCG' => 'A',
+	'GAT' => 'D',
+	'GAC' => 'D',
+	'GAA' => 'E',
+	'GAG' => 'E',
+	'GGT' => 'G',
+	'GGC' => 'G',
+	'GGA' => 'G',
+	'GGG' => 'G');
+    
+    if ($stopnames) {
+	$aminoacids{$_} = $stopcodons{$_} foreach keys %stopcodons;
+    }
+}
+

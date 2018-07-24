@@ -1,0 +1,11 @@
+#!/bin/bash
+
+lost=$1
+
+tmp1="flattenLiftOverLost.$$.1.tmp"
+tmp2="flattenLiftOverLost.$$.2.tmp"
+
+grep -v "^#" $lost > $tmp1
+grep "^#" $lost > $tmp2
+paste $tmp1 $tmp2
+rm -f $tmp1 $tmp2

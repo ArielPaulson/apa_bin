@@ -1,0 +1,309 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use File::Path qw/ make_path remove_tree /;
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## INPUT: a small-RNA BAM file and an genome/annotation build
+## OUTPUT: strandwise counts/RPKMs per gene
+##         strandwise aligned-bp per genomic compartment (PC-CDS, PC-UTR, NC-exon, intron, intergene, ribosome) 
+
+
+## Inputs
+my $bam;      # BAM file (genomic)
+my $TEbam;    # BAM file (aligned to TE fasta)
+my $geno;     # genome build name in /n/data1/genomes/indexes
+my $anno;     # associated annotation build name (path /n/data1/genomes/indexes/$geno/$anno must exist)
+my $outpref;  # output file (optional; otherwise taken from bam)
+my $Mval;     # true M value for RPKM (optional)
+my $switch;   # switch strandedness?  (e.g. if using Illumina stranded protocol)
+my $primary;  # use only BAM alignments flagged as primary? (default: all alignments)
+my $keep;     # do not delete intermediate datasets once run completes?
+my $verbose;  # print commands to screen in real time
+
+GetOptions("b=s"=>\$bam, "t=s"=>\$TEbam, "g=s"=>\$geno, "a=s"=>\$anno, "o=s"=>\$outpref, "M=i"=>\$Mval, "switch"=>\$switch, "primary"=>\$primary, "keep"=>\$keep, "verbose"=>\$verbose);
+
+
+## test arguments, create tempdir
+my $genodir = "/n/data1/genomes/indexes/$geno";
+my $annodir = "$genodir/$anno";
+my $GA = "$annodir/$geno.$anno";
+die "Expected path '$annodir' does not exist!\n" unless -d $annodir;
+my $gdat = "$GA.genedata.txt";
+my $sw = $switch ? '--switch' : '';
+my $std = $verbose ? 1 : 0;
+chomp(my $bam = `readlink -f $bam`);
+my ($bampath) = ($bam =~ /^(.*)\/[^\/]+$/);
+$bampath = '.' unless $bampath;   # bam file might not have explicit path
+($outpref = $bam) =~ s/\.bam$//i unless $outpref;
+$outpref .= '.smallRNA-quantitate';
+my $tmpdir = "smallRNA-quantitate.$$.tmp";
+system "rm -rf $tmpdir";
+system "mkdir $tmpdir";
+die "$0: Failed to create temp directory '$tmpdir'!\n" unless -d $tmpdir;
+
+my $log = "$outpref.log";
+my $LOG = &open2('W', $log, 'Log file');
+&logreport("preparing data...", 1, $LOG);
+
+
+## Globals
+my %knownExt = map {($_=>1)} qw/ bed gtf gff /;  # valid $defs extensions
+my %exonNumber;   # exon numbering per transcript
+my $known_M = $Mval ? 1 : 0;  # was M-value specified?
+my $mergeBed = '/n/local/stage/bedtools/bedtools2-2.24.0/bin/mergeBed';
+my $intersectBed = '/n/local/stage/bedtools/bedtools2-2.24.0/bin/intersectBed';
+my $samtools = 'samtools';
+my $htseq_count = 'htseq-count';
+my $splitBam = '/home/apa/local/bin/splitBam';
+my $bam2track = '/home/apa/local/bin/bam2track';
+my $sortBedCoord = '/home/apa/local/bin/sortBedCoord';
+my $bamHeaderChromSizes = '/home/apa/local/bin/bamHeaderChromSizes';
+
+my $ibam = "$tmpdir/input.bam";
+my $ibgp = "$tmpdir/input.plus.bg";
+my $ibgm = "$tmpdir/input.minus.bg";
+
+my $iTEbam = "$tmpdir/TE.bam";
+(my $iTEbamp = $iTEbam) =~ s/bam$/plus.bam/;
+(my $iTEbamm = $iTEbam) =~ s/bam$/minus.bam/;
+(my $iTEidxp = $iTEbamp) =~ s/bam$/idxstats.txt/;
+(my $iTEidxm = $iTEbamm) =~ s/bam$/idxstats.txt/;
+(my $iTEbgp = $iTEbamp) =~ s/bam$/bg/;
+(my $iTEbgm = $iTEbamm) =~ s/bam$/bg/;
+my $TEsizes = "$tmpdir/TE.chrom.sizes";
+my $TEbpp = "$tmpdir/TE_bp_s";
+my $TEbpm = "$tmpdir/TE_bp_a";
+
+my $totalbp = "$tmpdir/total_bp";
+my $itgcbp = "$tmpdir/itgc_bp";
+my $iint = "$tmpdir/iint.bed";
+my $itgc = "$tmpdir/itgc.bed";
+my $chrsz = "$tmpdir/chrom.sizes";
+&execute("ln -sf $GA.intergenes.bed $itgc", $std, $LOG, 3);
+&execute("ln -sf $GA.iintrons.bed $iint", $std, $LOG, 3);
+&execute("ln -sf $genodir/$geno.chrom.sizes $chrsz", $std, $LOG, 3);
+
+my (%gbio, %ulen, %counts, %RPKM);  # various hashes
+
+my %F = (
+    'ucds'  => { 'I' => "$tmpdir/ucds.bed",  'S' => "$tmpdir/ucds_s",  'A' => "$tmpdir/ucds_a"  },
+    'puxon' => { 'I' => "$tmpdir/puxon.bed", 'S' => "$tmpdir/puxon_s", 'A' => "$tmpdir/puxon_a" },
+    'nuxon' => { 'I' => "$tmpdir/nuxon.bed", 'S' => "$tmpdir/nuxon_s", 'A' => "$tmpdir/nuxon_a" },
+    'ribo'  => { 'I' => "$tmpdir/ribo.bed",  'S' => "$tmpdir/ribo_s",  'A' => "$tmpdir/ribo_a"  },
+    'iint'  => { 'I' => $iint,               'S' => "$tmpdir/iint_s",  'A' => "$tmpdir/iint_a"  },
+    'hts'   => { 'I' => "$GA.cuff.gtf",      'S' => "$tmpdir/htseq_s", 'A' => "$tmpdir/htseq_a" }
+);
+
+## get gene data
+my $GD = &open2('R', $gdat, 'Gene data file');
+my @cols;
+while (<$GD>) {
+    my @data = split /\t/, $_;
+    if ($. == 1) {
+	foreach my $i (0..$#data) {
+	    $cols[0] = $i if $data[$i] eq 'GeneID';
+	    $cols[1] = $i if $data[$i] eq 'Biotype';
+	    $cols[2] = $i if $data[$i] eq 'SimpleBiotype';
+	    $cols[3] = $i if $data[$i] eq 'Uxon_Len';
+	}
+    } else {
+	my @data2 = @data[@cols];
+	$gbio{B}{$data2[1]}{$data2[0]} = 1;   # by Biotype
+	$gbio{S}{$data2[2]}{$data2[0]} = 1;   # by SimpleBiotype
+	$gbio{R}{$data2[0]} = 1 if $data2[1] =~ /rRNA/;   # ribosomes, incl. mito and pseudo
+	$ulen{$data2[0]} = $data2[3];
+    }
+}
+close $GD;
+
+## split uxons by protein coding, noncoding
+my $UX  = &open2('R', "$GA.uxons.bed", 'Input uxons bed');
+my $UXN = &open2('W', $F{nuxon}{I}, 'Output NC-uxons bed');
+my $UXP = &open2('W', $F{puxon}{I}, 'Output PC-uxons bed');
+my $UXR = &open2('W', $F{ribo}{I},  'Output ribosome bed');
+my %x;
+while (<$UX>) {
+    my @data = split /\t/, $_;
+    my $gene = (split /:/, $data[3])[0];
+    $x{T}++;
+    if (exists $gbio{S}{'protein_coding'}{$gene} || exists $gbio{S}{'pseudogene'}{$gene}) {
+	print $UXP $_;
+	$x{P}++;
+    } elsif (exists $gbio{R}{$gene}) {
+	print $UXR $_;
+	$x{R}++;
+    } else {
+	print $UXN $_;
+	$x{N}++;
+    }
+}
+close $_ foreach ($UX, $UXN, $UXP, $UXR);
+&logreport("UXON DISTRIBUTION: $x{T} T | $x{P} P | $x{N} N | $x{R} R", $std, $LOG);
+
+## flatten CDS bed
+my $cds = "$GA.CDSs.bed";
+my $pcds = "$tmpdir/pcds.bed";
+my $ncds = "$tmpdir/ncds.bed";
+&execute("awk '{ if (\$6==\"+\") print \$0 }' $cds > $pcds", $std, $LOG, 2);
+&execute("awk '{ if (\$6==\"-\") print \$0 }' $cds > $ncds", $std, $LOG, 2);
+&execute("$mergeBed -i $pcds | awk '{ print \$0\"\\tPCDS.\"NR\"\\t1\\t+\" }' >  $F{ucds}{I}", $std, $LOG, 2);
+&execute("$mergeBed -i $ncds | awk '{ print \$0\"\\tNCDS.\"NR\"\\t1\\t-\" }' >> $F{ucds}{I}", $std, $LOG, 2);
+&execute("$sortBedCoord -i $F{ucds}{I} --overwrite", $std, $LOG, 3);
+
+## convert full bams to primary-alignments bams, if needed
+if ($primary) {
+    &execute("$samtools view -h -F 256 $bam | $samtools view -bS - > $ibam", $std, $LOG, 2);
+    &execute("$samtools view -h -F 256 $TEbam | $samtools view -bS - > $iTEbam", $std, $LOG, 2) if $TEbam;
+} else {
+    &execute("ln -sf \$(readlink -f $bam) $ibam", $std, $LOG, 3);
+    &execute("ln -sf \$(readlink -f $TEbam) $iTEbam", $std, $LOG, 3) if $TEbam;
+}
+
+## quantitate TEs, if any
+if ($TEbam) {
+    &logreport("quantitating TEs...", 1, $LOG);
+    &execute("$bamHeaderChromSizes $iTEbam $TEsizes", $std, $LOG, 2);
+    &execute("$splitBam $iTEbam", $std, $LOG, 3);
+    &execute("$samtools idxstats $iTEbamp > $iTEidxp", $std, $LOG, 2);
+    &execute("$samtools idxstats $iTEbamm > $iTEidxm", $std, $LOG, 2);
+    &execute("$bam2track -b $iTEbamp -c $TEsizes --BG1", $std, $LOG, 3);
+    &execute("$bam2track -b $iTEbamm -c $TEsizes --BG1", $std, $LOG, 3);
+    &execute("cut -f4 $iTEbgp >  $TEbpp", $std, $LOG, 2);
+    &execute("cut -f4 $iTEbgm | sed 's/-//' >> $TEbpm", $std, $LOG, 2);   ## remove minus signs from (-) strand bedGraph values!
+}
+
+## make stranded bedGraphs
+&logreport("quantitating genomic compartments...", 1, $LOG);
+&execute("$bam2track -b $ibam -g $geno --BG1 --stranded $sw", $std, $LOG, 3);
+&execute("cut -f4 $ibgp >  $totalbp", $std, $LOG, 2);
+&execute("cut -f4 $ibgm | sed 's/-//' >> $totalbp", $std, $LOG, 2);   ## remove minus signs from (-) strand bedGraph values!
+&execute("perl -i -pe 's/(.*)(\\t\\S+)\$/\$1\\tX\$2\\t+/' $ibgp", $std, $LOG, 3);  # add strand to bedGraphs
+&execute("perl -i -pe 's/(.*)(\\t\\S+)\$/\$1\\tX\$2\\t-/' $ibgm", $std, $LOG, 3);  # add strand to bedGraphs
+
+## count features
+&execute("$intersectBed -wa -a $ibgp -b $itgc | cut -f5 >  $itgcbp", $std, $LOG, 2);
+&execute("$intersectBed -wa -a $ibgm -b $itgc | cut -f5 | sed 's/-//' >> $itgcbp", $std, $LOG, 2);   ## remove minus signs from (-) strand bedGraph values!
+
+my $sense = $switch ? '-S' : '-s';
+my $anti  = $switch ? '-s' : '-S';
+foreach my $frac (sort keys %F) {
+    next if $frac eq 'hts';  # ucds puxon nuxon ribo iint
+    &execute("$intersectBed $sense -wa -a $ibgp -b $F{$frac}{I} | cut -f5 >  $F{$frac}{S}", $std, $LOG, 2);
+    &execute("$intersectBed $sense -wa -a $ibgm -b $F{$frac}{I} | cut -f5 | sed 's/-//' >> $F{$frac}{S}", $std, $LOG, 2); ## remove minus signs from (-) strand bedGraph values!
+    &execute("$intersectBed $anti -wa -a $ibgp -b $F{$frac}{I} | cut -f5 >  $F{$frac}{A}", $std, $LOG, 2);
+    &execute("$intersectBed $anti -wa -a $ibgm -b $F{$frac}{I} | cut -f5 | sed 's/-//' >> $F{$frac}{A}", $std, $LOG, 2);  ## remove minus signs from (-) strand bedGraph values!
+}
+
+## htseq-count genes
+&logreport("quantitating genes...", 1, $LOG);
+my $sense = $switch ? 'reverse' : 'yes';
+my $anti  = $switch ? 'yes' : 'reverse';
+&execute("$samtools view $ibam | perl -pe 's/\\s+NH:i:\\d+//' | $htseq_count -s $sense -a 0 -m intersection-nonempty - $F{hts}{I} > $F{hts}{S}", $std, $LOG, 2);  # stripping NH tag removes multiread status
+&execute("$samtools view $ibam | perl -pe 's/\\s+NH:i:\\d+//' | $htseq_count -s $anti  -a 0 -m intersection-nonempty - $F{hts}{I} > $F{hts}{A}", $std, $LOG, 2);
+
+&logreport("running R...", 1, $LOG);
+my $script = "$tmpdir/final.R";
+my $code = &Rscript;
+my $R = &open2('W', $script, 'R script');
+print $R $code;
+close $R;
+&execute("./$script > $script.Rout", $std, $LOG, 2);  # writes $outpref.txt
+
+## exit
+chomp(my $now = `date`);
+&logreport("$0 complete: $now", 1, $LOG);
+close $LOG;
+
+unless ($keep) {
+
+################## FIXME USE nfsAnalyze !!!!!!!!!!!!!!
+
+    system "rm -rf $tmpdir 2> /dev/null";
+    chomp(my $nfs = `ls $tmpdir/.nfs*`);
+#    system "lsof | grep $nfs";
+    my $killsh = "/tmp/$$.x.sh";
+    system "echo -e \"sleep 3\nkill $$\nrm -rf $tmpdir\nrm -f $killsh\" > $killsh";  # get around that bullshit .nfs file
+    system "chmod a+x $killsh";
+    system "$killsh &";  # $0 exits, but won't take this
+}
+exit;
+
+
+
+
+
+sub Rscript {
+
+    my $TEblock = <<EOF1;
+TE.s <- as.matrix(read.delim("$iTEidxp", header=FALSE, row.names=1))
+TE.a <- as.matrix(read.delim("$iTEidxm", header=FALSE, row.names=1))
+TE <- cbind(TE.s[,1], TE.s[,2]+TE.a[,2], TE.s[,2], TE.a[,2])[,c(1:4,2:4)]
+colnames(TE) <- colnames1
+for (i in 5:7) TE[,i] <- 1E9*(TE[,i]/(as.numeric(sum(TE[,2]))*TE[,1]))
+TE <- TE[rownames(TE)!="*",]
+TE <- TE[order(rownames(TE)),]
+TE <- data.frame(Group="TE",ID=rownames(TE),TE)
+hts <- rbind(hts, TE)
+
+fmat <- fmat[c(1:F,F),]
+fmat[F+1,2] <- "TE"
+fmat[F+1,3] <- sum(TE[,3])
+fmat[F+1,5] <- sum(scan("$TEbpp", what=0, sep="\\n"))
+fmat[F+1,6] <- sum(scan("$TEbpm", what=0, sep="\\n"))
+fmat[F+1,4] <- sum(fmat[F+1,5:6])
+fmat[F+1,7:9] <- NA
+rownames(fmat) <- NULL
+EOF1
+
+
+    my $code = <<EOF2;
+#!/usr/bin/env Rscript
+
+colnames1 <- c("Length","Count.U","Count.S","Count.A","RPKM.U","RPKM.S","RPKM.A")
+
+gd <- read.delim("$gdat", as.is=TRUE)
+gd <- gd[order(gd[,1]),]
+hts.s <- as.matrix(read.delim("$F{hts}{S}", header=FALSE, row.names=1))
+hts.a <- as.matrix(read.delim("$F{hts}{A}", header=FALSE, row.names=1))
+hts <- cbind(NA, hts.s[,1]+hts.a[,1], hts.s[,1], hts.a[,1])[,c(1,2:4,2:4)]
+colnames(hts) <- colnames1
+
+non.gene <- grep("_",rownames(hts))
+gd.ord <- match(gd[,1],rownames(hts))
+hts[gd.ord,1] <- gd\$Uxon_Len
+for (i in 5:7) hts[gd.ord,i] <- 1E9*(hts[gd.ord,i]/(as.numeric(sum(hts[gd.ord,2]))*hts[gd.ord,1]))
+hts[non.gene,5:7] <- NA
+hts <- hts[c(non.gene,gd.ord),]
+hts <- data.frame(Group="GENE",ID=rownames(hts),hts)
+
+fracs <- c("ucds","puxon","nuxon","ribo","iint","itgc","total")
+fnames <- c("PC-CDS","PC-UTR","NC-EXON","RIBO","INTRON","INTERGENIC","TOTAL")
+F <- length(fracs)
+
+fmat <- matrix(NA, F, length(colnames1), FALSE, list(fnames,colnames1))
+for (i in 1:(F-2)) {  ### skipping intergenic, total: these are not split out by sense/antisense
+    prefix <- paste0("$tmpdir/",fracs[i])
+    fmat[i,1] <- sum(as.numeric(system(paste0("/home/apa/local/bin/bedLengths -b ",prefix,".bed | cut -f7"), intern=TRUE)))
+    fmat[i,3] <- sum(scan(paste0(prefix,"_s"), what=0, sep="\\n"))
+    fmat[i,4] <- sum(scan(paste0(prefix,"_a"), what=0, sep="\\n"))
+}
+fmat[,2] <- rowSums(fmat[,3:4])
+fmat[2,] <- fmat[2,]-fmat[1,]  # remove CDS from PC-uxon -> UTR
+
+fmat[6,1] <- sum(as.numeric(system("/home/apa/local/bin/bedLengths -b $itgc | cut -f5", intern=TRUE)))
+fmat[7,1] <- sum(as.numeric(system("/home/apa/local/bin/bedLengths -b $chrsz | cut -f2", intern=TRUE)))
+fmat[6,2] <- sum(scan("$itgcbp", what=0, sep="\\n"))  # 'total' and 'itgc' only have totals, not sense/anti
+fmat[7,2] <- sum(scan("$totalbp", what=0, sep="\\n"))
+fmat <- data.frame(Group="BPTYPE",ID=rownames(fmat),fmat)
+
+$TEblock
+out <- rbind(fmat,hts)
+write.table(out, "$outpref.txt", sep="\\t", quote=FALSE, row.names=FALSE)
+
+EOF2
+
+    return $code;
+}
+

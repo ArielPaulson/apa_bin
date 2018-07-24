@@ -1,0 +1,903 @@
+#!/usr/bin/env Rscript
+
+
+## Takes a VCF, and does the following:
+## Calculates binned Hom/Het scores across genome, calls peaks, identifies initial region of interest (homozygosity ratio anomaly), and makes plots.
+## Repeats above process using Mut/Sib allele depths, just for comparison.
+## Adds the 'DPmin' INFO field, which is the lowest depth of any sample.  A fast way of filtering for sites with sufficient depth in all samples.
+## Writes subset VCFs: #1 contains records where genotype calls differ, and #2 is the subset of #1 where mutant is hom-alt and sibling is het.
+## Writes further subset VCFs of above VCFs #1 and #2: #3 is the subset of #1 within the region(s) of interest, and likewise #4 is the subset of #2.
+
+
+## Weaknesses:
+## 1. assumes that if 2 genotypes, mutant is first and wt is second
+## 2. no way to handle replicates at the moment -- having > 2 samples causes some tests to skip
+
+
+######### MUST WRITE RDataF AS FINAL FILE TO ENABLE COMPLETION-DETECTION BY PIPELINE
+
+
+ca <- commandArgs(trailing=TRUE)
+vcf <- ca[1]
+sample <- ca[2]
+geno <- ca[3]
+outpref <- ca[4]
+halt <- ifelse(length(ca)>4, ca[5], Inf)
+
+#vcf="/n/core/Bioinformatics/analysis/Piotrowski/heb/cbio.heb.100/data/output/annotate/degen_C116/degen_C116.merged.typed.snpEff.annot.rpkm.vcf.gz"; sample="degen_C116"; geno="danRer10"; outpref="/n/core/Bioinformatics/analysis/Piotrowski/heb/cbio.heb.100/data/output/analyze/degen_C116/degen_C116.merged.typed.snpEff.annot.rpkm.analyzed."; halt=Inf
+
+apabin <- paste0(system("echo $SIMR_APA_BIN",intern=TRUE),"/")
+if (apabin=="/") stop("Envar $SIMR_APA_BIN not set!\n")
+idxroot <- "/n/data1/genomes/indexes/"
+if (dir.exists(paste0(idxroot,geno))) {
+    ## Genome build label
+    geno.build <- TRUE
+    gpref <- paste0(idxroot,geno,"/",geno,".")
+} else if (file.exists(geno)) {
+    ## Genome toplevel fasta
+    ## Hopefully has accompanying gpref.chrom.sizes file!
+    geno.build <- FALSE
+    gpref <- sub(".fa[sta]*$",".",geno)
+}
+
+if (is.na(outpref)) outpref <- sub("\\.vcf(\\.gz)?$","",vcf)
+if (!grepl("\\.$",outpref)) outpref <- paste0(outpref,".")
+RData <- paste0(outpref,"tmp.RData")
+RDataF <- paste0(outpref,"RData")
+RDataV <- paste0(outpref,"vdat.RData")
+checkpoint <- 0
+
+if (file.exists(RData)) {
+    message("Reloading from last checkpoint...")
+    load(RData)  # also gets last 'checkpoint' value
+} else if (file.exists(RDataF)) {
+    message("Reloading final RData object...")
+    load(RDataF)  # also gets last 'checkpoint' value
+}
+if (file.exists(RDataV)) load(RDataV)  # 'vdat'
+
+
+## ensure these values are set as indicated, regardless of what was in RData
+source("/home/apa/apa_tools.R")  # also ensure these are latest
+winbp   <- 1E4  # H/H ratio will be calculated in bins of this size
+minpeak <- 1E5  # smallest width of 6-sigma peak to pay attention to
+maxgap6 <- 1E6  # 6-sigma H/H anomaly peaks separated by this or less will be merged
+maxgap3 <- 1E5  # 3-sigma H/H anomaly peaks separated by this or less will be merged
+tred   <- "#FF000019"  # transparent red
+tgreen <- "#00FF0014"  # transparent green
+tblue  <- "#0000FF19"  # transparent blue
+dgreen <- "#009900"    # dark green
+
+
+if (checkpoint==0) {
+    if (checkpoint==halt) quit()
+    message("Reading chromosome data...")
+    chrsz <- paste0(gpref,"chrom.sizes")
+    chrdat <- paste0(gpref,"chrom_data.txt")
+    if (geno.build) {
+        if (!file.exists(chrsz) | !file.exists(chrdat)) stop(paste0("One or both chromosome data files are missing:\n'",chrsz,"'\n'",chrdat,"'"))
+        chrsz <- read.delim(chrsz, as.is=TRUE, header=FALSE)
+        chrdat <- read.delim(chrdat, as.is=TRUE)
+        gpchr <- which(chrsz[,1] %in% chrdat[chrdat$Assembly=="chromosome" & !chrdat$Circular,1])
+    } else {
+        if (!file.exists(chrsz)) system(paste(apabin,"fastaLengths -f",geno,">",chrsz))
+        chrsz <- read.delim(chrsz, as.is=TRUE, header=FALSE)
+        gpchr <- c()
+    }
+    if (length(gpchr)==0) gpchr <- which(chrsz[,2]>=5E5)  # min 50kb should avoid mito
+    chrsz <- chrsz[gpchr,]
+    chrs <- chrsz[,1]
+    C <- length(chrs)
+    img.ij <- MA.scatter.plotdim(C)[1:2]
+    chri <- 1:C; names(chri) <- chrs
+    checkpoint <- 1
+    save(list=setdiff(ls(),"vdat"), file=RData)
+}
+
+
+
+if (checkpoint==1) {
+    if (checkpoint==halt) quit()
+    message("Reading input VCF '",vcf,"'...")  # and split on chromosome
+    vdat <- read.vcf(vcf)
+    vc <- ncol(vdat)  
+    vr <- nrow(vdat)
+    vrw <- nchar(vr)
+    message("  read ",vr," rows / ",vc," columns")
+    wf <- which(colnames(vdat)=="FORMAT")
+    if (length(wf)==0) stop("  No FORMAT column in vcf data!")
+    sc <- (wf+1):vc   # sample columns, typically 10=mut and 11=wt
+    ns <- length(sc)  # N sample columns
+    nsi <- 1:ns; names(nsi) <- colnames(vdat)[sc]
+    message("Extracting genotype datasets...")
+    sdat <- lapply(sc, function(i) {
+        do.call(rbind, lapply(strsplit(vdat[,i],":"), function(x) {
+            y <- rep(".",6)  # guarantee 6 cols each: GT, AD, DP, GQ, PL, HH  (HH populated below)
+            y[1:length(x)] <- x
+            y
+        }))
+    })
+    for (j in 1:ns) {
+        x <- strsplit(sdat[[j]][,1],"/")
+        multi <- sapply(x,length)>2
+        y <- rep(".",length(x))
+        x <- do.call(rbind, lapply(x, "[", 1:2))
+        y[x[,1]==x[,2]] <- "1"  # HOM is 1
+        y[x[,1]!=x[,2]] <- "0"  # HET is 0
+        y[multi] <- "0"
+        y[x[,1]=="."|x[,2]=="."] <- "."
+        sdat[[j]][,6] <- y
+        colnames(sdat[[j]]) <- c("GT","AD","DP","GQ","PL","HH")
+        vdat[,sc[j]] <- apply(sdat[[j]],1,paste,collapse=":")
+        sdat[[j]] <- as.data.frame(sdat[[j]])
+    }
+    if (ns > 0) vdat[,wf] <- paste0(vdat[,sc[1]-1],":HH")  # extend format description in FORMAT column, if any genotypes exist
+    if (ns==2) {
+        ## Identify mut-hom-alt/wt-het positions
+        ok1 <- sdat[[1]]$GT != "./."
+        ok2 <- sdat[[2]]$GT != "./."
+        d12 <- sdat[[1]]$GT != sdat[[2]]$GT
+        geno.diff <- ok1 & ok2 & d12
+        mnr <- sdat[[1]]$GT != "0/0"  ## ASSUMING MUT IS FIRST GENO
+        ho1 <- sdat[[1]]$HH == 1      ## ASSUMING MUT IS FIRST GENO
+        he2 <- sdat[[2]]$HH == 0      ## ASSUMING WT IS SECOND GENO
+        mut.hom.alt.wt.het <- mnr & ho1 & he2
+        ## Calculate genotype-difference score
+        ad1 <- suppressWarnings(lapply(strsplit(sdat[[1]][,2],","),as.numeric))  # mut allele depths
+        ad2 <- suppressWarnings(lapply(strsplit(sdat[[2]][,2],","),as.numeric))  # sib allele depths
+        multi.allele <- which(listLengths(ad1)>2 | listLengths(ad2)>2)   # CALCULATE THIS IMMEDIATELY: BEFORE CBIND PADDING!!!!
+        ad1p <- sapply(ad1, function(x) x[1]/sum(x,na.rm=TRUE) )  # mut ref depth as pct mut total (on [0,1])
+        ad2p <- sapply(ad2, function(x) x[1]/sum(x,na.rm=TRUE) )  # sib ref depth as pct sib total (on [0,1])
+        gd.score <- round(abs(ad1p-ad2p),2)   # abs difference in ref-depth pcts (on [0,1]), which is basically percent-difference in ref-percents between mut and sib
+        ## AFTER genodiff score, pad ad1, ad2 for cbinding and calculate FET p-values
+        ad1.len <- sapply(ad1,length)
+        ad2.len <- sapply(ad2,length)
+        ad.maxl <- max(c(ad1.len,ad2.len))
+        ad.padl <- 1:(ad.maxl-1)
+        for (i in ad.padl) {
+            pad <- rep(0,ad.maxl-i)
+            ad1[ad1.len==i] <- lapply(ad1[ad1.len==i], function(x) c(x,pad) )
+            ad2[ad2.len==i] <- lapply(ad2[ad2.len==i], function(x) c(x,pad) )
+        }
+        ad12.NA <- sapply(ad1, function(x) any(is.na(x))) | sapply(ad2, function(x) any(is.na(x)))
+        FET.P <- rep(NA,length(ad1))
+        FET.P[!ad12.NA] <- sapply(which(!ad12.NA), function(i) fisher.test(rbind(ad1[[i]],ad2[[i]]))[[1]] )
+        gd.score[multi.allele] <- NA   ### we don't have a good way to calculate multi-allele difference scores
+        ##for (m in multi.allele) gd.score[m] <- ????   ### LATER MAY DEVELOP A WAY TO SCORE THESE
+        rm(ok1,ok2,d12,ho1,he2,ad1,ad2,ad1p,ad2p)
+    } else {
+        geno.all <- do.call(cbind, lapply(sdat, "[[", "GT"))
+        geno.diff <- apply(geno.all, 1, function(x) luniq(x[x!="./."])>1 )
+        mut.hom.alt.wt.het <- rep(FALSE, length(geno.diff))  # not even testing if > 2 samples at this time -- obviously can be improved on later, if replicate metadata can be acquired
+        gds <- rep(NA,nrow(sdat[[1]]))
+        rm(geno.all)
+    }
+    
+    fmt <- paste0("%",vrw,"i variant positions\n%",vrw,"i have identical sample genotypes\n%",vrw,"i have variable sample genotypes (%0.1f&)\n%",vrw,"i are mut-hom-alt/wt-het (%0.1f&)")
+    message(gsub("&","%",sprintf(fmt,vr,sum(!geno.diff),sum(geno.diff),100*sum(geno.diff)/vr,sum(mut.hom.alt.wt.het),100*sum(mut.hom.alt.wt.het)/vr)))
+    message("Generating chromosome-wise datasets, then saving...")
+    dp.min <- paste0(";DPmin=",rowMin(do.call(cbind, lapply(sdat, "[[", "DP")))) # minimum depth in any sample
+    inp.dp <- paste0(";",sub(";.*","",sub(".*;DP=","DP=",vdat$INFO)))            # only ";DP=\d+" remains
+    pre.dp <- strsplit(vdat$INFO,";DP=[^;]+")                                    # second half MUST start with ";"
+    for (i in which(listLengths(pre.dp)==1)) pre.dp[[i]][2] <- ""                # unless there is no second half (usually just a few records)
+    vdat$INFO <- paste0(sapply(pre.dp,"[[",1), inp.dp, dp.min, sapply(pre.dp,"[[",2))  # injecting new "DPmin" field immediately after "DP" field
+    dp <- suppressWarnings(as.integer(sub(";DP=","",inp.dp)))
+    for (i in which(is.na(dp))) dp[i] <- sum(as.integer(unlist(strsplit(sub(";DP=","",inp.dp[i]),","))))  # correct multi-number depths (take sum)
+    dp.tot <- sum(as.numeric(dp))
+    pdat <- mat.split(data.frame(ROW=1:nrow(vdat),POS=vdat[,2],DP=dp,WIN.SCORE=NA), vdat[,1])
+    pdat.with.data <- which(listLengths(pdat,nrow)>0)[1]
+    for (i in which(listLengths(pdat,nrow)==0)) pdat[[i]] <- pdat[[pdat.with.data]][0,]
+    #dp2 <- zerofy(as.numeric(sdat[[1]][,3])) + zerofy(as.numeric(sdat[[2]][,3]))
+    #plot(dp, dp2, xlab="Total Depth", ylab="Sum Allele Depths", main="")
+    
+    checkpoint <- 2
+    rm(dp.min,inp.dp,pre.dp,dp)
+    save(vdat, file=RDataV)
+    save(list=setdiff(ls(),"vdat"), file=RData)
+}
+
+pdat.with.data <- which(listLengths(pdat,nrow)>0)[1]
+for (i in which(listLengths(pdat,nrow)==0)) pdat[[i]] <- pdat[[pdat.with.data]][0,]
+save(list=setdiff(ls(),"vdat"), file=RData)
+
+
+
+if (checkpoint==2) {
+    if (checkpoint==halt) quit()
+    message("Calculating binned HH, AD values...")
+    gene.bins <- hh.bins <- ad.bins <- new.list(chrs)
+    ad <- suppressWarnings(lapply(nsi, function(j) lapply(strsplit(sdat[[j]]$AD,","),as.numeric)))
+    ad1 <- lapply(ad, function(x) sapply(x, "[[", 1) )
+    ad2 <- lapply(ad, function(x) sapply(x, function(y) sum(y[-1]) ) )
+    
+    for (i in chri) {
+        pdi <- pdat[[chrs[[i]]]]
+        L <- chrsz[i,2]
+        b <- ceiling(L/winbp)
+        p <- lapply(1:b, function(j) {
+            x <- (j-1)*winbp+1
+            y <- j*winbp
+            pdi$ROW[pdi$POS>=x & pdi$POS<=y]
+        })
+        gene.bins[[i]] <- hh.bins[[i]] <- ad.bins[[i]] <- new.list(names(nsi))
+        for (j in nsi) {
+            gene.bins[[i]][[j]] <- sapply(1:b, function(k) length(p[[k]]) )
+            
+            hh.bins[[i]][[j]] <- sapply(1:b, function(k) {
+                ##IM(i,":",j,":",p[[k]])
+                hom <- zerofy(sum(sdat[[j]]$HH[p[[k]]]=="1",na.rm=TRUE))
+                het <- zerofy(sum(sdat[[j]]$HH[p[[k]]]=="0",na.rm=TRUE))
+                zerofy(c( HOM.RAW=hom, HET.RAW=het, HOM.HET=log2((hom+0.5)/(het+0.5)) ))
+            })
+            
+            ad.bins[[i]][[j]] <- sapply(1:b, function(k) {
+                ref <- zerofy(sum(unlist(ad1[[j]][p[[k]]]),na.rm=TRUE))
+                alt <- zerofy(sum(unlist(ad2[[j]][p[[k]]]),na.rm=TRUE))
+                zerofy(c( ALT.RAW=alt, REF.RAW=ref, ALT.REF=log2((alt+0.5)/(ref+0.5)) ))
+            })
+        }
+    }
+    
+    checkpoint <- 3
+    rm(ad,ad1,ad2)
+    save(list=setdiff(ls(),"vdat"), file=RData)
+}
+ 
+
+
+if (checkpoint==3) {
+    if (checkpoint==halt) quit()
+    message("Smoothing binned HH, AD values...")
+    ##hh.bins2 <- hh.smooth2 <- hh.bins
+    ##ad.bins2 <- ad.smooth2 <- ad.bins
+    ##h.score2 <- ad.score2 <- new.list(chrs)
+    hh.smooth <- hh.bins
+    ad.smooth <- ad.bins
+    hh.score <- ad.score <- new.list(chrs)
+    
+    #for (i in chri) {
+        if (FALSE) {
+            ## re-bin at 100k
+            for (j in 1:ns) {
+                nchb <- ncol(hh.bins[[i]][[j]])
+                nb2 <- ceiling(nchb/10)
+                hh.bins2[[i]][[j]] <- sapply(1:nb2, function(n) {
+                    a <- (n-1)*10+1
+                    b <- a+9
+                    if (b>nchb) b <- nchb
+                    rowSums(hh.bins[[i]][[j]][,a:b])
+                })
+                ad.bins2[[i]][[j]] <- sapply(1:nb2, function(n) {
+                    a <- (n-1)*10+1
+                    b <- a+9
+                    if (b>nchb) b <- nchb
+                    rowSums(ad.bins[[i]][[j]][,a:b])
+                })
+                rownames(hh.bins2[[i]][[j]]) <- rownames(ad.bins2[[i]][[j]]) <- rownames(hh.bins[[i]][[j]])
+                hh.bins2[[i]][[j]][3,] <- log2( (hh.bins2[[i]][[j]][1,]+0.5)/(hh.bins2[[i]][[j]][2,]+0.5) )
+                ad.bins2[[i]][[j]][3,] <- log2( (ad.bins2[[i]][[j]][1,]+0.5)/(ad.bins2[[i]][[j]][2,]+0.5) )
+            }
+        }
+    
+    ## smooth 10k   # and 100k
+    ## if hh.smooth2 (100k) ever gets re-created, use f=0.01 for lowess
+    for (i in chri) {
+        for (j in 1:ns) {
+            IM(chrs[i], j)
+            hh.smooth[[i]][[j]] <- list(LOW=hh.bins[[i]][[j]], LOW0=hh.bins[[i]][[j]], MAVG=hh.bins[[i]][[j]], MAVG0=hh.bins[[i]][[j]])
+            ad.smooth[[i]][[j]] <- list(LOW=ad.bins[[i]][[j]], LOW0=ad.bins[[i]][[j]], MAVG=ad.bins[[i]][[j]], MAVG0=ad.bins[[i]][[j]])
+            for (k in 1:3) {
+                if (all(hh.bins[[i]][[j]][k,]==0)) {
+                    for (L in 1:length(hh.smooth[[i]][[j]])) hh.smooth[[i]][[j]][[L]][hh.smooth[[i]][[j]][[L]]!=0] <- 0
+                } else {
+                    hh.smooth[[i]][[j]]$LOW[k,] <- lowess2(NAfy(hh.bins[[i]][[j]][k,],add=0),f=0.05,na.rm=TRUE)$y
+                    hh.smooth[[i]][[j]]$LOW0[k,] <- lowess(hh.bins[[i]][[j]][k,],f=0.05)$y
+                    hh.smooth[[i]][[j]]$MAVG[k,] <- mov.avg(NAfy(hh.bins[[i]][[j]][k,],add=0),10,na.rm=TRUE,interpolate=TRUE)
+                    hh.smooth[[i]][[j]]$MAVG0[k,] <- mov.avg(hh.bins[[i]][[j]][k,],10)
+                    ad.smooth[[i]][[j]]$LOW[k,] <- lowess2(NAfy(ad.bins[[i]][[j]][k,],add=0),f=0.05,na.rm=TRUE)$y
+                }
+                if (all(ad.bins[[i]][[j]][k,]==0)) {
+                    for (L in 1:length(ad.smooth[[i]][[j]])) ad.smooth[[i]][[j]][[L]][ad.smooth[[i]][[j]][[L]]!=0] <- 0
+                } else {
+                    ad.smooth[[i]][[j]]$LOW0[k,] <- lowess(ad.bins[[i]][[j]][k,],f=0.05)$y
+                    ad.smooth[[i]][[j]]$MAVG[k,] <- mov.avg(NAfy(ad.bins[[i]][[j]][k,],add=0),10,na.rm=TRUE,interpolate=TRUE)
+                    ad.smooth[[i]][[j]]$MAVG0[k,] <- mov.avg(ad.bins[[i]][[j]][k,],10)
+                }
+            }
+        }
+        hh.score[[i]] <- do.call(rbind, lapply(hh.smooth[[i]][[1]], "[", 3, ))  # HOM.HET row
+        ad.score[[i]] <- do.call(rbind, lapply(ad.smooth[[i]][[1]], "[", 3, ))  # HOM.HET row
+        rownames(hh.score[[i]]) <- names(hh.smooth[[i]][[1]])
+        rownames(ad.score[[i]]) <- names(ad.smooth[[i]][[1]])
+        ##hh.score2[[i]] <- do.call(rbind, lapply(hh.smooth2[[i]][[1]], "[", 3, ))  # HOM.HET row
+        ##ad.score2[[i]] <- do.call(rbind, lapply(ad.smooth2[[i]][[1]], "[", 3, ))  # HOM.HET row
+        ##rownames(hh.score2[[i]]) <- names(hh.smooth[[i]][[1]])
+        ##rownames(ad.score2[[i]]) <- names(ad.smooth[[i]][[1]])
+    }
+    
+    for (i in chri) {
+        for (s in 1:length(hh.smooth[[i]][[1]])) {  # 1:4; smoothing function versions (LOW, LOW0, MAVG, MAVG0)
+            ## HH scores
+            mu <- hh.smooth[[i]][[1]][[s]][3,]
+            wt <- hh.smooth[[i]][[2]][[s]][3,]
+            hh.score[[i]][s,] <- (mu-wt)*abs((mu+wt)/2)
+            ## AD scores
+            mu <- ad.smooth[[i]][[1]][[s]][3,]
+            wt <- ad.smooth[[i]][[2]][[s]][3,]
+            ad.score[[i]][s,] <- (mu-wt)*abs((mu+wt)/2)
+            ##mu2 <- hh.smooth2[[i]][[1]][[s]][3,]
+            ##wt2 <- hh.smooth2[[i]][[2]][[s]][3,]
+            ##hh.score2[[i]][s,] <- (mu2-wt2)*abs((mu2+wt2)/2)
+            ##mu2 <- ad.smooth2[[i]][[1]][[s]][3,]
+            ##wt2 <- ad.smooth2[[i]][[2]][[s]][3,]
+            ##ad.score2[[i]][s,] <- (mu2-wt2)*abs((mu2+wt2)/2)
+        }
+        
+        ## Add window scores to variant positions
+        pos <- pdat[[chrs[[i]]]]$POS
+        L <- chrsz[i,2]
+        b <- ceiling(L/winbp)
+        for (j in 1:b) {
+            x <- (j-1)*winbp+1
+            y <- j*winbp
+            pdat[[chrs[i]]]$WIN.SCORE[pos>=x & pos<=y] <- hh.score[[i]][1,j]  # MUST MATCH SCORE ROW USED TO CREATE "mNsd"
+        }
+        pdat[[chrs[i]]]$WIN.SCORE <- round(pdat[[chrs[i]]]$WIN.SCORE, 2)
+    }
+
+    hw.score <- unlist(lapply(names(pdat), function(chr) {
+        if (chr %in% chrs) {
+            pdat[[chr]]$WIN.SCORE
+        } else {
+            rep(NA,nrow(pdat[[chr]]))
+        }
+    }))
+    vdat$INFO <- paste0(vdat$INFO,";GenoDiffScore=",gd.score,";AlleleFETp=",signif(FET.P,3),";HomWinScore=",hw.score)
+    message("Writing Extended VCFs...")
+    write.vcf(vdat, paste0(outpref,"vcf"), tabix=TRUE)  # added GenoDiffScore and HomWinScore to INFO; extended the sample columns to full 5 fields and added the 6th "HH" field
+    if (any(geno.diff)) write.vcf(vdat[geno.diff,], paste0(outpref,"genodiff.vcf"), tabix=TRUE)  # subset of variants where genotypes vary across samples
+    if (any(mut.hom.alt.wt.het)) write.vcf(vdat[mut.hom.alt.wt.het,], paste0(outpref,"mut_hom-alt_wt_het.vcf"), tabix=TRUE)  # subset of variants where mutant is HOM and wt is HET
+    
+    checkpoint <- 4
+    save(list=setdiff(ls(),"vdat"), file=RData)
+}
+
+
+
+if (checkpoint==4) {
+    if (checkpoint==halt) quit()
+    message("Finding critical windows...")
+    
+    calc.gaps <- function(x) {
+        nr <- nrow(x)
+        if (nr>0) {
+            if (nr==1) {
+                x$GAP <- 0
+            } else {
+                x$GAP <- c(0,x[2:nr,2]-x[1:(nr-1),3])
+            }
+        }
+        x
+    }
+    
+    join.peaks <- function(x, maxgap=0) {
+        nr <- nrow(x)
+        if (nr>1) {
+            gr <- bed2gr(cbind(x[,1:3],1:nr,1,"+"))
+            ol <- as.matrix(findOverlaps(gr,gr))
+            ol <- ol[ol[,1]<ol[,2],,drop=FALSE]
+            if (length(ol)>0) {
+                ol <- pairs2subgraphs(ol)
+                rmv <- c()
+                for (i in 1:length(ol)) {
+                    x$START[min(ol[[i]])] <- min(x$START[ol[[i]]])
+                    x$END[min(ol[[i]])] <- max(x$END[ol[[i]]])
+                    rmv <- c(rmv, ol[[i]][2:length(ol[[i]])])
+                }
+                x <- x[-rmv,]
+            }
+        }
+        nr <- nrow(x)
+        if (maxgap>0 & nr>1) {
+            gaps <- x[2:nr,2]-x[1:(nr-1),3]
+            if (any(gaps<=maxgap)) {
+                runs <- find.runs(gaps<=maxgap)
+                runs <- runs[names(runs)=="TRUE"]
+                rmv <- c()
+                for (r in 1:length(runs)) {
+                    j <- runs[[r]][1]
+                    k <- runs[[r]][length(runs[[r]])]+1  # first row after run of TRUEs ends
+                    x[j,3] <- x[k,3]
+                    rmv <- c(rmv, (j+1):k)
+                }
+                x <- x[-rmv,]  # drop merged-in rows
+                x[,4] <- x[,3]-x[,2]  # recalc width
+                if (nrow(x)<nr) x <- join.peaks(x)  # recursively join until no joins left
+            }
+        }
+        if (nrow(x)>0) x[,4] <- x[,3]-x[,2]  # recalc width
+        calc.gaps(x)
+    }
+    
+    yrows <- ns+1
+
+    ## Determine some y-axis ranges
+    yr.fc <- range(c(
+        real(unlist(lapply(chri, function(i) lapply(hh.smooth[[i]], function(x) lapply(x,"[",3,) )))),
+        real(unlist(lapply(chri, function(i) hh.score[[i]][3,] )))
+        ##real(unlist(lapply(chri, function(i) lapply(hh.smooth2[[i]], function(x) lapply(x,"[",3,) )))),
+        ##real(unlist(lapply(chri, function(i) hh.score2[[i]][3,] )))
+    ))
+    yr.hh <- range(real(unlist(lapply(chri, function(i) lapply(hh.bins[[i]], "[", 1:2, ) ))))
+    yr.hh.n <- 1E6*yr.hh/dp.tot
+    ##yr.hh2 <- range(real(unlist(lapply(chri, function(i) lapply(hh.bins2[[i]], "[", 1:2, ) ))))
+    ##yr.hh2.n <- 1E6*yr.hh2/dp.tot
+    
+    yr.hhs <- range(real(unlist(lapply(chri, function(i) lapply(hh.smooth[[i]], function(x) lapply(x,"[",1:2,) )))))
+    ##yr.hhs2 <- range(real(unlist(lapply(chri, function(i) lapply(hh.smooth2[[i]], function(x) lapply(x,"[",1:2,) )))))
+    
+    yr.s <- range(real(unlist(c(hh.score))))
+    yr.d <- diff(yr.s)
+    yr.sx <- c(yr.s[1]-yr.d*0.1, yr.s[2]+yr.d*0.1)
+    
+    ##yr.s2 <- range(real(unlist(c(hh.score2))))
+    ##yr.d2 <- diff(yr.s2)
+    ##yr.sx2 <- c(yr.s2[1]-yr.d2*0.1, yr.s2[2]+yr.d2*0.1)
+    
+    yr <- range(real(unlist(c(hh.score))))
+    if (yr[1] < -4) yr[1] <- -4  # negative scores aren't really useful, so limit the negative y-range
+    yd <- diff(yr)
+    yr2 <- c(yr[1]-yd*0.1, yr[2]+yd*0.1)
+    
+    ## x-axis stuff
+    axMb <- axSeq <- axLab <- new.list(chrs)
+    for (i in chri) {
+        nc <- ncol(hh.score[[i]])
+        Mb <- trunc(nc/100)
+        axMb[[i]] <- 10*ceiling(Mb/10)
+        axSeq[[i]] <- c(0:axMb[[i]])*100  # ticks every Mb
+        axLab[[i]] <- rep(NA,length(axSeq[[i]]))
+        axLab[[i]][axSeq[[i]] %in% c(seq(0,axMb[[i]],5)*100)] <- seq(0,axMb[[i]],5)  # labels every 5Mb
+        axLab[[i]] <- axLab[[i]][axSeq[[i]] <= nc]  # FIRST
+        axSeq[[i]] <- axSeq[[i]][axSeq[[i]] <= nc]  # SECOND
+    }
+    rm(nc,Mb)
+    
+    ## Critical region detection -- double-threshold peak calling w/ mean + 3sd, 8sd
+    ## Using score matrix row 1, "LOW"
+    alls.low <- list(
+        HH=real(unlist(lapply(hh.score,"[",1,))),
+        AD=real(unlist(lapply(ad.score,"[",1,)))
+    )
+    m <- lapply(alls.low,mean)
+    s <- lapply(alls.low,sd)
+    mNsd <- list(
+        HH=sapply(1:10, function(i) m$HH+i*s$HH),
+        AD=sapply(1:10, function(i) m$AD+i*s$AD)
+    )
+    
+    x.wins <- x.wins2 <- new.list(qw(HH,AD), elem=new.list(chrs))
+    score.row <- 1  # LOW
+    sds <- list(HH=c(2,8),AD=c(4,8))   # lower, upper (mean+)SD values
+    for (i in chri) {
+        x.score <- list(HH=hh.score[[i]], AD=ad.score[[i]])
+        for (x in 1:2) {
+            if (any(falsify(x.score[[x]][score.row,]>=mNsd[[x]][sds[[x]][2]]))) {
+                ## upper-sigma "core" peaks
+                rUs <- do.call(rbind,find.runs(falsify(x.score[[x]][score.row,]>=mNsd[[x]][sds[[x]][2]])))
+                rUs <- calc.gaps(data.frame(CHR=chrs[i],START=winbp*rUs[,1],END=winbp*rUs[,2],NAME="",WIDTH=winbp*(rUs[,2]-rUs[,1]),STRAND="+",GAP=0)[rownames(rUs)=="TRUE",])
+                rUs <- rUs[rUs$WIDTH>minpeak,]
+                rUs <- join.peaks(rUs,maxgap6)
+                if (nrow(rUs)==0) next
+                ## widen remaining upper-sigma peaks to lower-sigma threshold
+                rLs <- do.call(rbind,find.runs(falsify(x.score[[x]][score.row,]>=mNsd[[x]][sds[[x]][1]])))
+                rLs <- calc.gaps(data.frame(CHR=chrs[i],START=winbp*rLs[,1],END=winbp*rLs[,2],NAME="",WIDTH=winbp*(rLs[,2]-rLs[,1]),STRAND="+",GAP=0)[rownames(rLs)=="TRUE",])
+                rLs <- rLs[rLs$WIDTH>minpeak,]
+                rLs <- rbind(rLs,rUs)
+                rLs <- rLs[order(rLs$START),]
+                rLs <- join.peaks(rLs,maxgap3)
+                if (nrow(rLs)>1) {
+                    rLs.ok <- rep(FALSE,nrow(rLs))
+                    for (rU in 1:nrow(rUs)) {
+                        for (rL in 1:nrow(rLs)) {
+                            if (rUs$START[rU]>=rLs$START[rL] & rUs$END[rU]<=rLs$END[rL]) rLs.ok[rL] <- TRUE
+                        }
+                    }
+                    rLs <- rLs[rLs.ok,]
+                }
+                rLs$START[rLs$START<=winbp] <- 0
+                rLs$END[rLs$END>chrsz[i,2]] <- chrsz[i,2]
+                nrLs <- nrow(rLs)
+                if (nrLs==0) next
+                fmt <- paste0("%0",max(nchar(nrLs)),"i")
+                rLs$NAME <- paste0(chrs[i],"-",sprintf(fmt,1:nrow(rLs)))
+                x.wins[[x]][[i]] <- rLs
+                ## for (r in 1:nrow(rLs)) rect(rLs$START[r]/winbp,yr.sx[1], rLs$END[r]/winbp,yr.sx[2], border=NA, col=tred)  # full y rect
+                ## ##for (r in 1:nrow(rUs)) rect(rUs$START[r]/winbp,yr.sx[1], rUs$END[r]/winbp,yr.sx[2], border=NA, col=tred)  # full y rect
+            }
+        }
+    }
+    ##hh.wins2 <- ad.wins2 <- new.list(chrs)   # maybe someday
+    hh.wins <- x.wins$HH
+    ad.wins <- x.wins$AD
+    rm(x.wins,x.score)
+
+    llhw <- listLengths(hh.wins)
+    if (any(llhw>0)) {
+        write.bed(do.call(rbind, hh.wins[llhw>0]), paste0(outpref,"hom_windows.txt"))  # force start, end, score to be digits-only (do not write in sci format)
+    } else {
+        system(paste("touch", paste0(outpref,"hom_windows.txt")))
+    }
+    llaw <- listLengths(ad.wins)
+    if (any(llaw>0)) {
+        write.bed(do.call(rbind, ad.wins[llaw>0]), paste0(outpref,"alt_windows.txt"))  # force start, end, score to be digits-only (do not write in sci format)
+    } else {
+        system(paste("touch", paste0(outpref,"alt_windows.txt")))
+    }
+    
+    checkpoint <- 5
+    save(list=setdiff(ls(),"vdat"), file=RData)
+}
+
+
+
+if (checkpoint==5) {
+    if (checkpoint==halt) quit()
+    message("Imaging HET/HOM calls...")
+    
+    
+    ## HIGH-DETAIL CHROM PLOTS WENT HERE BEFORE -- NOW IN MOTHBALLED CODE BLOCK AT END
+    
+    
+    ## HH PLOTS
+    
+    lp.mat <- lapply(chri, function(i) hh.score[[i]][c(3,1),] )  # MAVG, LOW
+    yr <- range(real(unlist(lp.mat)))
+    yr2 <- range(real(unlist(lapply(hh.score,"[",1,))))
+    yr <- if (yr[1]<0) { yr2*3 } else { c(0,yr2[2]*3) }
+    yrx <- c( yr[1]-diff(yr)*0.1,  yr[2]+diff(yr)*0.1 )
+    png(paste0(outpref,"GATK_HH_score_overview.png"), 300*img.ij[1], 300*img.ij[2])
+    par(mfrow=img.ij, mar=c(0,0,0,0), cex=1.2, xaxs="i")
+    for (i in chri) {
+        if (all(is.na(hh.score[[i]][3,]))) {
+            null.plot(ylim=yr, xlim=c(0,ncol(hh.score[[i]])))
+        } else {
+            lineplot(lp.mat[[i]], col=c(8,4), lwd=1:2, ylim=yr, axes=FALSE, ann=FALSE)
+        }
+        abline(h=c(0,mNsd$HH[sds$HH[2]]), lty=c(1,3), col=c(1,2))
+        text(ncol(hh.score[[i]])/2, yr[2], chrs[i], pos=1, cex=2)
+        if (length(hh.wins[[i]])==0) next
+        if (nrow(hh.wins[[i]])==0) next
+        for (r in 1:nrow(hh.wins[[i]])) rect(hh.wins[[i]]$START[r]/winbp,yrx[1], hh.wins[[i]]$END[r]/winbp,yrx[2], border=NA, col=tgreen)  # full y rect
+    }
+    dev.off()
+    
+    lp.mat <- lapply(chri, function(i) {
+        x <- rbind(hh.smooth[[i]][[1]]$LOW[1:2,], hh.smooth[[i]][[2]]$LOW[1:2,])
+        rownames(x) <- sub("\\.RAW$","",paste0(rep(names(hh.smooth[[i]]),each=2),".",rep(rownames(x)[1:2],2)))
+        x[c(1,3,2,4),]
+    })
+    yr <- quantile(real(unlist(lp.mat)), c(0.001,0.999))
+    ##if (yr[1]>0) yr[1] <- 0
+    yrx <- c( yr[1]-diff(yr)*0.1,  yr[2]+diff(yr)*0.1 )
+    png(paste0(outpref,"GATK_HH_calls_overview.png"), 300*img.ij[1], 300*img.ij[2])
+    par(mfrow=img.ij, mar=c(0,0,0,0), cex=1.2, xaxs="i")
+    for (i in chri) {
+        if (all(is.na(lp.mat[[i]]))) {
+            null.plot(ylim=yr, xlim=c(0,ncol(hh.smooth[[i]][[1]]$LOW)))
+        } else {
+            lineplot(lp.mat[[i]], ylim=yr, xaxt="n", col=c(2,4,"#FF9999","#9999FF"), lty=c(1,1,3,3), axes=FALSE, ann=FALSE)
+        }
+        abline(h=0)
+        text(ncol(hh.score[[i]])/2, yr[2], chrs[i], pos=1, cex=2)
+        if (length(hh.wins[[i]])==0) next
+        if (nrow(hh.wins[[i]])==0) next
+        for (r in 1:nrow(hh.wins[[i]])) rect(hh.wins[[i]]$START[r]/winbp,yrx[1], hh.wins[[i]]$END[r]/winbp,yrx[2], border=NA, col=tgreen)  # full y rect
+    }
+    dev.off()
+    
+    
+    ## AD PLOTS
+    
+    lp.mat <- lapply(chri, function(i) ad.score[[i]][c(3,1),] )  # MAVG, LOW
+    yr <- range(real(unlist(lp.mat)))
+    yr2 <- range(real(unlist(lapply(ad.score,"[",1,))))
+    yr <- if (yr[1]<0) { yr2*3 } else { c(0,yr2[2]*3) }
+    yrx <- c( yr[1]-diff(yr)*0.1,  yr[2]+diff(yr)*0.1 )
+    png(paste0(outpref,"GATK_AD_score_overview.png"), 300*img.ij[1], 300*img.ij[2])
+    par(mfrow=img.ij, mar=c(0,0,0,0), cex=1.2, xaxs="i")
+    for (i in chri) {
+        if (all(is.na(ad.score[[i]][3,]))) {
+            null.plot(ylim=yr, xlim=c(0,ncol(ad.score[[i]])))
+        } else {
+            lineplot(lp.mat[[i]], col=c(8,4), lwd=1:2, ylim=yr, axes=FALSE, ann=FALSE)
+        }
+        abline(h=c(0,mNsd$AD[sds$AD[2]]), lty=c(1,3), col=c(1,2))
+        text(ncol(ad.score[[i]])/2, yr[2], chrs[i], pos=1, cex=2)
+        if (length(ad.wins[[i]])==0) next
+        if (nrow(ad.wins[[i]])==0) next
+        for (r in 1:nrow(ad.wins[[i]])) rect(ad.wins[[i]]$START[r]/winbp,yrx[1], ad.wins[[i]]$END[r]/winbp,yrx[2], border=NA, col=tgreen)  # full y rect
+    }
+    dev.off()
+    
+    lp.mat <- lapply(chri, function(i) {
+        x <- rbind(ad.smooth[[i]][[1]]$LOW[1:2,], ad.smooth[[i]][[2]]$LOW[1:2,])
+        rownames(x) <- sub("\\.RAW$","",paste0(rep(names(ad.smooth[[i]]),each=2),".",rep(rownames(x)[1:2],2)))
+        x[c(1,3,2,4),]
+    })
+    yr <- range(real(unlist(lp.mat)))
+    yrx <- c( yr[1]-diff(yr)*0.1,  yr[2]+diff(yr)*0.1 )
+    png(paste0(outpref,"GATK_AD_calls_overview.png"), 300*img.ij[1], 300*img.ij[2])
+    par(mfrow=img.ij, mar=c(0,0,0,0), cex=1.2, xaxs="i")
+    for (i in chri) {
+        if (all(is.na(lp.mat[[i]]))) {
+            null.plot(ylim=yr, xlim=c(0,ncol(ad.smooth[[i]][[1]]$LOW)))
+        } else {
+            lineplot(lp.mat[[i]], ylim=yr, xaxt="n", col=c(2,4,"#FF9999","#9999FF"), lty=c(1,1,3,3), axes=FALSE, ann=FALSE)
+        }
+        abline(h=0)
+        text(ncol(ad.score[[i]])/2, yr[2], chrs[i], pos=1, cex=2)
+        if (length(ad.wins[[i]])==0) next
+        if (nrow(ad.wins[[i]])==0) next
+        for (r in 1:nrow(ad.wins[[i]])) rect(ad.wins[[i]]$START[r]/winbp,yrx[1], ad.wins[[i]]$END[r]/winbp,yrx[2], border=NA, col=tgreen)  # full y rect
+    }
+    dev.off()
+    
+    lp.mat <- lapply(chri, function(i) {
+        IM(i)
+        mad <- suppressWarnings(lapply(strsplit(sdat[[1]]$AD[pdat[[chrs[i]]]$ROW],","),as.numeric))  # mut allele depth
+        sad <- suppressWarnings(lapply(strsplit(sdat[[2]]$AD[pdat[[chrs[i]]]$ROW],","),as.numeric))  # sib allele depth
+        mr <- lapply(mad, function(x) x[1] )                   # mut ref depth
+        sr <- lapply(sad, function(x) x[1] )                   # sib ref depth
+        ma <- lapply(mad, function(x) sum(x[-1],na.rm=TRUE) )  # mut alt depth
+        sa <- lapply(sad, function(x) sum(x[-1],na.rm=TRUE) )  # sib alt depth
+        if (length(mad)>0) {
+            mr[listLengths(mr)==0] <- NA; mr <- zerofy(unlist(mr))
+            ma[listLengths(ma)==0] <- NA; ma <- zerofy(unlist(ma))
+        } else {
+            mr <- ma <- NA
+        }
+        if (length(sad)>0) {
+            sr[listLengths(sr)==0] <- NA; sr <- zerofy(unlist(sr))
+            sa[listLengths(sa)==0] <- NA; sa <- zerofy(unlist(sa))
+        } else {
+            sr <- sa <- NA
+        }
+        ad5 <- log2(rbind((ma+0.5)/(mr+0.5),(sr+0.5)/(sa+0.5))); rownames(ad5) <- qw(MLFC,SLFC)
+        ad5
+    })
+    yr <- range(real(unlist(lp.mat)))
+    yrx <- c( yr[1]-diff(yr)*0.1,  yr[2]+diff(yr)*0.1 )
+    png(paste0(outpref,"GATK_AD_lfc_overview.png"), 300*img.ij[1], 300*img.ij[2])
+    par(mfrow=img.ij, mar=c(0,0,0,0), cex=1.2, xaxs="i")
+    for (i in chri) {
+        if (all(is.na(lp.mat[[i]]))) {
+            null.plot(ylim=yr, xlim=c(0,chrsz[i,2]))
+        } else {
+            plot(0, 0, col=0, ylim=yr, xlim=c(0,chrsz[i,2]), axes=FALSE, ann=FALSE)  #axis(1,seq(0,axMb[[i]]*1E6,1E6),0:axMb[[i]])
+            for (r in 1:2) lines(pdat[[chrs[i]]]$POS, lp.mat[[i]][r,], ylim=yr, xaxt="n", col=c("#FF000044","#0000FF44")[r])
+        }
+        box()
+        abline(h=0)
+        text(chrsz[i,2]/2, yr[2], chrs[i], pos=1, cex=2)
+        if (length(ad.wins[[i]])==0) next
+        if (nrow(ad.wins[[i]])==0) next
+        for (r in 1:nrow(ad.wins[[i]])) rect(ad.wins[[i]]$START[r],yrx[1], ad.wins[[i]]$END[r],yrx[2], border=NA, col=tgreen)  # full y rect
+    }
+    dev.off()
+    
+    
+    ## CHROM PLOTS
+
+    if (any(llhw>0)) {
+        for (w in which(llhw>0)) {
+            chr <- chrs[w]
+            
+            ## HH PLOTS
+            png(paste0(outpref,"GATK_HH_chrom_",chr,".png"), 1000, 1500)
+            par(mfcol=c(3,1), cex=1.2, las=1, xaxs="i")
+            
+            lp.mat <- hh.score[[w]][c(3,1),]  # MAVG, LOW
+            yr <- quantile(real(unlist(lp.mat)), c(0.01,0.99))
+            yrx <- c( yr[1]-diff(yr)*0.1,  yr[2]+diff(yr)*0.1 )
+            lineplot(lp.mat, xlim=c(0,ncol(lp.mat)), ylim=yr, col=c(8,dgreen), lwd=1:2, xlab="Grey=100KB MovAvg, Green=Lowess", main=paste(chr,"HH Scores"), xaxt="n", legend=NA)
+            axis(1, at=axSeq[[i]], labels=axLab[[i]])
+            abline(h=c(0,mNsd$HH[sds$HH[2]]), lty=c(1,3), col=c(1,2))
+            for (r in 1:nrow(hh.wins[[w]])) rect(hh.wins[[w]]$START[r]/winbp,yrx[1], hh.wins[[w]]$END[r]/winbp,yrx[2], border=NA, col=tgreen)  # full y rect
+            
+            lp.mat <- rbind(hh.smooth[[w]][[1]]$LOW[3,], hh.smooth[[w]][[2]]$LOW[3,])
+            yr <- range(lp.mat)
+            yrx <- c( yr[1]-diff(yr)*0.1,  yr[2]+diff(yr)*0.1 )
+            rownames(lp.mat) <- names(hh.smooth[[w]])
+            lineplot(lp.mat, xlim=c(0,ncol(lp.mat)), col=c(2,4), lwd=2, xlab="Red=Mut, Blue=WT", main=paste(chr,"HOM/HET LFC"), xaxt="n", legend=NA)
+            axis(1, at=axSeq[[i]], labels=axLab[[i]])
+            abline(h=0)
+            for (r in 1:nrow(hh.wins[[w]])) rect(hh.wins[[w]]$START[r]/winbp,yrx[1], hh.wins[[w]]$END[r]/winbp,yrx[2], border=NA, col=tgreen)  # full y rect
+            
+            lp.mat <- rbind(hh.smooth[[w]][[1]]$LOW[1:2,], hh.smooth[[w]][[2]]$LOW[1:2,])
+            rownames(lp.mat) <- sub("\\.RAW$","",paste0(rep(names(hh.smooth[[w]]),each=2),".",rep(rownames(lp.mat)[1:2],2)))
+            lp.mat <- lp.mat[c(1,3,2,4),]
+            yr <- range(lp.mat)
+            yrx <- c( yr[1]-diff(yr)*0.1,  yr[2]+diff(yr)*0.1 )
+            lineplot(lp.mat, xlim=c(0,ncol(lp.mat)), col=c(2,4,"#FF9999","#9999FF"), lty=c(1,1,3,3), lwd=2, xlab="Red=Mut, Blue=WT | Solid=HOM, Dashed=HET", main=paste(chr,"HET, HOM Calls"), xaxt="n", legend=NA)
+            axis(1, at=axSeq[[i]], labels=axLab[[i]])
+            abline(h=0)
+            for (r in 1:nrow(hh.wins[[w]])) rect(hh.wins[[w]]$START[r]/winbp,yrx[1], hh.wins[[w]]$END[r]/winbp,yrx[2], border=NA, col=tgreen)  # full y rect
+            dev.off()
+        }
+    }
+    
+    if (any(llaw>0)) {
+        for (w in which(llaw>0)) {
+            chr <- chrs[w]
+            
+            ## AD PLOTS
+            png(paste0(outpref,"GATK_AD_chrom_",chr,".png"), 1000, 1500)
+            par(mfcol=c(3,1), cex=1.2, las=1, xaxs="i")
+            
+            lp.mat <- ad.score[[w]][c(3,1),]  # MAVG, LOW
+            yr <- range(c( range(real(lp.mat[2,])), quantile(real(lp.mat[1,]), c(0.01,0.99)) ))
+            yrx <- c( yr[1]-diff(yr)*0.1,  yr[2]+diff(yr)*0.1 )
+            lineplot(lp.mat, xlim=c(0,ncol(lp.mat)), ylim=yr, col=c(8,dgreen), lwd=1:2, xlab="Grey=100KB MovAvg, Green=Lowess", main=paste(chr,"AD Scores"), xaxt="n", legend=NA)
+            axis(1, at=axSeq[[i]], labels=axLab[[i]])
+            abline(h=c(0,mNsd$AD[sds$AD[2]]), lty=c(1,3), col=c(1,2))
+            for (r in 1:nrow(ad.wins[[w]])) rect(ad.wins[[w]]$START[r]/winbp,yrx[1], ad.wins[[w]]$END[r]/winbp,yrx[2], border=NA, col=tgreen)  # full y rect
+            
+            lp.mat <- rbind(ad.smooth[[w]][[1]]$LOW[3,], ad.smooth[[w]][[2]]$LOW[3,])
+            yr <- range(lp.mat)
+            yrx <- c( yr[1]-diff(yr)*0.1,  yr[2]+diff(yr)*0.1 )
+            rownames(lp.mat) <- names(ad.smooth[[w]])
+            lineplot(lp.mat, xlim=c(0,ncol(lp.mat)), col=c(2,4), lwd=2, xlab="Red=Mut, Blue=WT", main=paste(chr,"ALT/REF LFC"), xaxt="n", legend=NA)
+            axis(1, at=axSeq[[i]], labels=axLab[[i]])
+            abline(h=0)
+            for (r in 1:nrow(ad.wins[[w]])) rect(ad.wins[[w]]$START[r]/winbp,yrx[1], ad.wins[[w]]$END[r]/winbp,yrx[2], border=NA, col=tgreen)  # full y rect
+            
+            lp.mat <- rbind(ad.smooth[[w]][[1]]$LOW[1:2,], ad.smooth[[w]][[2]]$LOW[1:2,])
+            rownames(lp.mat) <- sub("\\.RAW$","",paste0(rep(names(ad.smooth[[w]]),each=2),".",rep(rownames(lp.mat)[1:2],2)))
+            lp.mat <- lp.mat[c(1,3,2,4),]
+            yr <- range(lp.mat)
+            yrx <- c( yr[1]-diff(yr)*0.1,  yr[2]+diff(yr)*0.1 )
+            lineplot(lp.mat, xlim=c(0,ncol(lp.mat)), col=c(2,4,"#FF9999","#9999FF"), lty=c(1,1,3,3), lwd=2, xlab="Red=Mut, Blue=WT | Solid=ALT, Dashed=REF", main=paste(chr,"ALT, REF Depths"), xaxt="n", legend=NA)
+            axis(1, at=axSeq[[i]], labels=axLab[[i]])
+            abline(h=0)
+            for (r in 1:nrow(ad.wins[[w]])) rect(ad.wins[[w]]$START[r]/winbp,yrx[1], ad.wins[[w]]$END[r]/winbp,yrx[2], border=NA, col=tgreen)  # full y rect
+            dev.off()
+        }
+    }
+    
+    checkpoint <- 6
+    save(list=setdiff(ls(),"vdat"), file=RData)
+}
+
+
+
+if (checkpoint==6) {
+    if (checkpoint==halt) quit()
+    xm <- 0.0290  # slope (w/ intercept=0) of empirical maximum depth-quality bulk correlation line (things above the line are "interesting")
+#    if (any(llhw>0) | any(llaw>0)) {
+    if (any(llhw>0)) {
+        if (!exists("vdat")) { message("Loading 'vdat' object..."); load(RDataV) }
+        wchrs <- chrs[llhw>0]
+        voi <- new.list(wchrs)
+        W <- 0  # total windows for genome (init)
+        for (i in 1:length(wchrs)) {
+            chr <- wchrs[i]
+            pdi <- pdat[[chr]]
+            R <- nrow(hh.wins[[chr]])  # windows from this chromosome
+            W <- W+R
+            voi[[chr]] <- lapply(1:R, function(r) {
+                pdiw <- pdi$POS>=hh.wins[[chr]]$START[r] & pdi$POS<=hh.wins[[chr]]$END[r]
+                pdir <- pdi$ROW[pdiw]
+                x <- vdat[pdir,]
+                dp <- pdi$DP[pdiw]
+                cbind(x, DP=dp, GX=x$QUAL/1000 > xm*dp+0.5 & dp>100, WIN=hh.wins[[chr]]$NAME[r])
+            })
+        }
+        
+        ylim <- c(0, max(unlist(lapply(voi, function(x) lapply(x,"[[","QUAL")))))/1000
+        png(paste0(outpref,"hom_window_quals.png"), 500*W, 1000)
+        par(mfcol=c(2,W), cex=1.2, las=1)
+        for (chr in wchrs) {
+            pdi <- pdat[[chr]]
+            for (r in 1:nrow(hh.wins[[chr]])) {
+                v <- voi[[chr]][[r]]
+                q <- round(v$QUAL/1000,1)
+                gx <- v$GX
+                Mb <- round(hh.wins[[chr]]$WIDTH[r]/1E6,1)
+                Mb <- ifelse( hh.wins[[chr]]$WIDTH[r]<1E6, paste0(round(hh.wins[[chr]]$WIDTH[r]/1E3,0),"KB"), paste0(round(hh.wins[[chr]]$WIDTH[r]/1E6,1),"MB") )
+                title <- paste0(sample,", ",hh.wins[[chr]]$NAME[r],": ",Mb,", N=",nrow(v))
+                plot(v$POS, q, col=0, ylim=ylim, ylab="VCF Qual (Thousands)", xlab="Chrom Pos", main=title)
+                points(v$POS[!gx], v$QUAL[!gx]/1000, col=1)
+                points(v$POS[gx], v$QUAL[gx]/1000, col=2)
+                plot(v$DP, q, col=0, ylim=ylim, ylab="VCF Qual (Thousands)", xlab="VCF Depth", main=title)
+                points(v$DP[!gx], v$QUAL[!gx]/1000, col=1)
+                points(v$DP[gx], v$QUAL[gx]/1000, col=2)
+                abline(0, xm, col=2)
+            }
+            #q1p <- quantile(voi[[chr]]$QUAL,0.99)
+            #I <- strsplit(voi[[chr]]$INFO[voi[[chr]]$QUAL>=q1p],";")
+            #A <- lapply(I, function(x) strsplit(sub("^ANN=","",x[grepl("^ANN=",x)]),",") )
+        }
+        dev.off()
+        
+        voi2 <- do.call(rbind, lapply(voi, function(x) do.call(rbind, x)))
+        voi2 <- voi2[voi2$GX,]
+        voi2 <- voi2[,c( match(qw(WIN,DP),colnames(voi2)), which(!(colnames(voi2) %in% qw(WIN,DP,GX))) )]
+        write.table2(voi2, paste0(outpref,"hom_windows_xvar.txt"))
+    } else {
+        system(paste("touch", paste0(outpref,"hom_windows_xvar.txt")))
+    }
+    
+    checkpoint <- 7
+    save(list=setdiff(ls(),"vdat"), file=RData)
+}
+
+
+
+
+##########  STILL UNDER DEVELOPMENT -- end of process not yet decided  ##########
+
+
+
+save.image(RDataF)
+system(paste("rm -f",RData))
+message(paste("vcfChromHetHom",sub("\\.$","",outpref),"complete!"))
+
+
+
+
+if (FALSE) {
+    pdf(paste0(outpref,"GATK_HH_plots2.pdf"), 2.5*yrows, 15)
+    par(mfrow=c(yrows,1), las=1)
+    for (i in chri) {
+        hhb <- hh.smooth[[i]]
+        hbn <- names(hhb)
+        nc <- ncol(hh.score[[i]])
+        Mb <- trunc(nc/100)
+        irow <- ifelse(ns==1, 2, ifelse(ns==2, 4, 2*ns+1))
+        par(mfrow=c(irow,1), mar=c(3,4,4,2), las=1, yaxs="i")
+        
+        ######### ADD 'sample' TO ALL 'main'
+        
+        ## HH MA plots
+        if (ns<=2) {
+            ## assume mut/wt; display on one plot
+            x <- rbind(hhb[[1]]$LOW[1:2,], hhb[[2]]$LOW[1:2,])
+            rownames(x) <- sub("\\.MA$","",paste0(rep(names(hhb),each=2),".",rep(rownames(x)[1:2],2)))
+            x <- x[c(1,3,2,4),]
+            lineplot(x, ylim=yr.hh, xaxt="n", col=c(2,4,"#FF9999","#9999FF"), lty=c(1,1,3,3), main=paste(chrs[i],"hom, het lowess"))
+            axis(1, axSeq[[i]], axLab[[i]])
+        } else {
+            ## one plot for each
+            for (j in 1:ns) {
+                if (all(is.na(c(hhb[[j]]$LOW[6,]))) | all(is.na(c(hhb[[j]]$LOW[7,])))) {
+                    null.plot(ylim=yr.hh, xlim=c(0,axMb[[i]]*100), main=paste(chrs[i], hbn[j]))
+                } else {
+                    lineplot(hhb[[j]]$LOW[7:6,], r.names=c("LFC","Lowess"), ylim=yr.hh, main=paste(chrs[i], hbn[j]), xaxt="n", lwd=c(1,2), col=c("#00000044",c(2,4)[j]))
+                }
+                axis(1, axSeq[[i]], axLab[[i]])
+            }
+        }
+        ## HH LFC plots
+        for (j in 1:ns) {
+            if (all(is.na(c(hhb[[j]]$LOW[8,]))) | all(is.na(c(hhb[[j]]$LOW[9,])))) {
+                null.plot(ylim=yr.fc, xlim=c(0,axMb[[i]]*100), main=paste(chrs[i], hbn[j]))
+            } else {
+                lineplot(hhb[[j]]$LOW[8:9,], ylim=yr.fc, main=paste(chrs[i], hbn[j]), xaxt="n", col=c("#00000044",c(2,4)[j]))
+            }
+            axis(1, axSeq[[i]], axLab[[i]])
+            abline(h=0)
+        }
+        if (all(is.na(c(hh.score[[i]])))) {
+            null.plot(ylim=yr, xlim=c(0,axMb[[i]]*100), main=paste(chrs[i],"comparison"), xaxt="n")
+        } else {
+            lineplot(hh.score[[i]], lwd=c(1,1,2), col=c("#FF9999","#9999FF","#00CC00"), ylim=yr, main=paste(chrs[i],"comparison"), xaxt="n")
+        }
+        axis(1, axSeq[[i]], axLab[[i]])
+        abline(h=mNsd$HH[c(3,8)], lty=3)
+        abline(h=0)
+        ## for (r in 1:nrow(rLs)) rect(rLs$START[r]/winbp,yr.sx[1], rLs$END[r]/winbp,yr.sx[2], border=NA, col=tred)  # full y rect
+        ## ##for (r in 1:nrow(rUs)) rect(rUs$START[r]/winbp,yr.sx[1], rUs$END[r]/winbp,yr.sx[2], border=NA, col=tred)  # full y rect
+    }
+    dev.off()
+}

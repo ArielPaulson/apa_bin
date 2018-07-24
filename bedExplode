@@ -1,0 +1,25 @@
+#!/usr/bin/env perl
+use strict;
+
+my ($file, @headersToExtract) = @ARGV;
+my (%data, %headersToExtract);
+(my $prefix = $file) =~ s/\.bed//;
+
+open IN, $file or die "Failed to open file '$file': $!\n";
+while (<IN>) {
+    next if /^#/;
+    my $chr = (split /\t/, $_, 2)[0];
+    $data{$chr} .= $_;
+}
+close IN;
+
+@headersToExtract = sort(keys %data) unless @headersToExtract;
+%headersToExtract = map {($_=>1)} @headersToExtract;
+
+foreach my $chr (@headersToExtract) {
+    open OUT, "> $prefix.$chr.bed";
+    print OUT $data{$chr};
+    close OUT;
+}
+exit;
+

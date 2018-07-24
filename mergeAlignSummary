@@ -1,0 +1,402 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use Data::Dumper;
+use strict;
+
+# usage: /home/apa/local/bin/mergeAlignSummary <files list>
+# files are tophat2 "align_summary.txt", or STDERR capture from bowtie2
+
+die "$0: No inputs specified!\n" unless @ARGV;   
+
+my $out;       # output file
+my $aligner;   # aligner name; either 'tophat', 'bowtie2', or 'star'
+my $PE;        # run was paired end?
+my $native;    # return results in native format (i.e. same format as the input file).  WARNING: if > 1 input, all stats will be combined.  Output will look like all runs had been aligned together.
+my $thresh;    # overaligned-multiread threshold (indicated in input file).  WARNING: if > 1 input, the last file's threshold will be applied to all files!  Hope they all used the same multiread threshold!
+my @inputs;    # list of input files
+my $dirname;   # use dataset file directory for column name? (otherwise, filename as given)
+my $nodirname; # remove dataset file directory from file name to create column name? (otherwise, filename as given)
+my $strip;     # any other substring (regexp) to remove from dataset file name during column name conversion
+# and @ARGV = list of "samtools idxstats" outputs
+
+
+my $bam;       # ONLY FOR TESTING bowtie2-PE single-file processing -- must be provided, has to be queried to replace missing data.
+# That said, BAM queries flatly contradict bowtie2 align summary values in many cases, which is partly why bowtie2-pe is not supported yet.
+
+
+GetOptions(
+    "o=s" => \$out,
+    "a=s" => \$aligner,
+    "t=i" => \$thresh,
+    "b=s" => \$bam,
+    "strip=s" => \$strip, 
+    "dirname" => \$dirname, 
+    "nodirname" => \$nodirname,
+    "PE" => \$PE,
+    "native" => \$native
+    );
+
+@inputs = @ARGV;
+
+
+## Test command line
+my %okAligners = map {($_=>1)} qw/ tophat bowtie2 star shortstack /;
+die "$0: Must specify -a as 'tophat', 'bowtie2', 'star', or 'shortstack'!\n" unless $okAligners{$aligner};
+die "$0: Bowtie1 not yet supported!\n" if $aligner eq 'bowtie1';
+die "$0: Bowtie2 --PE is not ready yet!\n" if $aligner eq 'bowtie2' && $PE && !$bam;
+
+
+## Globals
+my %DATA;      # storage hash
+my @output;    # output data
+my @names;     # file names
+my %LRnames = ('L','Left', 'R','Right');
+my $pct = '%';
+
+
+## Output handles
+my $OUT;
+if ($out) {
+    open $OUT, '>', $out or die "$0: Cannot write to output file '$out': $!\n";
+} else {
+    $OUT = *STDOUT;
+}
+
+
+## Main
+foreach my $i (0..$#inputs) {
+    my $file = $inputs[$i];
+    
+    ## decide on sample name
+    my $name;
+    if ($dirname) {
+        ($name) = ($file =~ /([^\/]+)\/[^\/]+$/);  # only the file's parent directory
+    } elsif ($nodirname) {
+        ($name) = ($file =~ /([^\/]+)$/);  # only the file's name
+    } else {
+        $name = $file;  # file's path as given
+    }
+    $name =~ s/$strip//;
+    push @names, $name;
+
+    open my $IN, '<', $file or die "$0: Cannot read input file '$file': $!\n";
+    
+    if ($aligner eq 'star') {
+        
+        ## PE or SE doesn't matter, unfortunately
+        
+        while (<$IN>) {
+            $_ =~ s/[\n\r]+$//;
+            if ($_ =~ /^\s+Number of input reads\s+\|\s+(\d+)/) {
+                $DATA{input} = $1;
+            } elsif ($_ =~ /^\s+Uniquely mapped reads number\s+\|\s+(\d+)/) {
+                $DATA{mono} = $1;
+            } elsif ($_ =~ /^\s+Number of reads mapped to multiple loci\s+\|\s+(\d+)/) {
+                $DATA{multi} = $1;
+            } elsif ($_ =~ /^\s+Number of reads mapped to too many loci\s+\|\s+(\d+)/) {
+                $DATA{over} = $1;
+                #	    } elsif ($_ =~ /^\s+% of reads unmapped: too many mismatches\s+\|\s+([\d.]+)/) {
+                #		$DATA{unmap} += sprintf("%0.6f", $DATA{input}*$1/100);
+                #	    } elsif ($_ =~ /^\s+% of reads unmapped: too short\s+\|\s+([\d.]+)/) {
+                #		$DATA{unmap} += sprintf("%0.6f", $DATA{input}*$1/100);
+                #	    } elsif ($_ =~ /^\s+% of reads unmapped: other\s+\|\s+([\d.]+)/) {
+                #		$DATA{unmap} += sprintf("%0.6f", $DATA{input}*$1/100);
+            }
+        }
+        
+        $DATA{mapped} = $DATA{mono}+$DATA{multi};
+        $DATA{unmap} = $DATA{input}-$DATA{mapped}-$DATA{over};
+        $DATA{mover} = $DATA{multi}+$DATA{over};
+        my $numbers = join "\t", map { $DATA{$_} } qw/ input mapped mono multi over unmap /;
+        push @output, sprintf("$name\t$numbers\t%0.4f\t%0.4f\t%0.4f\t%0.4f\t%0.4f\n", $DATA{mapped}/($DATA{input}||1), $DATA{mono}/($DATA{mapped}||1), $DATA{multi}/($DATA{mapped}||1), $DATA{over}/($DATA{mover}||1), $DATA{unmap}/($DATA{input}||1));
+        
+    } elsif ($aligner eq 'shortstack') {
+        
+        ## SE ONLY
+        
+        while (<$IN>) {
+            $_ =~ s/[\n\r]+$//;
+            if ($_ =~ /^\s+Unique mappers: (\d+) \/ (\d+)/) {
+                $DATA{mono} = $1;
+                $DATA{input} = $2;
+            } elsif ($_ =~ /^\s+Multi mappers: (\d+) \/ (\d+)/) {
+                $DATA{multi} = $1;
+            } elsif ($_ =~ /^\s+Non mappers: (\d+) \/ (\d+)/) {
+                $DATA{unmap} = $1;
+            } elsif ($_ =~ /^\s+XY:Z:M -- Unmapped because alignment number exceeded option bowtie_m (\d+): (\d+)/) {
+                $DATA{over} = $2;
+            }
+        }
+        
+        $DATA{mapped} = $DATA{mono}+$DATA{multi};
+        $DATA{mover} = $DATA{multi}+$DATA{over};
+        my $numbers = join "\t", map { $DATA{$_} } qw/ input mapped mono multi over unmap /;
+        push @output, sprintf("$name\t$numbers\t%0.4f\t%0.4f\t%0.4f\t%0.4f\t%0.4f\n", $DATA{mapped}/($DATA{input}||1), $DATA{mono}/($DATA{mapped}||1), $DATA{multi}/($DATA{mapped}||1), $DATA{over}/($DATA{mover}||1), $DATA{unmap}/($DATA{input}||1));
+        
+    } else {
+        
+        ## tophat or bowtie
+        
+        if ($PE) {
+            
+            if ($aligner eq 'tophat') {
+                
+                ## Paired-end, Tophat2
+                my ($LRP, $pairs);
+                while (<$IN>) {
+                    $_ =~ s/[\n\r]+$//;
+                    if ($_ =~ /^Left/) {
+                        $LRP = 'L';  # recording left data
+                    } elsif ($_ =~ /^Right/) {
+                        $LRP = 'R';  # recording right data
+                    } elsif ($_ =~ /^Aligned pairs:\s+(\d+)/) {
+                        $LRP = 'P';  # recording pair data
+                        $pairs = $1;
+                        $DATA{$LRP}{mapped} += $1;
+                    } elsif ($_ =~ /^\s+Input\s+:\s+(\d+)/) {
+                        $DATA{$LRP}{input} += $1;
+                    } elsif ($_ =~ /^\s+Mapped\s+:\s+(\d+)/) {
+                        $DATA{$LRP}{mapped} += $1;
+                    } elsif ($_ =~ /^\s+of these:\s+(\d+).*have multiple alignments \((\d+) have >(\d+)\)/) {
+                        $DATA{$LRP}{multi} += $1;
+                        $DATA{$LRP}{over} += $2;
+                        $thresh = $3;
+                    } elsif ($_ =~ /^\s+of these:\s+(\d+).*have multiple alignments/) {  # only when $LRP=='P'
+                        $DATA{$LRP}{multi} += $1;
+                    } elsif ($_ =~ /^\s+(\d+).*are discordant/) {  # only when $LRP=='P'
+                        $DATA{$LRP}{disc} += $1;
+                    } elsif ($_ =~ /^([\d.]+)% concordant/) {  # only when $LRP=='P'
+                        $DATA{$LRP}{conc} += sprintf("%0.0f",$pairs*$1/100);  # convert percent to actual number of pairs
+                        $DATA{$LRP}{input} += (sort {$b <=> $a} ($DATA{L}{input},$DATA{R}{input}))[0];  # max or L or R read counts
+                    }
+                }
+                
+            } elsif ($aligner eq 'bowtie2') {
+                
+                ## Paired-end, Bowtie2
+                
+                my $LRP;
+                while (<$IN>) {
+                    next if /^Warning:/;  # drop warnings
+                    $_ =~ s/%//;
+                    if ($_ =~ /^(\d+) reads; /) {
+                        $LRP = 'P';  # begin with paired stats
+                        $DATA{P}{input} = $DATA{L}{input} = $DATA{R}{input} = $1;
+                    } elsif ($_ =~ /^\s+(\d+) \([\d.]+\) were paired/) {
+                        $DATA{$LRP}{paired} = $1;
+                    } elsif ($_ =~ /^\s+(\d+) \([\d.]+\) aligned concordantly 0 times/) {
+                        ## ignore;
+                    } elsif ($_ =~ /^\s+(\d+) \([\d.]+\) aligned concordantly exactly 1 time/) {
+                        $DATA{$LRP}{mono} = $1;
+                        $DATA{$LRP}{mapped} += $1;
+                    } elsif ($_ =~ /^\s+(\d+) \([\d.]+\) aligned concordantly >1 times/) {
+                        $DATA{$LRP}{multi} = $1;
+                        $DATA{$LRP}{mapped} += $1;
+                    } elsif ($_ =~ /^\s+(\d+) \([\d.]+\) aligned discordantly 1 time/) {
+                        $DATA{$LRP}{disc} = $1;
+                        $DATA{$LRP}{mapped} += $1;
+                    } elsif ($_ =~ /^\s+(\d+) pairs aligned 0 times concordantly or discordantly/) {
+                        $LRP = 'M';  # now switch to mate stats
+                    } elsif ($_ =~ /^\s+(\d+) mates make up/) {
+                        $DATA{$LRP}{input} = $1;
+                    } elsif ($_ =~ /^\s+(\d+) \([\d.]+\) aligned 0 times\s*$/) {
+                        $DATA{$LRP}{unmap} = $1;
+                    } elsif ($_ =~ /^\s+(\d+) \([\d.]+\) aligned exactly 1 time/) {
+                        $DATA{$LRP}{mono} = $1;
+                        $DATA{$LRP}{mapped} += $1;
+                    } elsif ($_ =~ /^\s+(\d+) \([\d.]+\) aligned >1 times/) {
+                        $DATA{$LRP}{multi} = $1;
+                        $DATA{$LRP}{mapped} += $1;
+                    }
+                }
+                
+                print STDERR "Querying $bam for info that bowtie2 failed to report...\n";
+                my %orphans;
+                foreach my $LR (qw/ L R /) {
+                    my $F = $LR eq 'L' ? 'F' : 'f';
+                    open my $BAM, '-|', "samtools view -F 2 -$F 128 $bam";
+                    while (<$BAM>) {
+                        chomp;
+                        my @data = split /\t/, $_, 12;
+                        $orphans{$LR}{H}{$data[0]}++;
+                        if ($data[11] =~ /\tXS:i:/) {
+                            $orphans{$LR}{multi}++;
+                        } else {
+                            $orphans{$LR}{mono}++;
+                        }
+                    }
+                    close $BAM;
+                    #					foreach my $header (keys %{ $orphans{$LR}{H} }) {
+                    #						if ($orphans{$LR}{H}{$header} > 1) {
+                    #							$orphans{$LR}{multi2}++;
+                    #						} else {
+                    #							$orphans{$LR}{mono2}++;
+                    #						}
+                    #					}
+                    $orphans{$LR}{H} = scalar keys %{ $orphans{$LR}{H} };  # replace hash with key count only
+                }
+                
+                die "\n\n",Dumper(\%DATA),"\n\n",Dumper(\%orphans),"\n\n";
+            }
+            
+        } else {  # single-end
+            
+            if ($aligner eq 'tophat') {
+                
+                ## Single-end, Tophat2
+                while (<$IN>) {
+                    $_ =~ s/[\n\r]+$//;
+                    if ($_ =~ /Input\s*:\s*(\d+)/) {
+                        $DATA{input} += $1;
+                    } elsif ($_ =~ /Mapped\s*:\s*(\d+)/) {
+                        $DATA{mapped} += $1;
+                    } elsif ($_ =~ /of these\s*:\s*(\d+) .* \((\d+) have >(\d+)/) {
+                        $DATA{multi} += $1;
+                        $DATA{over} += $2;
+                        $thresh = $3;  ##### THE LAST INPUT FILE WINS -- ALL FILES WILL BE REPORTED AS HAVING THIS MULTIREAD THRESHOLD
+                    }
+                }
+                $DATA{unmap} = $DATA{input}-$DATA{mapped};
+                $DATA{mono} = $DATA{mapped}-$DATA{multi};
+                
+            } elsif ($aligner eq 'bowtie2') {
+                
+                ## Single-end, Bowtie2
+                while (<$IN>) {
+                    next if /^Warning:/;  # drop warnings
+                    s/[\n\r]+$//;
+                    if (/^(\d+) reads; of these:/) {
+                        $DATA{input} += $1;
+                    } elsif (/\s*(\d+) \S+ were unpaired; of these:/) {
+                        $DATA{unpair} += $1;
+                    } elsif (/\s*(\d+) \S+ aligned (.*)/) {
+                        my ($reads, $qualifier) = ($1, $2);
+                        if ($qualifier =~ /^0 times/) {
+                            $DATA{unmap} += $reads;
+                        } elsif ($qualifier =~ /^exactly 1 time/) {
+                            $DATA{mono} += $reads;
+                        } elsif ($qualifier =~ /^>1 times/) {
+                            $DATA{multi} += $reads;
+                        }
+                    }
+                    $DATA{mapped} = $DATA{mono}+$DATA{multi};
+                    
+                }
+            }
+            close $IN;
+        }
+        
+        unless ($native) {
+            ## tabular output formatting
+            if ($PE) {
+                push @output, $name;
+                print STDERR "$name\n";
+                foreach my $LRP (qw/ L R /) {
+                    my %x = %{ $DATA{$LRP} };  # shorter...
+                    $x{mono} = $x{mapped}-$x{multi};
+                    $x{unmap} = $x{input}-$x{mapped};
+                    $x{mover} = $x{multi}+$x{over};
+                    my $numbers = join "\t", map { $x{$_} } qw/ input mapped mono multi over unmap /;
+                    push @output, sprintf("\t$numbers\t%0.4f\t%0.4f\t%0.4f\t%0.4f\t%0.4f", $x{mapped}/($x{input}||1), $x{mono}/($x{mapped}||1), $x{multi}/($x{mapped}||1), $x{over}/($x{mover}||1), $x{unmap}/($x{input}||1));
+                }
+                my %x = %{ $DATA{P} };
+                $x{input} = $DATA{L}{input} unless $x{input};   ## SOME VERSION OF TOPHAT HAD THIS PROBLEM -- NO PAIRED INPUT VALUE
+                $x{mono} = $x{mapped}-$x{multi};
+                $x{unmap} = $x{input}-$x{mapped};
+                my $numbers = join "\t", map { $x{$_} } qw/ mapped mono multi over unmap /;
+                #	    print STDERR "INPUT: $x{input}, MAPPED: $x{mapped}\n";
+                push @output, sprintf("\t$numbers\t%0.4f\t%0.4f\t%0.4f\t%0.4f\n", $x{mapped}/($x{input}||1), $x{mono}/($x{mapped}||1), $x{multi}/($x{mapped}||1), $x{unmap}/($x{input}||1));    
+            } else {
+                $DATA{mono} = $DATA{mapped}-$DATA{multi};
+                $DATA{mover} = $DATA{multi}+$DATA{over};
+                $DATA{unmap} = $DATA{input}-$DATA{mapped};
+                if ($aligner eq 'tophat') {
+                    my $numbers = join "\t", map { $DATA{$_} } qw/ input mapped mono multi over unmap /;
+                    push @output, sprintf("$name\t$numbers\t%0.4f\t%0.4f\t%0.4f\t%0.4f\t%0.4f\n", $DATA{mapped}/($DATA{input}||1), $DATA{mono}/($DATA{mapped}||1), $DATA{multi}/($DATA{mapped}||1), $DATA{over}/($DATA{mover}||1), $DATA{unmap}/($DATA{input}||1));
+                } elsif ($aligner eq 'bowtie2') {
+                    my $numbers = join "\t", map { $DATA{$_} } qw/ input mapped mono multi unmap /;
+                    push @output, sprintf("$name\t$numbers\t%0.4f\t%0.4f\t%0.4f\t%0.4f\n", $DATA{mapped}/($DATA{input}||1), $DATA{mono}/($DATA{mapped}||1), $DATA{multi}/($DATA{mapped}||1), $DATA{unmap}/($DATA{input}||1));
+                }
+            }
+            %DATA = ();
+        }
+
+    }	
+    #    print STDERR "\n$name:\n",Dumper(\%DATA),"\n";   # TROUBLESHOOTING
+}
+
+
+
+### OUTPUT
+
+if ($aligner eq 'star' || $aligner eq 'shortstack') {
+    
+    print $OUT "File\tInput\tMapped\tMono\tMulti\tOver\tUnmapped\tMapped/Total\tMono/Mapped\tMulti/Mapped\tOver/Multi\tUnmapped/Total\n";
+    print $OUT @output;
+
+} else {
+    
+    if ($native) {
+        ## write output in input format -- aggregate multiple files' data, if necessary
+        my $w1 = $DATA{L}{input} > $DATA{R}{input} ? length($DATA{L}{input}) : length($DATA{R}{input});
+        my $w2 = $DATA{L}{over} > $DATA{R}{over} ? length($DATA{L}{over}) : length($DATA{R}{over});
+        if ($PE) {
+            ## native format for paired-end
+            foreach my $LR (qw/ L R /) {
+                my $fmt1 = "$LRnames{$LR} reads:\n          Input     :   %${w1}s\n           Mapped   :   %${w1}s (%4.1f%% of input)\n";
+                print $OUT sprintf($fmt1, $DATA{$LR}{input}, $DATA{$LR}{mapped}, 100*$DATA{$LR}{mapped}/($DATA{$LR}{input}||1));
+                my $fmt2 = "            of these:   %${w1}s (%4.1f%%) have multiple alignments (%${w2}s have >$thresh)\n";
+                print $OUT sprintf($fmt2, $DATA{$LR}{multi}, 100*$DATA{$LR}{multi}/($DATA{$LR}{mapped}||1), $DATA{$LR}{over});
+            }
+            my $fmt3 = "%4.1f%% overall read mapping rate.\n\n";
+            print $OUT sprintf($fmt3, 100*($DATA{L}{mapped}+$DATA{R}{mapped})/(($DATA{L}{input}+$DATA{R}{input})||1));
+            my $fmt4 = "Aligned pairs:   %${w1}s\n     of these:   %${w1}s (%4.1f%%) have multiple alignments\n";
+            print $OUT sprintf($fmt4, $DATA{P}{mapped}, $DATA{P}{multi}, 100*$DATA{P}{multi}/($DATA{P}{mapped}||1));
+            my $fmt5 = "                 %${w1}s (%4.1f%%) are discordant alignments\n";
+            print $OUT sprintf($fmt5, $DATA{P}{disc}, 100*$DATA{P}{disc}/($DATA{P}{mapped}||1));
+            my $fmt6 = "%4.1f%% concordant pair alignment rate.\n";
+            print $OUT sprintf($fmt6, 100*$DATA{P}{conc}/($DATA{P}{mapped}||1));
+        } else {
+            ## native format for single-end -- NOT READY YET
+            #	push @output, "37495713 reads; of these:\n";
+            #	push @output, "  37495713 (100.00%) were unpaired; of these:\n";
+            #	push @output, "    23883686 (63.70%) aligned 0 times\n";
+            #	push @output, "    6596691 (17.59%) aligned exactly 1 time\n";
+            #	push @output, "    7015336 (18.71%) aligned >1 times\n";
+            #	push @output, "36.30% overall alignment rate\n";
+        }	
+    } elsif ($PE) {
+        ## tabular format for paired-end
+        print $OUT "File";
+        print $OUT "\t$_.Input\t$_.Mapped\t$_.Mono\t$_.Multi\t$_.Over$thresh\t$_.Unmapped\t$_.Mapped/Total\t$_.Mono/Mapped\t$_.Multi/Mapped\t$_.Over$thresh/Multi\t$_.Unmapped/Total" foreach qw/ Left Right /;
+        print $OUT "\tPairs.Input\tPairs.Mapped\tPairs.Mono\tPairs.Multi\tPairs.Unmapped\tPairs.Mapped/Total\tPairs.Mono/Mapped\tPairs.Multi/Mapped\tPairs.Unmapped/Total\n";
+        print $OUT @output;
+    } else {
+        ## tabular format for single-end
+        if ($aligner eq 'tophat') {
+            print $OUT "File\tInput\tMapped\tMono\tMulti\tOver$thresh\tUnmapped\tMapped/Total\tMono/Mapped\tMulti/Mapped\tOver$thresh/Multi\tUnmapped/Total\n";
+        } elsif ($aligner eq 'bowtie2') {
+            print $OUT "File\tInput\tMapped\tMono\tMulti\tUnmapped\tMapped/Total\tMono/Mapped\tMulti/Mapped\tUnmapped/Total\n";
+        }
+        print $OUT @output;
+    }
+}
+exit;
+
+
+
+## Tophat SE
+#Reads:
+#          Input     :  38391463
+#           Mapped   :  20815339 (54.2% of input)
+#            of these:   2450510 (11.8%) have multiple alignments (50635 have >20)
+#54.2% overall read mapping rate.
+
+## Bowtie2 SE
+#14943807 reads; of these:
+#  14943807 (100.00%) were unpaired; of these:
+#    3544263 (23.72%) aligned 0 times
+#    8511187 (56.95%) aligned exactly 1 time
+#    2888357 (19.33%) aligned >1 times
+#76.28% overall alignment rate

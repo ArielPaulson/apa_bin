@@ -1,0 +1,18 @@
+#!/usr/bin/env perl
+use strict;
+
+my $i;
+while (<>) {
+    $_ =~ s/[\n\r]+$//;
+    $i++;
+    if ($i == 1) {
+	(my $header = $_) =~ s/^@//;
+	print "$header\t";
+    } elsif ($i == 2) {
+	print "$_\t";
+    } elsif ($i == 4) {
+	print "$_\n";
+	$i = 0;
+    }
+}
+exit;

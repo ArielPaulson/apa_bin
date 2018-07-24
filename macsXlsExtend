@@ -1,0 +1,195 @@
+#!/usr/bin/env perl
+use Excel::Writer::XLSX;
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## CURRENTLY BROKEN DUE TO DEPENDENCIES
+
+## ALSO TO FIX: OPTIONAL XLSX MODE SO OUTPUT LINES CAN EXCEED 65535
+
+# Deps: neighborsBed, (rm, mkdir)
+
+## Matches peaks to genes and writes an Excel file with oroginal macs2 peak data, nearest-neighbor data, and a UCSC link
+
+## Inputs
+my @xls;     # input macs2 .xls files, as post-GetOptions @ARGV
+my $geno;    # annot genome build, e.g. "mm10"
+my $anno;    # annotation build, e.g. "Ens_72".  *** MUST RESOLVE THIS PATH: /n/data1/genomes/bowtie-indexes/$geno/$anno/ ***
+my $strip;   # additional string (regexp) to strip from run and peak names (in addition to "_peaks.xls")
+
+## Inputs with defaults (incl. off-by-default)
+my $excel;       # output excel file; if specified, all output will become tabs in this file
+my $coding;      # use only protein-coding genes for neighbors
+my $minht = 0;   # minimum peak height
+my $minfc = 0;   # minimum fold-change
+
+GetOptions(
+    "g=s" => \$geno, 
+    "a=s" => \$anno, 
+    "x=s" => \$excel, 
+    "ht=i" => \$minht, 
+    "fc=f" => \$minfc, 
+    "coding" => \$coding, 
+    "strip=s" => \$strip
+    );
+@xls = @ARGV;
+
+## Globals
+my %tally;   # post-filter peak counts per run
+my %peaks;   # ranked peak IDs
+my %xlsData; # xls file data
+my %genes;   # line number => [gene data] hash
+my %symbols; # gene id => symbol hash
+my $biocol;  # genedata.txt biotype column number
+
+## Paths and Files
+my $bin = '/home/apa/local/bin';
+my $gendir = "/n/data1/genomes/bowtie-index/$geno";
+my $anndir = "$gendir/$anno";
+my $tmp = "macsXlsExtend.$$.tmp";
+my $genedata = "$anndir/$geno.$anno.genedata.txt";
+
+
+system "mkdir -p $tmp";
+die "Failed to create temp dir '$tmp'\n" unless -d $tmp;
+
+open my $IN1, '<', $genedata or die "$0: Failed to open gene data file '$genedata': $!\n";
+while (<$IN1>) {
+    $_ =~ s/[\n\r]+$//;
+    my @data = split /\t/, $_;  # (GeneID, Name, Chr, Start, End, Strand, Tot_Len, Uxon_Len, N_Trans, N_exons, Genomic_CDS_start, Genomic_CDS_End, Biotype, Status, Description)
+    if ($. == 1) {
+	foreach my $i (0..$#data) {
+	    $biocol = $i if $data[$i] eq 'Biotype';   # not same column in all "genedata.txt"s
+	}
+    } else {
+	$genes{$.} = \@data;
+	$symbols{$data[0]} = $data[1];
+    }
+}
+close $IN1;
+
+open my $OUT1, '>', "$tmp/nn.bed";
+foreach my $i (sort {$a <=> $b} keys %genes) {  
+    my ($id, $symbol, $chr, $start, $end, $strand, $biotype) = @{ $genes{$i} }[0..5,$biocol];
+    my $string = "$chr\t$start\t$end\t$id\t1\t$strand\n";
+    if ($coding) {
+	print $OUT1 $string if ($biotype eq 'protein_coding' || $biotype =~ /^TR/ || $biotype =~ /^IG/);
+    } else {
+	print $OUT1 $string;
+    }
+}
+close $OUT1;
+
+my @nnHeader = ("Nearest Neighbor","Hit Gene","5' Neighbor","5' Distance","3' Neighbor","3' Distance");
+my @colWidths = (6,5,10,10,6,11,6,14,16,14,20, 20,20,20,10,20,10);  # for Excel -- space indicates end of macs xls / beginning of neighbors
+
+my ($workbook, $header_format, $link_format);
+if ($excel) {
+    $workbook = Excel::Writer::XLSX->new($excel);
+    $header_format = $workbook->add_format();
+    $header_format->set_bold();
+    $link_format = $workbook->add_format();
+    $link_format->set_color('blue');
+}
+
+print "\n";
+foreach my $file (@xls) {
+    
+    my ($run) = ($file =~ /([^\/]+).macs2_peaks.xls/);
+    $run =~ s/$strip//;
+    print "$file:\n  Processing...\n";
+    
+    my $worksheet;
+    my $col = my $row = 0;
+    if ($excel) {
+	$worksheet = $workbook->add_worksheet($run);
+	$worksheet->activate();
+	$worksheet->freeze_panes(1, 0);
+    }
+    
+    open my $IN2, '<', $file or die "$0: Failed to open MACS xls file '$file' for reading: $!\n";
+    open my $BED, '>', "$tmp/$run.bed" or die "$0: Failed to open BED file '$file' for writing: $!\n";
+    while (<$IN2>) {
+	$_ =~ s/[\n\r]+$//;
+	if ($. <= 25) {   # headers
+	    push @{ $xlsData{$run}{H} }, "$_\n";
+	} elsif ($. == 26) {
+	    push @{ $xlsData{$run}{H} }, join("\t", ($_, @nnHeader)), "\n";
+	    $worksheet->write_row($row, 0, ['LINK', (split /\t/, $_), @nnHeader], $header_format) if $excel;
+	} else {
+	    my @data = split /\t/, $_;  # ($chr, $start, $end, $width, $summit, $height, $pord, $fc, $qord, $peakname)
+	    $tally{$run}{I}++;
+	    next if ($minht && $data[5] < $minht);
+	    next if ($minfc && $data[7] < $minfc);
+	    $tally{$run}{O}++;
+	    $data[9] =~ s/$strip//;
+	    push @{ $peaks{$run} }, $data[9];
+	    $xlsData{$run}{X}{$data[9]} = \@data;
+	    print $BED join("\t", @data[0..2,9]), "\n";
+	}
+    }
+    close $BED;
+    close $IN2;
+    
+    print "  Neighborizing...\n";
+    print "$bin/neighborsBed -a $tmp/$run.bed -b $tmp/nn.bed -g $gendir/$geno.chrom.sizes > $tmp/$run.nn.txt\n";
+    system "$bin/neighborsBed -a $tmp/$run.bed -b $tmp/nn.bed -g $gendir/$geno.chrom.sizes > $tmp/$run.nn.txt";
+    
+    open my $IN3, '<', "$tmp/$run.nn.txt";
+    while (<$IN3>) {
+	$_ =~ s/[\n\r]+$//;
+	my @data = split /\t/, $_;  # ($chr, $start, $end, $peakname, $hit, $nn5, $dist5, $nn3, $dist3)
+	$_ =~ s/(ENS\w+\d+)/$symbols{$1}/g foreach @data[4,5,7];
+	$_ =~ s/\(\.\)$// foreach @data[5,7];  # strip fake-strand from CHR.START, CHR.END
+	my $nearest;
+	if ($data[4]) {
+	    $nearest = $data[4];
+	} elsif ($data[5] =~ /^CHR/ && $data[7] =~ /^CHR/) {
+	    $nearest = '';
+	} elsif ($data[5] =~ /^CHR/) {
+	    $nearest = $data[7];
+	} elsif ($data[7] =~ /^CHR/) {
+	    $nearest = $data[5];
+	} elsif ($data[8] < $data[6]) {
+	    $nearest = $data[7];
+	} else {
+	    $nearest = $data[5];
+	}
+	$xlsData{$run}{N}{$data[3]} = [$nearest, @data[4..8]];
+    }
+    close $IN3;
+    
+    print "  Writing...\n";
+    open my $OUT2, '>', "$run${strip}_peaks.extended.xls";
+    print $OUT2 @{ $xlsData{$run}{H} };
+    foreach my $peak (@{ $peaks{$run} }) {
+	my @xdat = @{ $xlsData{$run}{X}{$peak} };
+	my @ndat = @{ $xlsData{$run}{N}{$peak} };
+	my @line = (@xdat, @ndat);
+	my ($chr, $start, $end) = @xdat[0..2];
+	print $OUT2 join("\t", @line), "\n";
+	if ($excel) {
+	    $row++;
+	    next if $row > 65534;   # CANNOT EXCEED 65535 ROWS FOR REGULAR EXCEL FILE!!!  (and they start at 0)
+	    $worksheet->write_row($row, 1, \@line);
+	    my $url = "http://genome.ucsc.edu/cgi-bin/hgTracks?db=$geno&position=$chr%3A$start-$end";
+	    $worksheet->write_url($row, 0, $url, 'UCSC');  # UCSC link, only in Excel file
+	}
+    }
+    close $OUT2;
+    
+    if ($excel) {
+	$worksheet->set_column($_, $_, $colWidths[$_]) foreach (0..16);
+	if ($row > 65534) {
+	    my $extra = $row - 65534;
+	    print "Excel sheet '$run' was truncated by $extra rows: can only print 65,535!\n";
+	}
+    }
+}
+
+$workbook->close() if $excel;
+system "rm -Rf $tmp";
+print "RUN\tPEAKS IN\tPEAKS OUT\n";
+print "$_\t$tally{$_}{I}\t$tally{$_}{O}\n" foreach sort keys %tally;
+exit;

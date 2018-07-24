@@ -1,0 +1,103 @@
+#!/usr/bin/perl
+
+my ($fname) = ($ARGV[0] =~ /([^\/]+)\.\w{3}$/);
+my $mode = $ARGV[0] =~ /\.psl$/i ? 1 : 0;
+$mode = $ARGV[1] unless $mode;   # 0 doesn't count
+$mode = undef if $mode eq '--gtf';
+die "Arg 2 'mode' must be 1, 2, or 3: see script for details\n" unless $mode;  # still no mode?
+my ($gtf);
+foreach (@ARGV[1..$#ARGV]) {
+    $gtf = 1 if $_ eq '--gtf';
+}
+
+# Modes:
+# 1 = proper psl format
+# 2 = psl-style UCSC alignment table: col 1 = alignment number, cols 2-22 are PSL definition (e.g. 'all_mrna.txt', 'all_est.txt')
+# 3 = pseudo-psl UCSC alignment table: columns must be as (1) above, EXCEPT: col 19 = 0 | col 20 = tBlockStarts | col 21 = tBlockEnds (e.g. 'refFlat.txt', AFTER YOU REORGANIZE IT)
+#     Note: files like 'refFlat.txt' don't provide most of the PSL data columns, but most aren't necessary anyway.  Just arrange in PSL order (noting changes to cols 19-21) and fill in missing columns with zeroes.
+
+my %strandMap = ('+'=>'+', '-'=>'-', '++'=>'+', '+-'=>'-', '-+'=>'-', '--'=>'+', '.'=>'.', ''=>'.', '*'=>'.');
+
+my $begin;
+open IN, $ARGV[0];
+while(<IN>) {
+    if ($. == 1) {
+	if ($_ =~ /^psLayout/) {  # full psl header
+	    $begin = 6;
+	} elsif ($_ =~ /^match/) {  # filtered psl header
+	    $begin = 2;
+	}
+    }
+    next if $. < $begin;
+    $_ =~ s/[\n\r\"]+$//;
+    my @data = split /\t/, $_;
+    shift @data if $mode == 2;
+    my ($match, $repmatch, $strand, $name, $length, $chr, $start, $end, $blocksizes, $qblockstarts, $tblockstarts) = @data[0,2,8..10,13,15,16,18..20];#    die "$match, $repmatch, $strand, $name2, $length, $chr, $start, $end, $blocksizes, $blockstarts\n";
+    if ($chr =~ /_random/) {
+	(my $chr1 = $chr) =~ s/_random//;
+	$chr1 =~ /\D/ ? ($alpha{$chr} = 1) : ($numeric{$chr} = 1);
+    } else {
+	$chr =~ /\D/ ? ($alpha{$chr} = 1) : ($numeric{$chr} = 1);
+    }
+    $start++;   # shift into 1-based
+    $score = $mode == 3 ? 1 : sprintf("%0.2f", 100*($match+$repmatch)/$length);
+    my $strand2 = $strandMap{$strand};
+    print "$0: Unknown strand '$strand' on line $.: $_\n" unless $strand2;
+    $coords{$chr}{"$start\t$end\t$name\t$."} = [$strand2, $score];    # additional indexing by line num to disambiguate multi-copy UCSC alignments
+    $blocksizes =~ s/,$//;
+    $qblockstarts =~ s/,$//;
+    $tblockstarts =~ s/,$//;
+    my @blockstarts = split /,/, $tblockstarts;
+    my @exonord = (1..scalar @blockstarts);
+    @exonord = reverse @exonord if $strand2 eq '-';
+    if ($mode == 3) {
+	my @blockends = @blockstarts;    # not actually tBlockStarts, if $mode == 3
+	my @blockstarts = split /,/, $qblockstarts;    # not actually qBlockStarts either
+	$_++ foreach @blockstarts;   # shift into 1-based
+	foreach my $i (0..$#blockstarts) {
+	    $exons{$name}{$.}{$i} = [$blockstarts[$i], $blockends[$i], $exonord[$i]];
+	}
+    } else {
+	my @blocksizes = split /,/, $blocksizes;
+	my @blockstarts = split /,/, $tblockstarts;
+	$_++ foreach @blockstarts;   # shift into 1-based
+	foreach my $i (0..$#blockstarts) {
+	    $exons{$name}{$.}{$i} = [$blockstarts[$i], $blockstarts[$i]+$blocksizes[$i]-1, $exonord[$i]];
+	}
+    }
+}
+close IN;
+
+my @chrs = ( (sort {$a <=> $b} keys %numeric), (sort keys %alpha) );
+my %already;
+
+unless ($gtf) {
+    open EXON, "> $fname.exons.bed";
+    open TRANS, "> $fname.trans.bed";
+    open GFF, "> $fname.gff";
+}
+open GTF, "> $fname.gtf";
+foreach my $chr (@chrs) {
+    foreach my $entry (sort {$a <=> $b} keys %{ $coords{$chr} }) {
+	my ($start, $end, $name, $lnum) = split /\t/, $entry;
+	my ($strand, $score) = @{ $coords{$chr}{$entry} };
+	my $copies = scalar keys %{ $exons{$name} };
+	$already{$name}++;
+	my $name2 = $copies > 1 ? "$name-$already{$name}" : $name;    # suffix ID to disambiguate multi-copy UCSC alignments
+	print TRANS "$chr\t$start\t$end\t$name2\t$score\t$strand\n" unless $gtf;
+	print GFF "$chr\t$fname\ttranscript\t$start\t$end\t$score\t$strand\t.\tID=$name2\n" unless $gtf;
+	foreach my $i (sort {$a <=> $b} keys %{ $exons{$name}{$lnum} }) {
+	    my ($estart, $eend, $erank) = @{ $exons{$name}{$lnum}{$i} };
+	    print GTF "$chr\t$fname\texon\t$estart\t$eend\t$score\t$strand\t.\tgene_id \"$name2\"; transcript_id \"$name2.1\"\n";
+	    print GFF "$chr\t$fname\texon\t$estart\t$eend\t$score\t$strand\t.\tID=$name2:$erank;Parent=$name2\n" unless $gtf;
+	    print EXON "$chr\t$estart\t$eend\t$name2:$erank\t1\t$strand\n" unless $gtf;
+	}
+    }
+}
+unless ($gtf) {
+    close EXON;
+    close TRANS;
+    close GFF;
+}
+close GTF;
+exit;

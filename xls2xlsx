@@ -1,0 +1,276 @@
+#!/usr/bin/env perl
+use Excel::Writer::XLSX;
+use Spreadsheet::ParseExcel;
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+## Reads xls and re-writes as xlsx
+## 
+## CANNOT preserve row/col freezing, as ParseExcel does not contain this data, see https://groups.google.com/forum/#!topic/spreadsheet-parseexcel/ZFxaPs7IM0Q
+##  this is why the $freeze argument exists (and will be applied to all sheets)
+
+## FUTURE: accept module as additional input, with format declarations to be applied to module-indicated columns or rows
+
+my $input;       # input XLS
+my $output;      # OPTIONAL output XLSX name, else ${input}x (assumes $input ends with ".xls")
+my $freeze;      # "i,j" where i is row and j is col to freeze.  Either of i or j can be omitted (e.g. "1,").
+my $nofmt;       # do not import cell formatting (will still import row heights and col widths)
+my $recolwidth;  # recalc column widths?
+
+GetOptions("i=s"=>\$input, "o=s"=>\$output, "f=s"=>\$freeze, "--no-cell-formatting"=>\$nofmt, "--recalc-column-widths"=>\$recolwidth);
+
+die "$0: Cannot find input excel file '$input'!\n" unless -e $input;
+$output = "${input}x" unless $output;
+my @freeze;
+if ($freeze && $freeze ne ',') {
+    @freeze = split /,/, $freeze;
+    $freeze[0] = 0 unless $freeze[0];
+    $freeze[1] = 0 unless $freeze[1];
+}
+
+my %AlignH = (1,'left', 2,'center', 3,'right', 4,'fill', 5,'justify', 6,'center_across', 7,'justify');  # original XLS '7' value does not exist in XLSX
+my %AlignV = (0,'top', 1,'vcenter', 2,'bottom', 3,'vjustify', 4,'vjustify');  # original XLS '4' value does not exist in XLSX
+
+my $inbook = Spreadsheet::ParseExcel->new()->parse($input);
+my $outbook = Excel::Writer::XLSX->new($output);
+my @insheets = $inbook->worksheets();
+
+foreach my $i (0..$#insheets) {
+    print "initialize $i\n";
+    my $insheet = $insheets[$i];
+    my $sheetname = $insheet->get_name();
+    my $outsheet = $outbook->add_worksheet($sheetname);
+    $outsheet->set_first_sheet() unless $i;
+    $outsheet->activate() unless $i;
+    
+    ## Import cell data and formats
+    my @rowrange = $insheet->row_range();
+    my @colrange = $insheet->col_range();
+    
+    print "Converting sheet: $sheetname | rows $rowrange[0]-$rowrange[1] | cols $colrange[0]-$colrange[1]\n";
+    
+    my (%colnames, %matrix, %colwidths, %urlcols);
+    foreach my $icol (0..$colrange[1]) {
+        my $cell = $insheet->get_cell(0, $icol);
+        $colnames{ $cell->value() } = $icol if defined $cell;
+    }
+    
+    my $Nurls = 0;
+    foreach my $irow (0..$rowrange[1]) {
+        print "  row: $irow\n" if $irow % 1000 == 0;
+        foreach my $icol (0..$colrange[1]) {
+            #print "$irow, $icol\n";
+            my $val;
+            my $outfmt = $outbook->add_format();
+            my $cell = $insheet->get_cell($irow, $icol);
+            if (defined $cell) {
+                $val = $cell->value();
+                $matrix{$irow}{$icol} = $val;
+                $colwidths{$icol} = length($val) if length($val) > $colwidths{$icol};
+                my $infmt = $cell->get_format();
+                $outfmt = &get_format($infmt, $outfmt) if $infmt && !$nofmt;
+                if ($val =~ /^(http|ftp|mailto|=?HYPERLINK)/) {
+                    $urlcols{$icol} = 1;
+                    if ($Nurls <= 65535 && length($val) <= 255) {
+                        $outfmt->set_color('blue');
+                        $outfmt->set_underline();
+                        $outsheet->write_url($irow, $icol, $val, $outfmt);
+                        $Nurls++;
+                    } else {
+                        $outsheet->write($irow, $icol, $val);   # write URL as plain text if URL too long, or too many URLs on page
+                    }
+                } else {
+                    $outsheet->write($irow, $icol, $val, $outfmt);
+                }
+            }
+        }
+    }
+    
+    ## Import row heights and col widths, freeze window if specified
+    ## Ignore README tabs
+    if ($sheetname eq 'README') {
+        $outsheet->set_column( 0, 0, 18 );  # width 18 for first column
+    } else { 
+        $outsheet->freeze_panes( $freeze[0], $freeze[1] ) if @freeze;
+        print "Row heights...\n";
+        my @rowheights;
+        eval { @rowheights = $insheet->get_row_heights() };  ## bad code in module; lack of row heights kills script
+        if ($!) {
+            #print "eval failed: ignoring rowheights: $!\n";
+        } else {
+            if (!@rowheights) {
+                # assumed to all be default
+                #print " no rowheights\n";
+            } elsif ($#rowheights==0 && $rowheights[0]==12.75) {
+                # all default; no need to re-apply
+                #print " all are $rowheights[0]\n";
+            } else {
+                if ($#rowheights==0) {
+                    @rowheights = map { $rowheights[0] } ($rowrange[0]..$rowrange[1]);
+                } 
+                #print " observed \@rowheights:\n@rowheights\n";
+                $outsheet->set_row( $_, $rowheights[$_] ) foreach ($rowrange[0]..$rowrange[1]);
+            }
+        }
+        print "Col widths...\n";
+        #my @colwidths = $insheet->get_col_widths();
+        #$outsheet->set_column( $_, $_, $colwidths[$_] ) foreach ($colrange[0]..$colrange[1]);
+        foreach (0..$colrange[1]) {
+            my $width = $matrix{0}{$_} eq 'Description' ? 9 : $urlcols{$_} ? length($matrix{0}{$_}) : $colwidths{$_};
+            $outsheet->set_column($_, $_, $width);
+        }
+    }
+    
+    ## Column-type specific ops
+    ## THIS IS TEMPORARY.  For GATK pipeline only.  Whole txt -> xlsx approach will soon be rewritten to avoid this step
+    foreach my $hmcol (qw/ GenoDiffScore HomWinScore AlleleFETp SnpOrtho.Score /) {
+        if (exists $colnames{$hmcol}) {
+            print "Special Col Ops: $hmcol\n";
+            my $icol = $colnames{$hmcol};
+            my ($minval, $maxval) = (9E9, 0);
+            foreach my $irow (1..$rowrange[1]) {
+                $maxval = $matrix{$irow}{$icol} if $matrix{$irow}{$icol} > $maxval;
+                $minval = $matrix{$irow}{$icol} if $matrix{$irow}{$icol} < $minval;
+            }
+            $minval = 0 unless $minval;
+            $maxval = 0 unless $maxval;
+            if ($hmcol == 'SnpOrtho.Score') {
+                print "  CONDITIONAL FORMATTING: $hmcol ($icol), 1-$rowrange[1], [$minval,0,$maxval]\n";
+                $outsheet->conditional_formatting( 1, $icol, $rowrange[1], $icol, { type=>'3_color_scale', min_value=>$minval, mid_value=>0, max_value=>$maxval, min_color=>"#0000FF", mid_color=>"#FFFFFF", max_color=>"#FF0000", min_type=>'num', mid_type=>'num', max_type=>'num' } );
+            } else {
+                print "  CONDITIONAL FORMATTING: $hmcol ($icol), 1-$rowrange[1], [$minval,$maxval]\n";
+                $outsheet->conditional_formatting( 1, $icol, $rowrange[1], $icol, { type=>'2_color_scale', min_value=>$minval, max_value=>$maxval, min_color=>"#FFFFFF", max_color=>"#FF0000", min_type=>'num', max_type=>'num' } );
+            }
+        }
+    }
+}
+
+{
+    print "Finalizing...\n";
+    local $SIG{__WARN__} = \&no_warnings;  # quash "uninitialized value" warnings from modules; there are tons
+    $outbook->close();
+}
+exit;
+
+
+sub no_warnings {
+    ## See: http://www.perlmonks.org/?node_id=1062996
+    my ($message) = @_;
+#    if ($message =~ /^Use of uninitialized value/) { return; }
+#    warn $message;         # <-------- Is this correct ?
+}
+
+
+sub get_format {
+    
+    local $SIG{__WARN__} = \&no_warnings;
+    my ($infmt, $outfmt) = @_;
+    
+    ## Import cell formatting
+    ## NOT importing ReadDir, Lock, Hidden
+    $outfmt->set_align( $AlignH{$infmt->{AlignH}} ) if $infmt->{AlignH};
+    $outfmt->set_align( $AlignV{$infmt->{AlignV}} ) if defined $infmt->{AlignV};
+    $outfmt->set_indent( $infmt->{Indent} ) if $infmt->{Indent};
+    $outfmt->set_text_wrap( $infmt->{Wrap} ) if $infmt->{Wrap};
+    $outfmt->set_shrink( $infmt->{Shrink} ) if $infmt->{Shrink};
+    $outfmt->set_rotation( $infmt->{Rotate} ) if $infmt->{Rotate};
+    $outfmt->set_justlast( $infmt->{JustLast} ) if $infmt->{JustLast};
+    if (defined $infmt->{Fill}) {
+        my ($pattern, $front_color, $back_color) = $infmt->{Fill};
+        $outfmt->set_pattern($pattern);
+        $outfmt->set_fg_color($front_color);
+        $outfmt->set_bg_color($back_color);
+    }
+    if (defined $infmt->{BdrStyle}) {
+        my ($left, $right, $top, $bottom) = $infmt->{BdrStyle};
+        $outfmt->set_left($left) if $left;
+        $outfmt->set_right($right) if $right;
+        $outfmt->set_top($top) if $top;
+        $outfmt->set_bottom($bottom) if $bottom;
+    }
+    if (defined $infmt->{BdrColor}) {
+        my ($left, $right, $top, $bottom) = $infmt->{BdrColor};
+        $outfmt->set_left_color($left) if $left;
+        $outfmt->set_right_color($right) if $right;
+        $outfmt->set_top_color($top) if $top;
+        $outfmt->set_bottom_color($bottom) if $bottom;
+    }
+    if (defined $infmt->{BdrDiag}) {
+        my ($kind, $style, $color) = $infmt->{BdrDiag};
+        $outfmt->set_diag_type($kind) if $kind;
+        $outfmt->set_diag_border($style) if $style;
+        $outfmt->set_diag_color($color) if $color;  # or $workbook->ColorIdxToRGB($color);
+    }
+    
+    ## Import font formatting
+    my $infont = $infmt->{Font};
+    $outfmt->set_font($infont->{Name});
+    $outfmt->set_bold() if $infont->{Bold};
+    $outfmt->set_italic() if $infont->{Italic};
+    $outfmt->set_underline($infont->{UnderlineStyle});
+    $outfmt->set_size($infont->{Height});
+    $outfmt->set_color($infont->{Color});
+    $outfmt->set_font_strikeout($infont->{Strikeout});
+    $outfmt->set_font_script($infont->{Super});
+    
+    return $outfmt;
+    
+    ## XLS GET FORMAT
+    ## $format->{$_} foreach qw/ Font AlignH AlignV Indent Wrap Shrink Rotate JustLast ReadDir BdrStyle BdrColor BdrDiag Fill Lock Hidden /;  # also Style = 1|undef
+    ## $format->{AlignH} can be: 0 => No alignment, 1 => Left, 2 => Center, 3 => Right, 4 => Fill, 5 => Justify, 6 => Center across, 7 => Distributed/Equal spaced
+    ## $format->{AlignV} can be: 0 => Top, 1 => Center, 2 => Bottom, 3 => Justify, 4 => Distributed/Equal spaced
+    ## $font->{$_} foreach qw/ Name Bold Italic Underline UnderlineStyle Height Color Strikeout Super /;
+    ## $font->{Super} can be: 0 => None, 1 => Superscript, 2 => Subscript
+    ## $font->{UnderlineStyle} can be: 0 => None, 1 => Single, 2 => Double, 33 => Single accounting, 34 => Double accounting
+    ##
+    ## XLSX SET FORMAT
+    ## Category   Description       Property        Method Name
+    ## --------   -----------       --------        -----------
+    ## Font       Font type         font            set_font()
+    ##            Font size         size            set_size()
+    ##            Font color        color           set_color()
+    ##            Bold              bold            set_bold()
+    ##            Italic            italic          set_italic()
+    ##            Underline         underline       set_underline()
+    ##            Strikeout         font_strikeout  set_font_strikeout()
+    ##            Super/Subscript   font_script     set_font_script()
+    ##            Outline           font_outline    set_font_outline()
+    ##            Shadow            font_shadow     set_font_shadow()
+    ## 
+    ## Number     Numeric format    num_format      set_num_format()
+    ## 
+    ## Protection Lock cells        locked          set_locked()
+    ##            Hide formulas     hidden          set_hidden()
+    ## 
+    ## Alignment  Horizontal align  align           set_align()
+    ##            Vertical align    valign          set_align()
+    ##            Rotation          rotation        set_rotation()
+    ##            Text wrap         text_wrap       set_text_wrap()
+    ##            Justify last      text_justlast   set_text_justlast()
+    ##            Center across     center_across   set_center_across()
+    ##            Indentation       indent          set_indent()
+    ##            Shrink to fit     shrink          set_shrink()
+    ## 
+    ## Pattern    Cell pattern      pattern         set_pattern()
+    ##            Background color  bg_color        set_bg_color()
+    ##            Foreground color  fg_color        set_fg_color()
+    ## 
+    ## Border     Cell border       border          set_border()
+    ##            Bottom border     bottom          set_bottom()
+    ##            Top border        top             set_top()
+    ##            Left border       left            set_left()
+    ##            Right border      right           set_right()
+    ##            Border color      border_color    set_border_color()
+    ##            Bottom color      bottom_color    set_bottom_color()
+    ##            Top color         top_color       set_top_color()
+    ##            Left color        left_color      set_left_color()
+    ##            Right color       right_color     set_right_color()
+    ##            Diagonal type     diag_type       set_diag_type()
+    ##            Diagonal border   diag_border     set_diag_border()
+    ##            Diagonal color    diag_color      set_diag_color()
+
+}
+
+

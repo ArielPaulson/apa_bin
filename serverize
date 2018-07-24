@@ -1,0 +1,36 @@
+#!/bin/bash
+
+## working, but still under construction
+
+sh=$1
+
+servers=(mango hickory cypress maple genekc03)
+
+n=$(cat $sh | wc -l)
+c=$(echo "$n/5" | bc)
+r=$(echo "$n-$c*5" | bc)
+echo "$n $c $r"
+
+if [ $r -gt 0 ]; then
+   
+else
+  
+fi
+
+split -l $c $sh
+mv xaa mango
+mv xab hickory
+mv xac cypress
+mv xad maple
+mv xae genekc03
+
+p=10
+
+for srv in ${servers[@]}; do split -l $p $srv; rename x $srv.x x*; done
+
+for srv in ${servers[@]}; do ls $srv.x* | awk '{ print "./"$1" &" }' > $srv; done
+
+for srv in ${servers[@]}; do echo "./$srv"; done
+
+
+

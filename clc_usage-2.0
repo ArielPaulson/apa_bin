@@ -1,0 +1,184 @@
+#!/usr/bin/env perl
+require '/home/apa/local/bin/apa_routines.pm';
+use Data::Dumper;
+use strict;
+
+my %labs = (
+    'g1019' => 'Abmayr',
+    'g1013' => 'Baumann',
+    'g1024' => 'Blanchette',
+    'g1005' => 'Conaway',
+    'g1006' => 'Conaway',
+    'g1011' => 'Gerton',
+    'g1025' => 'Gibson',
+    'g1010' => 'Hawley',
+    'g2006' => 'Kulesa',
+    'g1020' => 'Jaspersen',
+    'g1001' => 'Krumlauf',
+    'g1004' => 'LinhengLi',
+    'g1023' => 'RongLi',
+    'g1026' => 'Mak',
+#    'g' => 'Piotrowski',
+#    'g' => 'Sanchez',
+    'g1022' => 'Si',
+    'g1027' => 'Shilatifard',
+    'g1008' => 'Trainor',
+    'g1018' => 'Workman',
+    'g1002' => 'Xie',
+    'g1021' => 'Yu',
+    'g1028' => 'Zeitlinger',
+    'g0000' => 'Core',
+    'g9999' => 'Multiple',
+    'gXXXX' => 'Unknown'
+    );
+my %ignore = map {($_=>1)} qw/ clclicsrv clcgenomics /;
+my (%dates, %userlab, %packages, %userIO, %current, $umax, $pmax, $mode);
+
+## assumes 'Normal' log format; don't know what the other options are...
+
+my ($user, $pass);
+while (!$user) {
+    print "Enter windows username:\n";
+    chomp($user = <>);
+}
+while (!$pass) {
+    print "Enter windows password:\n";
+    system('stty','-echo');
+    chomp($pass = <>);
+    system('stty','echo');
+}
+
+print "Reading from current appkc03 logfile\n";
+chdir 'tmp';
+system "smbget -u $user -p $pass -w simr01 smb://appkc03/CLCLicenseServer/licenseserver.log";
+open IN, 'licenseserver.log' or die "Can't open license log!  Bad username/password?\n";
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    $dates{$1}{$2}{$3}++ if $_ =~ /^\[(\d{4})-(\d{2})-(\d{2})\s/;
+    my ($timestamp, $action, $user, $domain, $ip, $package);
+    if (($timestamp, $action, $user, $domain, $ip, $package) = ($_ =~ /^\[(.*?)\] (CHECK[INOUT]+) by (\w+)@(\S+) \[([\d.]+)\]: (.*)/)) {  # user action
+	next if $ignore{$user};
+	next if (!$package || $package =~ /FAIL:/);  # unsuccessful action
+	$packages{$package}{A}++ if $action eq 'CHECKOUT';
+	$packages{$package}{U}{$user}++ if $action eq 'CHECKOUT';
+	$umax = length($user) if length($user) > $umax;  # for user names (any > 3 ?)
+	$pmax = length($package) if length($package) > $pmax;  # for package names
+	push @{ $userIO{$user}{$domain}{$ip}{$package}{$action} }, $timestamp;
+	$action eq 'CHECKOUT' ? ($current{$user}{$domain}{$ip}{$package}++) : ($current{$user}{$domain}{$ip}{$package} = 0); # counting currently-in-use licenses;
+    } elsif ($_ =~ /^\[(.*?)\] LM-X License Server/) {  # server was rebooted -- roll back pending checkouts (instead of faking checkin-times)
+	foreach my $user (keys %userIO) {
+	    foreach my $domain (keys %{ $userIO{$user} }) {
+		foreach my $ip (keys %{ $userIO{$user}{$domain} }) {
+		    foreach my $package (keys %{ $userIO{$user}{$domain}{$ip} }) {
+			next unless $current{$user}{$domain}{$ip}{$package};
+			pop @{ $userIO{$user}{$domain}{$ip}{$package}{CHECKOUT} } foreach (1..$current{$user}{$domain}{$ip}{$package});
+#			print "$1: Rolling back $user, $domain, $ip, $package: $current{$user}{$domain}{$ip}{$package} checkouts\n";
+			$current{$user}{$domain}{$ip}{$package} = 0;
+		    }
+		}
+	    }
+	}
+    } elsif ($_ =~ /CHECK/) {
+	print "PARSE FAIL: $_\n";
+    }
+}
+my $entries = $.;
+close IN;
+system 'rm -f licenseserver.log';
+
+my ($yr0, $yr1) = (sort {$a <=> $b} keys %dates)[0,-1];
+my $mo0 = (sort {$a <=> $b} keys %{ $dates{$yr0} })[0];
+my $mo1 = (sort {$b <=> $a} keys %{ $dates{$yr1} })[0];
+my $dy0 = (sort {$a <=> $b} keys %{ $dates{$yr0}{$mo0} })[0];
+my $dy1 = (sort {$b <=> $a} keys %{ $dates{$yr1}{$mo1} })[0];
+
+my $date0 = "$yr0-$mo0-$dy0";
+my $date1 = "$yr1-$mo1-$dy1";
+
+my $smax = 4;  # for header width 'USES'
+my $hmax = 5;  # for header width 'HOURS'
+my ($lmax, $total, %ulabs, %uses, %usetimes);
+
+foreach (values %labs) {
+    $lmax = length($_) if length($_) > $lmax;
+}
+
+foreach my $user (keys %userIO) {
+    foreach my $domain (keys %{ $userIO{$user} }) {
+	foreach my $ip (keys %{ $userIO{$user}{$domain} }) {
+	    foreach my $package (keys %{ $userIO{$user}{$domain}{$ip} }) {
+		my (@outs, @ins);
+		@outs = @{ $userIO{$user}{$domain}{$ip}{$package}{CHECKOUT} } if $userIO{$user}{$domain}{$ip}{$package}{CHECKOUT};
+		@ins = @{ $userIO{$user}{$domain}{$ip}{$package}{CHECKIN} } if $userIO{$user}{$domain}{$ip}{$package}{CHECKIN};
+#		print "$user, $domain, $ip, $package, ", (scalar @outs), ", ", (scalar @ins), ": $current{$user}{$domain}{$ip}{$package}\n";
+		pop @outs foreach (1..$current{$user}{$domain}{$ip}{$package});  # disregard in-use license checkouts
+		my ($Nout, $Nin) = ((scalar @outs), (scalar @ins));
+		if (@outs && @ins) {
+		    if ($#outs > $#ins) {  # someone probably had a package checked out when this script ran
+			@outs = @outs[0..$#ins];
+			print "Notice: User $user package $package has $Nout checkouts and $Nin checkins.  Could be currently in use.\n";
+		    } elsif ($#outs < $#ins) {   # ??? problem with report
+			print "WARNING: Log file issues -- more checkins than checkouts!  Usage times may be all wrong.\n";
+		    }
+		    foreach (0..$#outs) {
+			my $elapsed = runtime($outs[$_], $ins[$_], 'HOUR', 2);
+#			print "$user\t$domain\t$ip\t$package\t$outs[$_]\t$ins[$_]\t$elapsed\n";
+			$usetimes{USER}{$user} += $elapsed;
+			$usetimes{PACKAGE}{$package} += $elapsed;
+			$usetimes{UPACK}{$user}{$package} += $elapsed;
+		    }
+		    $uses{$user} += scalar @outs;
+		} else {  # assumed no checkins -- ignore until first checkin
+#		    print "$user, $domain, $ip, $package | $Nout, $Nin\n";
+		}
+	    }
+	}
+    }
+}
+
+foreach (keys %uses) {  # user ids
+    next if $ignore{$_};
+    $smax = length($uses{$_}) if length($uses{$_}) > $smax;
+    $hmax = length(int($usetimes{USER}{$_}+1)) if length(int($usetimes{USER}{$_}+1)) > $hmax;
+    chomp(my $groups = `groups $_`);
+    if ($groups eq '$_ : $_' || $groups eq '$_ : $_ fs_users domainusers') {
+	$groups = 'gXXXX'; # no meaningful associations
+    } else {
+	my $ngroups;
+	$ngroups++ while $groups =~ m/ (g\d+)/g;
+	if ($ngroups <= 1) {
+	    $userlab{$_} = $groups =~ / (g\d+)/ ? $1 : 'g0000'; # else core
+	} else {
+	    $userlab{$_} = 'g9999'; # multi-lab user
+	}
+    }
+}
+
+foreach my $user (keys %userIO) {
+    foreach my $package (keys %{ $usetimes{UPACK}{$user} }) {
+#	print "$user\t$package\t$usetimes{UPACK}{$user}{$package}\n";
+    }
+}
+
+my (%LabHourTotals, $htotal2);
+print "\n********************\n  CLC USAGE REPORT \n********************\n";
+print "\n$entries lines read.\n\nFirst record:\t$date0\nLast record:\t$date1\n";
+foreach my $package (sort {$packages{$b}{A} <=> $packages{$a}{A}} keys %packages) {
+    my (%ulabs, $utotal, $htotal);
+    print "\nPACKAGE '$package':\n\nUSER\tUSES\tHOURS\tLAB\n";
+    foreach my $user (sort {$uses{$b} <=> $uses{$a}} keys %uses) {
+	next if $ignore{$user};
+	next unless $packages{$package}{U}{$user};
+	printf "%-${umax}s\t%${smax}d\t%${hmax}d\t%-${lmax}s\n", $user, $packages{$package}{U}{$user}, int($usetimes{UPACK}{$user}{$package}), $labs{ $userlab{$user} };
+	$htotal += int($usetimes{UPACK}{$user}{$package});
+	$utotal += $packages{$package}{U}{$user};
+	$ulabs{ $labs{ $userlab{$user} } }++;
+	$LabHourTotals{ $labs{ $userlab{$user} } } += int($usetimes{UPACK}{$user}{$package});
+    }
+    $htotal2 += $htotal;
+    printf "TOTAL\t%${smax}s\t%${hmax}d\t%-${lmax}s\n", $utotal, $htotal, scalar keys %ulabs;
+}
+print "\nTOTAL USAGE BY LAB:\n\nPCT\tLAB\n";
+printf("%4.1f\t%-${lmax}s\n", 100*$LabHourTotals{$_}/$htotal2, $_) foreach sort { $LabHourTotals{$b} <=> $LabHourTotals{$a} } keys %LabHourTotals;
+print "\n";
+exit;

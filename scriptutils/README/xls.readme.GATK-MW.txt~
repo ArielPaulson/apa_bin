@@ -1,0 +1,64 @@
+This document contains ...	
+	
+	
+	
+	
+Explanation of columns:	
+	
+CHROM	Chromosome
+POS	Variant Position
+ID	Variant ID, if known from other databases
+REF	Reference call
+ALT	Alternate calls (alleles)
+QUAL	VCF Quality Score
+FILTER	List of filters failed, if any
+ALLELE	Allele number (usually 1 or 2; multi-allele positions have been split into one allele per row)
+DP	Total depth at position
+AlleleFETp	-log10 of FET p-value for allelic difference
+GenoDiffScore	Genotype Difference Score, on [0,100]
+HomWinScore	Hom/Het bin score at this position
+*.GT	Sample Genotype columns; see explanation below
+*.AD	Sample Allele-Depth columns; see explanation below
+*.RP	Sample Reference-Percent columns; see explanation below
+Consequence	snpEff effect
+Impact	snpEff severity
+Gene_Name	Gene Symbol
+Gene_ID	Gene ID
+Feature_Type	“transcript”
+Feature_ID	Transcript ID
+Trans_Biotype	Transcript Biotype
+Rank	Affected exon rank in transcript
+HGVS.c	Nucleotide change in transcript
+HGVS.p	Peptide change in transcript
+cDNA_Pos	Affected position in transcript
+CDS_Pos	Affected position in transcript CDS
+AA_Pos	Affected position in peptide
+Distance	Distance from gene (proximal-intergenic variants only)
+Errors	Transcript annotation errors; usually indicate incompleteness of transcript model
+IGV_Link	Link to position in IGV session, if IGV session is open locally.
+EnsTrans_Link	Link to Ensembl transcript page
+EnsGene_Link	Link to Ensembl gene page
+Zfin_Link	Link to Zfin gene page
+Description	Gene Description
+
+
+How to read diploid+ *.GT columns:
+	Diploid GT (genotype) columns typically have 2-3 numbers separated by slashes, indicating allele(s) found and zygosity.
+  Multiploid GT columns could concievably have as many numbers as the allowed ploidy, although such a hyper-variable position would be very rare.
+	Number 0 always stands for the reference allele; numbers 1-N stand for alternate alleles discovered.
+	Diploid organisms have 1 or more other numbers, indicating non-ref alleles.  Pooled samples may have > 2 alleles at a site, resulting in 3 numbers (and very rarely, 4 or more).
+	Common diploid GT values: “0/0” (homozygous ref), “1/1” (homozygous alt), “0/1” (heterozygous, 1 ref and 1 alt), “./.” (genotype undetectable – no coverage)
+	Rarer diploid GT values with pooled samples: “2/2” (homozygous alt, alternate allele #2), “1/2” (heterozygous alt, alternate alleles 1 and 2), “0/2” (heterozygous, 1 ref and 1 alt allele #2)
+
+
+How to read diploid+ *.AD and *.RP columns:
+	Diploid AD (Allele Depth) fields typically have 2-3 numbers separated by commas, indicating read coverage supporting various alleles.
+  Like the GT columns, there will be one number per allele called per position.  A pair of GT and AD fields will always have the same number of numbers.
+  The first value is always ref; values 2-N are for the alternate alleles.  Number of alternate alleles reported should be reflected in the genotype calls at that position.
+  RP (Reference Percent) is always the first number over the sum of all numbers (multiplied by 100).
+Examples:
+	AD value “0,19” indicates 0 reads supported ref and 19 reads supported alt – this is a homozygote, and the corresponding GT field should be “1/1”, homozygous alt.  RP is 0.
+	AD value “7,0” indicates 7 reads supported ref and 0 reads supported alt – this is also a homozygote, and the corresponding GT field should be “0/0”, homozygous ref.  RP is 100.
+	AD value “2,2” indicates 2 reads supported ref and 2 reads supported alt – this is a heterozygote, and the corresponding GT field should be “0/1”.  Also this call is weak, since the total depth is only 4.  RP is 50.
+	AD value “1,200,15” indicates a multi-allele heterozygous position, with 1 read supporting ref, 200 supporting alt allele #1, and 15 supporting alt allele #2.  GT fields at this position will be some combination of 0, 1, and 2.  RP is 0.462963.
+

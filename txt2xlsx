@@ -1,0 +1,131 @@
+#!/usr/bin/env perl
+require "$ENV{SIMR_APA_BIN}/apa_routines.pm";
+use Excel::Writer::XLSX;
+use Text::CSV;
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+## Reads text and re-writes as xlsx
+
+
+my $freeze; # "i,j" where i is row and j is col to freeze.  Either of i or j can be omitted (e.g. "1,").
+my ($names, $adjust, $boldhead, $csv);
+
+GetOptions("n=s"=>\$names, "f=s"=>\$freeze, "csv"=>\$csv, "adjust"=>\$adjust, "bold-header"=>\$boldhead);
+my ($output, @inputs) = @ARGV;
+
+my @freeze;
+if ($freeze && $freeze ne ',' && $freeze ne '0,0') {
+    @freeze = split /,/, $freeze;
+    $freeze[0] = 0 unless $freeze[0];
+    $freeze[1] = 0 unless $freeze[1];
+}
+
+my @names;
+if ($names) {
+    if (-e $names) {
+        chomp(@names = split /\n/, `cat $names`);
+        
+        ############# FIXME: ELSE IF REGEX
+        
+    } else {
+        @names = split /,/, $names;
+    }
+}
+print "@names\n";
+
+my $outbook = Excel::Writer::XLSX->new($output);
+my $hformat = $outbook->add_format();
+$hformat->set_bold();
+my $urlcount;
+
+foreach my $i (0..$#inputs) {
+    
+    my $input = $inputs[$i];
+    my $name = $names[$i] || "Sheet".($i+1);
+    print "Converting $input ($name)\n";
+    my $outsheet = $outbook->add_worksheet($name);
+    $outsheet->set_first_sheet() unless $i;
+    $outsheet->activate() unless $i;
+    my (@data, @colwidths);
+    
+    if ($csv) {
+        
+        my $doc = Text::CSV->new ( { binary => 1 } ) or die "Cannot use CSV: ".Text::CSV->error_diag ();
+        #$doc->eol ("\r\n");
+        open my $fh, "<:encoding(utf8)", $input or die "$input: $!";
+        while ( my $row = $doc->getline( $fh ) ) {
+            #$row->[2] =~ m/pattern/ or next; # 3rd field should match
+            push @data, $row;
+        }
+        $doc->eof or $doc->error_diag();
+        close $fh;
+        
+    } else {
+        
+        my $IN = &open2('R', $input, 'input text file');
+        while (<$IN>) {
+            s/[\n\r]+$//;
+            push @data, [split /\t/, $_];
+        }
+        close $IN;
+    }
+    
+    foreach my $row (0..$#data) {
+        if ($row==0 && $boldhead) {
+            $outsheet->write_row($row, 0, @{$data[$row]}, $hformat);
+        } else {
+            ##$outsheet->write_row($row, 0, $data[$row]);    # ORIGINAL LINE
+            my @fields = @{$data[$row]};
+            foreach my $i (0..$#fields) {
+                if ($fields[$i] =~ /^(f|ht)tp/) {
+                    if ($urlcount>65535 || length($fields[$i])>255) {
+                        $outsheet->write_string($row, $i, $fields[$i]);
+                    } else {
+                        $outsheet->write_url($row, $i, $fields[$i]);
+                        $urlcount++;
+                    }
+                } elsif ($fields[$i] =~ /[^\d.-]/) {
+                    $outsheet->write_string($row, $i, $fields[$i]);
+                } elsif ($fields[$i]) {
+                    $outsheet->write_number($row, $i, $fields[$i]);
+                } else {
+                    $outsheet->write_blank($row, $i);
+                }
+            }
+        }
+    }
+    
+    if ($adjust) {
+        foreach my $row (0..$#data) {
+            foreach (0..$#{ $data[$row] }) {
+                my $len = length($data[$row]->[$_]);
+                $colwidths[$_] = $len if $len > $colwidths[$_];
+            }
+        }
+        foreach my $col (0..$#colwidths) {
+            $outsheet->set_column( $col, $col, $colwidths[$col] );
+        }
+    }
+    
+    $outsheet->freeze_panes( $freeze[0], $freeze[1] ) if @freeze;
+}
+{
+    print "Finalizing...\n";
+    local $SIG{__WARN__} = \&no_warnings;  # quash "uninitialized value" warnings from modules; there are TONS
+    $outbook->close();
+}
+print "$0 complete!\n";
+exit;
+
+
+sub no_warnings {
+    ## See: http://www.perlmonks.org/?node_id=1062996
+    my ($message) = @_;
+#    if ($message =~ /^Use of uninitialized value/) { return; }
+#    warn $message;         # <-------- Is this correct ?
+}
+
+

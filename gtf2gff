@@ -1,0 +1,70 @@
+#!/usr/bin/env perl
+use Data::Dumper;
+use Pod::Usage;
+#use strict;
+
+die;  ## Will eventually convert GTF to GFF
+
+
+my $bin = '/home/apa/local/bin';
+
+die "$0: No GTFs specified!\n" unless @ARGV;
+
+my %okTypes = map {($_=>1)} qw/ exon CDS five_prime_UTR three_prime_UTR start_codon stop_codon /;
+
+foreach my $gtf (@ARGV) {
+    
+    open my $IN1, '<', $gtf or die "$0: Cannot open gtf file '$gtf' for reading: $!\n";
+    print "Processing $gtf...\n";
+    my (%data, @chrs);
+    
+    while (<$IN1>) {
+	$_ =~ s/[\n\r]//g;
+	my ($chr, $src, $type, $start, $end, $score, $strand, $phase, $annot) = split /\t/, $_;
+	next unless $okTypes{$type};
+	my ($gene) = ($annot =~ /gene_id \"(.*?)\"/);
+	my ($trans) = ($annot =~ /transcript_id \"(.*?)\"/);
+	
+	$data{$chr}{G}{$gene}{GDAT} = [join("\t", $chr, $src, 'gene'), "$strand\t."] unless exists $data{$chr}{G}{$gene}{GDAT};
+	$data{$chr}{G}{$gene}{T}{$trans}{TDAT} = [join("\t", $chr, $src, 'mRNA'), "$strand\t."] unless exists $data{$chr}{G}{$gene}{T}{$trans}{TDAT};
+	
+	print "No gene! '$annot'\n" unless $gene;
+	print "No trans! '$annot'\n" unless $trans;
+	push @chrs, $chr unless $data{$chr};  # record only once, in order
+	
+	push @{ $data{$chr}{G}{$gene}{B} }, ($start, $end);
+	push @{ $data{$chr}{T}{$trans}{B} }, ($start, $end);
+	$data{$chr}{G}{$gene}{T}{$trans} = 1;
+	my $FN = ++$data{$chr}{T}{$trans}{FN}{$type};
+	$data{$chr}{T}{$trans}{F}{$type}{$FN} = join("\t", $chr, $src, $type, $start, $end, $score, $strand, $phase);
+    }
+    close $IN1;
+    
+    my ($name) = ($gtf =~ /([^\/]+)\.gtf$/i);
+    my $gff = "$name.gff";
+    open my $OUT, '>', $gff;
+    
+    foreach my $chr (@chrs) {
+	foreach my $gene (keys %{ $data{$chr}{G} }) {
+	    print STDERR "$chr\t$gene\n";
+	    my $strand = $data{$chr}{G}{$gene}{S};
+	    my ($gstart, $gend) = (sort {$a <=> $b} @{ $data{$chr}{G}{$gene}{B} })[0,-1];
+	    print $OUT $data{$chr}{G}{$gene}{GDAT}->[0],"\t$gstart\t$gend\t",$data{$chr}{G}{$gene}{GDAT}->[1],"\tID=$gene\n";
+	    foreach my $trans (keys %{ $data{$chr}{G}{$gene}{T} }) {
+		my ($tstart, $tend) = (sort {$a <=> $b} @{ $data{$chr}{T}{$trans}{B} })[0,-1];
+		print $OUT $data{$chr}{G}{$gene}{T}{$trans}{TDAT}->[0],"\t$tstart\t$tend\t",$data{$chr}{G}{$gene}{T}{$trans}{TDAT}->[1],"\tID=$trans; Parent=$gene\n";
+		foreach my $feat (keys %{ $data{$chr}{G}{$gene}{T}{$trans}{F} }) {
+		    foreach my $featnum (keys %{ $data{$chr}{G}{$gene}{T}{$trans}{F}{$feat} }) {
+			print $OUT "$data{$chr}{T}{$trans}{F}{$feat}{$featnum}\tID=$trans.$feat.$featnum; Parent=$trans\n";
+		    }
+		}
+	    }
+	}
+    }
+    close $OUT;
+    
+    system "/home/apa/local/bin/sortBedCoord -i $gff --gtf --overwrite";
+}
+print "$0 complete!\n";
+exit;
+

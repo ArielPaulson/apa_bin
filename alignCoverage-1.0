@@ -1,0 +1,183 @@
+#!/usr/bin/env perl
+require '/home/apa/local/bin/apa_routines.pm';  # &blockify
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## calculates the percent of each blast/blat query/subject covered by alignments
+## if alignments are 'sam' then operation is to calculate portion of query which was alignable, i.e. not soft-clipped
+
+my %oktypes = ('blast',1, 'blat',1, 'sam',1);
+my ($aligns, $fasta, $type, $query, $outfile, $subject, $gapped, $alignedonly, $maskfa);
+GetOptions("a=s"=>\$aligns, "f=s"=>\$fasta, "t=s"=>\$type, "o=s"=>\$outfile, "query"=>\$query, "subject"=>\$subject, "gapped"=>\$gapped, "aligned-only"=>\$alignedonly, "maskfa"=>\$maskfa);
+
+$type = $type ? $type : $aligns =~ /\.[^.]*blast[pnx]?$/ ? 'blast' : $aligns =~ /\.psl$/ ? 'blat' : $aligns =~ /\.sam$/ ? 'sam' : undef;
+$outfile = $outfile ? $outfile : "$aligns.alignCoverage.txt";
+
+die "$0: Cannot specify both 'query' and 'subject'!\n" if $query && $subject;
+die "$0: Must specify one of 'query' or 'subject'!\n" unless $query || $subject;
+die "$0: 'type' not specified, and cannot be detected!\n" unless $type;
+die "$0: 'type' must be either 'blast' or 'blat'!\n" unless $oktypes{$type};
+die "$0: type 'blast' requires a fasta file!\n" if $type eq 'blast' && !$fasta;
+die "$0: 'gapped' only works for type 'blat'!\n" if $gapped && $type ne 'blat';
+
+die "$0: 'subject' mode not yet enabled for 'blat' format!\n" if $type eq 'blat' && $subject;
+
+my (@headers, %trueheaders, %data, %mask);
+
+if ($fasta) {
+    
+    ## blat retains query, subject lengths in output, but not blast -- use fasta
+    print "Reading fasta...\n";
+    open my $FA, '<', $fasta or die "$0: Cannot read fasta file '$fasta': $!\n";
+    my $header;
+    while (<$FA>) {
+	$_ =~ s/[\n\r]+//;
+	if ($_ =~ /^>(\S+)/) {  # select only up to the fist whitespace, if any
+	    $header = $1;
+	    push @headers, $header;
+	    $trueheaders{$header} = "$_";
+	} else {
+	    $data{$header}{LEN} += length($_);
+	    push @{ $mask{$header} }, (split //, "\U$_");
+	}
+    }
+    close $FA;
+    
+    ## prep maps here, since it is possible
+    print "Initializing maps...\n";
+    foreach my $header (@headers) {
+	$data{$header}{MAP} = [map {0} (1..$data{$header}{LEN})];
+    }
+}
+
+print "Processing alignments...\n";
+open my $IN, '<', $aligns or die "$0: Cannot read alignments file '$aligns': $!\n";
+if ($type eq 'blast') {
+    
+    while (<$IN>) {
+	$_ =~ s/[\n\r]+$//;
+	next unless $_;
+	my @fields = split /\t/, $_;
+	my ($qry, $subj, $idt, $mlen, $mms, $Ngaps, $qpos1, $qpos2, $spos1, $spos2, $eval, $score) = @fields[0..11];
+	my ($header, $start, $end);
+	if ($query) {
+	    $header = $qry;
+	    ($start, $end) = (sort {$a <=> $b} ($qpos1, $qpos2));
+	    $data{$header}{OTH}{$subj} = 1;
+	} else {
+	    $header = $subj;
+	    ($start, $end) = (sort {$a <=> $b} ($spos1, $spos2));
+	    $data{$header}{OTH}{$qry} = 1;
+	}
+	$data{$header}{ALN}++;
+	$data{$header}{MAP}->[$_]++ foreach ($start..$end);
+    }
+    
+} elsif ($type eq 'blat') {
+    
+    while (<$IN>) {
+	$_ =~ s/[\n\r]+$//;
+	next unless $_;
+	my @fields = split /\t/, $_;
+	my ($ident, $mismatch, $reps, $Ns, $qgaps, $qgapbp, $sgaps, $sgapbp, $strand, $qry, $qrylen, $qpos1, $qpos2, $subj, $subjlen, $spos1, $spos2, $blocks, $blocksizes, $qstarts, $sstarts) = @fields[0..20];
+	my ($astart, $aend, @starts);
+	my $header = $query ? $qry : $subj;
+	unless ($fasta) {
+	    push @headers, $header unless exists $data{$header};
+	}
+	if ($query) {
+	    $data{$header}{LEN} = $qrylen;
+	    $data{$header}{OTH}{$subj} = 1;
+	    ($astart, $aend) = (sort {$a <=> $b} ($qpos1, $qpos2));
+	} else {
+	    $data{$header}{LEN} = $subjlen;
+	    $data{$header}{OTH}{$qry} = 1;
+	    ($astart, $aend) = (sort {$a <=> $b} ($spos1, $spos2));
+	}
+	$data{$header}{ALN}++;
+	unless (exists $data{$header}{MAP}) {
+	    ## blat mode does not require a companion fasta; may need to build maps on the fly
+	    $data{$header}{MAP} = map {0} (1..$data{$header}{LEN});
+	}
+	if ($gapped) {
+	    ## fill maps block by block
+	    if ($query) {
+		$qstarts =~ s/,$//;
+		@starts = split /,/, $qstarts;
+	    } else {
+		$sstarts =~ s/,$//;
+		@starts = split /,/, $sstarts;
+	    }
+	    $blocksizes =~ s/,$//;
+	    my @blocks = split /,/, $blocksizes;
+	    foreach my $i (0..$#blocks) {
+		my ($bstart, $bend) = ($starts[$i]+1, $starts[$i]+$blocks[$i]);
+		$data{$header}{MAP}->[$_]++ foreach ($bstart..$bend);
+	    }
+	} else {
+	    ## fill maps over entire aligned region, gaps/introns notwithstanding
+	    $data{$header}{MAP}->[$_]++ foreach ($astart..$aend);
+	}
+    }
+    
+} elsif ($type eq 'sam') {
+    
+    while (<$IN>) {
+	next if $_ =~ /^\@/;
+	my ($header, $cigar) = (split /\t/, $_)[0,5];
+	my $start = $cigar =~ /^(\d+)S/ ? 1+$1 : 1;
+	my $end = $cigar =~ /(\d+)S$/ ? $data{$header}{LEN}-$1 : $data{$header}{LEN};
+	$data{$header}{MAP}->[$_]++ foreach ($start..$end);
+    }
+    
+}
+close $IN;
+
+print "Writing output...\n";
+open my $OUT, '>', $outfile or die "$0: Cannot write output file '$outfile': $!\n";
+print $OUT $query ? 'Query' : 'Subject';
+print $OUT "\tLength\tN_Aligns\tN_";
+print $OUT $query ? 'Subjects' : 'Queries';
+print $OUT "\tMin_Depth\tMax_Depth\tCov_Bp\tCov_Pct\n";
+my $MFA;
+if ($maskfa) {
+    (my $masked = $fasta) =~ s/.fa$/.alignCoverageMasked.fa/;
+    open $MFA, '>', $masked or die "$0: cannot write output fasta '$masked': $!\n";
+}
+foreach my $header (@headers) {
+    if ($alignedonly && !$data{$header}{ALN}) {
+	if ($maskfa) {
+	    my $seq = join '', @{ $mask{$header} };
+	    my $block = ${ &blockify(\$seq) };
+	    print $MFA "$trueheaders{$header}\n$block\n";
+	}
+	next;
+    }
+    $data{$header}{OTH} = scalar keys %{ $data{$header}{OTH} };  # convert hash to key count
+    $data{$header}{MIN} = 9E9;  # initialize with impossibly high value
+    foreach my $i (1..$data{$header}{LEN}) {
+	if ($data{$header}{MAP}->[$i]) {
+	    $data{$header}{COV}++;
+	    if ($maskfa) {
+		my $letter = $mask{$header}->[$i-1];
+		$mask{$header}->[$i-1] = "\L$letter";
+	    }
+	}
+	$data{$header}{MIN} = $data{$header}{MAP}->[$i] if $data{$header}{MAP}->[$i] < $data{$header}{MIN};
+	$data{$header}{MAX} = $data{$header}{MAP}->[$i] if $data{$header}{MAP}->[$i] > $data{$header}{MAX};
+    }
+    $data{$header}{PCT} = sprintf("%0.4f", 100*$data{$header}{COV}/$data{$header}{LEN});
+    print $OUT join("\t", ($header, map { $data{$header}{$_}||0 } qw/ LEN ALN OTH MIN MAX COV PCT /)),"\n";
+    if ($maskfa) {
+	my $seq = join '', @{ $mask{$header} };
+	my $block = ${ &blockify(\$seq) };
+	print $MFA "$trueheaders{$header}\n$block\n";
+    }
+}
+close $OUT;
+close $MFA if $maskfa;
+exit;
+
+
+

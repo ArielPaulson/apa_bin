@@ -1,0 +1,74 @@
+#!/usr/bin/perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my ($input, $stdio, $byline);
+
+GetOptions("i=s"=>\$input, ""=>\$stdio, "by-line"=>\$byline);
+
+my %special = ("\t" => '\t', "\n" => '\n', "\r" => '\r', ' ' => 'Space');
+my %chars;
+
+if ($byline) {
+    
+    my $maxline;
+    if ($input) {
+        open my $IN, '<', $input or die "$0: Cannot open file '$input': $!\n";
+        while (<$IN>) {
+            $chars{$.}{$_}++ foreach (split //, $_);
+        }
+        $maxline = $.;
+        close $IN;
+    } elsif ($stdio) {
+        while (<>) {
+            $chars{$.}{$_}++ foreach (split //, $_);
+        }
+        $maxline = $.;
+    } else {
+        die "$0: No input!\n";
+    }
+    
+    my $maxlinew = length($maxline);
+    foreach my $line (1..$maxline) {
+        print sprintf("LINE %${maxlinew}i: ",$line);
+        foreach (sort keys %{ $chars{$line} }) {
+            my $label = $special{$_} ? $special{$_} : $_;
+            print "$label($chars{$line}{$_}) ";
+        }
+        print "\n";
+    }
+    
+} else {
+    
+    if ($input) {
+        open my $IN, '<', $input or die "$0: Cannot open file '$input': $!\n";
+        while (<$IN>) {
+            $chars{$_}++ foreach (split //, $_);
+        }
+        close $IN;
+    } elsif ($stdio) {
+        while (<>) {
+            $chars{$_}++ foreach (split //, $_);
+        }
+    } else {
+        die "$0: No input!\n";
+    }
+    
+    my $total;
+    print "CHAR\tASCII\tHEX\tCOUNT\n";
+    foreach (sort keys %chars) {
+        my $label = $special{$_} ? $special{$_} : $_;
+        my $ascii = ord($_);
+        my $hex1 = int($ascii/16);
+        my $hex2 = $ascii % 16;
+        $hex1 = ('A','B','C','D','E','F')[$hex1-10] if $hex1 > 9;
+        $hex2 = ('A','B','C','D','E','F')[$hex2-10] if $hex2 > 9;
+        print "$label\t$ascii\t$hex1$hex2\t$chars{$_}\n";
+        $total += $chars{$_};
+    }
+    print "TOTAL\t\t\t$total\n";
+    
+}
+
+exit;

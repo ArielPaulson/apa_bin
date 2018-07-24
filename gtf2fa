@@ -1,0 +1,89 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my ($reffa, $ingtf, $outfa, @args) = @ARGV;
+
+die "$0: Input GTF file unspecified or nonexistent!\n" unless -e $ingtf;
+my $gzfa = 0;
+if (-e $reffa) {
+    ## then OK
+} elsif (-e "$reffa.gz") {
+    $gzfa = 1;
+    system "gunzip $reffa.gz";
+} else {
+    die "$0: Reference fasta file unspecified or nonexistent!\n" unless -e $reffa;
+}
+
+my ($cds, $keep, $withgene, $verbose);
+foreach (@args) {
+    $cds = 1 if $_ eq '--cds' || $_ eq '--CDS';
+    $keep = 1 if $_ eq '--keep';
+    $withgene = 1 if $_ eq '--with-gene';
+    $verbose = 1 if $_ eq '--verbose';
+}
+
+($outfa = $ingtf) =~ s!\.gtf\d?$!.fa!i unless $outfa;
+my $gzin = $ingtf =~ /\.gz/;
+my $gzout = $outfa =~ s/\.gz//;
+
+my $tmp = "gtf2fa.$$.tmp";
+my $tmpgtf = "$tmp.input.gtf";
+my $tmpgtf2 = "$tmp.input2.gtf";
+
+if ($cds) {
+    if ($gzin) {
+        &execute("zcat $ingtf | grep -v \"^#\" | grep -P \"\\t(CDS\|stop_codon)\\t\" | sed 's/stop_codon/CDS/' > $tmpgtf");
+    } else {
+        &execute("grep -v \"^#\" $ingtf | grep -P \"\\t(CDS\|stop_codon)\\t\" | sed 's/stop_codon/CDS/' > $tmpgtf");
+    }
+} else {
+    if ($gzin) {
+        &execute("zcat $ingtf | grep -v \"^#\" > $tmpgtf");
+    } else {
+        &execute("cat $ingtf | grep -v \"^#\" > $tmpgtf");
+    }
+}
+chomp(my $gtfwc = `cat $tmpgtf | wc -l`);
+
+if ($gtfwc) {
+    if ($withgene) {
+        print "Guaranteeing unique transcript IDs...\n" if $verbose;
+        open IN, '<', $tmpgtf;
+        open OUT, '>', $tmpgtf2;
+        while (<IN>) {
+            my ($gene) = ($_ =~ /gene_id "([^"]+)"/);
+            my ($trans) = ($_ =~ /transcript_id "([^"]+)"/);
+            $_ =~ s/transcript_id "[^"]+"/transcript_id "$gene|$trans"/;
+            print OUT $_;
+        }
+        close OUT;
+        close IN;
+    } else {
+        &execute("ln -sf $tmpgtf $tmpgtf2");
+    }
+    &execute("gtfToGenePred -allErrors $tmpgtf2 $tmp.genePred 2> $outfa.genePred-errors");
+    &execute("tail -1 $outfa.genePred-errors");
+    &execute("/home/apa/local/bin/scriptutils/genePredToBed $tmp.genePred $tmp.bed12");
+    &execute("/home/apa/local/bin/sortBedCoord -i $tmp.bed12 --overwrite");
+    &execute("fastaFromBed -name -split -s -fi $reffa -bed $tmp.bed12 -fo $outfa");
+    &execute("perl -i -pe 's/^(>.*)::.*/\$1/' $outfa");          # remove the extra fastaFromBed header crap
+    &execute("perl -i -pe 's/^(>.*)\\([+-]\\)\$/\$1/' $outfa");  # remove even more fastaFromBed header crap
+    &execute("perl -i -pe 's/(\\w{50})/\$1\\n/g' $outfa");       # line length = 50bp
+    &execute("gzip -f $outfa") if $gzout;
+} else {
+    print STDERR "WARNING: No lines in temp GTF!  No output will be written.\n";
+}
+
+system "gzip $reffa" if $gzfa;
+&execute("rm -f $tmp.*") unless $keep;
+print "gtf2fa $ingtf complete!\n";
+exit;
+
+
+sub execute {
+    my ($cmd, $print) = @_;
+    print "$cmd\n" if $print || $verbose;
+    system $cmd;
+}

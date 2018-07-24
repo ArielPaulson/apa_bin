@@ -1,0 +1,460 @@
+#!/usr/bin/env perl
+#$Id$
+
+# Copyright © 2010, Stowers Institute for Medical Research.  All rights reserved.
+
+# c.f. attached LICENSE
+
+=pod
+
+=head1 SYNOPSIS
+
+runMotifs is a MEME suite pipeline.  Given some inputs and parameters, it will find, characterize, and test enrichments for a given number of motifs.
+
+=head1 OPTIONS
+
+=over
+
+=item S<CORE OPTIONS>
+
+=over
+
+=item B<-o output_dir>
+
+The directory to write results to.  Will die if directory already exists.  Default 'runMotifs_results'.
+
+=back
+
+=item S<INPUT STYLE 1 (fasta files)>
+
+=over
+
+=item B<-ff foreground_fasta>
+
+The fasta file of "foreground" sequences, e.g. peaks, promoters, etc.
+
+=item B<-bf background_fasta>
+
+The fasta file of "background" sequences, e.g. random peaks, scrambled promoters, etc.
+
+=back
+
+=item S<INPUT STYLE 2 (bed files + genome)>
+
+=over
+
+=item B<-fb foreground_bed>
+
+A bed file of "foreground" coordinates, e.g. peaks, promoters, etc.
+
+=item B<-bb background_bed>
+
+A bed file of "background" coordinates, e.g. random peaks, promoters of other genes, etc.
+
+=item B<-gf genome_fasta>
+
+A top-level fasta for the genome in question.  The bed files will be converted to fastas using these sequences.
+
+=item B<-cs chromosome_sizes>
+
+If available, a 2-column file with chromosome name in col 1 and length (bp) in col 2.  Entries in col 1 must match fasta headers.  Sizes will be calculated automatically if not supplied, but can add a few minutes to runtime.
+
+=item B<-nr N_random_coords>
+
+In lieu of a background bed, give a number of random background sets to generate.  For each coordinate in the foreground bed, N random coordinates will be generated for a background.  These will have the same size distribution and chromosomal frequencies as the foreground coords, and if possible will not overlap each other.  This option gets triggered if foreground bed is specified but background bed is not.  Default N = 10.
+
+=item B<-nb N-blocks_bed>
+
+If you are using -nr, and the genome fasta contains unsequenced regions (blocks on Ns), and these are noted in a bed file, specify that file here.  This way random background coords will avoid unsequenced regions.
+
+=item B<--create-N>
+
+If you want to use -nb but have no N-blocks bed file, this switch will create one for you, and use it automatically.  Be forewarned, this could take 0.5-2 hrs depending on the genome.  Off by default.
+
+=back
+
+=item S<MEME Options>
+
+=over
+
+=item B<-meme meme_dir>
+
+If a MEME run for these regions already exists, point to it here.  Otherwise will execute a new MEME run.
+
+=item B<-nm N_motifs>
+
+How many motifs to search for; default 10.
+
+=item B<-np N_processors>
+
+How many processors to use when running MEME; default 1.
+
+=item B<-nw min_motif_width>
+
+Minimum motif width to allow; default 6.
+
+=item B<-xw max_motif_width>
+
+Maximum motif width to allow, default 20.
+
+=item B<--no-rc>
+
+MEME motifs must be on forward strand only (sequence as-is); do not include sequence revcomps in the motif search.  Off by default (so revcomp searching is the default).
+
+=item B<-mod mod_mode>
+
+The same argument for MEME.  Controls number of times each sequence can contribute to a motif definition.  Can be 'oops', 'zoops', or 'anr':
+
+=over
+
+=item B<-mod oops>
+
+"Only One Per Sequence": each sequence must contribute one and only one word to each motif.
+
+=item B<-mod zoops>
+
+"Zero or One Per Sequence": each sequence may contribute one word to a motif, or none.
+
+=item B<-mod anr (Default)>
+
+"Any Number of Regions": each sequence can contribute any number of words to a motif, or none.
+
+=back
+
+=back
+
+=item S<Tomtom Options>
+
+=over
+
+=item B<-tom tomtom_dir>
+
+If a Tomtom run (for an existing MEME run) already exists, point to it here.  Othwerwise will execute a new Tomtom run.
+
+=item B<-md motif_database>
+
+If using -tom, make sure to specify the .meme file used for the motif definitions.  Otherwise, the default DB will be used.
+
+=item B<-to tomtom_min_overlap>
+
+If not using -tom, specify the minimum number of overlapping positions for a motif alignment (between MEME and database).  Default 4.
+
+=item B<-tq tomtom_q_value_threshold>
+
+If not using -tom, specify a q-value cutoff for Tomtom motif matches.  Default 0.1.
+
+=back
+
+=item S<FIMO Options>
+
+=over
+
+=item B<-fp p_value_threshold>
+
+Specify the maximum p-value allowed for FIMO motif matches.  Default 0.01.
+
+=item B<-fp2 p_value_threshold_2>
+
+Causes the fimoPlus script to calculate motif enrichments over the motif match p-value range [p_value, p_value_2]; increments are in powers of 10.  Thus, using -fp 0.01 and -fp2 0.00001 will evaluate enrichments 4 times, using p = { 0.01 0.001 0.0001 0.00001 }, and only motif instances at or below that p-value will be considered. 
+
+=item B<--do-fimo-q>
+
+Allow FIMO to calculate q-values for motif matches.  RUNTIME WARNING: EVEN FOR MEDIUM-SIZED DATASETS, THIS CAN TAKE HOURS.  Off by default; p-value thresholding is usually sufficient.
+
+=item B<-fq q_value_threshold>
+
+If using --do-fimo-q, then specify the maximum q-value allowed for FIMO motif matches.  Default 1.
+
+=back
+
+=item S<OTHERS>
+
+=over
+
+=item B<--help>
+
+Display command line usage with options.
+
+=item B<--man>
+
+Display complete manual page and exit.
+
+=head1 RUNNING
+
+=head1 OUTPUTS
+
+=over
+
+=item B<>
+
+=back
+
+=head1 EXAMPLES
+
+=over
+
+=item C<>
+
+=back
+
+=head1 VERSION
+
+$Revision:  1.0$
+
+=head1 AUTHOR
+
+Ariel Paulson (apa@stowers-institute.org)
+
+=head1 DEPENDENCIES
+
+perl
+
+=head1 AVAILABILITY
+
+Download at will.
+
+=cut
+
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+no strict 'refs';
+use Cwd;
+
+my ($fgfa, $bgfa, $genfa, $fgbed, $bgbed, $chrsizes, $Nblocks, $createNB, $norevcomp);
+my ($memerun, $tomrun, $help, $man);
+
+my $meme = 'meme';  # executables
+my $fimo = 'fimo';
+my $tomtom = 'tomtom';
+my $fimoplus = '/home/apa/local/bin/fimoPlus-1.0';
+
+#my $motifdb = '/n/site/inst/Linux-x86_64/bioinfo/MEME/meme_4.8.1/dbs/motif_databases/';  # bundled MEME DBs location, FYI
+my $motifdb = '/home/apa/meme/support_files/transfac-2012.2.meme';  # default DB location
+
+my $Nrand = 10;		# number of random background sets to generate (unless background already specified)
+my $outdir = 'runMotifs_results';
+
+my $Nproc = 1;		# cores for parallel MEME
+my $Nmotifs = 10;	# MEME motifs to report
+my $minw = 6;		# MEME min motif width
+my $maxw = 20;		# MEME max motif width
+my $mod = 'anr';	# MEME -mod value: can be 'zoops', 'oops', 'anr'
+my $maxsize = 1E7;	# MEME max memory size
+my $alphabet = 'dna';	# MEME alphabet type
+
+my $maxscores = 1E9;	# max number of FIMO hits to remember
+my $fimop = 0.01;	# FIMO p-value threshold
+my $fimop2;             # if specified, allows evaluation of enrichement over the motif match p-value range $fimop-$fimop2.  Range increments in powers of 10, e.g. 0.01-0.00001 evaluates at { 0.01 0.001 0.0001 0.00001 }
+my $fimoq = 1;		# FIMO q-value threshold (IF calculating q-values; won't do it automatically; see below)
+my $dofimoq;		# generate FIMO q-values?  (*** MAY DRASTICALLY INCREASE RUNTIME ***)
+
+my $tomover = 4;	# Tomtom min overlap to require for motif alignments
+my $tomq = 0.1;	        # Tomtom max q-value threshold to report
+
+GetOptions(
+    "ff=s" => \$fgfa, 
+    "bf=s" => \$bgfa, 
+    "gf=s" => \$genfa, 
+    "fb=s" => \$fgbed, 
+    "bb=s" => \$bgbed, 
+    "nr=i" => \$Nrand, 
+    "cs=s" => \$chrsizes, 
+    "nb=s" => \$Nblocks, 
+    "o=s" => \$outdir, 
+    "fp=f" => \$fimop,
+    "fp2=f" => \$fimop2,
+    "fq=f" => \$fimoq,
+    "np=i" => \$Nproc,
+    "nm=i" => \$Nmotifs,
+    "nw=i" => \$minw,
+    "xw=i" => \$maxw,
+    "mod=s" => \$mod,
+    "meme=s" => \$memerun,
+    "tom=s" => \$tomrun,
+    "md=s" => \$motifdb,
+    "to=s" => \$tomover,
+    "tq=s" => \$tomq,
+    "create-N" => \$createNB, 
+    "no-rc" => \$norevcomp,
+    "dofimoq" => \$dofimoq,
+
+    "help" => \$help,
+    "man" => \$man
+    ) or pod2usage(1);
+
+pod2usage(1) if $help;
+pod2usage(-exitstatus => 0, -verbose => 2) if $man;
+
+my %OKhost = map {($_=>1)} qw/ genekc03 genekc04 maple /;
+my $OKhoststr = join ', ', sort keys %OKhost;
+my $host = (split /\./, `hostname`)[0];
+die "Not running on an approved server!\n Try one of: $OKhoststr instead\n" unless $OKhost{$host};
+
+die "Output directory '$outdir' already exists!\n" if -d $outdir;
+&file_validate('F', $fgfa, $fgbed);
+&file_validate('B', $bgfa, $bgbed) if ($bgfa || $bgbed);
+die "Background must be specified (cannot be automatically generated) if foreground is a fasta!\n" if ($fgfa && !($bgfa || $bgbed)); 
+die "Genome fasta must be supplied if inputs are bed files!\n" if (($fgbed || $bgbed) && !$genfa);
+die "If foreground is a bed file, then background bed must be supplied, or N random background sets must be > 0!\n" if ($fgbed && !$bgbed && $Nrand < 1);
+
+chomp(my $begin = `date`);
+my $wdir = "runMotifs.$$.tmp";
+&execute("mkdir -p $wdir");
+
+my $logfile = "$wdir/log";
+open LOG, "> $logfile";
+print LOG "Run Parameters:\n";
+print LOG "-ff\tfgfa\n" if $fgfa;
+print LOG "-bf\t$bgfa\n" if $bgfa;
+print LOG "-gf\t$genfa\n" if $genfa;
+print LOG "-fb\t$fgbed\n" if $fgbed;
+print LOG "-gb\t$bgbed\n" if $bgbed;
+print LOG "-nr\t$Nrand\n" if $Nrand;
+print LOG "-cs\t$chrsizes\n" if $chrsizes;
+print LOG "-nb\t$Nblocks\n" if $Nblocks;
+print LOG "-o\t$outdir\n";
+print LOG "-fp\t$fimop\n";
+print LOG "-fp2\t$fimop2\n";
+print LOG "-fq\t$fimoq\n";
+print LOG "-np\t$Nproc\n" unless $memerun;
+print LOG "-nm\t$Nmotifs\n" unless $memerun;
+print LOG "-nw\t$minw\n" unless $memerun;
+print LOG "-xw\t$maxw\n" unless $memerun;
+print LOG "-mod\t$mod\n" unless $memerun;
+print LOG "-meme\t$memerun\n" if $memerun;
+print LOG "-tom\t$tomrun\n" if $tomrun;
+print LOG "-md\t$motifdb\n";
+print LOG "-to\t$tomover\n" unless $tomrun;
+print LOG "-tq\t$tomq\n" unless $tomrun;
+print LOG "--create-N\tYES\n" if $createNB;
+print LOG "--dofimoq\tYES\n" if $dofimoq;
+print LOG "--no-rc\tYES\n" if $norevcomp;
+print LOG "\n\nRun Messages:\n";
+close LOG;
+
+my $memedir = $memerun ? $memerun : "$wdir/meme_out";
+my $tomdir = $tomrun ? $tomrun : "$wdir/tomtom_out";
+my $fimoplusdir = "$wdir/fimoplus_out";
+
+## Chrom sizes file and N-blocks bed creation, if necessary
+unless (-e $chrsizes) {
+    &execute("/home/apa/local/bin/fastaLengths -f $genfa > $wdir/chr.sizes");
+    $chrsizes = "$wdir/chr.sizes";
+}
+if ($createNB && ! -e $Nblocks) {
+    &execute("/home/apa/local/bin/chrom_N_blocks $genfa $wdir/N.blocks");
+    $Nblocks = "$wdir/N.blocks";
+}
+
+## Foreground setup
+if (-e $fgbed) {
+    $fgfa = "$wdir/fg.fa";
+    &fixbed($fgbed, 'fg');	 # create ID-corrected copy of BED file
+    $fgbed = "$wdir/fg.bed";	 # created by &fixbed
+    &execute("/home/apa/local/bin/fastaGenomeSlicer -r $genfa -i $fgbed");
+    &execute("mv $fgbed.fa $fgfa");
+}
+
+## Background setup
+unless ($bgfa) {  # then either $bgbed is given, or it will be created and coverted to fasta
+    $bgfa = "$wdir/bg.fa";
+    my $bgtmp = "$wdir/bg.bed.tmp";
+    unless ($bgbed) {
+	if (-e $Nblocks) {
+	    &execute("/home/apa/local/bin/getRandomCoords -b $fgbed -n $Nblocks -c $chrsizes -s $Nrand --avoid > $bgtmp");
+	} else {
+	    &execute("/home/apa/local/bin/getRandomCoords -b $fgbed -c $chrsizes -s $Nrand --avoid > $bgtmp");
+	}
+    }
+    &fixbed($bgtmp, 'bg');
+    system "rm -f $bgtmp";
+    $bgbed = "$wdir/bg.bed";	 # created by &fixbed
+    &execute("/home/apa/local/bin/fastaGenomeSlicer -r $genfa -i $bgbed");
+    &execute("mv $bgbed.fa $bgfa");
+}
+
+# not running repeatmasker yet...
+
+## MEME Suite
+
+## Translate some variables into MEME/FIMO arguments
+my ($fast, $text) = $dofimoq ? ('', '') : ('--fast', '--text');
+my $rc = $norevcomp ? '' : '-revcomp';
+my $alpha = "-$alphabet";
+
+## Run MEME, Tomtom, fimoplus as necessary
+&execute("$meme $fgfa -o $memedir $alpha $rc -p $Nproc -nmotifs $Nmotifs -minw $minw -maxw $maxw -mod $mod -maxsize $maxsize") unless $memerun;
+&execute("$tomtom -o $tomdir -min-overlap $tomover -thresh $tomq $memedir/meme.html $motifdb") unless $tomrun;
+&execute("$fimoplus -o $fimoplusdir $fast -f $fgfa -b $bgfa -p $fimop -p2 $fimop2 -q $fimoq -m $memedir/meme.html -t $tomdir/tomtom.txt -td $motifdb");
+
+## Individual FIMO calls, FYI
+#my ($fgfimodir, $bgfimodir) = qw/ fimo_fg_out fimo_bg_out /;
+#&execute("$fimo -o $fgfimodir --max-stored-scores $maxscores $text -p $fimop -p2 $fimop2 -q $fimoq $memedir/meme.html $fgfa") unless -d $fgfimodir;
+#&execute("$fimo -o $bgfimodir --max-stored-scores $maxscores $text -p $fimop -p2 $fimop2 -q $fimoq $memedir/meme.html $bgfa") unless -d $bgfimodir;
+
+## Finalizing
+&execute("mv $wdir $outdir");
+chomp(my $end = `date`);
+&execute("Begin: $begin\nEnd:   $end\nrunMotifs Complete!\n", 1);
+exit;
+
+
+
+
+
+
+sub execute {
+    my ($cmd, $norun) = @_;
+    print "$cmd\n";
+    open LOG, ">> $logfile";
+    print LOG "$cmd\n";
+    close LOG;
+    system $cmd unless $norun;
+}
+
+sub fixbed {
+    my ($bed, $fb) = @_;
+    if (open IN, $bed) {
+	open OUT, "> $wdir/$fb.bed";
+	while (<IN>) {
+	    my @data = split /\t/, $_;
+	    $data[3] =~ s/[:-]/_/g;    # ensure IDs have no : or -, or else IDs will be truncated in FIMO output
+	    print OUT join("\t",@data);
+	}
+	close OUT;
+	close IN;
+    } else {
+	die "Failed to open bed file '$bed'!\n";
+    }
+}
+
+sub file_validate {
+    my ($type, $fa, $bed) = @_;
+    my $ok = 1;
+    my $Lname = $type eq 'F' ? 'foreground' : 'background';
+    my $Uname = $type eq 'F' ? 'Foreground' : 'Background';
+    if (-e $fa && -e $bed) {
+	$ok = 0;
+	die "Cannot specify both fasta and bed files for $Lname!\n";
+    } elsif (-e $fa) {
+	open IN, $fa or die "Cannot read input file '$fa': $!\n";
+	while (<IN>) {
+	    next if $_ =~ /^#/;
+	    die "$Uname fasta '$fa' does not appear to be in fasta format!\n" unless $_ =~ /^>/;  # tests first non-comment line
+	    last;
+	}
+	close IN;
+    } elsif (-e $bed) {
+	open IN, $bed or die "Cannot read input file '$bed': $!\n";
+	while (<IN>) {
+	    next if $_ =~ /^#/;
+	    die "$Uname bed '$bed' does not appear to be in bed format!\n" unless scalar(split /\t/, $_) >= 3;  # tests first non-comment line
+	    die "$Uname bed '$bed' is missing column 4!\n" if scalar(split /\t/, $_) == 3;  # tests first non-comment line
+	    last;
+	}
+	close IN;
+    } else {
+	die "Must specify either a fasta or bed file for $Lname!\n";
+    }
+}

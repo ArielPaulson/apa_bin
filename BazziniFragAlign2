@@ -1,0 +1,159 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my ($sample, $cores, $mem, $aligner) = @ARGV;
+my $outdir = "/n/core/Bioinformatics/analysis/Bazzini/arb/cbio.arb.101/data/output/$sample";
+$aligner = 'bowtie2' unless $aligner;
+$cores = 1 unless $cores;
+$mem = '1G' unless $mem;
+
+my $bin = '/home/apa/local/bin';
+my $refdir = '/n/core/Bioinformatics/analysis/Bazzini/arb/cbio.arb.101/code/refs';
+my @orgs = qw/ Drosophila Danio Pombe Schmidtea MiniGene /;
+
+foreach my $org ('MiniGene') {
+    
+    my $prefix = "$outdir/$org/$sample.$org.read_fractions.reconstructed-fragments";
+    my $nolfq1 = "$prefix.no-overlap_1.fastq.gz";
+    my $nolfq2 = "$prefix.no-overlap_2.fastq.gz";
+    my $emufq1 = "$prefix.101bp-emu_1.fastq.gz";
+    my $emufq2 = "$prefix.101bp-emu_2.fastq.gz";
+    my $fragfa = "$prefix.fa.gz";
+    
+    ## Read set size and STAR-#-cores determination
+    ## De-parallelize STAR for small read sets, otherwise can hang.   ### NOT: still hangs, even if only 1 core ###
+    my $nolsz  = (split /\n/, `ls -lS $nolfq1 $nolfq2 | awk '{ print \$5 }'`)[0];   # larger of the two
+    my $emusz  = (split /\n/, `ls -lS $emufq1 $emufq2 | awk '{ print \$5 }'`)[0];   # larger of the two
+    my $frasz = (split /\n/, `ls -l $fragfa | awk '{ print \$5 }'`)[0];
+    my $nolcores = $nolsz <= 1E4 ? 1 : $cores;
+    my $emucores = $emusz <= 1E4 ? 1 : $cores;
+    my $fracores = $frasz <= 1E4 ? 1 : $cores;
+    
+    ## Full references
+    my $noldir = "$prefix.no-overlap.full/$aligner";
+    my $emudir = "$prefix.101bp-emu.full/$aligner";
+    my $fradir = "$prefix.full-frag.full/$aligner";
+    system "rm -rf $_ && mkdir -p $_" foreach ($noldir, $emudir, $fradir);
+    
+    my ($nolcmd, $emucmd, $fracmd);
+    my $STARflags = "--genomeDir $refdir/${org}_full/STAR --readFilesCommand zcat --outSAMtype BAM Unsorted";  # --outReadsUnmapped Fastx";
+    my $bt2flags = "--no-mixed --no-discordant -I 200 -X 600 -x $refdir/${org}_full/${org}_full";   # --no-overlap
+    if ($aligner eq 'STAR') {
+        $nolcmd = "STAR $STARflags --outFileNamePrefix $noldir/ --runThreadN $nolcores --readFilesIn $nolfq1 $nolfq2";
+        $emucmd = "STAR $STARflags --outFileNamePrefix $emudir/ --runThreadN $emucores --readFilesIn $emufq1 $emufq2";
+        $fracmd = "STAR $STARflags --outFileNamePrefix $fradir/ --runThreadN $fracores --readFilesIn $fragfa";
+    } elsif ($aligner eq 'bowtie2') {
+        $nolcmd = "bowtie2 $bt2flags -p $cores -1 $nolfq1 -2 $nolfq2 -S $noldir/bowtie2.sam 2> $noldir/bowtie2.align_summary.txt";
+        $emucmd = "bowtie2 $bt2flags -p $cores -1 $emufq1 -2 $emufq2 -S $emudir/bowtie2.sam 2> $emudir/bowtie2.align_summary.txt";
+        $bt2flags .= " -f --un-gz $fradir/unaligned_1.fastq.gz";  # for frags only!
+        $fracmd = "bowtie2 $bt2flags -p $cores -U $fragfa -S $fradir/bowtie2.sam 2> $fradir/bowtie2.align_summary.txt";
+    }
+    if (-e $nolfq1) {
+        print "$nolcmd\n"; system $nolcmd;
+    }
+    if (-e $emufq1) {
+        print "$emucmd\n"; system $emucmd;
+    }
+    if (-e $fragfa) {
+        print "$fracmd\n"; system $fracmd;
+    }
+    sleep 1;  # killability
+    
+    foreach my $dir ($noldir, $emudir, $fradir) {
+        next if $dir eq $noldir && ! -e $nolfq1;
+        next if $dir eq $emudir && ! -e $emufq1;
+        next if $dir eq $fradir && ! -e $fragfa;
+        if ($aligner eq 'STAR') {
+            my $cmd1 = "samtools sort -n -@ $cores -m $mem -o $dir/Aligned.out.name-sorted.bam $dir/Aligned.out.bam";
+            print "$cmd1\n"; system $cmd1;
+            my $cmd2 = "gzip $dir/Unmapped.*";
+            #print "$cmd2\n"; system $cmd2;  ### IGNORE THIS STEP
+        } elsif ($aligner eq 'bowtie2') {
+            my $cmd1 = "samtools view -h -bS -F 4 $dir/bowtie2.sam > $dir/bowtie2.unsorted.bam";
+            print "$cmd1\n"; system $cmd1;
+            my $cmd2 = "samtools sort -n -@ $cores -m $mem -o $dir/bowtie2.name-sorted.bam $dir/bowtie2.unsorted.bam";
+            print "$cmd2\n"; system $cmd2;
+            my $cmd3 = "rm -f $dir/bowtie2.sam";
+            print "$cmd3\n"; system $cmd3;
+            unless ($dir eq $fradir) {  # frags already have the unaligned fraction written
+                next;  ### IGNORE THIS STEP
+                my $cmd4;
+                if ($dir eq $noldir) {
+                    $cmd4 = "$bin/fastqUnaligned -fq1 $nolfq1 -fq2 $nolfq2 -p $dir/unaligned $dir/bowtie2.unsorted.bam";
+                } else {
+                    $cmd4 = "$bin/fastqUnaligned -fq1 $emufq1 -fq2 $emufq2 -p $dir/unaligned $dir/bowtie2.unsorted.bam";
+                }
+                print "$cmd4\n"; system $cmd4;
+            }
+        }
+    }
+    sleep 1;  # killability
+    
+    unless ($org eq 'MiniGene') {   # MiniGene is only 'full', there is no 'longest' version
+        
+        ## Longest-only references
+        my $noldir = "$prefix.no-overlap.longest/$aligner";
+        my $emudir = "$prefix.101bp-emu.longest/$aligner";
+        my $fradir = "$prefix.full-frag.longest/$aligner";
+        system "rm -rf $_ && mkdir -p $_" foreach ($noldir, $emudir, $fradir);
+        
+        my ($nolcmd, $emucmd, $fracmd);
+        my $STARflags = "--genomeDir $refdir/${org}_longest/STAR --readFilesCommand zcat --outSAMtype BAM Unsorted";  # --outReadsUnmapped Fastx";
+        my $bt2flags = "--no-mixed --no-discordant -I 200 -X 600 -x $refdir/${org}_longest/${org}_longest";   # --no-overlap
+        if ($aligner eq 'STAR') {
+            $nolcmd = "STAR $STARflags --outFileNamePrefix $noldir/ --runThreadN $nolcores --readFilesIn $nolfq1 $nolfq2";
+            $emucmd = "STAR $STARflags --outFileNamePrefix $emudir/ --runThreadN $emucores --readFilesIn $emufq1 $emufq2";
+            $fracmd = "STAR $STARflags --outFileNamePrefix $fradir/ --runThreadN $fracores --readFilesIn $fragfa";
+        } elsif ($aligner eq 'bowtie2') {
+            $nolcmd = "bowtie2 $bt2flags -p $cores -1 $nolfq1 -2 $nolfq2 -S $noldir/bowtie2.sam 2> $noldir/bowtie2.align_summary.txt";
+            $emucmd = "bowtie2 $bt2flags -p $cores -1 $emufq1 -2 $emufq2 -S $emudir/bowtie2.sam 2> $emudir/bowtie2.align_summary.txt";
+            $bt2flags .= " -f --un-gz $fradir/unaligned_1.fastq.gz";  # for frags only!
+            $fracmd = "bowtie2 $bt2flags -p $cores -U $fragfa -S $fradir/bowtie2.sam 2> $fradir/bowtie2.align_summary.txt";
+        }
+        if (-e $nolfq1) {
+            print "$nolcmd\n"; system $nolcmd;
+        }
+        if (-e $emufq1) {
+            print "$emucmd\n"; system $emucmd;
+        }
+        if (-e $fragfa) {
+            print "$fracmd\n"; system $fracmd;
+        }
+        sleep 1;  # killability
+        
+        foreach my $dir ($noldir, $emudir, $fradir) {
+            next if $dir eq $noldir && ! -e $nolfq1;
+            next if $dir eq $emudir && ! -e $emufq1;
+            next if $dir eq $fradir && ! -e $fragfa;
+            if ($aligner eq 'STAR') {
+                my $cmd1 = "samtools sort -n -@ $cores -m $mem -o $dir/Aligned.out.name-sorted.bam $dir/Aligned.out.bam";
+                print "$cmd1\n"; system $cmd1;
+                my $cmd2 = "gzip $dir/Unmapped.*";
+                #print "$cmd2\n"; system $cmd2;  ### IGNORE THIS STEP
+            } elsif ($aligner eq 'bowtie2') {
+                my $cmd1 = "samtools view -h -bS -F 4 $dir/bowtie2.sam > $dir/bowtie2.unsorted.bam";
+                print "$cmd1\n"; system $cmd1;
+                my $cmd2 = "samtools sort -n -@ $cores -m $mem -o $dir/bowtie2.name-sorted.bam $dir/bowtie2.unsorted.bam";
+                print "$cmd2\n"; system $cmd2;
+                my $cmd3 = "rm -f $dir/bowtie2.sam";
+                print "$cmd3\n"; system $cmd3;
+                unless ($dir eq $fradir) {  # frags already have the unaligned fraction written
+                    next;  ### IGNORE THIS STEP
+                    my $cmd4;
+                    if ($dir eq $noldir) {
+                        $cmd4 = "$bin/fastqUnaligned -fq1 $nolfq1 -fq2 $nolfq2 -p $dir/unaligned $dir/bowtie2.unsorted.bam";
+                    } else {
+                        $cmd4 = "$bin/fastqUnaligned -fq1 $emufq1 -fq2 $emufq2 -p $dir/unaligned $dir/bowtie2.unsorted.bam";
+                    }
+                    print "$cmd4\n"; system $cmd4;
+                }
+            }
+        }
+        sleep 1;  # killability
+        
+    }
+}
+

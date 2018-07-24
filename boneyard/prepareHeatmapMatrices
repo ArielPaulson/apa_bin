@@ -1,0 +1,303 @@
+#!/usr/bin/env Rscript
+
+
+## THIS SCRIPT EXPECTS THAT YOU HAVE PROCESSED SAMPLES WITH THE PIPELINE: /home/apa/local/bin/chipseq-tertiary.
+## Thus, in the dataroot/ location (specified below), each sample name will be its own subdirectory.
+## Within each of these subdirs, there will be a "bams" directory containing "pooled.bam".
+## 'dataroot' and IP-input sample name pairs will be given below, and the corresponding pooled.bams used.
+## It is OK to give IPs without inputs -- some protocols like ATAC, Nexus have no inputs -- the RData objects will lack the LFC matrices, that's all.
+##
+## See args below for inputs.
+## Outputs: a directory tree containing heatmap matrix RData objects, also a small RData file with a list object, showing the final tree and its contents.
+## Within the tree root, each bed file gets its own directory.
+##  Within bed directories, each value of K gets a subdir.
+##   Within these subdirs, each BAM file gets its own RData object.
+##    So, final paths like output_root/bed_file/k_value/sample_name.coverage_matrix_data.RData
+##
+## Finally, each RData file contains one object 'coverage.matrix.data', with this structure:
+##  coverage.matrix.data <- list(
+##    matrix=list(            # list of matrices of IP signal and transformations thereof.  Float values have been rounded to 3 places.
+##      raw=matrix(...),      # Raw CoverageView::cov.matrix() output (transposed), such that rows = peaks, cols = coverageView bins.
+##      logrpm=matrix(...),   # log2-adjusted-RPM, that is, log2(1E6*(raw+1)/M), where 'M' is the value of 'aligns' below.
+##      pctmax=matrix(...),   # raw/max(raw).  To curb outliers, max(raw) is actually quantile(raw,0.99), and final matrix values > 1 have been thresholded down to 1.
+##      zscore=matrix(...)    # the logrpm matrix, as row z-scores, i.e. t(scale(t(logrpm))).
+##    ),                      
+##    LFC.matrix=list(        # An empty list, OR, if N inputs supplied, then a list of N matrices, one for each input (usually, 0 or 1 inputs given).
+##      input.i=matrix(...),  # this "logrpm" - input i "logrpm"
+##      ...,                  # ...
+##      input.N=matrix(...)   # this "logrpm" - input N "logrpm"
+##    ),
+##    aligns=aligns,          # N alignments in IP bam (samtools view IP.bam | wc -l)
+##    bam=bams,               # /path/to/IP.bam
+##    bed=bed,                # BED file supplied for CoverageView::cov.matrix()
+##    inputs=inputs,          # vector of /path/to/input.bam(s), one for each matrix in "LFC.matrix".  Or, empty.
+##    RData=outfiles          # /path/to/this.RData, just for reference.
+##  )
+
+
+## SETUP
+
+source("/home/apa/apa_tools.R")
+
+ca <- commandArgs(trailing=TRUE)
+bedlist <- ca[1]    # headered 2-col file with col 1 = name, col 2 = path/to/bedfile
+ip.inp <- ca[2]     # headered 2-col file: col 1 = IP sample name; col 2 = input sample name (if any), colnames = "IP", "Input".
+dataroot <- ca[3]   # all data should be systematically arranged within this location (expecting chipseq_tertiary pipeline output structure)
+                    ## multiple dataroots (as comma-sep string) can be given, and will be searched.  *** HOWEVER: sample names must be unique across all these locations!! ***
+outpath <- ca[4]    # directory where cov.mats will be written
+genome <- ca[5]     # genome label, e.g. "mm10": what genome are these peaks from, so we know if flanked peaks run off the end of the chromosome.
+kval <- ca[6]       # peak +- flank value (from midpoint), e.g. 5000 to make heatmaps from peak-mids+-5000.  Can be CSV, e.g. 1000,2000,5000 for multiple k.
+cores <- ca[7]      # N cores for CoverageView matrix generation
+clobber <- as.logical(ca[8])
+
+## bedlist="b4.beds"; ip.inp="b4.ipi.txt"; dataroot="~/cbio.bdk.113/data/output,~/cbio.bdk.107/data"; outpath="~/cbio.bdk.113/data/cov.mats"; genome="mm10"; kval="5000"; cores=40
+
+message("Validating arguments...")
+dataroot <- unlist(strsplit(dataroot,","))
+D <- length(dataroot)
+for (i in 1:D) {
+    if (!dir.exists(dataroot[i])) stop("Data root location '",dataroot[i],"' does not exist!\n")
+    if (!grepl("/$",dataroot[i])) dataroot[i] <- paste0(dataroot[i],"/")
+}
+
+if (!grepl("/$",outpath)) outpath <- paste0(outpath,"/")
+beds.RData <- paste0(outpath,"cov.mat.beds.RData")
+paths.RData <- paste0(outpath,"cov.mat.paths.RData")
+tempstring <- paste0(random.string(10),".tmp.")
+beds.RData.tmp <- sub("RData",paste0(tempstring,"RData"),beds.RData)
+paths.RData.tmp <- sub("RData",paste0(tempstring,"RData"),paths.RData)
+
+kval <- as.numeric(unlist(strsplit(kval,",")))
+K <- length(kval)
+if (any(is.na(kval))) stop("Some 'kval' values were not numeric!\n")
+
+cores <- as.numeric(cores)
+if (is.na(cores)) stop("Cores value '",cores,"' was not numeric!\n")
+
+
+
+## Process IP-input pairings
+
+message("Checking IP/input pairings...")
+ip.inp <- read.delim(ip.inp, as.is=TRUE)
+inp.given <- ip.inp[,2]!=""
+inp.given[is.na(inp.given)] <- FALSE
+any.inp <- any(inp.given)
+
+dup <- duplicated(ip.inp)
+if (any(dup)) {
+    message(paste(sum(dup),"duplicated IP-input pairings removed!\n"))
+    ip.inp <- ip.inp[!dup,]
+}
+if (any.inp) ip.inp[ip.inp[,2]=="",2] <- NA
+
+
+
+## READ FINAL PEAKLISTS FOR HEATMAPS
+## GENERATE HEATMAP VERSION(S) FOR EACH BED
+
+message("Reading bed files...")
+beds1 <- read.delim(bedlist, as.is=TRUE)
+if (any(duplicated(beds1[,1]))) stop("Bed file names (column 1 of bed list) are not unique!  Halting.\n")
+beds1 <- cbind(beds1, FULL=NA)
+for (i in 1:nrow(beds1)) beds1$FULL[i] <- system(paste0("bash -c 'readlink -f ",beds1[i,2],"'"),intern=TRUE)
+
+beds <- named.vector(beds1[,2], beds1[,1])
+beds <- lapply(lapply(beds, read.bed), '[', , 1:6)  # read only first 6 cols // should die if any missing files
+sapply(beds, nrow)
+cov.mat.beds <- beds
+cov.mat.paths <- beds
+
+## Named index vectors for apply-type calls
+bedi <- 1:length(beds); names(bedi) <- names(beds)
+ki <- 1:K; names(ki) <- paste0("k",kval/1E3)   # "5000" named "k5", e.g.
+
+
+## GET IP AND INPUT BAM PATHS
+## MATCH IPS WITH INPUTS
+
+message("Checking bam files...")
+source.sample <- function(sample) {
+    paths <- c()
+    for (i in 1:D) if (file.exists(paste0(dataroot[i],sample,"/bams/pooled.bam"))) paths <- c(paths,dataroot[i])
+    if (length(paths)==0) {
+        stop(paste0("Sample '",sample,"' was NOT found in the following locations: ",paste(dataroot,collapse="', '"),".  Halting.\n"))
+    } else if (length(paths)>1) {
+        stop(paste0("Sample '",sample,"' was found in multiple locations: '",paste(paths,collapse="', '"),"'.  Halting.\n"))
+    } else {
+        paths
+    }
+}
+
+get.aligns <- function(x) {
+    ## 'x' is a /path/to/bam
+    idx <- sub("bam$","idxstats.txt",x)
+    if (!file.exists(idx)) {
+        message(paste0("expected idxstats file '",idx,"' not found, creating...\n"))
+        if (!file.exists(paste0(x,'.bai'))) system(paste("samtools index",x))
+        system(paste("samtools idxstats",x,">",idx))
+    }
+    N <- as.numeric(system(paste0("bash -c 'paste -s -d+ <(cut -f3 ",idx,") | bc'"),intern=TRUE))
+    ifelse (length(N)==0, NA, N)
+}
+
+## IP bams
+bams <- sapply(unique(ip.inp$IP), function(x) paste0(source.sample(x),x,"/bams/pooled.bam") )
+names(bams) <- unique(ip.inp$IP)
+
+## Input bams
+if (any.inp) {
+    bams.inp <- unique(ip.inp$Input[!is.na(ip.inp$Input)])
+    bams.inp <- named.vector(sapply(bams.inp, function(x) paste0(source.sample(x),x,"/bams/pooled.bam") ), bams.inp)
+} else {
+    bams.inp <- c()
+}
+
+## Name vectors
+samples <- names(bams)
+if (any.inp) inputs <- names(bams.inp)
+
+## Named index vectors for apply-type calls
+bami <- 1:length(bams); names(bami) <- names(bams)
+if (any.inp) {
+    inpbami <- 1:length(bams.inp)
+    names(inpbami) <- names(bams.inp)
+}
+
+## Were BAM filenames successfully reconstructed
+ok <- file.exists(bams)
+if (any.inp) ok.inp <- file.exists(bams.inp)
+
+## Aligned read counts per BAM (for RPM conversion)
+aligns <- named.vector(sapply(bams, get.aligns), names(bams))
+if (any.inp) aligns.inp <- named.vector(sapply(bams.inp, get.aligns), names(bams.inp))
+
+## CHECK: are all BAM files found, have known N alignments
+message("IP BAM status:")
+print(data.frame(ok,aligns,bams))
+message("Input BAM status:")
+if (any.inp) print(data.frame(ok.inp,aligns.inp,bams.inp))
+
+if (any(is.na(aligns))) stop("Some IP bams could not be counted!  Cannot proceed.\n")
+if (any.inp) if (any(is.na(aligns.inp))) stop("Some input bams could not be counted!  Cannot proceed.\n")
+
+
+## Just before takeoff (after everything else has been vetted):
+## Make heatmap versions of bed files (convert peaks to windows of fixed length; remove any that run off ends of chroms)
+message("Everything checks out, now making expanded bed files...")
+bed.paths <- new.list(names(bedi))
+for (i in 1:length(bedi)) {
+    cov.mat.beds[[i]] <- cov.mat.paths[[i]] <- new.list(names(ki))  # to start; more added below
+    orig <- beds[[i]]
+    nco <- ifelse(ncol(orig)>6,6,ncol(orig))
+    colnames(orig)[1:nco] <- c("Chr","Start","End","Name","Score","Strand")[1:nco]  # prevents breaking if input bed had > 6 cols
+    for (k in ki) {
+        message(names(bedi)[i]," ",kval[k])
+        ## Create cov.mat output location
+        cov.mat.paths[[i]][[k]] <- paste0(outpath,names(beds)[i],"/",names(ki)[k])  # initially; later gets replaced with IP/input list
+        system(paste0("mkdir -p ",cov.mat.paths[[i]][[k]]))  # output cov.mat RData object locations
+        if (!dir.exists(cov.mat.paths[[i]][[k]])) stop("Failed to create coverage matrix output location '",cov.mat.paths[[i]][[k]],"'!\n")
+        ## Create heatmap bed
+        bed.paths[[i]][[k]] <- paste0(cov.mat.paths[[i]][[k]],"/",names(beds)[i],".",names(ki)[k],".bed")
+        cov.mat.beds[[i]][[k]] <- write.heatmap.bed(beds[[i]], bed.paths[[i]][[k]], genome, window=kval[k]*2)
+        orig <- cbind(orig, cov.mat.beds[[i]][[k]]$OK)
+        colnames(orig)[ncol(orig)] <- paste0("OK.",names(ki)[k])
+        cov.mat.beds[[i]][[k]] <- cov.mat.beds[[i]][[k]][cov.mat.beds[[i]][[k]]$OK,1:6]  # drop any peaks that were dropped in the output
+        message("Wrote: ",bed.paths[[i]][[k]])
+    }
+    cov.mat.beds[[i]]$original  <- orig        # original unfiltered bed coords, also has "OK" columns for each K value, indicating if that coord made it to that k-bed file
+    cov.mat.paths[[i]]$original <- orig
+    cov.mat.beds[[i]]$input  <- beds1$FULL[i]  # path to original input bed file
+    cov.mat.paths[[i]]$input <- beds1$FULL[i]
+}
+
+
+if (!file.exists(beds.RData)) {
+    save(cov.mat.beds, file=beds.RData)
+} else {
+    ## adding to existing collection; ensure additions are valid
+    beds.merge.ok <- coverage.matrix.RData.validate(cov.mat.beds, beds.RData)
+    if (beds.merge.ok) {
+        ## merge new data into existing RData file
+        coverage.matrix.RData.validate(cov.mat.beds, beds.RData, combine=TRUE)
+    } else {
+        message("Current 'cov.mat.beds' dataset incompatible with existing!  Saving to '",beds.RData.tmp,"'.\n")
+        save(cov.mat.beds, file=beds.RData.tmp)
+    }
+}
+
+
+
+
+## GENERATE COVERAGE MATRICES
+## EACH BED FILE GETS ONE COLUMN PER BAM
+library(CoverageView)
+message("\nGenerating matrices...")
+
+## Get ordered bam vectors in IP-input table row order
+IP.bam <- match(ip.inp$IP, names(bams))
+if (any.inp) {
+    inp.bam <- match(ip.inp$Input, names(bams.inp))
+    has.inp <- !is.na(inp.bam)
+} else {
+    has.inp <- rep(FALSE,length(IP.bam))
+}
+
+## For each bed file, for each k value, for each IP-input pairing (rows in ip.inp), compute one RData object
+#cov.mat.paths <- cov.mat.beds
+for (i in bedi) {
+    for (k in ki) {
+        bed <- bed.paths[[i]][[k]]
+        out <- cov.mat.paths[[i]][[k]]  # save off location value, then replace with IP/input list below
+        if (any.inp) {
+            bam.list <- list(IP=bams[IP.bam],input=bams.inp)
+        } else {
+            bam.list <- list(IP=bams[IP.bam])
+        }
+        cov.mat.paths[[i]][[k]] <- lapply(bam.list, function(x){ x[!is.na(x)]=NA; x })  # initialize as all NA
+        
+        ## generate input matrices FIRST
+        if (length(bams.inp)>0) {
+            group <- paste0("Bed: ",names(bedi)[i],", k: ",names(ki)[k],", inputs")
+            message(group)
+            cov.mat.paths[[i]][[k]]$input <- coverage.matrix.generate(bams.inp, bed, out, 100, cores, clobber=clobber, skip=TRUE)  # writes RData objects
+            message(group," complete!\n")
+        }
+        
+        ## generate IP matrices SECOND: requires RData objects from inputs
+        ## IPs with input first
+        if (sum(has.inp)>0) {
+            group <- paste0("Bed: ",names(bedi)[i],", k: ",names(ki)[k],", IPs with inputs")
+            message(group)
+            cov.mat.paths[[i]][[k]]$IP[ has.inp] <- coverage.matrix.generate(bams[ has.inp], bed, out, 100, cores, cov.mat.paths[[i]][[k]]$input[inp.bam[has.inp]], clobber=clobber, skip=TRUE)  # writes RData objects
+            message(group," complete!\n")
+        }
+        
+        ## IPs with no input second
+        if (sum(!has.inp)>0) {
+            group <- paste0("Bed: ",names(bedi)[i],", k: ",names(ki)[k],", IPs with no inputs")
+            message(group)
+            cov.mat.paths[[i]][[k]]$IP[!has.inp] <- coverage.matrix.generate(bams[!has.inp], bed, out, 100, cores, clobber=clobber, skip=TRUE)  # writes RData objects
+            message(group," complete!\n")
+        }
+    }
+}
+
+
+if (!file.exists(paths.RData)) {
+    save(cov.mat.paths, file=paths.RData)
+} else {
+    ## adding to existing collection; ensure additions are valid
+    paths.merge.ok <- coverage.matrix.RData.validate(cov.mat.paths, paths.RData)
+    if (paths.merge.ok) {
+        ## merge new data into existing RData file
+        message("Current 'cov.mat.paths' dataset is compatible with the existing one!\n")
+        coverage.matrix.RData.validate(cov.mat.paths, paths.RData, combine=TRUE)
+    } else {
+        message("Current 'cov.mat.paths' dataset incompatible with existing!  Saving to '",paths.RData.tmp,"'.\n")
+        save(cov.mat.paths, file=paths.RData.tmp)
+    }
+}
+
+message(paste0("Matrix creation complete!\nSee: ",paths.RData))
+

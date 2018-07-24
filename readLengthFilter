@@ -1,0 +1,92 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my $file;     # input file (fasta|fastq)
+my $type;       # 'fasta' or 'fastq', if files have atypical extensiona
+my $length;     # read length threshold to filter on.
+my $drop;       # remove reads >= $length (default: keep only reads >= $length)
+my ($help, $man, $version);
+
+GetOptions(
+    "i=s" => \$file,
+    "t=s" => \$type,
+    "l=i" => \$length,
+    "drop" => \$drop,
+    "help" => \$help
+    );
+
+my %types = map {($_=>1)} qw/ fasta fastq /;
+my $typestr = join ', ', map { "'$_'" } sort keys %types;
+
+unless ($type) {
+    $type = 'fasta' if ($file =~ /fasta$/i || $file =~ /fa$/i || $file =~ /fasta.gz$/i || $file =~ /fa.gz/i);
+    $type = 'fastq' if ($file =~ /fastq$/i || $file =~ /fq$/i || $file =~ /fastq.gz$/i || $file =~ /fq.gz/i);
+}
+
+die "$0: Unknown file type '$type': must be one of: $typestr\n" unless $types{$type};
+die "$0: invalid read length '$length' specified: must be a positive integer!\n" if $length <= 0 || $length =~ /\./;
+
+my (@OUTPUT, @record, $i, $tmpseq, $total, $kept);
+open my $IN, '<', $file or die "$0: Cannot open input $type '$file': $!\n";
+
+if ($type eq 'fasta') {
+    
+    while (<$IN>) {
+	push @record, $_;
+	if ($_ =~ /^>/) {
+	    if ($tmpseq) {
+		my $readLen = length($tmpseq);
+		if ($readLen >= $length) {
+		    unless ($drop) {
+			push @OUTPUT, @record;
+			$kept++;
+		    }
+		} else {
+		    if ($drop) {
+			push @OUTPUT, @record;
+			$kept++;
+		    }
+		}
+		@record = ();
+		$tmpseq = '';
+	    }
+	} else {
+	    $_ =~ s/[\n\r]+$//;
+	    $tmpseq .= $_;
+	}
+    }
+    
+} elsif ($type eq 'fastq') {
+    
+    while (<$IN>) {
+	$i++;
+	push @record, $_;
+	if ($i == 4) {
+	    $total++;
+	    $_ =~ s/[\n\r]+$//;
+	    my $readLen = length($_);
+	    if ($readLen >= $length) {
+		unless ($drop) {
+		    push @OUTPUT, @record;
+		    $kept++;
+		}
+	    } else {
+		if ($drop) {
+		    push @OUTPUT, @record;
+		    $kept++;
+		}
+	    }
+	    @record = ();
+	    $i = 0;
+	}
+    }
+}
+close $IN;
+
+print @OUTPUT;
+my $kpct = sprintf("%0.1f", 100*$kept/$total);
+print STDERR "$file: $total total, $kept kept ($kpct%)\n";
+exit;
+

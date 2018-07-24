@@ -1,0 +1,46 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my ($inpsl, $outbb, $genome, $chrsize);
+
+GetOptions("i=s" => \$inpsl, "o=s" => \$outbb, "g=s" => \$genome, "c=s" => \$chrsize);
+
+if ($genome && $chrsize) {
+    print STDERR "$0: Do not specify both '-g' and '-c'!  Ignoring '-g'...\n";
+} elsif ($genome && !$chrsize) {
+    $chrsize = "/n/data1/genomes/bowtie-index/$genome/$genome.chrom.sizes";
+    die "$0: Cannot locate chrom sizes file '$chrsize'!  Bad genome label?\n" unless -e $chrsize;
+} elsif ($chrsize && !-e $chrsize) {
+    die "$0: Cannot find chrom sizes file '$chrsize'!\n";
+} elsif (!$genome && !$chrsize) {
+    die "$0: Must specify one of '-g' or '-c'!\n";
+}
+
+$outbb = "$inpsl.bb" unless $outbb;
+
+my $tmp = "psl2bb.$$.tmp";
+my $bin = '/home/apa/local/bin';
+my $utils = "$bin/scriptutils";
+
+print "\n";  # push off prompt, if background execute
+
+my $cmd = "$bin/pslTrim $inpsl > $tmp.psl";
+print "$cmd\n"; system $cmd;
+
+my $cmd = "$utils/pslToBed $tmp.psl $tmp.bed";
+print "$cmd\n"; system $cmd;
+
+my $cmd = "$bin/sortBedCoord -i $tmp.bed --overwrite";
+print "$cmd\n"; system $cmd;
+
+my $cmd = "$utils/bedToBigBed -tab -type=bed12 $tmp.bed $chrsize $outbb";
+print "$cmd\n"; system $cmd;
+
+my $cmd = "rm -f $tmp.*";
+print "$cmd\n"; system $cmd;
+
+print "$0: Complete!\n";
+exit;
+

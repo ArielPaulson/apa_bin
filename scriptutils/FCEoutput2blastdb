@@ -1,0 +1,28 @@
+#!/bin/bash
+
+fasta=$1
+FCEdir=`readlink -f $2`  # CONVERT DIRECTORY TO ROOTED PATH: DOES NOT WORK WITH MAC UNIX
+FCEprefix=$3
+dbprefix=$4
+writedir=$5
+
+fasta=~/bioan/Baumann/LizardAssembly/gularis_transcriptome/gularis_test_assembly/trinity/trinity_80/contig_eval/Trinity.fa
+FCEdir=`pwd`
+FCEprefix='Trinity'
+dbprefix='gularis'
+writedir='blastdb'
+
+rm -Rf $writedir
+mkdir $writedir
+cp $fasta $writedir/${dbprefix}_nt.fa
+cat $FCEdir/$FCEprefix.allframes.fa $FCEdir/$FCEprefix.allframes.short.fa > $writedir/x
+~/lbin/fastaHeaderTransform -i $writedir/x -o $writedir/${dbprefix}_aa.fa --custom '($NEW=$OLD)=~s/\|\d+$//; $NEW=~s/Frame//;'
+perl -i -p -e 's/_/*/g' $writedir/${dbprefix}_aa.fa
+cp $FCEdir/$FCEprefix.translation_summary.txt $writedir/x
+tail -n +3 $FCEdir/$FCEprefix.translation_summary.short.txt >> $writedir/x
+~/lbin/scriptutils/FCEsummary2blastkey.pl $writedir/x $writedir/${dbprefix}_aa.fa.key.txt
+formatdb -p F -o F -l $writedir/${dbprefix}_nt.fa.log -i $writedir/${dbprefix}_nt.fa
+formatdb -p T -o F -l $writedir/${dbprefix}_aa.fa.log -i $writedir/${dbprefix}_aa.fa
+rm -f $writedir/x
+cp /home/apa/local/bin/scriptutils/generic_blastmapper.pl $writedir
+

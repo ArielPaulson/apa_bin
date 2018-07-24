@@ -1,0 +1,628 @@
+#!/usr/bin/env perl
+use Image::Magick;
+use Getopt::Long;
+use Data::Dumper;
+use Pod::Usage;
+use strict;
+use Cwd;
+
+## Script takes a heatmap image with visually-resolvable cells (i.e. nrow, ncol not very large).
+## Script returns a block of html for incorporation into a webpage.  This html block encodes an image map for said heatmap.
+## Imagemap html expects file to be in same directory
+
+my %bw = map {($_=>1)} ('65535,65535,65535,0', '0,0,0,0');   # white and black, per Image::Magick
+my %ktypes = map {($_=>1)} qw/ column row /;
+(my $wdir = cwd()) =~ s/^\/n\//http:\/\/bioinfo\/n\//;
+
+## Get arguments
+my ($heatmap, $UL, $LR, $namesfile, $datafile, $grid, $findcol);
+my ($auto, $schema, $Nrow_exp, $Nrow_obs, $Ncol_exp, $Ncol_obs, $mapwidth, $mapheight, $x_start, $y_start, $x_end, $y_end, @x_pos, @y_pos);
+my $pixvar = 3;		# default allowing at most a 3-pixel variance among accepted heatmap row/col sizes -- any variance at all should be a (random?) artifact of the plotting device and resolution
+my $bkgpct = 0.5;	# default minimum percent of background-color pixels in a row to consider row marginal (i.e. not part of heatmap)
+my $gridcol = '39321,39321,39321,0';   # my default gridline col, "grey60" in R, per Image::Magick
+
+GetOptions(
+    "h=s" => \$heatmap,
+    "d=s" => \$datafile,
+    "n=s" => \$namesfile,
+    "g=s" => \$gridcol,
+    "UL=s" => \$UL,
+    "LR=s" => \$LR,
+    "b=s" => \$bkgpct,
+    "p=i" => \$pixvar,
+    "grid" => \$grid,
+    "find-grid-col" => \$findcol
+) or pod2usage(2);
+
+
+
+
+
+## Read heatmap
+$auto = 1 unless ($UL && $LR);	# autodetect boundaries unless specified
+my ($heatname) = ($heatmap =~ /([^\/]+)\.[^\.]+$/);  # crop directory and extension
+(my $imagename = $heatmap) =~ s/\.png$/.imagemap.png/;
+(my $htmlname = $heatmap) =~ s/\.png$/.imagemap.html/;
+chomp(my $heatmap64 = `/home/apa/local/bin/png64 -i $heatmap`);
+
+print "\nProcessing '$heatmap'\n";
+my $image = Image::Magick->new;
+my $msg = $image->Read($heatmap);
+die "$msg\n" if $msg;
+
+## Get heatmap coords
+my ($nrow_all, $ncol_all, $background);
+if ($auto) {	# heatmap coords must be detected
+    print "Auto-detecting heatmap boundaries...\n";
+    ($nrow_all, $ncol_all, $background) = ($image->Get('base-rows'), $image->Get('base-columns'), $image->Get('background'));
+    #print "$nrow_all, $ncol_all, $background\n";
+    my (%gtempx, %gtempy);
+    foreach my $x (1..$ncol_all) {
+        foreach my $y (1..$nrow_all) {
+            my $color = $image->Get("pixel[$x,$y]");
+            #print "GLOBAL | $x, $y | $color\n";
+            $gtempx{$x}{$color}++;
+            $gtempy{$y}{$color}++;
+        }
+    }
+    ($x_start, $x_end) = &detect_boundaries('column', \%gtempx);
+    ($y_start, $y_end) = &detect_boundaries('row', \%gtempy);
+} else {		# heatmap coords known
+    ($x_start, $y_start) = split /,/, $UL;
+    ($x_end, $y_end) = split /,/, $LR;
+}
+@x_pos = ($x_start..$x_end);
+@y_pos = ($y_start..$y_end);
+$mapwidth = scalar @x_pos;
+$mapheight = scalar @y_pos;
+print "x start: $x_start\nx end: $x_end\ny start: $y_start\ny end: $y_end\nwidth: $mapwidth\nheight: $mapheight\n";
+
+
+
+
+
+
+## Capture the image pixel by pixel into the @map matrix
+my %allvals;
+my @pixmap = map {[map {0} @y_pos]} @x_pos;
+print "Scanning heatmap pixels...\n";
+foreach my $i (0..$#x_pos) {
+    my $x = $x_pos[$i];
+    foreach my $j (0..$#y_pos) {
+        my $y = $y_pos[$j];
+        my $color = $image->Get("pixel[$x,$y]");
+        #print "SET: $i: $x | $j: $y | $color\n";
+        $pixmap[$i][$j] = $color;   # capture every pixel value into the image map @pixmap
+        $allvals{$color}++;
+    }
+}
+#print Dumper(\%allvals), "\n";
+
+
+
+
+
+
+## If $findcol, then just take a pixel census of row 2 and exit
+if ($findcol) {
+    my (%pixels, $maxp);
+    my $maxn = 5;
+    print scalar(@x_pos), " ", scalar(@y_pos), "\n";
+    $pixels{$pixmap[$_][1]}++ foreach (0..$#x_pos);
+    foreach (keys %pixels) {
+	$maxp = length($_) if length($_) > $maxp;
+	$maxn = length($pixels{$_}) if length($pixels{$_}) > $maxn;
+    }
+    printf("\nPixel census from row 2:\n%-${maxp}s  %-${maxn}s\n", 'Color', 'Count');
+    printf("%-${maxp}s  %${maxn}i\n", $_, $pixels{$_}) foreach sort {$pixels{$b} <=> $pixels{$a}} keys %pixels;
+    print "\n";
+    exit;
+}
+
+
+
+
+
+
+## Read names, data
+my (%colnames, %rownames, %maplinks, $celldata, $functions);
+open IN, $namesfile or die "Can't open names file '$namesfile'!\n";
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    my ($side, @names) = split /\t/, $_;
+    if ($side eq 'ROWS') {
+	%rownames = map {($names[$_]=>$_)} 0..$#names;
+    } elsif ($side eq 'COLS') {
+	%colnames = map {($names[$_]=>$_)} 0..$#names;
+    } else {
+	die "Malformed names file: line $. entry not 'ROWS' or 'COLS'!\n";
+    }
+}
+close IN;
+
+my ($lines, %linklines, @keepcols);
+my $blurb = "<A>*<SPAN>This is a different percent:<BR>Of all genes in DB with term,<BR>this many are also in the cluster</SPAN></A>";
+open IN, $datafile or die "Can't open data file '$datafile': $!\n";   # expecting a sig terms file from FatiClone
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    my @data = split /\t/, $_;  # (map, cluster, db, level, acc, name, fg%, bg%, ratio, db%, enrich, rawp, adjp, odds, cihi, cilo, fgw, fgwo, bgw, bgwo, dbw, inpSymb, inpName, inpXref, mapSymb, mapName, mapXref, inpRows)
+    die "Cluster '$data[1]' is not in the column names list!\n" unless exists $colnames{$data[1]};
+    die "Term name '$data[5]' is not in the row names list!\n" unless exists $rownames{$data[5]};
+    
+    if ($. == 1) {
+        foreach my $i (0..$#data) {
+            push @keepcols, $i unless $data[$i] =~ /^Input_/;
+        }
+    } else {
+        @data = @data[@keepcols];
+        my $cell = "R$rownames{$data[5]}C$colnames{$data[1]}";
+        my @gids = split /; /, $data[24];
+        my @symbs = split /; /, $data[22];
+        my $fgN = $data[16]+$data[17];
+        my $bgN = $data[18]+$data[19];
+        $maplinks{ $rownames{$data[5]} }{ $colnames{$data[1]} } = "href=\"#\" id=\"$cell\"";
+        
+        $celldata .= <<EOF;
+	<DIV id="${cell}TD" title="Term Data">
+	<TABLE>
+	<TR> <TD><B>Cluster</TD> <TD colspan=3 class="L">$data[1]</TD> </TR>
+	<TR> <TD><B>Term&nbsp;Name</TD> <TD colspan=3 class="L">$data[5]</TD> </TR>
+	<TR> <TD colspan=4><BR></TD> </TR>
+	
+	<TR> <TD><B>Term&nbsp;Accession</TD> <TD><B>Term&nbsp;DB</TD> <TD><B>Term&nbsp;Level</TD> <TD></TD> <TD></TD> </TR>
+	<TR> <TD>$data[4]</TD> <TD>$data[2]</TD> <TD>$data[3]</TD> <TD></TD> </TR>
+	<TR> <TD colspan=4><BR></TD> </TR>
+	
+	<TR> <TD></TD> <TD><B>Cluster</TD> <TD><B>Background</TD> <TD><B>Entire&nbsp;DB</TD> <TD></TD> </TR>
+	<TR> <TD><B>%&nbsp;With&nbsp;Term</TD> <TD>$data[6]</TD> <TD>$data[7]</TD> <TD id="dbb">$data[9]$blurb</TD> <TD></TD> </TR>
+	<TR> <TD><B>With&nbsp;Term</TD> <TD>$data[16]</TD> <TD>$data[18]</TD> <TD>$data[20]</TD>  <TD></TD> </TR>
+	<TR> <TD><B>Without&nbsp;Term</TD> <TD>$data[17]</TD> <TD>$data[19]</TD> <TD></TD> <TD></TD> </TR>
+	<TR> <TD><B>Genes</TD> <TD>$fgN</TD> <TD>$bgN</TD> <TD></TD> <TD></TD> </TR>
+	<TR> <TD colspan=4><BR></TD> </TR>
+	
+	<TR> <TD><B>Enrich</TD> <TD><B>Log2FC</TD> <TD><B>Raw&nbsp;P</TD> <TD><B>Adj&nbsp;P</TD> <TD></TD> </TR>
+	<TR> <TD>$data[10]</TD> <TD>$data[8]</TD> <TD>$data[11]</TD> <TD>$data[12]</TD> <TD></TD> </TR>
+	<TR> <TD colspan=4 class="L"><BR><B><a href="#" id="${cell}GL">Cluster Genes With Term</a></TD> </TR>
+	</TABLE>
+	</DIV>
+	
+	<DIV id="${cell}GD" title="Gene Data">
+	<TABLE id="genes">
+	<TR> <TD><B>ID</TD> <TD><B>Symbol</TD> </TR>
+EOF
+	
+        $celldata .= "	<TR> <TD>$gids[$_]</TD> <TD>$symbs[$_]</TD> </TR>\n" foreach 0..$#gids;
+        $celldata .= "	</TABLE>\n	</DIV>\n\n";
+    
+        $functions .= <<EOF;
+	\$(function() {
+		\$( "#$cell" ).click(function() {
+			\$( "#${cell}TD" ).dialog({width: 600});
+			return false;
+		});
+		\$( "#${cell}TD" ).hide();
+		return false;
+	});
+	\$(function() {
+		\$( "#${cell}GL" ).click(function() {
+			\$( "#${cell}GD" ).dialog({width: 600});
+			return false;
+		});
+		\$( "#${cell}GD" ).hide();
+		return false;
+	});
+
+EOF
+    }
+}
+$lines = $.;
+close IN;
+
+
+
+
+
+
+## Find all x positions where color changes occur
+my (@xdstarts, @ydstarts);
+($Nrow_exp, $Ncol_exp) = ( scalar(keys %rownames), scalar(keys %colnames) );
+if ($grid) {
+    my @tmp = @{ &detect_gridlines() };
+    @xdstarts = ($x_pos[0], @{ $tmp[0] });   # prepend initial pixel pos
+    @ydstarts = ($y_pos[0], @{ $tmp[1] });   # prepend initial pixel pos
+} elsif ($auto) { 	# may have to downsize one of these if autodetection was used
+    @xdstarts = ($x_start); # unless $colschemas{$schema};  
+    @ydstarts = ($y_start); # unless $rowschemas{$schema};
+} else {
+    @xdstarts = @{ &detect_breaks('column', $Ncol_exp) };
+    @ydstarts = @{ &detect_breaks('row', $Nrow_exp) };
+}
+my $Ncol_obs = scalar(@xdstarts);
+my $Nrow_obs = scalar(@ydstarts);
+print "$Nrow_obs obs rows, $Ncol_obs obs cols\n";
+
+
+
+
+
+
+## Print imagemapped version of heatmap (imagemap creation may die, so do this now)
+foreach my $i (0..$#xdstarts) {
+    my $xi = $xdstarts[$i];
+    $image->Set("pixel[$xi,$_]"=>'green') foreach @y_pos;   # draw white lines delimiting imagemap cells -- do they correspond to heatmap cells?
+    foreach my $j (0..$#ydstarts) {
+	my $yi = $ydstarts[$j];
+	$image->Set("pixel[$_,$yi]"=>'green') foreach @x_pos;   # draw white lines delimiting imagemap cells -- do they correspond to heatmap cells?
+    }
+}
+foreach my $x ($x_start, $x_end) {
+    $image->Set("pixel[$x,$_]"=>'blue') foreach @y_pos;   # draw white lines delimiting imagemap boundaries -- do they correspond to heatmap cells?
+}
+foreach my $y ($y_start, $y_end) {
+    $image->Set("pixel[$_,$y]"=>'blue') foreach @x_pos;   # draw white lines delimiting imagemap boundaries -- do they correspond to heatmap cells?
+}
+my $msg = $image->Write($imagename);
+print "Failed to create image '$imagename': $msg\n" if $msg;
+
+
+
+
+
+
+## Apply schema and create imagemap html, unless schema could not be applied
+my $html_header = <<EOF;
+<!doctype html>
+<HTML lang="en">
+<HEAD>
+	<meta charset="utf-8" />
+	<title></title>
+	<link rel="stylesheet" href="http://code.jquery.com/ui/1.10.0/themes/base/jquery-ui.css" />
+	<script src="http://code.jquery.com/jquery-1.8.3.js"></script>
+	<script src="http://code.jquery.com/ui/1.10.0/jquery-ui.js"></script>
+	<style>
+		#dbb { position: relative; }
+		#dbb a span { display: none; color: #FFFFFF; }
+		#dbb a:hover span { display: block; position: absolute; width: 300px; background: #aaa; height: 100px; left: -320px; top: 20px; color: #FFFFFF; padding: 7px; text-align: center}
+		table TD { padding-left: 4px; padding-right: 4px; text-align: right; }
+		table#genes TD { padding-right: 20px; text-align: left; }
+		.L { padding-left: 4px; padding-right: 4px; text-align: left; }
+	</style>
+	<script>
+$functions
+	</script>
+</HEAD>
+	
+<BODY>
+$celldata
+	
+	<IMG src="data:image/png;base64,$heatmap64" USEMAP="$heatname">
+	<MAP name="$heatname">
+EOF
+
+#	<IMG src="$heatmap" USEMAP="$heatname">    # old way: requires external image file
+
+
+my @html = ($html_header);
+my @yis;
+foreach my $i (0..$#xdstarts) {
+    my $xi = $xdstarts[$i];
+    my $xf = $i == $#xdstarts ? $x_end : $xdstarts[$i+1]-1;
+#	print "xi: $xi-$xf\n";
+    foreach my $j (0..$#ydstarts) {
+	my $yi = $ydstarts[$j];
+	my $yf = $j == $#ydstarts ? $y_end : $ydstarts[$j+1]-1;
+	push @yis, "yi: $yi-$yf\n" unless $i;
+	# push @html, "<AREA shape=rect coords=\"$xf,$yi,$xi,$yf\" href=\"$links{$i}{$j}\" target=\"new\">\n";
+	push @html, "	<AREA shape=rect coords=\"$xf,$yi,$xi,$yf\" $maplinks{$j}{$i}>\n";
+    }
+}
+#print @yis;
+push @html, "</MAP>\n\n</BODY>\n</HTML>";
+open OUT, "> $htmlname";
+print OUT @html;
+close OUT;
+print "Imagemap for $heatmap complete!\n";
+exit;
+
+
+
+
+
+
+############################################################################     SUBROUTINES     ############################################################################
+############################################################################     SUBROUTINES     ############################################################################
+############################################################################     SUBROUTINES     ############################################################################
+############################################################################     SUBROUTINES     ############################################################################
+############################################################################     SUBROUTINES     ############################################################################
+
+
+
+
+
+
+
+sub detect_boundaries {
+    
+    my ($type, $HASHREF) = @_;
+    die "Unknown type '$type'!\n" unless $ktypes{$type};
+    print "Detecting $type boundaries for heatmap...\n";
+    my ($outer, $inner, $start, $end, %candidates, %blocks, %tempblocks);
+    
+    if ($type eq 'column') {
+        ($outer, $inner) = ($ncol_all, $nrow_all);
+    } elsif ($type eq 'row') {
+        ($outer, $inner) = ($nrow_all, $ncol_all);
+    }
+    
+    foreach my $i (1..$outer) {
+        my $Nbkg = $$HASHREF{$i}{$background};
+        #print "$i: $Nbkg\n";
+        $candidates{$i} = 1 if ($Nbkg / $inner < $bkgpct);    # possible heatmap row/col: less than $bkgpct of the row/col is background color
+    }
+    my @cand = sort {$a <=> $b} keys %candidates;
+    #print "Candidates: @cand\n";
+    my $nblocks = 1;
+    @{ $blocks{$nblocks} } = ($cand[0]);   # initialize
+    foreach my $i (1..$#cand) {
+        $nblocks++ if ($cand[$i] - $cand[$i-1] > 1);  # gap; start new block
+        push @{ $blocks{$nblocks} }, $cand[$i];
+    }
+    foreach my $block (1..$nblocks) {
+        my ($bmin, $bmax) = (sort {$a <=> $b} @{ $blocks{$block} })[0,-1];
+        my $bwidth = $bmax - $bmin + 1;
+        #print "block $block: $bmin-$bmax, $bwidth\n";
+        $tempblocks{$bwidth}{"$bmin\t$bmax"} = 1;
+    }
+    my $max = (sort {$b <=> $a} keys %tempblocks)[0];  # widest x block or tallest y block
+    #print "Max block size: $max\n";
+    if (scalar (keys %{ $tempblocks{$max} }) == 1) {
+        ($start, $end) = split /\t/, (keys %{ $tempblocks{$max} })[0];
+    } else {   # > 1 block with largest width??
+        my $terminal = (sort {$a <=> $b} keys %{ $tempblocks{$max} })[0];
+        ($start, $end) = split /\t/, $terminal;
+    }
+    $end-- if $type eq 'row';   # has the weakness of calling the lower axis line as part of the heatmap
+    
+    return($start, $end);
+}
+
+
+
+
+
+
+
+
+sub detect_gridlines {
+    
+    print "Detecting gridlines in heatmap...\n";
+    
+    ## Find all positions where grid color occurs
+    my (@rowstarts, @colstarts, %allcols);
+    
+    ## test for grid row positions on second col
+    foreach my $j (0..$#y_pos) {
+        next if ($j == 0 || $j == $#y_pos);  # ignore framing lines
+        push @rowstarts, $y_pos[$j] if $pixmap[1][$j] eq $gridcol;
+        $allcols{$pixmap[1][$j]}++;
+    }
+    
+    ## test for grid col positions on second row
+    foreach my $i (0..$#x_pos) {
+        next if ($i == 0 || $i == $#x_pos);  # ignore framing lines
+        push @colstarts, $x_pos[$i] if $pixmap[$i][1] eq $gridcol;
+        $allcols{$pixmap[$i][1]}++;
+    }
+    
+    my $ngridx = $#colstarts + 1;
+    my $ngridy = $#rowstarts + 1;
+    #print "$_\t$allcols{$_}\n" foreach sort {$allcols{$b} <=> $allcols{$a}} keys %allcols;
+    print "$ngridx v gridlines, $ngridy h gridlines\n";
+    
+    return([\@colstarts, \@rowstarts]);
+}
+
+
+
+
+
+
+
+
+sub detect_breaks {
+    
+    my ($type, $EXP) = @_;
+    die "Unknown type '$type'!\n" unless $ktypes{$type};
+    print "Detecting $type breaks in heatmap...\n";
+    
+    ## Find all positions where color changes occur
+    my ($OBS, %delta, @dstarts, $endpos, %allvals2);
+    if ($type eq 'column') {
+	$endpos = $x_end;
+	## for each row, look for color breaks across cols
+	foreach my $j (0..$#y_pos) {
+	    my $y = $y_pos[$j];
+	    my $prev_color;
+	    foreach my $i (0..$#x_pos) {
+		my $x = $x_pos[$i];
+		warn "Out of indices at [$i,$j]!\n" unless $pixmap[$i][$j];
+		my $color = $pixmap[$i][$j];
+#				print "GET: $i: $x | $j: $y | $color: $prev_color\n";
+		$delta{$x} = 1 if $color ne $prev_color;
+		$prev_color = $color;
+		$allvals2{$color}++;
+	    }
+#			print "row $j pixel $y: ", scalar (keys %delta), " cumulative changes\n";
+	}
+    } elsif ($type eq 'row') {
+	$endpos = $y_end;
+	## for each col, look for color breaks across rows
+	foreach my $i (0..$#x_pos) {
+	    my $x = $x_pos[$i];
+	    my $prev_color;
+	    foreach my $j (0..$#y_pos) {
+		my $y = $y_pos[$j];
+		warn "Out of indices at [$i,$j]!\n" unless $pixmap[$i][$j];
+		my $color = $pixmap[$i][$j];
+		$delta{$y} = 1 if $color ne $prev_color;
+		$prev_color = $color;
+	    }
+#			print "column $i pixel $x: ", scalar (keys %ydelta), " cumulative changes\n";
+	}
+    }
+    
+    @dstarts = sort {$a <=> $b} keys %delta;
+#	print "dstarts 1: @dstarts\n";
+    pop @dstarts if ($dstarts[-1] - $x_end >= 1); 		# remove outside boundary hit if exists
+    if ($dstarts[1] - $dstarts[0] <= 2) {	# incorrect start boundary (user error, or autodetect thrown off by the axis line)
+#		print "$dstarts[1] - $dstarts[0] <= 2\n";
+	shift @dstarts;
+	if ($type eq 'column') {
+	    $x_start++;
+	    shift @x_pos;
+	} else {
+	    $y_start++;
+	    shift @y_pos;
+	}
+    }
+    if ($dstarts[-1] - $dstarts[-2] <= 2) {	# incorrect end boundary (user error, or autodetect thrown off by the axis line)
+#		print "$dstarts[-1] - $dstarts[-2] <= 2\n";
+	pop @dstarts;
+	if ($type eq 'column') {
+	    $x_end--;
+	    pop @x_pos;
+	} else {
+	    $y_end--;
+	    pop @y_pos; 
+	}
+    }
+#	print "dstarts 2: @dstarts\n";
+    $mapwidth = scalar @x_pos;		# recalculate here, just to be safe
+    $mapheight = scalar @y_pos;
+    
+    ## test for under- or over-sized breaks (we assume heatmap $type sizes should be ~ equal)
+    my ($normal, %breaksizes, %breakpos, %normalsized, %undersized, %oversized);
+    foreach my $i (0..$#dstarts) {
+	my $ipos = $dstarts[$i];
+	my $fpos = $i == $#dstarts ? $endpos : $dstarts[$i+1]-1;
+	my $size = $fpos-$ipos;
+	next unless $size;  			# first can be zero?
+	$breaksizes{$size}++;
+	$breakpos{$size}{$ipos} = 1;	# gap begins at $pos
+#		print "$i: $ipos: $size\n";
+    }
+    my @sizes = sort {$a <=> $b} keys %breaksizes;
+    my $basesize = (sort { $breaksizes{$b} <=> $breaksizes{$a} } keys %breaksizes)[0];	# most prevalent size
+#	print "Column base size $basesize\n";
+    foreach my $size (@sizes) {
+#		print "$basesize, $size, ", $size - $basesize, "\n";
+	if ($size - $basesize > $pixvar) {
+	    $oversized{$size}{$_} = 1 foreach keys %{ $breakpos{$size} };
+#			print "oversized: $size\n";
+	} elsif ($basesize - $size > $pixvar) {
+	    $undersized{$_} = $size foreach keys %{ $breakpos{$size} };
+#			print "undersized: $size\n";
+	} else {
+	    $normalsized{$size}++;
+#			print "normal: $size\n";
+	}
+    }
+
+    ## detect 'normal' break size, if necessary
+    if (%oversized || %undersized) {
+	my ($sum, $weights);
+	foreach (keys %normalsized) {
+	    $sum += ($_*$normalsized{$_});
+	    $weights += $normalsized{$_};
+	}
+	$normal = int($sum/$weights);    # "normal" break size, i.e. weighted avg of non-oversized break sizes
+#		print "$basesize base, $normal normal\n";
+    }
+    
+    ## split up oversized breaks
+    if (%oversized) {
+	my (%overbreaks, @addbreaks);
+	foreach my $over (keys %oversized) {
+	    $overbreaks{$over} = int($over/$normal) - 1;	# how many normal breaks fit into each oversized one (less 1 since a break already exists...)
+#			print "$over\t$overbreaks{$over}\n";
+	    foreach my $pos (keys %{ $breakpos{$over} }) {
+		foreach my $i (1..$overbreaks{$over}) {
+		    push @addbreaks, $pos+($normal*$i) + 1;		# add new breaks (they need an extra pixel to sit right...)
+#					print "Adding new break: $pos ", $pos+($normal*$i), "\n";
+		}
+	    }
+	}
+	@dstarts = sort {$a <=> $b} (@dstarts, @addbreaks);
+    }
+
+    ## merge undersized breaks
+    if (%undersized) {
+	my $Nunder = scalar keys %undersized;
+	print "More than 4 undersized $type breaks ($Nunder) were detected: this may cause problems...\n" if $Nunder > 4;
+	print "An odd number of undersized $type breaks ($Nunder) were detected: failure is immanent...\n" if $Nunder % 2 == 1;
+	my ($size, $sum, %merges, %rmvbreaks);
+	my @brkp = keys %undersized;
+	my @brks = values %undersized;
+	$sum += $undersized{$_} foreach keys %undersized;		# total size of undersized regions
+	my $nmerged = sprintf("%0.0f", $sum / $normal);			# number of final merged $types
+	if ($nmerged < 1) {
+	    print "WARNING: < 1 merge assigned!  Forcing 1...\n";
+	    $nmerged = 1;							# failsafe if $normal >> $sum (for some strange reason): at least it will still create the imagemap .png for scrutiny
+	}
+#		print "Breaks: @brkp | @brks\n$sum, $normal, $nmerged\n";
+	my $permerge = int($Nunder / $nmerged);					# number of undersized $types in each merge
+	my $M = 1;
+	foreach my $pos (sort {$a <=> $b} keys %undersized) {
+	    push @{ $merges{$M} }, $pos;		# divvy up breaks into merge batches
+	    $size++;
+	    if ($size == $permerge) {   # reached per-merge quota 
+		$M++;
+		$size = 0;
+	    }
+	}
+	$M--;	# always over-increments 1 at end
+#		print "Merge numbers: $sum, $nmerged, $permerge, $M\n";
+	foreach my $merge (1..$M) {
+#			print "$merge: @{ $merges{$merge} }\n";
+	    shift @{ $merges{$merge} };		# first $pos is exempt
+	    foreach (@{ $merges{$merge} }) {
+		$rmvbreaks{$_} = 1;  # others get removed
+#				print "Removing break: $_ $undersized{$_}\n";
+	    }
+	}
+	my @truestarts;
+	foreach (@dstarts) {
+	    push @truestarts, $_ unless $rmvbreaks{$_};
+	}
+	@dstarts = sort {$a <=> $b} @truestarts;
+    }
+    
+    $OBS = scalar @dstarts;
+    if ($EXP && $EXP != $OBS) {
+	## Break detection failed to find the required number of breaks: resort to even distribution of breaks
+	print "Measured $type change positions $OBS != number of reported ${type}s $EXP!\n Resorting to ham-handed divisions...\n";
+	my ($base, $rem, $running, @hamstarts);
+	if ($type eq 'column') {
+	    $base = int($mapwidth/$EXP);		# base pixels per division
+	    $rem = $mapwidth-$base*$EXP;		# leftover pixels to distribute
+	} elsif ($type eq 'row') {
+	    $base = int($mapheight/$EXP);		# base pixels per division
+	    $rem = $mapheight-$base*$EXP;		# leftover pixels to distribute
+	}
+	my $per = $EXP / $rem;					# give 1 extra pixel every $per divisions
+	my @divs = map {$base} (1..$EXP);		# widths for each division
+	foreach (1..$EXP) {
+	    $divs[$_-1]++ if $_ % $per == 0;	# assign extra pixels
+	}
+	my $init = ($type eq 'column') ? $x_start : $y_start;
+	foreach (@divs) {
+	    $running += $_;
+	    push @hamstarts, $init+$running;
+	}
+	@dstarts = @hamstarts;	# completely reassign
+	$OBS = scalar @dstarts;
+    }
+    print "Obs N ${type}s: $OBS | Exp N ${type}s: $EXP\n";
+    
+    return(\@dstarts);
+}

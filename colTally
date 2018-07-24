@@ -1,0 +1,66 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my ($col, $transpose, $file, $nosort, $delim, $skip, $retally, $stdio);
+
+GetOptions("c=i" => \$col, "f=s" => \$file, "d=s" => \$delim, "s=i" => \$skip, "trans" => \$transpose, "nosort" => \$nosort, "retally" => \$retally, "" => \$stdio);
+
+my (%tally, %tally2, %order, $tempfile, $delimblock);
+
+$delim =~ s/'//g;
+$delimblock = "-d'$delim'" if $delim;
+
+my $IN;
+if ($stdio) {
+    my $i;
+    while (<>) {
+	chomp;
+	$i++;
+	$tally{$_}++;
+	$order{$_} = $i unless $order{$_};
+    }
+} else {
+    if ($col) {  # tally on specific column
+	die "Column number '$col' must be a positive integer!\n" unless ($col > 0 && $col == int($col));
+	$tempfile = "/tmp/coltally_$$.tmp";
+	system "cut -f$col $delimblock $file > $tempfile";	# send to temp file, because there are limits on what Perl can read in from sys capture
+	die "Unable to create tempfile '$tempfile'!\n" unless -e $tempfile;
+	open $IN, '<', $tempfile or die "$0: Could not open tempfile '$tempfile': $!\n";
+    } else {
+	open $IN, '<', $file or die "$0: Could not open file '$file': $!\n";
+    }
+
+    while (<$IN>) {
+	next if ($skip && $. <= $skip);
+	chomp;
+	$tally{$_}++;
+	$order{$_} = $. unless $order{$_};
+    }
+    close $IN;
+
+    if ($col) {   # tempfile created
+	unlink $tempfile or die "$0: Could not remove tempfile '$tempfile': $!\n";
+    }
+}
+
+if ($transpose) {
+    $tally2{ $tally{$_} }++ foreach keys %tally;
+} else {
+    %tally2 = %tally;
+}
+
+if ($retally) {   # tally of counts per entry
+    my %tallyR;
+    $tallyR{ $tally2{$_} }++ foreach keys %tally2;
+    my @keys = $nosort ? (sort {$a <=> $b} keys %tallyR) : (sort { $tallyR{$b} <=> $tallyR{$a} || $a <=> $b } keys %tallyR);
+    print "N\@Count\tCount\n";
+    print "$tallyR{$_}\t$_\n" foreach @keys;
+} else {    # tally of original entries
+    my @keys = $nosort ? (sort {$order{$a} <=> $order{$b}} keys %tally2) : (sort {$tally{$b} <=> $tally{$a}} keys %tally2);
+    print "Count\tItem\n";
+    print "$tally2{$_}\t$_\n" foreach @keys;
+}
+exit;
+

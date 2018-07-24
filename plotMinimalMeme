@@ -1,0 +1,13 @@
+#!/usr/bin/env Rscript
+
+source("/n/projects/apa/R/apa_tools.R")
+argv <- commandArgs(trailingOnly=TRUE)
+mots <- read.minimal.meme(argv[1])$MOTIFS
+nsites <- slice.list(mots, "nsites")
+pwms <- slice.list(mots, "pwm")
+names(pwms) <- paste(sapply(names(mots), function(x){ unlist(strsplit(x," "))[1] }), " (N=", nsites, ")", sep="")
+pdfname <- ifelse(length(argv)>1, argv[2], paste(meme,"pdf",sep="."))
+logo.batchpdf(pwms, pdfname)
+quit()
+
+

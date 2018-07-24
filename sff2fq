@@ -1,0 +1,128 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use strict;
+use Cwd;
+
+
+# script converts a 454 .sff sequence output file to fastq | output is <fname>.fq where file was <fname>.sff
+# written by Ariel Paulson 20120601
+#
+# REQUIRED:
+# -f <file> indicates input .sff file
+# OR
+# -a <fasta> from already-unpacked .sff
+# -q <raw_quals> and qualities
+#
+# OPTIONAL:
+# -o <output_file> speficies the output file name, instead of default
+# -b <barcode> is the length of the barcode (stripped barcodes are appended to the headers)
+# -s <script> is the copy of 'sff_extract' being used, see http://bioinf.comav.upv.es/sff_extract/
+# --key causes leading 4nt ('gact' key sequence) to be dropped (PRIOR to barcode stripping)
+# --trim-N causes trailing Ns to be dropped
+
+
+## Set up
+
+my $wd = cwd();
+my ($file, $fasta, $quals, $outfile, $barcode, $key, $trimN);
+my $sffx = '/home/apa/local/bin/sff_extract-0.2.13';
+GetOptions("f=s" => \$file, "a=s" => \$fasta, "q=s" => \$quals, "o=s" => \$outfile, "b=i" => \$barcode, "s=s" => \$sffx, "key" => \$key, "trim-N" => \$trimN);
+die "Input sff '$file' not found!\n" if ($file && !-e $file);
+die "Input fasta '$fasta' not found!\n" if ($fasta && !-e $fasta);
+die "Input qualities file '$quals' not found!\n" if ($quals && !-e $quals);
+die "Specify either (-f) OR (-a and -q)\n" if (($fasta && !$quals) || ($quals && !$fasta) || ($file && $fasta));
+
+my ($fasta2, $quals2, $fname);
+my $tempdir = "sff2fastq_temp_$$";
+
+if ($file) {
+    
+    ($fname) = ($file =~ /([^\/]+)\.sff$/i);
+    
+    ## Create temp dir
+    
+    system "mkdir -p $tempdir";
+    die "Failed to create temp dir '$tempdir'\n" unless -d $tempdir;
+    system "cp $file $tempdir/";
+    
+    ## Convert .sff to .fasta, .fasta.qual
+    
+    chdir $tempdir;
+    system "$sffx $fname.sff";
+    chdir '..';
+    
+    $fasta2 = "$tempdir/$fname.fasta";
+    $quals2 = "$tempdir/$fname.fasta.qual";
+    
+} else {
+
+    ($fname) = ($fasta =~ /([^\/]+)\.f[ast]+$/i);
+
+    $fasta2 = $fasta;
+    $quals2 = $quals;
+
+}
+
+my ($header, @headers, %seq, %qual);
+
+## Read .fasta
+
+open IN, $fasta2;
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    if ($_ =~ /^>(.*)/) {
+	push @headers, $1;
+	$header = $1;
+    } else {
+	$seq{$header} .= $_;
+    }
+}
+close IN;
+
+## Read .qual
+
+open IN, $quals2;
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    if ($_ =~ /^>(.*)/) {
+	$header = $1;
+    } else {
+	$qual{$header} .= "$_ ";
+    }
+}
+close IN;
+
+## Write fastq
+
+$outfile = "$fname.fq" unless $outfile;
+open OUT, "> $outfile";
+foreach my $header (@headers) {
+    my $SEQ = $seq{$header};
+    my $QUAL = join '', map { chr($_+33) } split /\s+/, $qual{$header};
+    my $header2;
+    if ($key) {  # drop key sequence, i.e. leading 'gact'
+	$SEQ = substr($SEQ, 4);
+	$QUAL = substr($QUAL, 4);
+    }
+    if ($barcode) {  # capture & remove barcode AFTER any key-dropping
+	my $code = substr($SEQ, 0, $barcode);
+	$SEQ = substr($SEQ, $barcode);
+	$QUAL = substr($QUAL, $barcode);
+	$header2 = "$header|$code";  # APPEND BARCODE TO HEADER!!!
+    } else {
+	$header2 = $header;
+    }
+    if ($trimN) {  # strip trailing Ns from sequence
+	$SEQ =~ s/n+$//i;
+	$QUAL = substr($QUAL, 0, length($SEQ));
+    }
+    my $string = '@'.$header2."\n$SEQ\n+\n$QUAL\n";
+    print OUT $string;
+}
+close OUT;
+
+## Close out
+
+system "rm -Rf $tempdir" if $file;
+print "sff2fq $fname complete!\n";
+exit;

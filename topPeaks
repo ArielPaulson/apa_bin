@@ -1,0 +1,40 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my $N;        # number of top peaks to take
+my $byscore;  # sort output by scores (descending)?
+my $input;    # input BED file
+my $output;   # output BED file
+my %scored;   # data-by-score hash
+
+GetOptions("i=s" => \$input, "o=s" => \$output, "n=i" => \$N, "byscore" => \$byscore);
+
+open IN, $input or die "$0: Cannot open '$input' for reading: $!\n";
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    my $score = (split /\t/, $_)[4];
+    push @{ $scored{$score} }, [$., "$_\n"];
+}
+close IN;
+
+my $n;       # current number of printed peaks
+my @output;  # output
+foreach my $score (sort {$b <=> $a} keys %scored) {
+    last if $n >= $N;
+    foreach my $entry (@{ $scored{$score} }) {
+	$n++;
+	push @output, $entry;
+	last if $n >= $N;
+    }
+}
+
+open OUT, "> $output" or die "$0: Cannot open path '$output' for writing: $!\n";
+if ($byscore) {
+    print OUT $$_[1] foreach @output;
+} else {
+    print OUT $$_[1] foreach sort { $$a[0] <=> $$b[0] } @output;
+}
+close OUT;
+exit;

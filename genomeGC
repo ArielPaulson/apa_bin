@@ -1,0 +1,53 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## reports GC percent in $bin-bp bins across the genome, in .wig format
+
+my ($fasta, $bin) = @ARGV;
+
+my ($header, @headers, %seq);
+
+my %GCbases = map {($_=>1)} qw/ G g C c /;
+
+print STDERR "Reading fasta...\n";
+
+open my $IN, '<', $fasta or die "Failed to open fasta '$fasta': $!\n";
+while (<$IN>) {
+    $_ =~ s/[\n\r]+$//;
+    if ($_ =~ /^>(.*)/) {
+	$header = $1;
+	push @headers, $1;
+    } else {
+	$seq{$header} .= $_;
+    }
+}
+close $IN;
+
+my %seqlen = map {($_ => length($seq{$_}))} @headers;
+
+print STDERR "Calculating GC...\n";
+
+foreach my $header (@headers) {
+    for (my $i = 0; $i < $seqlen{$header}; $i += $bin) {
+	my $j = $i + $bin;
+	my ($gc, $width);
+	foreach my $base (split //, substr($seq{$header}, $i, $bin)) {
+	    $gc++ if $GCbases{$base};
+	}
+	if ($j <= $seqlen{$header}) {
+	    $width = $bin;
+	} else {
+	    $j = $seqlen{$header};
+	    $width = $j-$i;
+	}
+	print STDERR join("\t", $header, $i, $j, $gc, $width), "\n" unless $width;
+	print join("\t", $header, $i, $j, sprintf("%0.0f\n", 100*$gc/$width));
+    }
+}
+
+print STDERR "Complete!\n";
+
+exit;
+

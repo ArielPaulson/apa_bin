@@ -1,0 +1,28 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use strict;
+
+my $cdsFa;  # CDS fasta
+my $geneCodonTables;  # 2-col tab-delim table, 1 header line, col 1 gene ID, col 2 snpEff codon table name
+
+($cdsFa, $geneCodonTables) = @ARGV;
+
+my $FA = &open2('R', $cdsFa, 'CDS Fasta');
+my @x = &readFasta($FA);
+close $FA;
+my @headers = @{$x[0]};
+my %CDSseq = %{$x[1]};
+
+my %gct;
+my $GCT = &open2('R', $geneCodonTables, 'Gene Codon Table List');
+while (<$GCT>) {
+    s/[\n\r]+$//;
+    my ($gene, $table) = split /\t/, $_;
+    $gct{$gene} = $table;
+}
+close $GCT;
+
+system "/home/apa/local/bin/fastaTranslate -f -p -h --relax-M --incomplete --report";
+
+
+

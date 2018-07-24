@@ -1,0 +1,199 @@
+#!/bin/bash
+
+geno=$1     # genome build dir from /n/data1/genomes/bowtie-index
+anno=$2     # an annot build dir name for this genome (/n/data1/genomes/bowtie-index/$geno/$anno must exist)
+outfile=$3  # output file
+perchr=$4   # report stats per chrom as well as genome? (any value for true); default no
+
+mergeBed=/n/local/stage/bedtools/bedtools2-2.19.0/bin/mergeBed
+subtractBed=/n/local/stage/bedtools/bedtools2-2.19.0/bin/subtractBed
+
+gdir=/n/data1/genomes/bowtie-index/$geno
+gprefix=$gdir/$geno
+adir=$gdir/$anno
+aprefix=$adir/$geno.$anno
+
+if [ -z $geno ]; then
+    echo "No genome given!  Exiting."
+    exit
+elif [ ! -d $gdir ]; then
+    echo "Genome '$geno' not found!  Exiting."
+    exit
+fi
+if [ -z $anno ]; then
+    echo "No annotation version given!  Exiting."
+    exit
+elif [ ! -d $adir ]; then
+    echo "Annotation version '$anno' not found for genome '$geno'!  Exiting."
+    exit
+fi
+if [ -z $outfile ]; then
+    echo "No output file given!  Exiting."
+    exit
+fi
+
+touch $outfile
+outfile=$(readlink -f $outfile)
+
+tmp=/tmp/GenomeBpTypes.$$
+mkdir $tmp
+cd $tmp
+pwd=$(pwd)
+if [ "$pwd" != "$tmp" ]; then
+    echo "Failed to create / cd to temp directory '$tmp'!  Exiting."
+    exit
+fi
+
+fai=$gprefix.fa.fai
+GS=$(paste -s -d+ <(cut -f2 $fai) | bc)  # genome size
+
+echo -e "\tTOTAL\tINTERGENE\tINTRON\tPC-UTR\tPC-CDS\tNC-EXON\tRIBOSOME" > $outfile
+
+echo "Preparing Genomic BED files..."
+grep -P "\t(Mt_)?rRNA\t" $aprefix.genedata.txt | cut -f3-5 > ribo.bed
+$mergeBed -i ribo.bed > ribo
+cat $aprefix.CDSs.bed | awk '{ if ($3 > $2) print $0 }' > cds1  # no single-bp UTRs
+$mergeBed -i cds1 > cds
+$mergeBed -i $aprefix.UTRs.bed > utr
+$mergeBed -i $aprefix.iintrons.bed > iint
+$mergeBed -i $aprefix.intergenes.bed > itgc
+$mergeBed -i $aprefix.uxons.bed > uxo
+cat cds utr | /home/apa/local/bin/sortBedCoord - > uxo2
+
+echo "Removing overlaps..."
+$subtractBed -a utr -b cds > pure_UTR              # subtract CDS from UTR (pure UTRs)
+$subtractBed -a uxo -b uxo2 > uxo-uxo2            # subtract merged CDS+UTR from unioned-exons (should have nothing left)
+$subtractBed -a uxo -b cds > uxo-cds              # subtract CDS from unioned-exons (provides unioned-UTRs)
+$subtractBed -a iint -b uxo > pure_IINT            # subtract unioned-exons from intersected-introns (should have no effect)
+$subtractBed -a pure_UTR -b ribo > pure_PC-UTR    # subtract ribosomes from pure UTRs (only p
+$subtractBed -a uxo-uxo2 -b ribo > uxo-uxo2-ribo
+
+echo "Calculating compartment sizes..."
+mv uxo-uxo2-ribo NC-EXON
+mv pure_PC-UTR PC-UTR
+mv cds PC-CDS
+mv itgc INTERGENE
+mv pure_IINT INTRON
+mv ribo RIBOSOME
+
+line="Genome\t$GS"
+for bed in INTERGENE INTRON PC-UTR PC-CDS NC-EXON RIBOSOME
+do
+    N=$(paste -s -d+ <(/home/apa/local/bin/bedLengths -b $bed | cut -f4) | bc)
+    if [ -z $N ] || [ $N == "" ]; then N=0; fi
+    line="$line\t$N"
+done
+echo -e $line
+echo -e $line >> $outfile
+
+
+if [ ! -z $perchr ]; then
+
+    for chr in $(cut -f1 $fai)
+    do
+	echo "Preparing $chr BED files..."
+	
+	grep -P "\t(Mt_)?rRNA\t" $aprefix.genedata.txt | grep -P "\t$chr\t" | cut -f3-5 > $chr.ribo1
+	nribo=$(cat $chr.ribo1 | wc -l)
+	if [ $nribo -gt 0 ]; then $mergeBed -i $chr.ribo1 > $chr.ribo; fi
+	
+	grep -P "^$chr\t" $aprefix.CDSs.bed | awk '{ if ($3 > $2) print $0 }' > $chr.cds1  # no single-bp UTRs
+	ncds=$(cat $chr.cds1 | wc -l)
+	if [ $ncds -gt 0 ]; then $mergeBed -i $chr.cds1 > $chr.cds; fi
+	
+	grep -P "^$chr\t" $aprefix.UTRs.bed > $chr.utrs1
+	nutr=$(cat $chr.utrs1 | wc -l)
+	if [ $nutr -gt 0 ]; then $mergeBed -i $chr.utrs1 > $chr.utr; fi
+	
+	grep -P "^$chr\t" $aprefix.iintrons.bed > $chr.iintrons1
+	niint=$(cat $chr.iintrons1 | wc -l)
+	if [ $niint -gt 0 ]; then $mergeBed -i $chr.iintrons1 > $chr.iint; fi
+	
+	grep -P "^$chr\t" $aprefix.intergenes.bed > $chr.intergenes1
+	ninter=$(cat $chr.intergenes1 | wc -l)
+	if [ $ninter -gt 0 ]; then $mergeBed -i $chr.intergenes1 > $chr.itgc; fi
+	
+	grep -P "^$chr\t" $aprefix.uxons.bed > $chr.uxons1
+	nuxons=$(cat $chr.uxons1 | wc -l)
+	if [ $nuxons -gt 0 ]; then $mergeBed -i $chr.uxons1 > $chr.uxo; fi
+	
+	echo "Removing overlaps..."
+	if [ -e $chr.utr ] && [ -e $chr.cds ]; then
+	    cat $chr.cds $chr.utr | /home/apa/local/bin/sortBedCoord - > $chr.uxo2
+	    $subtractBed -a $chr.utr -b $chr.cds > $chr.pure_UTR
+	elif [ -e $chr.utr ]; then
+	    cat $chr.utr | /home/apa/local/bin/sortBedCoord - > $chr.uxo2
+	    cat $chr.utr > $chr.pure_UTR
+	elif [ -e $chr.cds ]; then
+	    cat $chr.cds | /home/apa/local/bin/sortBedCoord - > $chr.uxo2
+	fi
+	
+	if [ -e $chr.uxo ] && [ -e $chr.uxo2 ]; then
+	    $subtractBed -a $chr.uxo -b $chr.uxo2 > $chr.uxo-uxo2
+	elif [ -e $chr.uxo ]; then
+	    cat $chr.uxo > $chr.uxo-uxo2
+#	elif [ -e $chr.uxo2 ]; then
+#	    ## Not possible (CDS+UTR but no uxons)
+	fi
+	
+	if [ -e $chr.uxo ] && [ -e $chr.cds ]; then
+	    $subtractBed -a $chr.uxo -b $chr.cds > $chr.uxo-cds
+	elif [ -e $chr.uxo ]; then
+	    cat $chr.uxo > $chr.uxo-cds
+#	elif [ -e $chr.cds ]; then
+#	    ## Not possible (CDS but no uxons)
+	fi
+	
+	if [ -e $chr.iint ] && [ -e $chr.uxo ]; then
+	    $subtractBed -a $chr.iint -b $chr.uxo > $chr.pure_IINT
+#	elif [ -e $chr.uxo ]; then
+#	    ## Nothing to do
+#	elif [ -e $chr.iint ]; then
+#	    ## Not possible (iintrons but no uxons)
+	fi
+	
+	if [ -e $chr.pure_UTR ] && [ -e $chr.ribo ]; then
+	    $subtractBed -a $chr.pure_UTR -b $chr.ribo > $chr.pure_PC-UTR
+	elif [ -e $chr.pure_UTR ]; then
+	    cat $chr.pure_UTR > $chr.pure_PC-UTR
+#	elif [ -e $chr.ribo ]; then
+#	    ## Nothing to do (are ncRNAs classified as UTR exons??  Hopefully not?)
+	fi
+	
+	if [ -e $chr.uxo-uxo2 ] && [ -e $chr.ribo ]; then
+	    $subtractBed -a $chr.uxo-uxo2 -b $chr.ribo > $chr.uxo-uxo2-ribo
+	elif [ -e $chr.uxo-uxo2 ]; then
+	    cat $chr.uxo-uxo2 > $chr.uxo-uxo2-ribo
+#	elif [ -e $chr.ribo ]; then
+#	    ## Not possible (ribosomes but no uxons)
+	fi
+	
+	echo "Calculating compartment sizes..."
+	if [ -e $chr.uxo-uxo2-ribo ]; then mv $chr.uxo-uxo2-ribo $chr.NC-EXON; fi
+	if [ -e $chr.pure_PC-UTR ]; then mv $chr.pure_PC-UTR $chr.PC-UTR; fi
+	if [ -e $chr.cds ]; then mv $chr.cds $chr.PC-CDS; fi
+	if [ -e $chr.itgc ]; then mv $chr.itgc $chr.INTERGENE; fi
+	if [ -e $chr.pure_IINT ]; then mv $chr.pure_IINT $chr.INTRON; fi
+	if [ -e $chr.ribo ]; then mv $chr.ribo $chr.RIBOSOME; fi
+	
+	BP=$(grep -P "^$chr\t" $fai | cut -f2)
+	line="$chr\t$BP"
+	for bed in INTERGENE INTRON PC-UTR PC-CDS NC-EXON RIBOSOME
+	do
+	    if [ -e $chr.$bed ]; then
+		N=$(paste -s -d+ <(/home/apa/local/bin/bedLengths -b $chr.$bed | cut -f4) | bc)
+	    else
+		N=0
+	    fi
+	    line="$line\t$N"
+	done
+	echo -e $line
+	echo -e $line >> $outfile
+	
+    done
+fi
+
+cd ..
+#rm -rf $tmp
+echo "GenomeBpTypes $geno $anno done!"
+

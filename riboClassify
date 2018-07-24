@@ -1,0 +1,159 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## Operates on an Ensembl transcriptome build.
+## Can take a fasta of NCBI / Silva rRNA objects to help with annotation.
+## Performs deeper classification of ribosomes than provided by Ensembl.
+## Returns a tabular all-ribosome dataset, with sequences.
+## New dataset includes correct SimpleBiotype and rRNA class, as well as
+##  annotations of classifiable sub-features of 'misc' rRNA objects.
+
+my $prefix;  # input prefix for transcriptome build files (need $prefix.[remap|cuff].gtf, $prefix.genedata.txt)
+my $outpref; # output prefix
+my $annofa;  # NCBI/Silva annotation fasta; headers must only be object type, see below
+
+## $annotfa content:
+## Each sequence must be only one ribosomal feature: either an rRNA, or a spacer.
+## Each header must have format ">id|class(completeness)"
+## "id" must NOT contain any of these symbols: > | ( )
+## "class" must match one of these three regexps:  /^[0-9.]+S_rRNA$/  OR  /^ITS[12]a?$/  OR  /^ETS[53]$/
+## "completeness" must be either "full" or "partial"
+
+
+GetOptions("p=s"=>\$prefix, "o=s"=>\$outpref "f=s"=>\$annofa);
+
+
+my $gdat = "$pub/$geno.$anno.genedata.txt";
+open my $GD, '-|', "grep -vP \"\\tprotein_coding\\t\" $gdat | grep -v \"ribosomal protein\"";  # should retain header line
+my @colnames;
+while (my $line = <$GD>) {
+    $line =~ s/[\n\r]+$//;
+    my @data = split /\t/, $line;
+    if ($. == 1) {
+        $gdheader = "$line\tClass\tMaxTrans\tTransLen\tGC%\tSeq\n";
+        @colnames = @data;
+    } else {
+        my %x = map { ($colnames[$_] => $data[$_]) } (0..$#data);
+        if ($x{SimpleBiotype} eq 'rRNA' || $x{SimpleBiotype} eq 'rRNA_pseudogene') {
+            my $gene = $x{GeneID};
+            my $ntrans = scalar(keys %{ $gt{$gene} });
+            my $maxtrans = (sort { $gt{$gene}{$b} <=> $gt{$gene}{$a} } keys %{ $gt{$gene} })[0];
+            my $maxseq = $seq{$maxtrans};
+            my $maxlen = length($maxseq);
+            unless ($maxlen) {
+                print STDERR "$x{GeneID}, $x{Name}, $x{Biotype}: $ntrans transcripts, max $maxtrans has length 0 ($x{Description})!\n";
+                $maxlen = 1;
+            }
+            my $gcn;
+            $gcn++ while $maxseq =~ /[gc]/ig;
+            my $gcp = sprintf("%0.2f",100*$gcn/$maxlen);
+            my ($class, $testnum) = @{ &get_ribo_class_Ensembl($x{Name}, $x{Chr}, $x{Description}) };
+            my $is_ps = $x{Biotype} eq 'pseudogene';
+            my $is_ribo = $x{Description} =~ /ribosom/ && $x{Description} =~ /RNA/;
+            $is_ps = 1 if $class eq 'misc';  # if Ensembl won't type it, then it is probably a fragment of the repeat
+            my $class2 = $class =~ /^(Mt_rRNA|5S_rRNA|misc)$/ ? $class : 'ribo-repeat';  # IF NOT THESE 3, ASSUMED TO BE REPEAT-ASSOCIATED
+            
+            
+            #### WORKING HERE: output columns not finalized
+            
+            
+            push @{ $output{$class2} }, "$line\t$class\t$maxtrans\t$maxlen\t$gcp\t$maxseq\n";
+            push @seq5S, ">$x{Name}\n$maxseq\n" if $class eq '5S_rRNA';
+        }
+    }
+}
+close $GD;
+
+
+## Get 5S consensus
+if (@seq5S) {
+    my $n5S = scalar(@seq5S);
+    print "Generating 5S_rRNA consensus from $n5S sequences...\n";
+    open FA5, '>', "$pref.5S_rRNA.fa";
+    print FA5 @seq5S;
+    close FA5;
+    my $cmd = "muscle -in $pref.5S_rRNA.fa -out $pref.5S_rRNA.aln.fa";
+    print "RUNNING: $cmd\n"; system $cmd;
+    my $cmd = "/home/apa/local/bin/multialignConsensus -f $pref.5S_rRNA.aln.fa > $pref.5S_rRNA.aln.txt";
+    print "RUNNING: $cmd\n"; system $cmd;
+    chomp(my $seq5S = `grep ^CONSENSUS $pref.5S_rRNA.aln.txt | sed 's/-//g' | awk '{ print \$2 }'`);
+    my $len5S = length($seq5S);
+    my $gcn;
+    $gcn++ while $seq5S =~ /[gc]/ig;
+    my $gcp = sprintf("%0.2f",100*$gcn/$len5S);
+    my $cmd = "grep ^CONSENSUS $pref.5S_rRNA.aln.txt | sed \"s/CONSENSUS/5S_rRNA|consensus_of_${n5S}_Ensembl_genes:$len5S:$gcp/\" | sed 's/-//g' | /home/apa/local/bin/tab2fasta - > $pref.5S_rRNA.consensus.fa";
+    print "RUNNING: $cmd\n"; system $cmd;
+}
+
+
+## Deal with 'misc' ribosomes
+
+
+#### WORKING HERE: blast/blat annot fasta AND known ribosomes into miscs; make bed file with annotated sections for all miscs
+
+
+$misc_gd = "$pref.misc.genedata.txt";
+if (-e $misc_gd) {
+    print "\nThe following biotype combinations were found in '$misc_gd':\n";
+    system "tail -n +2 $misc_gd | cut -f13,14 | sort -u";
+    print "\n";
+} else {
+    print "\nNo miscellaneous ribosomes!\n";
+}
+
+exit;
+
+
+
+
+sub get_ribo_class_Ensembl {
+    my @x = @_;
+    ## Take an array with (gene symbol, chromosome, description)
+    ## Figures out what type of ribosome it is
+    if ($x[1] eq 'chrM') {         # mitochondrials 1   ##### THIS MUST BE TESTED FIRST #####
+        return ['Mt_rRNA', 1];
+    } elsif ($x[0] =~ /^Mt/i) {    # mitochondrials 2
+        return ['Mt_rRNA', 2];
+    } elsif ($x[2] =~ /mitochondri/i && $x[2] =~ /RNA/i) {  # mitochondrials 3
+        return ['Mt_rRNA', 3];
+    } elsif ($x[0] =~ /pre[_-]rRNA/i) {      # full repeats
+        return ["pre_rRNA", 4];
+    } elsif ($x[0] =~ /^([\d.]+S)_?r/i) {      # the easiest
+        return ["${1}_rRNA", 5];
+    } elsif ($x[0] =~ /[^\d]([\d.]+S)_?r/i) {  # another way of doing the above
+        return ["${1}_rRNA", 6];
+    } elsif ($x[0] =~ /5S/i) {     # harder 5S
+        return ['5S_rRNA', 7];
+    } elsif ($x[0] =~ /5.?8S/i) {  # harder 5.8S
+        return ['5.8S_rRNA', 8];
+    } elsif ($x[0] =~ /^RDN(\d+)-/) {       # sacCer
+        return ["$1S_rRNA", 9];
+    } elsif ($x[2] =~ /([\d.]+S) ribo/i) {  # if annotated in description only (pombe, 23S pseudoknots)
+        return ["${1}_rRNA", 10];
+    } elsif ($x[2] =~ /([\d.]+S) rRNA/i) {  # another way of doing the above
+        return ["${1}_rRNA", 11];
+    } elsif ($x[0] =~ /[^\d]5.?8sr?[^\d]/i) {   # trying very hard, 5.8S version
+        return ['5.8S_rRNA', 12];
+    } elsif ($x[0] =~ /[^\d]([\d]{1,2})sr?[^\d]/i) {  # trying very hard, everything-else version
+        return ["$1S_rRNA", 13];
+    } else {                      # failing
+        return ['misc', 14];
+    }
+}
+
+
+# PROCESSING: from "An overview of pre-ribosomal RNA processing in eukaryotes"
+# sacCer: 35S->33->32->20+27SA.  20->18.  27SA->27SB->26+7.  7->6->5.8.  26->25.5->25.
+# mammal: 47S->45->30+43.  30->36->21->18.  43->41->32.5->32->12+28.5.  12->7->6->5.8.  28.5->28.
+# ignore: 60S, 40S (these are final assembled subunits, not transcripts)
+# mito??
+
+# pseudo: /pseudogene/, /pseudoknot/, /predicted gene, \d+/,
+# repeat: /pre-(ribo|rRNA)/, precursors given above
+# mito: split into small (small|12S), large (large|16S), or repeat (see below)
+# mito repeat: large () or small (15S), 21S
+
+

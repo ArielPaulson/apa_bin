@@ -1,0 +1,78 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my $mergeBed = '/n/local/stage/bedtools/bedtools2-2.19.0/bin/mergeBed';
+
+my ($file, $type) = @ARGV;
+($type) = ($file =~ /\.(\w{3,4})$/) unless $type;
+my ($bed, $gtf);
+if ($type =~ /^bed$/i) {
+    $bed = 1;
+} elsif ($type =~ /^gtf/i) {
+    $gtf = 1;
+} else {
+    die "$0: File must have appropriate extension: 'bed' or 'gtf'; 'gtf' may be followed by one digit.\n";
+}
+my $tmp = "exons2uxons.$$.tmp";
+my ($pre, $post) = ("$tmp.premerge", "$tmp.postmerge");
+my (%gdat, %geneord, %exnum);
+
+open my $OUT, '>', $pre;
+if ($bed) {
+    
+    open my $IN1, '<', $file or die "$0: Failed to open BED file '$file': $!\n";  # expecting an exons.bed file, with IDs = geneID or geneID:exonNum; geneID may not contain colons
+    while (<$IN1>) {
+	$_ =~ s/[\n\r]+$//;
+#	next if ($_ =~ /^track / || $_ =~ /^#/);
+	my ($chr, $start, $end, $id, $score, $strand) = split /\t/, $_;
+	my ($gene, $num) = $id =~ /:/ ? (split /:/, $id) : ($id, '');
+	$num = ++$exnum{$gene} unless $num;
+	print $OUT "$gene\t$start\t$end\t$num\n";
+	$gdat{$gene} = [$chr, $strand];
+	$geneord{$gene} = $.;   # overwrites but maintains order
+    }
+    close $IN1;
+    
+#    print STDERR scalar(keys %gdat), "genes counted\n";
+    
+} elsif ($gtf) {
+    
+    open my $IN2, '<', $file or die "$0: Failed to open GTF file '$file': $!\n";  # expecting a gtf2+ GTF file with a gene ID field like { gene_id "geneID"; }
+    while (<$IN2>) {
+	$_ =~ s/[\n\r]+$//;
+	next if ($_ =~ /^track/ || $_ =~ /^#/);
+	my ($chr, $source, $feature, $start, $end, $score, $strand, $phase, $annot) = split /\t/, $_;
+	my ($gene) = ($annot =~ /gene_id "(.*?)"/);
+	my $num = ++$exnum{$gene};
+	$start--;   # 0-based
+	print $OUT "$gene\t$start\t$end\t$num\n";
+	$gdat{$gene} = [$chr, $strand];
+	$geneord{$gene} = $.;   # overwrites but maintains order
+    }
+    close $IN2;
+    
+}
+close $OUT;
+
+system "/home/apa/local/bin/sortBedCoord -i $pre --overwrite --no-chr-sort";
+system "$mergeBed -nms -i $pre > $post";
+
+my @output;
+open my $IN3, '<', $post or die "$0: Failed to open post-merge file '$post': $!\n";
+while (<$IN3>) {
+    chomp;
+    my ($gene, $start, $end, $ids) = split /\t/, $_;
+    my ($chr, $str) = @{ $gdat{$gene} };
+    my @nums = split /;/, $ids;
+    my $newid = "$gene:" . (join '|', sort {$a <=> $b} @nums);
+    push @output, "$chr\t$start\t$end\t$newid\t1\t$str\n";
+}
+close $IN3;
+
+system "rm -f $pre";
+system "rm -f $post";
+
+print @output;
+exit;

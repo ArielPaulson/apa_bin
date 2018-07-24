@@ -1,0 +1,549 @@
+#!/usr/bin/env perl
+use Data::Dumper;
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my $molngs;                      # required, takes everything for given MOLNG
+my ($flowcell, $lanes, $ends);   # optional, restricts fastqs to those matching these
+my $nomerge;                     # do not merge sample fastqs; symlink in using unique sample-based fastq names
+my $writedir = '../data/fastq';  # default location for writing merged fastqs
+my $rename;                      # optional file indicating how to rename samples, see below.
+my $debug;                       # verbose reporting to screen
+my $namevet;                     # "pre-run" mode for vetting sample names
+my $molng_name;                  # add the MOLNG number to output files
+my $use_report;                  # specify an edited merge_report.txt (output from this script)
+                                 #   if given, all outputs will be remade using ONLY the fastqs found in $use_report.
+
+GetOptions("w=s"=>\$writedir, "m=s"=>\$molngs, "f=s"=>\$flowcell, "n=s"=>\$lanes, "e=i"=>\$ends, "r=s"=>\$rename, "report=s"=>\$use_report, "no-merge"=>\$nomerge, "debug"=>\$debug, "vet"=>\$namevet, "molng-name"=>\$molng_name);
+
+die "$0: no MOLNG numbers given!\n" unless $molngs;
+my @molngs;
+foreach my $molng (split /,/, $molngs) {
+    $molng = "MOLNG-$molng" unless $molng =~ /^MOLNG/;
+    push @molngs, $molng;
+}
+my %molngs = map {($_=>1)} @molngs;
+
+my (%ALLMOLNG, %CSV, %already, %newnames, %newlost, %excluded, %usefq, %data, %namevet, %vet, %samp2ordsamp, %OSfail, %minRL);
+my (@cols, @report);
+my $is_old;
+
+if ($use_report) {
+    $usefq{$_} = 1 foreach split /\n/, `cut -f14 $use_report | tail -n +2`;
+}
+
+if ($rename) {
+    ## If given, '$rename' is a 2-3 column file, tab delim, with 1-line header.
+    ## col 1 = old sample name; col 2 = new sample name; col 3 = library id.
+    ## Will rename all matching samples in the outputs.
+    open my $RN, '<', $rename;
+    while (<$RN>) {
+        chomp;
+        next if $. == 1;   ## EXPECTS HEADER
+        my ($old, $new, $library) = split /\t/, $_;
+        my $key = "$library.$old";
+        die "$0: old sample '$key' library '$library' is duplicated in the renaming file!  Halting.\n" if exists $newnames{$key};
+        $newnames{$key} = [$library, $old, $new, 0];
+    }
+    close $RN;
+}
+
+## Detect where the MOLNG folders are
+my $nan = '/n/analysis';
+foreach my $lab (glob "$nan/*") {
+    foreach my $researcher (glob "$lab/*") {
+        foreach my $molngdir (glob "$researcher/*") {
+            (my $molng = $molngdir) =~ s/.*\///;
+            $lab =~ s!$nan/!!;
+            $researcher =~ s!$nan/$lab/!!;
+            $ALLMOLNG{$molng} = [$molngdir, $lab, $researcher];
+       }
+    }
+}
+
+foreach my $molng (@molngs) {
+    my $root = $ALLMOLNG{$molng}->[0];
+    print "ROOT: $root\n";
+    die "$0: /n/analysis location '$root' does not exist!\n" unless -d $root;
+    if ($flowcell) {
+        $CSV{$flowcell} = "$root/$flowcell/Sample_Report.csv";
+        die "$0: Expected Sample_Report.csv file '$root/$flowcell/Sample_Report.csv' not found!\n" unless -e $CSV{$flowcell};
+        $already{FC}{$molng}{$flowcell} = 1;
+    } else {
+        foreach my $csv (split /\n/, `ls $root/*/Sample_Report.csv`) {
+            my ($fc) = ($csv =~ /$root\/([^\/]+)\/Sample_Report.csv/);
+            die "$0: Flowcell '$fc' has > 1 Sample_Report.csv!  Halting.\n" if $already{FC}{$molng}{$fc};
+            $already{FC}{$molng}{$fc} = 1;
+            $CSV{$molng}{$fc} = $csv;
+        }
+        die "$0: No Sample_Report.csv files found within '$root/*/'!\n" unless %CSV;
+    }
+}
+
+## Sample_Report.csv fields:
+## OLD: output | order |              lane | sample name | library id | illumina index | custom barcode | read | reference |       total reads | pass filter reads | pass filter percent | align percent | type | read length
+## NEW: output | order | order type | lane | sample name | library id | illumina index | custom barcode | read | reference | lab | total reads | pass filter reads | pass filter percent | align percent | type | read length
+
+print "CSV:\n",Dumper(\%CSV),"\n";
+
+## Older format columns
+my @usecols_old = ('output','order','lane','sample name','library id','illumina index','custom barcode','read','type','read length','DELME');   ## last column just for length consistency with new
+## Newer format columns
+my @usecols_new = ('Output','Order','Lane','SampleName','LibraryID','IndexSequence1','IndexSequence2','Read','Type','ReadLength','OrderType');  ## OrderType only in 'new'!
+
+push @report, [qw/ Lab Researcher Order SampleType OriginalSample RenamedSample Library Barcode Platform Flowcell Lane EndType End Length InputFastq OutputFastq /];
+foreach my $molng (@molngs) {
+    my ($molngdir, $lab, $researcher) = @{ $ALLMOLNG{$molng} };
+    foreach my $fc (sort keys %{ $CSV{$molng} }) {
+        my $csv = $CSV{$molng}{$fc};
+        (my $path = $csv) =~ s/\/Sample_Report.csv//;
+        open my $IN, '<', $csv or die "$0: Failed to read Sample_Report.csv '$csv': $!\n";
+        while (<$IN>) {
+            s/[\n\r]+$//;
+            my @fields = split /,/, $_;
+            if ($. == 1) {
+                ## HEADER
+                @cols = ();
+                foreach my $i (0..$#usecols_new) {
+                    foreach my $j (0..$#fields) {
+                        if ($fields[$j] eq $usecols_new[$i]) {
+                            push @cols, $j;
+                            last;
+                        }
+                    }
+                }
+                unless (@cols) {
+                    foreach my $i (0..$#usecols_old) {
+                        foreach my $j (0..$#fields) {
+                            if ($fields[$j] eq $usecols_old[$i]) {
+                                push @cols, $j;
+                                last;
+                            }
+                        }
+                    }
+                    if (@cols) {
+                        $is_old = 1;
+                    } else {
+                        die "$0: Failed to identify required columns in sample report file '$csv'!\n";
+                    }
+                }
+            } else {
+                ## DATA
+                my ($fq, $mol, $lane, $oldsamp, $lib, $idx1, $idx2, $end, $type, $len, $ordtype) = @fields[@cols];
+                #print "FQ $fq | MOLNG $mol | LANE $lane | SAMP $oldsamp | LIB $lib | IDX1 $idx1 | IDX2 $idx2 | $end | $type | $len | $ordtype\n";
+                my $idx12 = $idx2 ? "$idx1-$idx2" : $idx1;  ## FROM HERE ON OUT, DUAL BARCODES ARE CONSIDERED AS A UNIT
+                next unless $mol eq $molng;
+                my ($samp, $newsamp);  # keep separate.  $samp is master name going forward (old or new); $newsamp exists ONLY if renaming samples
+                my $fcl = length($fc);
+                my $platform = $fcl < 7 ? 'miseq' : $fq =~ /^n_/ ? 'nextseq' : $fq =~ /^s_/ && ($fcl==9||$fcl==10) ? 'hiseq' : '';
+                if ($rename) {
+                    my $key = "$lib.$oldsamp";
+                    if (exists $newnames{$key}) {
+                        ## rename any eligible samples immediately
+                        $newnames{$key}->[3] = 1;  # found and converted
+                        $newsamp = $newnames{$key}->[2];
+                        print "Converting sample name: '$oldsamp' => '$newsamp' ($lib)\n" if $debug;
+                        $samp = $newsamp;
+                    }
+                } else {
+                    $samp = $oldsamp;
+                }
+                $namevet{$mol}{$lib}{$oldsamp}{$idx12} = $samp;
+                my $ordsamp = "$mol.$samp";   # the most straightworward backup-name possible (if $samp is not unique); keep for later testing
+                my %sampOS = ('S',$samp, 'O',$ordsamp);
+                $samp2ordsamp{$samp}{$ordsamp} = 1;
+                my $isbam = $fq =~ /\.bam$/;  # bams not fastqs; early NextSeq problem
+                $len =~ s/\s+$//;  # trailing whitespace has been observed
+                if ($len =~ /^(\d+) (\d+)$/) {
+                    ## old-style PE read lengths
+                    $len = $end == 2 ? $2 : $1;
+                }
+                $fq = "$path/$fq";
+                next if %usefq && !$usefq{$fq};
+                if ($type =~ /single/i) {
+                    $type = 'single';
+                } elsif ($type =~ /pair/i) {
+                    $type = 'paired';
+                } else {
+                    ## unknown pairing status; known to happen with early NextSeq file conventions, so check this first...
+                    if ($fq =~ /\/(L\d+)-([ACGT]+)_(S[1234])_(L00[1234]).bam$/) {
+                        ## Early NextSeq; handle below
+                        $isbam = 1;
+                    } elsif ($isbam) {
+                        die "$0: Got BAM not FASTQ, but run not detectably NextSeq!\n $_\n";
+                    } else {
+                        print STDERR "WARNING: read ends type '$type' unrecognized for sample '$samp': $mol | $fq | $idx12 | $lane | $end\n";
+                        $type = '';   # could default to single-end here
+                    }
+                }
+                my (@fastqs, @ends);
+                if ($isbam) {
+                    ## OLD NEXTSEQ: BOTH FASTQS REPRESENTED BY ONE LINE: MUST LOOP BELOW FOR BOTH FASTQS
+                    (my $pref = $fq) =~ s/\.bam$//;
+                    my $fq1 = "${pref}_R1_001.fastq.gz";
+                    my $fq2 = "${pref}_R2_001.fastq.gz";
+                    if (-e $fq1) {
+                        @fastqs = ($fq1);
+                        @ends = (1);
+                    } else {
+                        die "$0: cannot find imputed end-1 fastq '$fq1'!\n";
+                    }
+                    if (-e $fq2) {
+                        push @fastqs, $fq2;
+                        push @ends, 2;
+                        $type = 'paired';
+                    } else {
+                        $type = 'single';
+                    }
+                } else {
+                    ## EVERYTHING ELSE: ONE FASTQS REPRESENTED BY ONE LINE: LOOP BELOW FOR PENDING END ONLY
+                    @fastqs = ($fq);
+                    @ends = ($end);
+                }
+                foreach my $i (0..$#fastqs) {
+                    my $fastq = $fastqs[$i];
+                    my $fqend = $ends[$i];
+                    print STDERR "WARNING: Skipping fastq '$fastq': already seen before!\n" if $already{FQ}{$fastq};
+                    $already{FQ}{$fastq} = 1;
+                    unless ($len) {
+                        #print "Detecting read length for: '$fastq'...";
+                        $| = 1;
+                        chomp($len = `zcat $fastq | head -2 | tail -1 | wc -c`);
+                        $len--;
+                        #print " ($len bp)\n";
+                    }
+                    print STDERR "FOUND: $samp | LIB: $lib | IDX12: $idx12 | LEN: $len | TYPE: $type | END: $fqend | MOLNG: $mol | FC: $fc | LANE: $lane | FQ: $fastq\n" if $debug;
+                    push @report, [$lab, $researcher, $mol, $ordtype, $oldsamp, $newsamp, $lib, $idx12, $platform, $fc, $lane, $type, $fqend, $len, $fastq, ''];
+                    
+                    foreach my $OS (qw/ O S /) {
+                        ## Storing two clones of the data structures: one using $samp, and the other $ordsamp.
+                        ## If $samp fails to be unique, then $ordsamp is the next most-obvious replacement, and will be sufficient probably 99.9% of the time.
+                        ## Only if BOTH fail to be unique (it has happened) then we go down the $lib/$idx/$len/$type-appending route to uniqueness (later).
+                        push @{ $data{$OS}{ $sampOS{$OS} }{$lib}{$idx12}{$len}{$type}{$fqend}{$mol}{$fc}{$lane} }, $fastq;
+                        $vet{$OS}{SAMP}{ $sampOS{$OS} }{LIB}{$lib} = 1;
+                        $vet{$OS}{SAMP}{ $sampOS{$OS} }{IDX}{$idx12} = 1;
+                        $vet{$OS}{SAMP}{ $sampOS{$OS} }{LEN}{$len} = 1;
+                        $vet{$OS}{SAMP}{ $sampOS{$OS} }{TYPE}{$type} = $fqend if $fqend > $vet{$OS}{SAMP}{ $sampOS{$OS} }{TYPE}{$type};  # recording highest end number per end type
+                        $vet{$OS}{LIB}{$lib}{SAMP}{ $sampOS{$OS} } = 1;
+                        $vet{$OS}{LIB}{$lib}{IDX}{$idx12} = 1;
+                        $vet{$OS}{LIB}{$lib}{LEN}{$len} = 1;
+                        $vet{$OS}{LIB}{$lib}{TYPE}{$type} = $fqend if $fqend > $vet{$OS}{LIB}{$lib}{TYPE}{$type};
+                        $vet{$OS}{IDX}{$idx12}{SAMP}{ $sampOS{$OS} } = 1;
+                        $vet{$OS}{IDX}{$idx12}{LIB}{$lib} = 1;
+                        $vet{$OS}{IDX}{$idx12}{LEN}{$len} = 1;
+                        $vet{$OS}{IDX}{$idx12}{TYPE}{$type} = $fqend if $fqend > $vet{$OS}{IDX}{$idx12}{TYPE}{$type};
+                    }
+                }
+            }
+        }
+        close $IN;
+    }
+}
+
+
+if ($namevet) {
+    print "ORDER\tLIBRARY\tINDEX\tOLDSAMPLE\tNEWSAMPLE\n";
+    foreach my $molng (sort keys %namevet) {
+        foreach my $lib (sort keys %{ $namevet{$molng} }) {
+            foreach my $oldsamp (sort keys %{ $namevet{$molng}{$lib} }) {
+                foreach my $idx12 (sort keys %{ $namevet{$molng}{$lib}{$oldsamp} }) {
+                    my $samp = $namevet{$molng}{$lib}{$oldsamp}{$idx12};
+                    print "$molng\t$lib\t$idx12\t$oldsamp\t$samp\n";
+                }
+            }
+        }
+    }
+    exit;  # name-vetting is all that happens!
+}
+
+
+if ($rename) {
+    ## check for unconverted sample names; may indicate typos in the renaming file
+    my @lostnames;
+    foreach my $key (sort keys %newnames) {
+        push @lostnames, join("\t", @{ $newnames{$key} }) unless $newnames{$key}->[3];
+    }
+    if (@lostnames) {
+        print STDERR "*** WARNING: the following samples names were supposed to be converted, but were not found in the sample reports:\n";
+        print "LIB\tOLD\tNEW\tFOUND\n";
+        print "$_\n" foreach @lostnames;
+        print "\n";
+    }
+}
+
+
+foreach my $OS (qw/ O S /) {
+    my $OSname = $OS eq 'S' ? 'sample' : 'order-sample';
+    
+    ## Vet sample associations
+    foreach my $samp (sort keys %{ $vet{$OS}{SAMP} }) {
+        my @libs = sort keys %{ $vet{$OS}{SAMP}{$samp}{LIB} };
+        if ($#libs>0) {
+            my $libstr = join(', ', @libs);
+            print STDERR "WARNING: $OSname '$samp' associated with ",($#libs+1)," libraries: $libstr\n";   # multiple libraries per sample name
+            $OSfail{$OS}{S}{$samp} = 1;
+        }
+        my @idxs = sort keys %{ $vet{$OS}{SAMP}{$samp}{IDX} };
+        if ($#idxs>0) {
+            my $idxstr = join(', ', @idxs);
+            print STDERR "WARNING: $OSname '$samp' associated with ",($#idxs+1)," barcodes: $idxstr\n";   # multiple barcodes per sample name
+            $OSfail{$OS}{S}{$samp} = 1;
+        }
+        my @lens = sort keys %{ $vet{$OS}{SAMP}{$samp}{LEN} };
+        if ($#lens>0) {
+            my $lenstr = join(', ', @lens);
+            print STDERR "WARNING: $OSname '$samp' associated with ",($#lens+1)," read lengths: $lenstr\n";   # multiple read lengths per sample name
+            $OSfail{$OS}{S}{$samp} = 1;
+        }
+        my @types = sort keys %{ $vet{$OS}{SAMP}{$samp}{TYPE} };
+        if ($#types>0) {
+            my $typestr = join(', ', @types);
+            print STDERR "WARNING: $OSname '$samp' associated with ",($#types+1)," end types: $typestr\n";   # multiple read end types per sample name
+            $OSfail{$OS}{S}{$samp} = 1;
+        }
+        foreach my $type (@types) {
+            if ($type eq 'single') {
+                if ($vet{$OS}{SAMP}{$samp}{TYPE}{$type} > 1) {   # not enough fastqs
+                    print STDERR "WARNING: $OSname '$samp': some '$type'-end runs have both end fastqs\n";
+                    $OSfail{$OS}{S}{$samp} = 1;
+                }
+            } elsif ($type eq 'paired') {
+                if ($vet{$OS}{SAMP}{$samp}{TYPE}{$type} == 1) {  # too many fastqs
+                    print STDERR "WARNING: $OSname '$samp': some '$type'-end runs lack both end fastqs\n";
+                    $OSfail{$OS}{S}{$samp} = 1;
+                }
+            }
+        }
+    }
+
+    ## Vet library associations
+    foreach my $lib (sort keys %{ $vet{$OS}{LIB} }) {
+        my @samps = sort keys %{ $vet{$OS}{LIB}{$lib}{SAMP} };
+        if ($#samps>0) {
+            my $sampstr = join(', ', @samps);
+            print STDERR "WARNING: Library '$lib' associated with ",($#samps+1)," samples: $sampstr\n";   # multiple sample names per library
+            $OSfail{$OS}{L}{$lib} = 1;
+        }
+        my @idxs = sort keys %{ $vet{$OS}{LIB}{$lib}{IDX} };
+        if ($#idxs>0) {
+            my $idxstr = join(', ', @idxs);
+            print STDERR "WARNING: Library '$lib' associated with ",($#idxs+1)," barcodes: $idxstr\n";   # multiple barcodes per library
+            $OSfail{$OS}{L}{$lib} = 1;
+        }
+        my @lens = sort keys %{ $vet{$OS}{LIB}{$lib}{LEN} };
+        if ($#lens>0) {
+            my $lenstr = join(', ', @lens);
+            print STDERR "WARNING: Library '$lib' associated with ",($#lens+1)," read lengths: $lenstr\n";   # multiple read lengths per library
+            $OSfail{$OS}{L}{$lib} = 1;
+        }
+        my @types = sort keys %{ $vet{$OS}{LIB}{$lib}{TYPE} };
+        if ($#types>0) {
+            my $typestr = join(', ', @types);
+            print STDERR "WARNING: Library '$lib' associated with ",($#types+1)," end types: $typestr\n";   # multiple read end types per library
+            $OSfail{$OS}{L}{$lib} = 1;
+        }
+        foreach my $type (@types) {
+            if ($type eq 'single') {
+                if ($vet{$OS}{LIB}{$lib}{TYPE}{$type} > 1) {   # not enough fastqs
+                    print STDERR "WARNING: Library '$lib': some '$type'-end runs have both end fastqs\n";
+                    $OSfail{$OS}{L}{$lib} = 1;
+                }
+            } elsif ($type eq 'paired') {
+                if ($vet{$OS}{LIB}{$lib}{TYPE}{$type} == 1) {  # too many fastqs
+                    print STDERR "WARNING: Library '$lib': some '$type'-end runs lack both end fastqs\n";
+                    $OSfail{$OS}{L}{$lib} = 1;
+                }
+            }
+        }
+    }
+
+    ## Vet index associations
+    foreach my $idx (sort keys %{ $vet{$OS}{IDX} }) {
+        my @samps = sort keys %{ $vet{$OS}{IDX}{$idx}{SAMP} };
+        if ($#samps>0) {
+            my $sampstr = join(', ', @samps);
+            print STDERR "WARNING: Barcode '$idx' associated with ",($#samps+1)," samples: $sampstr\n";   # multiple sample names per barcode
+            $OSfail{$OS}{I}{$idx} = 1;
+        }
+        my @libs = sort keys %{ $vet{$OS}{IDX}{$idx}{LIB} };
+        if ($#libs>0) {
+            my $libstr = join(', ', @libs);
+            print STDERR "WARNING: Barcode '$idx' associated with ",($#libs+1)," libraries: $libstr\n";   # multiple libraries per barcode
+            $OSfail{$OS}{I}{$idx} = 1;
+        }
+        my @lens = sort keys %{ $vet{$OS}{IDX}{$idx}{LEN} };
+        if ($#lens>0) {
+            my $lenstr = join(', ', @lens);
+            print STDERR "WARNING: Barcode '$idx' associated with ",($#lens+1)," read lengths: $lenstr\n";   # multiple read lengths per barcode
+            $OSfail{$OS}{I}{$idx} = 1;
+        }
+        my @types = sort keys %{ $vet{$OS}{IDX}{$idx}{TYPE} };
+        if ($#types>0) {
+            my $typestr = join(', ', @types);
+            print STDERR "WARNING: Barcode '$idx' associated with ",($#types+1)," end types: $typestr\n";   # multiple read end types per barcode
+            $OSfail{$OS}{I}{$idx} = 1;
+        }
+        foreach my $type (@types) {
+            if ($type eq 'single') {
+                if ($vet{$OS}{IDX}{$idx}{TYPE}{$type} > 1) {   # not enough fastqs
+                    print STDERR "WARNING: Barcode '$idx': some '$type'-end runs have both end fastqs\n";   # not enough fastqs
+                    $OSfail{$OS}{I}{$idx} = 1;
+                }
+            } elsif ($type eq 'paired') {
+                if ($vet{$OS}{IDX}{$idx}{TYPE}{$type} == 1) {  # too many fastqs
+                    print STDERR "WARNING: Barcode '$idx': some '$type'-end runs lack both end fastqs\n";  # too many fastqs
+                    $OSfail{$OS}{I}{$idx} = 1;
+                }
+            }
+        }
+    }
+    
+}
+
+
+
+## Print merge commands
+my (@output, @outcrop, @fqr);
+foreach my $samp (sort keys %data) {
+    print STDERR "SAMP: $samp\n" if $debug;
+    my $label = $samp;
+    my $nlib = scalar keys %{ $data{$samp} };
+    my $addlib = $nlib > 1;
+    print STDERR "WARNING: sample '$samp' is associated with $nlib libraries: will not merge across libraries!\n" if $addlib;
+    foreach my $lib (sort keys %{ $data{$samp} }) {
+        print STDERR "SAMP: $samp | LIB: $lib\n" if $debug;
+        my $label = $addlib ? "$label.$lib" : $label;
+        my $nidx = scalar keys %{ $data{$samp}{$lib} };
+        my $addidx = $nidx > 1;
+        print STDERR "WARNING: sample '$samp' library '$lib' is associated with $nidx barcodes: will not merge across barcodes!\n" if $addidx;
+        foreach my $idx (sort keys %{ $data{$samp}{$lib} }) {
+            print STDERR "SAMP: $samp | LIB: $lib | IDX: $idx\n" if $debug;
+            my $label = $addidx ? "$label.$idx" : $label;
+            my $croplabel = $label;
+            my @obslen = sort {$a <=> $b} keys %{ $data{$samp}{$lib}{$idx} };
+            my $addlen = scalar @obslen > 1;
+            my $minlen = undef;
+            print STDERR "WARNING: sample '$samp' library '$lib' barcode '$idx' has multiple read lengths: will not merge different lengths!\n" if $addlen;
+            $minlen = $obslen[0] if $addlen;
+            my %cropmerge;
+            foreach my $len (sort keys %{ $data{$samp}{$lib}{$idx} }) {
+                print STDERR "SAMP: $samp | LIB: $lib | IDX: $idx | LEN: $len\n" if $debug;
+                my $label = $addlen ? "$label.${len}bp" : $label;
+                my $ntype = scalar keys %{ $data{$samp}{$lib}{$idx}{$len} };
+                my $addtype = $ntype > 1;
+                print STDERR "WARNING: sample '$samp' library '$lib' barcode '$idx' read length '$len' has multiple end types: will not merge different types!\n" if $addtype;
+                foreach my $type (sort {$a <=> $b} keys %{ $data{$samp}{$lib}{$idx}{$len} }) {
+                    print STDERR "SAMP: $samp | LIB: $lib | IDX: $idx | LEN: $len | TYPE: $type\n" if $debug;
+                    my $label = $addtype ? "$label.$type" : $label;
+                    foreach my $end (sort {$a <=> $b} keys %{ $data{$samp}{$lib}{$idx}{$len}{$type} }) {
+                        print STDERR "SAMP: $samp | LIB: $lib | IDX: $idx | LEN: $len | TYPE: $type | END: $end\n" if $debug;
+                        
+                        my $mergepref = $type eq 'single' ? "$writedir/$label" : "$writedir/${label}_$end";  # drop end-1 '_1' for single-end runs
+                        my $mergefq = "$mergepref.fastq.gz";
+                        my @mergelist;
+                        foreach my $mol (sort keys %{ $data{$samp}{$lib}{$idx}{$len}{$type}{$end} }) {
+                            my $nfc = scalar keys %{ $data{$samp}{$lib}{$idx}{$len}{$type}{$end}{$mol} };
+                            print STDERR "SAMP: $samp | LIB: $lib | IDX: $idx | LEN: $len | TYPE: $type | END: $end | MOL: $mol ($nfc)\n" if $debug;
+                            foreach my $fc (sort keys %{ $data{$samp}{$lib}{$idx}{$len}{$type}{$end}{$mol} }) {
+                                my $nln = scalar keys %{ $data{$samp}{$lib}{$idx}{$len}{$type}{$end}{$mol}{$fc} };
+                                print STDERR "SAMP: $samp | LIB: $lib | IDX: $idx | LEN: $len | TYPE: $type | END: $end | MOL: $mol | FC: $fc ($nln)\n" if $debug;
+                                foreach my $lane (sort {$a <=> $b} keys %{ $data{$samp}{$lib}{$idx}{$len}{$type}{$end}{$mol}{$fc} }) {
+                                    my @fqs = @{ $data{$samp}{$lib}{$idx}{$len}{$type}{$end}{$mol}{$fc}{$lane} };
+                                    my $nfq = scalar @fqs;
+                                    print STDERR "SAMP: $samp | LIB: $lib | IDX: $idx | LEN: $len | TYPE: $type | END: $end | MOL: $mol | FC: $fc | LANE: $lane ($nfq)\n" if $debug;
+                                    if ($nfq > 1) {
+                                        my $msg = "WARNING: More than 1 fastq ($nfq) associated with $samp | $lib | $idx | $len | $type | $end | $mol | $fc | $lane!\n";
+                                        $msg .=   "         $_\n" foreach @fqs;
+                                        print STDERR $msg;
+                                    }
+                                    push @mergelist, @fqs;
+                                    push @{ $cropmerge{$end}{KEEP} }, @fqs if $addlen && $len == $minlen;
+                                    push @{ $cropmerge{$end}{CROP} }, @fqs if $addlen && $len > $minlen;
+                                }
+                            }
+                        }
+                        if (scalar(@mergelist)==1) {
+                            push @output, "ln -sf $mergelist[0] $mergefq\n";
+                        } elsif ($nomerge) {
+                            foreach my $fqpath (@mergelist) {
+                                (my $fqname = $fqpath) =~ s/.*\///;
+                                push @output, "ln -sf $fqpath $mergepref.$fqname\n";
+                            }
+                        } else {
+                            push @output, "zcat @mergelist | gzip > $mergefq\n";
+                        }
+                        push @fqr, "/home/apa/local/bin/readCount --uhisto $mergefq > $mergefq.fqr &\n";
+                        
+                        ## Finally, update merge report with any changes
+                        my $matched;
+                        foreach my $i (0..$#report) {
+                            ## [$lab, $researcher, $mol, $ordtype, $oldsamp, $newsamp, $lib, $idx12, $platform, $fc, $lane, $type, $fqend, $len, $infastq, $outfastq];
+                            if ($report[$i][6] eq $lib && $report[$i][7] eq $idx && $report[$i][11] eq $type && $report[$i][12] eq $end && $report[$i][13] eq $len) {
+                                ## If everything else matches, then test possible sample names
+                                if ($report[$i][5] && $report[$i][5] eq $samp) {
+                                    ## new sample name assigned, test ONLY new name, not old name
+                                    $matched = 1;
+                                } elsif ($report[$i][4] eq $samp) {
+                                    ## no new name assigned; test old name
+                                    $matched = 1;
+                                }
+                                if ($matched) {
+                                    $report[$i][5] = $label if $label ne $samp;   # update new sample name, if necessary
+                                    $report[$i][15] = $mergefq;
+                                }
+                            }
+                        }
+                        print "WARNING: Unable to locate report record for sample '$samp' (output label '$label')!\n" unless $matched;
+                        
+                    }
+                }
+            }
+            #print Dumper(\%cropmerge),"\n" if %cropmerge;
+            my $cmends = scalar keys %cropmerge;
+            foreach my $end (sort keys %cropmerge) {
+                my $mergepref = $cmends == 1 ? "$writedir/$croplabel" : "$writedir/${croplabel}_$end";  # drop end-1 '_1' for single-end runs
+                my $mergefq = "$mergepref.fastq.gz";
+                my $K = join(' ', @{ $cropmerge{$end}{KEEP} });
+                my $C = join(' ', @{ $cropmerge{$end}{CROP} });
+                push @outcrop, "(zcat $K && zcat $C | fastx_trimmer -l $minlen -) | gzip > $mergefq\n";
+                push @fqr, "/home/apa/local/bin/readCount --uhisto $mergefq > $mergefq.fqr &\n";
+            }
+        }
+    }
+}
+
+system "mkdir -p $writedir";  # FASTQS WILL GO HERE, NOT OUTPUTS
+
+my $MR = $molng_name ? "merge_report.$molngs.txt" : "merge_report.txt";
+open REP, "> $MR";
+print REP join("\t",@$_),"\n" foreach @report;
+close REP;
+system "bash -c '(head -1 $MR && tail -n +2 $MR | sort) > x.$$.tmp'";
+system "mv -f x.$$.tmp $MR";
+
+if (@output) {
+    my $MSH = $molng_name ? "merge.$molngs.sh" : "merge.sh";
+    open OUT1, "> $MSH";
+    print OUT1 "#!/bin/bash\n";
+    print OUT1 @output;
+    close OUT1;
+}
+
+if (@outcrop) {
+    my $CMSH = $molng_name ? "cropmerge.$molngs.sh" : "cropmerge.sh";
+    open OUT2, "> $CMSH";
+    print OUT2 "#!/bin/bash\n";
+    print OUT2 @outcrop;
+    close OUT2;
+}
+
+my $FQR = $molng_name ? "fqReads.$molngs.sh" : "fqReads.sh";
+open OUT3, "> $FQR";
+print OUT3 "#!/bin/bash\n";
+print OUT3 @fqr;
+close OUT3;
+exit;
+
+
+

@@ -1,0 +1,59 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## JUST A FRIENDLY PERL WRAPPER FOR /home/apa/local/bin/scriptutils/colorMultialign.R
+
+## Required, unless printing a color key
+my $alignfa = 'NA';      # multiple-alignment fasta, e.g. output from muscle, clustalw
+my $outpng = 'NA';       # name for output PNG
+
+## Optional
+my $width = 150;         # number of positions per row in output
+my $alphabet = 'AA';     # default AA, not DNA
+my $colors = 'residues'; # color scheme: "residues", "conservation"    # , or "properties"
+my $as_cons = 'NA';      # output consensus version (gets extra consensus row; identities shown as ".")
+my $reorder = 'NA';      # reorder rows of multiple alignment by this order (also used to drop rows)
+my $max_flank = 'NA';    # maximum positions on either side of the marked position(s) to show; if 2+ positions and > $max_pos nt/aa between them, then multiple images will result.
+my $mark_row = 'NA';     # row(s) to mark (headers shown in bold), as CSV string; can include ranges like "5-10"
+my $mark_pos = 'NA';     # position(s) to mark (gets extra row with asterisks), as CSV string; can include ranges like "5-10"
+my $mark_alt = 'NA';     # alt residues for $mark_pos positions (SAME ORDER), as CSV string: must have single $mark_rows and $tabular; get alt classification from substituting $mark_alt residues
+my $key_only = 'FALSE';  # print only a color key; must specify color scheme
+my $tabular = 'FALSE';   # return tabular dataset of position classifications (if using colors = 'conservation' or 'properties')
+my $make_pdf = 'FALSE';  # use PDF instead
+my $verbose = 'FALSE';   # show extra output to screen?
+
+GetOptions(
+    "f=s"=>\$alignfa, 
+    "o=s"=>\$outpng, 
+    "w=i"=>\$width,
+    "c=s"=>\$colors,
+    "a=s"=>\$alphabet,
+    "mr=s"=>\$mark_row,
+    "mp=s"=>\$mark_pos,
+    "ma=s"=>\$mark_alt,
+    "reorder=s"=>\$reorder,
+    "max-flank=i"=>\$max_flank,
+    "as-cons"=>\$as_cons,
+    "key-only"=>\$key_only,
+    "tabular"=>\$tabular,
+    "pdf"=>\$make_pdf,
+    "verbose"=>\$verbose
+    );
+
+$as_cons = 'TRUE' if $as_cons == 1;
+$key_only = 'TRUE' if $key_only == 1;
+$tabular = 'TRUE' if $tabular == 1;
+$make_pdf = 'TRUE' if $make_pdf == 1;
+$verbose = 'TRUE' if $verbose == 1;
+
+my %okAlpha = map {($_=>1)} qw/ AA DNA /;
+my %okColor = map {($_=>1)} qw/ residues conservation properties /;
+
+die "$0: '-a' (alphabet) must be either 'AA' or 'DNA'!\n" unless $okAlpha{$alphabet};
+die "$0: '-c' (color scheme) must be one of 'residues', 'conservation', or 'properties'!\n" unless $okColor{$colors};
+
+system "/home/apa/local/bin/scriptutils/colorMultialign.R $alignfa $outpng $width $as_cons $colors $mark_row $mark_pos $mark_alt $reorder $max_flank $alphabet $tabular $key_only $make_pdf $verbose";
+exit;
+

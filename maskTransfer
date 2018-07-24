@@ -1,0 +1,59 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## Takes a lowercase-masked fasta file and transfers the masking to a corresponding fastq file
+
+my ($fasta, $fastq, $outfq);
+GetOptions("fa=s"=>\$fasta, "fq=s"=>\$fastq, "o=s"=>\$outfq);
+
+my (%faseq, $i, $header, $skip, @record);
+my $lost = my $found = 0;
+
+open my $FA, '<', $fasta or die "$0: Cannot read fasta file '$fasta': $!\n";
+while (<$FA>) {
+    $_ =~ s/[\n\r]+$//;
+    if ($_ =~ /^>(.*)/) {
+	$header = $1;
+    } else {
+	$faseq{$header} .= $_;
+    }
+}
+close $FA;
+
+open my $FQ, '<', $fastq or die "$0: Cannot read fastq file '$fastq': $!\n";
+open my $OUT, '>', $outfq or die "$0: Cannot write fastq file '$outfq': $!\n";
+while (<$FQ>) {
+    $_ =~ s/[\n\r]+$//;
+    $i++;
+    if ($i == 1) {
+	push @record, "$_\n";
+	($header = $_) =~ s/^\@//;
+	unless ($faseq{$header}) {
+	    print "Not in fasta: $header\n";
+	    $skip = 1;
+	}
+    } elsif ($i == 2) {
+	if (length($_) == length($faseq{$header})) {
+	    push @record, "$faseq{$header}\n";
+	} else {
+	    print STDERR "$header: fq len ",length($_)," != fa len ",length($faseq{$header}),"!\n" unless $skip;
+	    $skip = 1;
+	}
+    } elsif ($i == 3) {
+	push @record, "$_\n";
+    } elsif ($i == 4) {
+	push @record, "$_\n";
+	print $OUT @record unless $skip;
+	$skip ? $lost++ : $found++;
+	$i = 0;
+	$skip = 0;
+	@record = ();
+    }
+}
+close $FQ;
+close $OUT;
+print STDERR "$found matched records | $lost records not in fasta\n$0 complete!\n";
+exit;
+

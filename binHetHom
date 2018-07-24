@@ -1,0 +1,110 @@
+#!/usr/bin/env perl
+require '/home/apa/local/bin/apa_routines.pm';  # chrsort, mean, stdev
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+# TO DO: Add gap column to track which bins have gaps / are all gap
+
+# Deps: binGenomeBed, intersectBed, (rm)
+
+## Inputs
+my $vcf;      # input VCF/BCF file to quantitate
+my $bin;      # genome bin size, in bp
+my $usechr;   # restrict to only this chromosome
+my $outfile;  # output file
+my $keep;     # keep intermediate datasets? (default no)
+my ($help, $man, $version);
+
+GetOptions(
+    "i=s" => \$vcf,
+    "b=i" => \$bin,
+    "c=s" => \$usechr,
+    "o=s" => \$outfile,
+    "keep" => \$keep,
+    "help" => \$help,
+    "man" => \$man,
+    "version" => \$version
+    );
+
+die "$0: No input specified!\n" unless $vcf;
+die "$0: No bin size given!\n" unless $bin;
+$outfile = "$vcf.bin$bin.txt" unless $outfile;
+
+## Globals
+my %BED;    # BED intervals
+my @chrs;   # ordered chrs
+my %counts; # read counts
+my %HH = map {($_=>1)} qw/ HET HOM /;  # filtering hash
+my %VAR = map {($_=>1)} qw/ SNP MNP INS DEL /;  # filtering hash
+
+## Files and Paths
+my $bed = $usechr ? "$vcf.$usechr.$bin.bed" : "$vcf.$bin.bed";
+my $out = $usechr ? "$vcf.$usechr.$bin.out" : "$vcf.$bin.out";
+
+
+## Main
+
+# generate genome-bin bed
+if ($usechr) {
+    system "/home/apa/local/bin/binGenomeBed -b $vcf -w $bin -c $usechr > $bed";
+} else {
+    system "/home/apa/local/bin/binGenomeBed -b $vcf -w $bin > $bed";
+}
+
+open my $IN1, '<', $bed;
+while (<$IN1>) {
+    my ($chr, $start, $end, $name) = split /\t/, $_;
+    $BED{$chr}{$start} = $end;
+}
+close $IN1;
+@chrs = @{ &chrsort(\@chrs) };
+
+# bam coverage on intervals -- unfortunately double-counts reads overlapping the breaks
+system "intersectBed -wao -a $vcf -b $bed > $out";
+
+# read intersectBed output (unsorted -- bad output)
+open my $IN2, '<', $out;
+while (my $line = <$IN2>) {
+    chomp($line);
+    my ($qual, $info, $chr, $start, $end) = (split /\t/, $line)[5,7,-5..-3];
+    push @chrs, $chr unless exists $counts{$chr};  # input order
+    push @{ $counts{$chr}{$start}{Q} }, $qual;
+    $counts{$chr}{$start}{N}++;
+    foreach my $field (split /;/, $info) {
+	if ($HH{$field}) {
+	    $counts{$chr}{$start}{$field}++;
+	} elsif ($VAR{$field}) {
+	    $counts{$chr}{$start}{$field}++;
+	}
+    }
+}
+close $IN2;
+
+# sort it correctly and re-output
+open my $OUT1, '>', $outfile;
+print $OUT1 "Chr\tStart\tEnd\tN\tQ.MIN\tQ.MAX\tQ.MEAN\tQ.SD\tHET\tHOM\tSNP\tMNP\tINS\tDEL\n";
+foreach my $chr (@chrs) {
+    foreach my $start (sort {$a <=> $b} keys %{ $BED{$chr} }) {
+	my @sortQ = $counts{$chr}{$start}{Q} ? (sort {$a <=> $b} @{ $counts{$chr}{$start}{Q} }) : (0);
+	my @stats = (
+	    $counts{$chr}{$start}{N}||0, 
+	    sprintf("%0.2f",$sortQ[0]), 
+	    sprintf("%0.2f",$sortQ[-1]), 
+	    sprintf("%0.2f",&mean(\@sortQ)), 
+	    sprintf("%0.2f",&stdev(\@sortQ)), 
+	    map {$counts{$chr}{$start}{$_}||0} qw/ HET HOM SNP MNP INS DEL /
+	    );
+	print $OUT1 join("\t", $chr, $start, $BED{$chr}{$start}, @stats), "\n";
+    }
+}
+close $OUT1;
+
+## Exit
+unless ($keep) {
+    system "rm -f $out";
+    system "rm -f $bed";
+}
+print "$0 $vcf $bin Complete!\n";
+exit;
+

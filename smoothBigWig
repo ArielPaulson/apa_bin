@@ -1,0 +1,33 @@
+#!/usr/bin/env perl
+use strict;
+
+my ($inbw, $width, $chrsize, $outbw) = @ARGV;
+
+system "/home/apa/local/install/java_genomics_toolkit/toolRunner.sh wigmath.MovingAverageSmooth -w $width -i $inbw -o $tmp.1.wig";
+
+perl -e '
+ open IN, "$ARGV[0].1.wig";
+ open OUT, "> $ARGV[0].2.wig";
+ while (<IN>) {
+  if ($_ =~ /^\d/) {
+   chomp;
+   my ($pos, $val) = split /\s+/, $_;
+   if (defined $val) {
+    printf OUT "$pos %0.3f\n", $val;
+   } else {
+    printf OUT "%0.3f\n", $pos;
+   }
+  } else {
+   print OUT $_;
+  }
+ }
+ close IN;
+ close OUT;
+' $tmp
+
+($outbw = $inbw) =~ s/bw$/sm$width.bw/ unless $outbw;
+system "wigToBigWig $tmp.1.wig $chrsize $outbw";
+system "rm -r $tmp.*";
+print "smoothBigWig Complete!\n";
+exit;
+

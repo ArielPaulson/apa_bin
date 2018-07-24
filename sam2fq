@@ -1,0 +1,15 @@
+#!/usr/bin/env perl
+use strict;
+
+foreach my $file (@ARGV) {
+    open IN, $file or die "Cannot read '$file': $!\n";
+    open OUT, "> $file.fq" or die "Cannot write '$file.fq': $!\n";
+    while (<IN>) {
+	next if $_ =~ /^@/;  # header line
+	my ($header, $read, $qual) = (split /\t/, $_)[0,9,10];
+	print OUT '@',"$header\n$read\n+$header\n$qual\n";
+    }
+    close IN;
+    close OUT;
+}
+exit;

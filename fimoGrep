@@ -1,0 +1,94 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+require '/home/apa/local/bin/apa_routines.pm';
+
+my $mfasta;  # degenerate-DNA motifs fasta
+my $sfasta;  # sequence fasta
+
+($mfasta, $sfasta) = @ARGV;
+
+my (@headers, @mnames, %seq, %mot);
+my %regex = (
+    "A" => "A",
+    "C" => "C",
+    "G" => "G",
+    "T" => "T",
+    "R" => "[RAG]",
+    "Y" => "[YCT]",
+    "M" => "[MAC]",
+    "K" => "[KGT]",
+    "S" => "[SCG]",
+    "W" => "[WAT]",
+    "B" => "[BCGT]",
+    "V" => "[VACG]",
+    "D" => "[DAGT]",
+    "H" => "[HACT]",
+    "N" => "[NACGT]"
+);
+
+open my $FA, '<', $sfasta or die "$0: Cannot read from sequence fasta '$sfasta': $!\n";
+my $header;
+while (<$FA>) {
+    $_ =~ s/[\n\r]+$//;
+    if (/^>(.*)/) {
+	$header = $1;
+	push @headers, $header;
+    } else {
+	$seq{$header} .= uc($_);
+    }
+}
+close $FA;
+
+open my $MOT, '<', $mfasta or die "$0: Cannot read from motifs fasta '$mfasta': $!\n";
+my $mname;
+while (<$MOT>) {
+    $_ =~ s/[\n\r]+$//;
+    if (/^>(.*)/) {
+	$mname = $1;
+	push @mnames, $mname;
+    } else {
+	$mot{$mname} .= uc($_);
+    }
+}
+close $MOT;
+
+foreach my $mname (@mnames) {
+    my $word = $mot{$mname};
+    my $width = length($word);
+    my $reg = join('', map {$regex{$_}} split(//,$word));
+    my $word_rc = reverse $word;
+    $word_rc =~ tr/ACGTRYMKSWBVDHN/TGCAYRKMWSVBHDN/;
+    my $reg_rc = join('', map {$regex{$_}} split(//,$word_rc));
+    delete $mot{$mname};
+    $mot{$mname} = [$width, $word, $word_rc, $reg, $reg_rc];
+    print STDERR "MNAME=$mname, WIDTH=$width, WORD=$word, WORD_RC=$word_rc, REGEX=$reg, REGEX_RC=$reg_rc\n";
+}
+
+my %mot_i;
+print "sequence\tmotif\tstart\tend\tstrand\tmatched\n";
+foreach my $header (@headers) {
+    foreach my $mname (@mnames) {
+	my ($width, $word, $word_rc, $reg, $reg_rc) = @{ $mot{$mname} };
+	while ($seq{$header} =~ m/($reg|$reg_rc)/ig) {
+	    $mot_i{$mname}++;
+	    my $pos = pos($seq{$header});  ### END OF MATCH
+	    my $match = my $W_match = "\U$&";
+	    my $str = '+';
+	    if ($match =~ m/^$reg$/i) {
+		## ok
+	    } elsif ($match =~ m/^$reg_rc$/i) {
+		$str = '-';
+		$W_match = reverse($match);
+		$W_match =~ tr/ACGTRYMKSWBVDHN/TGCAYRKMWSVBHDN/;
+	    } else {
+		print STDERR "Match Failed! $match -vs- ($reg|$reg_rc)\n";
+	    }
+#	    $match = $match.'.'.$mot_i{$mname} if $unames;
+	    print "$header\t$mname\t".($pos-$width+1)."\t$pos\t$str\t$W_match\n";
+	}
+    }
+}
+
+

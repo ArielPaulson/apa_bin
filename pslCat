@@ -1,0 +1,6 @@
+#!/usr/bin/env perl
+use strict;
+
+my $first = shift @ARGV;
+system "cat $first";  # includes header
+system "tail -n +6 $_" foreach @ARGV;  # subsequents lack header

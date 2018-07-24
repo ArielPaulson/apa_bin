@@ -1,0 +1,10 @@
+#!/n/local/stage/perlbrew/perlbrew-0.43/perls/perl-5.16.0/bin/perl
+use Net::SSH qw/ ssh /;
+
+my $cmd = "perl /home/apa/local/bin/scratchspace-2.0";
+if ($ARGV[0]) {
+    my $results = ssh($ARGV[0], $cmd);
+} else {
+    system $cmd;
+}
+

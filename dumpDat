@@ -1,0 +1,15 @@
+#!/usr/bin/env perl
+use Storable qw/ retrieve /;
+use Data::Dumper;
+
+my %known = map {($_=>1)} qw/ SCALAR ARRAY HASH /;
+
+my $file = $ARGV[0];
+my ($fname) = ($ARGV[0] =~ /([^\/]+)$/);
+my $obj = retrieve($file) or die "Cannot read file '$file': $!\n";
+my $ref = ref($obj);
+
+die "Don't know what to do with objects of type '$ref'!\n" unless $known{$ref};
+
+print "OBJECT TYPE $ref:\n", Dumper($obj), "\n";
+exit;

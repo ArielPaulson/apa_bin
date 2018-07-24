@@ -1,0 +1,112 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## Inputs
+my $input;     # input file = FIMO or fimoPlus output
+my $format;    # specific format of $input (see strings in %okFormats below)
+my $motif1;    # a single motif ID in the FIMO output (column 1) to make a PWM for.  IF MERGING > 1 MOTIF: pass in 2-col file; col 1 = id, col 2 = 5' offset, in bp, for motif multi-alignment.  At least one motif must have offset = 0; the rest are relative to this motif.
+my $motName;   # a name for the output motif (and output files: "$motName.meme", "$motName.png")
+my $pThresh;   # p-value threshold to include motif hits (meaningless if using fimoPlus 'grep' output)
+my $IDcol;     # column to get IDs from in fimo output (1, or also 2 with fimoPlus formats)
+
+## Globals
+my %motifs;    # motif ID(s), as hash, including offsets if multiple motifs
+my %PWMs;      # PWMs object
+my $contrib;   # number of motifs contributing to PWM
+my $bpcontrib; # total bp contributing to PWM
+my $width;     # final motif width
+my $outmeme;   # output minimal-meme motif definition
+my $outpdf;    # output motif seqLogo image
+
+my $bin = '/home/apa/local/bin';  # scripts location
+my @bases = qw/ A C G T /;        # currently accepted alphabet for motifs
+
+GetOptions("i=s" => \$input, "f=s" => \$format, "m=s" => \$motif1, "n=s" => \$motName, "p=s" => \$pThresh, "c=i" => \$IDcol);
+
+$outmeme = "$motName.meme";
+$outpdf = "$motName.pdf";
+$IDcol = 1 unless $IDcol;
+$IDcol--;  # in 0-based
+
+my %okFormats = (                 # valid input formats
+    'fimo' => [$IDcol,5,7],       # regular FIMO output, with q-values
+    'fimo-text' => [$IDcol,6,7],  # FIMO '--text' output, no q values
+    'plus' => [$IDcol,7,8],       # regular fimoPlus output, no q-values
+    'plus-q' => [$IDcol,7,9],     # fimoPlus '--calc-q' output, with q-values
+    'plus-grep' => [$IDcol,6]     # fimoPlus '--grep' output 
+);  
+
+die "$0: unrecognized input format '$format'!  See documentation.\n" unless $okFormats{$format};
+die "$0: output motif name not specified!\n" unless $motName;
+
+if (-e $motif1) {  # file
+    open my $IN0, '<', $motif1 or die "$0: Failed to open motifs file '$motif1': $!\n";
+    while (<$IN0>) {
+	$_ =~ s/[\n\r]+$//;
+	my ($motif, $offset) = split /\t/, $_;
+	$motifs{$motif} = $offset;
+    }
+    close $IN0;
+} else {
+    %motifs = ($motif1,0);
+}
+
+$pThresh = 1 unless $pThresh;
+
+open my $IN1, '<', $input or die "$0: Failed to open input file '$input': $!\n";
+if ($format eq 'plus-grep') {
+    while (<$IN1>) {
+	$_ =~ s/[\n\r]+$//;
+	my @fields = split /\t/, $_;
+	my ($id, $match) = @fields[@{ $okFormats{$format} }];
+	next unless exists $motifs{$id};
+	my @bases = split //, "\U$match";
+	foreach my $pos (0..$#bases) {
+	    my $alnPos = $pos+$motifs{$id};  # $_+$motifs{$id} offsets current motif position into multi-aligned-motif space
+	    $PWMs{$alnPos}{$bases[$pos]}++;
+	}
+	$bpcontrib += $#bases+1;
+	$contrib++;
+    }
+} else {
+    while (<$IN1>) {
+	$_ =~ s/[\n\r]+$//;
+	my @fields = split /\t/, $_;
+	my ($id, $p, $match) = @fields[@{ $okFormats{$format} }];
+	next unless exists $motifs{$id};
+	next if $p > $pThresh;
+	my @bases = split //, "\U$match";
+	foreach my $pos (0..$#bases) {
+	    my $alnPos = $pos+$motifs{$id};  # $_+$motifs{$id} offsets current motif position into multi-aligned-motif space
+	    $PWMs{$alnPos}{$bases[$pos]}++;
+	}
+	$bpcontrib += $#bases+1;
+	$contrib++;
+    }
+}
+close IN;
+
+print "$contrib motif instances found; $bpcontrib bp.\n";
+$width = scalar keys %PWMs;
+
+open my $OUT, '>', $outmeme or die "$0: Cannot open output .meme file '$outmeme' for writing: $!\n";
+print $OUT "MEME version 4.4\n\nALPHABET= ACGT\n\nstrands: + -\n\nBackground letter frequencies (from uniform background):\nA 0.25000 C 0.25000 G 0.25000 T 0.25000 \n\n";
+print $OUT "MOTIF $motName\nletter-probability matrix: alength= 4 w= $width nsites= $contrib E= 0\n";
+foreach my $pos (sort {$a <=> $b} keys %PWMs) {
+    my $sum;
+    $sum += $PWMs{$pos}{$_} foreach @bases;
+    my $missing = $contrib-$sum;  # how many sequences reporting at this position, vs total contributing sequences
+    foreach my $base (@bases) {
+	$PWMs{$pos}{$base} += 0.25*$missing;   # if any non-equivalenced positions exist in multi-aligned-motif space, give each base 0.25 for each sequence that didn't contribute to this position (adding an N, basically)
+	printf $OUT "  %0.6f\t", $PWMs{$pos}{$base} / $contrib;
+    }
+    print $OUT "\n";
+}
+close $OUT;
+
+print "Plotting PWM via seqLogo...\n";
+system "$bin/plotMinimalMeme $outmeme $outpdf";
+print "$0 Complete!\n";
+exit;

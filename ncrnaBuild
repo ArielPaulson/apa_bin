@@ -1,0 +1,1061 @@
+#!/usr/bin/env Rscript
+
+## This one-script pipeline generates a set of housekeeping-ncRNA bowtie2 indexes + companion files for a specified organism
+## Dependencies: RCurl, biomaRt, GenomicRanges
+## Typically run by "/home/apa/local/bin/ncrnaBuild <Genus_species>"
+## Three extra flags: --clobber, --restart, --refine
+## By default, the pipeline detects current ensembl version and create working directory "<org>/Ens<version>"
+## --clobber forces overwrite of existing working dir.  Otherwise, pipeline will die if working directory already exists.
+## --restart restarts the pipeline from the a working directory.  Pipeline uses checkpoints to skip previous steps.
+## --refine re-runs the pipeline from a working directory, incoorporating changes to target biotypes and gene annotations.
+##   These changes must be made to config and gene_master files in that working directory.
+## 
+## Indexes + companion files are intended for use with the one-script small-RNA NGS analysis pipeline /home/apa/local/bin/alignToRNA
+## To run this script, the sole necessary argument is "Genus_species".
+## However, a config file must exist for this organism (and preferably, a gene_master file also)
+## See the end of this script for documentation on config files and gene_master files.
+## One can also specify a non-default location for the config files as a second argument to this script, but this should rarely be necessary.
+## Outputs: a fasta, fasta index, set of bowtie2 indexes, genedata.txt file, copy of the config file, and copy of the gene_master file (or, will recreate one as much as possible)
+
+
+
+
+
+## Command line arguments, etc, or show available orgs if no command args
+## Put first in script, just for ease of access
+message("Processing command line...")
+options(stringsAsFactors=FALSE)
+master.path <- "/n/projects/apa/stuff/bowtie_building/ncRNA_builds/config_files"  # default path for datasets
+cmd.args <- commandArgs(trailing=TRUE)
+trna.biotype <- "tRNAScan-SE"  # automatic initial biotype for optional tRNAScan-SE data
+ribo.biotype <- "NCBI-Ribo"    # automatic initial biotype for optional NCBI ribosome data
+checkpoint <- 0   # use checkpoints to determine how far along we are, and restart if necessary
+
+
+
+
+
+## A few custom functions
+
+parse.config <- function(path, org, geno, enstag=NULL) {
+    ## Parse config file -- MUST EXIST
+    ## ORGANISM, BIOMART, DATASET, BIOTYPES records should always exist (one each); TRNA_DAT, NCBI_RIBO optional (NCBI_RIBO can have > 1).
+    if (length(enstag)>0) {
+        cfg.file <- dir(path, patt="*.config.txt")[1]  # should only be one in build directory
+        if (is.na(cfg.file)) stop(paste0("Expected config file '",cfg.file,"' not found!  Halting."))
+        cfg.label <- "build"
+    } else {
+        message(paste("PATH:",path))
+        cfg.all <- dir(path, patt=paste0("sRNA\\.",geno,"\\..*\\.config.txt"))   # e.g. "sRNA.mm10.*.config.txt"
+        if (length(cfg.all)>0) {
+            ## Select latest-versioned config file
+            cfg.fields <- do.call(rbind, strsplit(cfg.all,"\\."))  # "sRNA", "mm10", "Ens_72", "config", "txt"
+            cfg.ver <- as.numeric(cfg.fields[,3])  # get version numbers, if > 1 file
+            cfg.latest <- cfg.all[which.max(cfg.ver)]
+            cfg.file <- paste0(path,"/",cfg.latest)
+            cfg.label <- "most-recent"
+        } else {
+            stop("No config files found!")
+        }
+    }
+    message(paste0("Parsing ",cfg.label," config file '",cfg.file,"'..."))
+    cfg <- read.delim(cfg.file, as.is=TRUE, header=FALSE)  # read config file
+    cfg <- split(cfg[,2], cfg[,1])   # convert file contents to named list, where names were column 1 of file -- allows multiple entries for some fields
+    cfg$BIOTYPES <- unlist(strsplit(cfg$BIOTYPES," "))  # split biotypes string into vector
+    if ("NCBI_RIBO" %in% names(cfg)) cfg$NCBI_RIBO <- nameless(t(sapply(cfg$NCBI_RIBO,function(x) unlist(strsplit(x," ")) )))  # 1+ lines containing c(nucleotide accession, new symbol) -> matrix
+    if ("TRNA_DATA" %in% names(cfg)) cfg$TRNA_DATA <- unlist(strsplit(cfg$TRNA_DATA," "))  # TRNA_DAT record has 2 elements: fasta URL, table URL, in that order
+    list(cfg,cfg.file)
+}
+
+prior.genes <- function(path, org, enstag=NULL) {
+    if (length(enstag)>0) {
+        kg.file <- paste0(path,"/",orgver,".gene_master.txt")  # systematic name, build directory
+        if (!file.exists(kg.file)) stop(paste0("Expected gene_master file '",kg.file,"' not found!  Halting."))
+        kg.label <- "build"
+    } else {
+        kg.all <- dir(path, patt=paste0("sRNA\\.",geno,"\\..*\\.gene_master\\.txt"))   # e.g. "sRNA.mm10.*.gene_master.txt"
+        if (length(kg.all)>0) {
+            ## Select and parse known-genes file
+            kg.fields <- do.call(rbind, strsplit(kg.all,"\\."))  # "sRNA", "mm10", "Ens_72", "gene_master", "txt"
+            kg.ver <- as.numeric(kg.fields[,3])  # get gene_master version numbers, if > 1 file
+            kg.latest <- kg.all[which.max(kg.ver)]
+            kg.file <- paste0(path,"/",kg.latest)
+            kg.label <- "most-recent"
+        } else {
+            message(paste0("No prior gene_master files found for genome '",geno,"'."))
+        }
+    }
+    message(paste0("Parsing ",kg.label," gene_master file '",kg.file,"'..."))
+    known.genes <- read.delim(kg.file, as.is=TRUE)
+    list(known.genes, kg.file)
+}
+
+biotype.gt <- function(x, status, transcripts=FALSE) {
+    ## 'x' is a derivative of the all.genes table, or at least a data.frame with columns 'Biotype', 'Gene.ID', and 'Transcript ID' (and 'Trans.Biotype', if transcripts=TRUE)
+    ## if transcripts=FALSE, returns a 4-col dataframe: STATUS (given), BIOTYPE (name), GENES (count), TRANSCRIPTS (count)
+    ## if transcripts=TRUE, returns a 5-col dataframe: STATUS (given), GENE.BIOTYPE (name), TRANSCRIPT.BIOTYPE (name), GENES (count), TRANSCRIPTS (count)
+    ## if 'x' is an atomic vector, returns a df with 1 row per element, all other stats 0.  'x' can also be character(0) for a rowless df.
+    if (is.vector(x) & is.atomic(x)) {
+        lx <- length(x)
+        if (transcripts) {
+            data.frame(STATUS=rep(status,lx),GENE.BIOTYPE=x,TRANS.BIOTYPE=x,GENES=rep(0,lx),TRANSCRIPTS=rep(0,lx))
+        } else {
+            data.frame(STATUS=rep(status,lx),BIOTYPE=x,GENES=rep(0,lx),TRANSCRIPTS=rep(0,lx))
+        }
+    } else {
+        u <- unique(x$Biotype)
+        if (transcripts & "Trans.Biotype" %in% colnames(x)) {
+            y <- do.call(rbind, lapply(u, function(bg) {
+                wg <- x$Biotype==bg
+                do.call(rbind, lapply(unique(x$Trans.Biotype[wg]), function(bt) {
+                    wt <- x$Trans.Biotype==bt
+                    data.frame(STATUS=status, GENE.BIOTYPE=bg, TRANS.BIOTYPE=bt, GENES=length(unique(x$Gene.ID[wt])),TRANSCRIPTS=length(unique(x$Transcript.ID[wt])))
+                }))
+            }))
+        } else {
+            y <- do.call(rbind, lapply(u, function(b){
+                w <- x$Biotype==b
+                data.frame(STATUS=status, BIOTYPE=b, GENES=length(unique(x$Gene.ID[w])),TRANSCRIPTS=length(unique(x$Transcript.ID[w])))
+            }))
+        }
+        y[order(y[,2]),]
+    }
+}
+
+## End custom functions
+
+
+
+
+
+## Process command-line arguments
+if (length(cmd.args)==0) {
+
+    ## no args given
+    cfgs <- dir(master.path, patt="\\.config\\.txt$")  # existing config files
+    orgs <- sub("\\.config\\.txt$","",cfgs)  # organisms for config files
+    message(paste(c("\nUsage is: '/home/apa/local/bin/ncrnaBuild Genus_species'\n\nConfig files exist for the following organisms:",orgs,""),collapse="\n"))
+    quit()
+    
+} else {
+    
+    library(getopt)
+    spec <- matrix(c(
+        'org',      'o', 1, 'character', 'Genus_species',
+        'geno',     'g', 1, 'character', 'genome build name for this org, from /n/data1/genomes/bowtie-index',
+        'ensver',   'e', 1, 'character', 'annot build name for this genome, e.g. "Ens_80" or "EnsGen_28"',
+        'host',     'h', 2, 'character', 'IF NOT CURRENT ENSEMBL: archive biomart host name, e.g. "may2015.archive.ensembl.org" ',
+        'path',     'p', 2, 'character', 'alternate path for config files', 
+        'clobber',  'c', 0, 'logical',   'restart from scratch and clobber existing output directory? (default no)',
+        'restart',  'r', 0, 'logical',   'restart from last checkpoint? (default no)',
+        'refine',   'f', 0, 'logical',   'refine existing build? (default no)'
+    ), byrow=TRUE, ncol=5)
+    opt <- getopt(spec)
+    if (!is.null(opt$help)) {
+        cat(getopt(spec, usage=TRUE))
+        q(status=1)
+    }
+    
+    ## unpack 'opt'
+    org <- opt[["org"]]
+    geno <- opt[["geno"]]
+    message(paste("GENO:",geno))
+    in.path <- ifelse(is.null(opt[["path"]]), NA, opt[["path"]])
+    clobber <- ifelse(is.null(opt[["clobber"]]), FALSE, TRUE)
+    restart <- ifelse(is.null(opt[["restart"]]), FALSE, TRUE)
+    refine <- ifelse(is.null(opt[["refine"]]), FALSE, TRUE)
+    mart.host <- ifelse(is.null(opt[["host"]]), "www.biomart.org", opt[["host"]])
+    
+    ## Checkpoint RData object
+    tmp <- paste0("ncrnaBuild.",org,".",geno,".RData")
+    
+    if (file.exists(tmp)) {  # temp file exists, what to do?
+        
+        if (clobber) {
+            
+            ## Destroy saved session if clobbering
+            system(paste("rm -f",tmp))
+            
+        } else if (restart|refine) {
+            
+            ## Temp versions of current args
+            this.clobber <- refine
+            this.restart <- refine
+            this.refine <- refine
+            ## Reload saved session
+            load(tmp)
+            ## Replace old args
+            clobber <- this.clobber
+            restart <- this.restart
+            refine <- this.refine
+            ## Delete temp args (so that they are not saved, and cannot overwrite temp args on successive reloads!!!!!!)
+            rm(this.clobber,this.restart,this.refine)
+            
+            if (refine) {
+                
+                x <- parse.config(out.path, org, geno, enstag)  # if refining, reload config file here (FROM EXISTING BUILD DIRECTORY) (something may have changed, e.g. biotype list)
+                cfg <- x[[1]]
+                cfg.file <- x[[2]]
+                rm(x)
+                checkpoint <- 1  # if refining, restart past checkpoint #1
+                
+            }
+            
+        } else {
+            
+            ## ignore it; left over from some prior run
+            
+        }
+        
+    } else {
+        
+        if (restart|refine) stop("No saved session exists: cannot restart or refine build!")
+        
+    }
+    
+    message(paste("\nOrganism:",org,"\nGenome Version:",geno,"\nClobber:",clobber,"\nRestart:",restart,"Refine:",refine,"\nInput Path:",in.path,"\n"))
+    
+}
+
+
+
+
+
+## If only refining the build, checkpoint-1 code is unnecessary
+if (!refine & checkpoint < 1) {
+    
+    ## Identify source directory from organism, and latest version number
+    if (!is.na(in.path)) {
+        
+        ## input path specified -- draw config files from there
+        ##
+        ## BLOCK BELOW IS NOT WELL DEVELOPED -- probably should be removed.  Go with defaults, or re-run from scratch.
+        ##
+        in.paths <- sub("^\\./","",list.dirs())  # current-path subdirectories
+        in.paths <- in.paths[grep(paste0("^",org),in.paths)]  # current-path subdirectories that start with Genus_species
+        if (length(in.paths)>0) {
+            ## matching directory found
+            path.ver <- as.numeric(sub("^[^0-9]+","",in.paths))
+            max.ver <- max(path.ver)
+            in.path <- in.paths[as.integer(path.ver)==as.integer(max.ver)]   # if possible, take config from latest-version build of organism
+            if (length(in.path)>1) stop(paste("Too many latest-version directories for organism '",org,"': ",paste0(in.path,collapse=", "),"\n"))  # too many choices!
+        } else {
+            ## no matching directory found -- fall back to default location
+            in.path <- master.path
+        }
+        
+    } else {
+        
+        ## use default config data location
+        in.path <- master.path
+        
+    }
+
+    ## Vet config file, now that in.path is defined
+    x <- parse.config(in.path,org,geno)
+    cfg <- x[[1]]
+    cfg.file <- x[[2]]
+    rm(x)
+    
+    
+    
+    
+    
+    ## Prepare Ensembl biomart connection
+    message("Checking biomaRt version...")
+    library(biomaRt)
+    if (mart.host == "www.biomart.org") {
+        lm <- listMarts()
+        if (grepl("\\*",cfg$BIOMART)) cfg$BIOMART <- lm[grep(paste0("^",sub("\\*","",cfg$BIOMART)),lm[,1]),1]   # swing-version = Ensembl Genomes mart; grep instead of match
+        mart <- useMart(cfg$BIOMART, dataset=cfg$DATASET)
+        ensver <- lm[lm[,1]==cfg$BIOMART,2]  # e.g. "ENSEMBL GENES 73 (SANGER UK)" or "ENSEMBL FUNGI 19 (EBI UK)"
+        ensnum <- as.numeric(gsub("[ \\(]","",regmatches(ensver,regexpr(" [0-9]+ \\(",ensver))))  # version number
+        enstag <- paste0(ifelse(cfg$BIOMART=="ensembl","Ens_","EnsGen_"), ensnum)  # filename tag, e.g. "Ens72", or "EnsGen19" for Ensembl-Genomes marts
+    } else if (cfg$BIOMART != "ensembl") {
+        stop("Archival biomarts only available for Ensembl.org genomes!")  # not ensemblgenomes genoems
+    } else {
+        cfg$BIOMART <- "ENSEMBL_MART_ENSEMBL"
+        lm <- listMarts(host=mart.host)
+        mart <- useMart(cfg$BIOMART, dataset=cfg$DATASET, host=mart.host)
+        ensver <- lm[lm[,1]==cfg$BIOMART,2]  # e.g. "ENSEMBL GENES 73 (SANGER UK)" or "ENSEMBL FUNGI 19 (EBI UK)"
+        ensnum <- as.numeric(gsub("[ \\(]","",regmatches(ensver,regexpr(" [0-9]+ \\(",ensver))))  # version number
+        enstag <- paste0("Ens_", ensnum)  # filename tag, e.g. "Ens72", or "EnsGen19" for Ensembl-Genomes marts
+    }
+    orgver <- paste("sRNA",geno,enstag,sep=".")
+    message("mart=",cfg$BIOMART,", version tag=",enstag)  # print pending mart name and filename tag to screen
+    quit()
+    
+    
+    
+    
+    ## Designate output path / die if exists
+    out.path <- paste0(org,"/",enstag)  # output directory (systematic name)
+    if (file.exists(out.path)) {
+        if (clobber) {
+            system(paste("rm -rf",out.path))  # remove if clobbering
+            system(paste("mkdir",out.path))   # and re-create
+        } else if (restart | refine) {
+            ## just continue
+        } else {
+            stop(paste0("Output path '",out.path,"' already exists!\n"))  # die if exists, and not clobbering
+        }
+    } else {
+        if (restart | refine) {
+            ## something is wrong...
+            stop(paste0("Output path '",out.path,"' does not exist: no build to restart or refine!\n"))
+        } else { 
+            system(paste("mkdir",out.path))  # otherwise, create new
+        }
+    }
+    suppressWarnings(system(paste0("cp ",cfg.file," ",out.path,"/",orgver,".config.txt")))  # copy the config file in use to output directory
+    
+    
+    
+    
+    
+    ## Set checkpoint
+    checkpoint <- 1
+    save.image(tmp)
+    
+}
+if (!refine) message("*****  Passed Checkpoint 1  *****")
+
+
+
+
+
+if (checkpoint < 2) {
+    
+    ## These few lines must happen regardless of refine or !refine
+    library(biomaRt)
+    date <- system("date",intern=TRUE)
+    
+    if (refine) {
+        
+        message("Partitioning Ensembl datasets...")
+        message(paste("",date))  # print to screen, with leading space
+        
+    } else {
+        
+        ## If only refining the build, this block is unnecessary.
+        
+        ## Get Ensembl data from biomart connection
+        message("Downloading and partitioning Ensembl datasets...  (this may take a few minutes)")
+        message(paste("",date))  # print to screen, with leading space
+        
+        ## All-genes dataset
+        all.genes <- getBM(attributes=c("gene_biotype","external_gene_name","ensembl_gene_id","ensembl_transcript_id","chromosome_name","transcript_start","transcript_end","strand","transcript_length","percentage_gc_content","transcript_biotype","transcript_status","status","description"), mart=mart)  # base dataset -- 14 columns
+        message(paste("",nrow(all.genes),"genes retrieved"))
+        all.genes <- cbind(fasta.header="", all.genes[,c(1,1,2,2:ncol(all.genes))])  # add 3 new columns to front -- now at 17 columns
+        str.col <- which(colnames(all.genes)=="strand")  # insert exons column after this
+        all.genes <- cbind(all.genes[,1:str.col], exons=0, all.genes[,(str.col+1):ncol(all.genes)])  # add exons column -- now at 18 columns (final)
+        all.genes$strand <- c("-",".","+")[all.genes$strand+2]  # convert -1 => '-' and 1 => '+'
+        colnames(all.genes) <- c("Fasta.Header","Biotype","Alt.Biotype","Symbol","Use.Symbol","Gene.ID","Transcript.ID","Chromosome","Start","End","Strand","Exons","Length","GC.Percent","Trans.Biotype","Trans.Status","Gene.Status","Gene.Description")  # final col names
+        
+    }
+    
+    
+    
+    
+    
+    ## ##########  If refining the build, the pipeline basically re-starts here  ########## ##
+    
+    
+    
+    
+    
+    ## filter noncoding-genes dataset out of all-genes dataset
+    message("Filtering for ncRNAs...")
+    nc.genes <- all.genes[all.genes$Biotype %in% cfg$BIOTYPES,]     # select only desired ncRNA biotypes (biotypes may have changed, if refining build)
+    
+    ## If any biotypes in the config file are no longer in use, we need to know
+    obsolete.biotypes <- setdiff(cfg$BIOTYPES, nc.genes$Biotype)
+    NOBS <- length(obsolete.biotypes)
+    if (NOBS>0) {
+        ## We have obsoletes; account for them in final biotypes report
+        obsolete.genes <- known.genes[known.genes$Biotype %in% obsolete.biotypes,]
+        obsolete.biotype.stats <- biotype.gt(known.genes[known.genes$Biotype %in% obsolete.biotypes,], "Obsolete")  # by gene biotype
+        obsolete.biotype.stats2 <- biotype.gt(known.genes[known.genes$Biotype %in% obsolete.biotypes,], "Obsolete", TRUE)  # by gene + trans biotype
+        message(paste0(" ",NOBS,"/",luniq(cfg$BIOTYPES)," biotypes are obsolete: ",paste(obsolete.biotypes,collapse=", ")))
+        message(paste(nrow(obsolete.genes),"prior genes exist with obsolete biotypes"))
+    } else {
+        ## We do not have obsoletes, however, we may be refining a build which used to have some.  Ensure the stats are wiped out.
+        obsolete.genes <- all.genes[0,]  # just so the object exists; 0 rows
+        obsolete.biotype.stats <- biotype.gt(character(0), "")  # by gene biotype
+        obsolete.biotype.stats2 <- biotype.gt(character(0), "", TRUE)  # by gene + trans biotype
+    }
+    
+    ## Continue with ncRNA processing, if filters succeeded
+    
+    if (nrow(nc.genes)==0) {
+        
+        fail <- TRUE  # prepare to die if nothing left!
+        message(" No genes with specified biotypes exist in this version of Ensembl!  Preparing to exit...\n")
+        
+    } else {
+        
+        message(paste("",nrow(nc.genes),"relevant noncoding genes"))
+        fail <- FALSE
+        nc.biotype.stats <- biotype.gt(nc.genes, "Included")  # gene biotypes
+        nc.biotype.stats2 <- biotype.gt(nc.genes, "Included", TRUE)  # gene + transcript biotypes
+        
+        ## Count exons ONLY for NC genes -- otherwise takes way too long!!
+        message(" Counting exons for relevant genes...")
+        nc.exons <- getBM(attributes=c("ensembl_transcript_id","ensembl_exon_id"), filters="ensembl_transcript_id", values=nc.genes$Transcript.ID, mart=mart)  # get exons per ncRNA transcript
+        nc.exons <- table(nc.exons[,1])  # exon count per transcript
+        nc.genes$Exons <- nc.exons[match(nc.genes$Transcript.ID, names(nc.exons))]   # add to ncRNA-genes table
+        all.genes$Exons[match(names(nc.exons),all.genes$Transcript.ID)] <- nc.exons  # add to all-genes table
+        
+    }
+    
+    ## Excluded-genes dataset (for QC)
+    excluded <- rep(TRUE,nrow(all.genes))  # genes to classify as 'excluded'
+    excluded[which(all.genes$Gene.ID %in% nc.genes$Gene.ID)] <- FALSE  # for new builds, only this test will matter
+    if (exists("trna.biotype")) excluded[which(all.genes$Biotype == trna.biotype)] <- FALSE  # when refining builds, this test now matters
+    if (exists("ribo.biotype")) excluded[which(all.genes$Biotype == ribo.biotype)] <- FALSE  # ditto
+    excluded.genes <- all.genes[excluded,]  # select all the other biotypes
+    if (nrow(excluded.genes)==0) {
+        message(" No genes with non-specified biotypes exist in this version of Ensembl!\n")  # warn if no non-ncRNA genes!
+    } else {
+        excluded.biotype.stats <- biotype.gt(excluded.genes, "Excluded")  # gene biotypes
+        excluded.biotype.stats2 <- biotype.gt(excluded.genes, "Excluded", TRUE)  # gene + transcript biotypes
+        write.table(excluded.genes, paste0(out.path,"/",orgver,".excluded_genes.txt"), sep="\t", quote=FALSE, row.names=FALSE)  # write excluded_genes table
+    }
+    if (fail) quit()  # if no NC biotypes identified, then quit, after writing excluded genes and biotype statuses
+    
+    ## Mark end of the downloading/filtering process, and set checkpoint
+    date <- system("date",intern=TRUE)
+    system("date",intern=TRUE)
+    message(paste("",date))  # print to screen, with leading space
+    checkpoint <- 2
+    save.image(tmp)
+    
+}
+message("*****  Passed Checkpoint 2  *****")
+
+
+
+
+
+if (checkpoint < 3) {
+    
+    ## Filter Ensembl data
+    message("Filtering Ensembl datasets...")
+    final.genes <- nc.genes   # initially -- gets modified if 'known.genes' file is found
+    
+    ## Test for known-genes file(s)
+    use.kg <- FALSE  # initially
+    if (refine) {
+        ## If refining build, then use the gene_master file in the build directory (this may have been modified)
+        ko <- prior.genes(in.path, org)  # ORIGINAL gene_master data, when build first ran
+        known.genes.old <- ko[[1]]
+        known.genes.file.old <- ko[[2]]
+        k <- prior.genes(out.path, org, enstag)  # CURRENT gene_master data, since we are refining build
+        known.genes <- k[[1]]
+        known.genes.file <- k[[2]]
+        rm(k,ko)
+    } else {
+        ## If running new build, look for gene_master files in the config directory (or other specified location)
+        k <- prior.genes(in.path, org)
+        known.genes <- k[[1]]
+        known.genes.file <- k[[2]]
+        rm(k)
+    }
+    
+    ## Incorporate known-gene data
+    if (exists("known.genes")) {
+        kg.ngenes <- length(unique(known.genes$Gene.ID))
+        kg.ntrans <- nrow(known.genes)
+        ignored <- known.genes$Alt.Biotype=="IGNORE"
+        g.ignored <- length(unique(known.genes$Gene.ID[ignored]))
+        t.ignored <- length(unique(known.genes$Transcript.ID[ignored]))
+        message(paste0(t.ignored," prior transcripts (",g.ignored," genes) were flagged as IGNORE."))
+        no.symbol <- which(known.genes$Use.Symbol=="")    # any missing Use Symbols?
+        known.genes$Use.Symbol[no.symbol] <- known.genes$Symbol[no.symbol]      # if Use Symbol is empty, take old symbol
+        no.biotype <- which(known.genes$Alt.Biotype=="")  # any missing Alt Biotypes?
+        known.genes$Alt.Biotype[no.biotype] <- known.genes$Biotype[no.biotype]  # if Alt Biotype is empty, take Ensembl biotype
+        g.no.biotype <- length(unique(known.genes$Gene.ID[no.biotype]))
+        t.no.biotype <- length(unique(known.genes$Transcript.ID[no.biotype]))
+        message(paste(kg.ngenes-g.no.biotype-g.ignored,"prior genes have a prior Alt.Biotype (which is not IGNORE)."))
+        non.ensembl <- c("NCBI-Ribo","tRNAScan-SE")  # status values for non-Ensembl genes (if any)
+        kg.ens <- known.genes[!mgrepl(non.ensembl,known.genes$Gene.Status),]  # restrict to Ensembl (non-Ensembl handled separately)
+        kg.ens.ngenes <- length(unique(kg.ens$Gene.ID))
+        kg.ens.ntrans <- nrow(kg.ens)
+        if (nrow(kg.ens)>0) use.kg <- TRUE   # if any genes left in 'known.genes', then use it.  Otherwise, generate something like it from scratch.
+        message(paste0(kg.ntrans," prior transcripts (",kg.ngenes," genes) accepted."))
+        message(paste0(kg.ens.ntrans," prior Ensembl transcripts (",kg.ens.ngenes," Ensembl genes) accepted."))
+    }
+    
+    if (use.kg) {
+        
+        ## Already read known-genes dataset from file; compare to current Ensembl data
+        ## Comparison must be transcript-wise, as some ncRNAs actually have multiple transcripts
+        trans.va <- venn.areas(list(KNOWN=kg.ens$Transcript.ID,CURRENT=nc.genes$Transcript.ID))  # venn diag areas list, comparing transcripts in 'known.genes' object (from gene_master file) vs current Ensembl data
+        message(paste("PRIOR-ONLY:  ",length(trans.va[[1]])))
+        message(paste("CURRENT-ONLY:",length(trans.va[[2]])))
+        message(paste("OVERLAP:     ",length(trans.va[[3]])))
+        
+        ## any Ensembl transcripts in known.genes which no longer exist in Ensembl?
+        if (length(trans.va[[1]])>0) {
+            old.genes <- kg.ens[kg.ens$Transcript.ID %in% trans.va[[1]],]
+            write.table(old.genes, paste0(out.path,"/",orgver,".old_genes.txt"), sep="\t", quote=FALSE, row.names=FALSE)  # write expired transcripts to their own file
+        }
+        
+        ## any gene IDs not in the current-known-genes list?
+        if (length(trans.va[[2]])>0) {
+            new.genes <- nc.genes[nc.genes$Transcript.ID %in% trans.va[[2]],]
+            write.table(new.genes, paste0(out.path,"/",orgver,".new_genes.txt"), sep="\t", quote=FALSE, row.names=FALSE)  # write novel transcripts to their own file
+        }
+        
+        ## any genes shared between lists?  (ideally, all of them)
+        if (length(trans.va[[3]])>0) {
+            
+            ## Some Ensembl transcript IDs were shared between existing, new Ensembl datasets
+            ## Initialize 'final.genes' table with transcripts shared between current-Ensembl and existing gene_master table
+            
+            ca <- match(trans.va[[3]],all.genes$Transcript.ID)    # where are common genes in all.genes object (current)
+            cf <- match(trans.va[[3]],final.genes$Transcript.ID)  # where are common genes in final.genes object (current)
+            ck <- match(trans.va[[3]],known.genes$Transcript.ID)  # where are common genes in known.genes object (prior)
+            
+            final.genes$Alt.Biotype[cf] <- known.genes$Alt.Biotype[ck]  # import prior alternate (hand-crafted) Biotype annotations, if any
+            final.genes$Use.Symbol[cf] <- known.genes$Use.Symbol[ck]    # import prior alternate (hand-crafted) Symbol annotations, if any
+            all.genes$Alt.Biotype[ca] <- known.genes$Alt.Biotype[ck]    # ditto
+            all.genes$Use.Symbol[ca] <- known.genes$Use.Symbol[ck]      # ditto
+            
+            no.alt.bio <- which(truthify(final.genes$Alt.Biotype==""))  # any missing alt biotypes? (most will be missing)
+            no.use.sym <- which(truthify(final.genes$Use.Symbol==""))   # any missing use symbols?  (most will be missing)
+            no.alt.bio.a <- match(final.genes$Transcript.ID[no.alt.bio], all.genes$Transcript.ID)  # equivalent positions in 'all.genes'
+            no.use.sym.a <- match(final.genes$Transcript.ID[no.use.sym], all.genes$Transcript.ID)  # ditto
+            
+            final.genes$Alt.Biotype[no.alt.bio] <- final.genes$Biotype[no.alt.bio]  # if missing "alt" biotypes, copy from old
+            final.genes$Use.Symbol[no.use.sym] <- final.genes$Symbol[no.use.sym]    # if missing "use" symbols, copy from old
+            all.genes$Alt.Biotype[no.alt.bio.a] <- final.genes$Biotype[no.alt.bio]  # ditto
+            all.genes$Use.Symbol[no.use.sym.a] <- final.genes$Symbol[no.use.sym]    # ditto
+            
+            ## Genes may have > 1 transcript.  Ensure "IGNORE" flags propagate to all transcripts per ignored gene.
+            ignored.gids <- all.genes$Gene.ID[all.genes$Alt.Biotype=="IGNORE"]  # gene IDs affected by the IGNORE alt-biotype
+            all.genes$Alt.Biotype[all.genes$Gene.ID %in% ignored.gids] <- "IGNORE"
+            final.genes$Alt.Biotype[final.genes$Gene.ID %in% ignored.gids] <- "IGNORE"
+            
+            ## Gene/Transcript counts for final biotypes
+            final.biotype.stats <- biotype.gt(final.genes, "Final")  # gene biotypes
+            final.biotype.stats2 <- biotype.gt(final.genes, "Final", TRUE)  # gene + transcript biotypes
+            
+            ## Since the potential for IGNOREd genes exists, split affected biotypes into Excluded (IGNORE) and Final (Included)
+            ## Get g/t stats for ignored biotypes; remove ignored counts from previous biotype stats with "Included"
+            ignored.genes <- all.genes[all.genes$Alt.Biotype=="IGNORE",]  # genes affected by the IGNORE alt-biotype
+            if (nrow(ignored.genes)>0) {
+                ignored.biotype.stats <- biotype.gt(ignored.genes, "Excluded")  # stats for IGNOREd gene biotypes only; treat as Excluded
+                ignored.biotype.stats2 <- biotype.gt(ignored.genes, "Excluded", TRUE)  # stats for IGNOREd gene + transcript biotypes only; treat as Excluded
+                for (i in 1:nrow(ignored.biotype.stats)) {
+                    w <- which(nc.biotype.stats[,2]==ignored.biotype.stats[i,2])  # affected biotype row in 'nc.stats'
+                    nc.biotype.stats[w,3] <- nc.biotype.stats[w,3]-ignored.biotype.stats[i,3]  # remove number of genes flagged as 'IGNORE'
+                }
+            }
+            
+        } else {
+            
+            ## No Ensembl gene IDs were shared between existing, new Ensembl datasets -- really?
+            message(paste0("WARNING: No transcripts in common between old (",length(unique(kg.ens$Transcript.ID)),"), new (",length(unique(nc.genes$Transcript.ID)),") datasets!"))
+            
+        }
+        
+    } else {
+        
+        ## No known-genes file existed -- create a preliminary one from current Ensembl data
+        message("No prior known-genes file; starting from scratch.")
+        
+    }
+    
+    ## template for Ensembl-transcript fasta headers: biotype|geneID|transcriptID|chromosome|symbol
+    final.genes[,1] <- apply(final.genes[,c(3,6:8,5)], 1, paste, collapse="|")
+    message(paste0(nrow(final.genes)," final transcripts (",length(unique(final.genes$Gene.ID))," genes) selected."))
+    
+    
+    
+    
+    
+    ## Get Ensembl transcript sequences
+    message("Downloading relevant transcript sequences...")
+    library(biomaRt)
+    final.seq <- getSequence(id=final.genes$Transcript.ID, type="ensembl_transcript_id", seqType="cdna", mart=mart)   # transcript sequences for 'final.genes'
+    seq.ord <- match(final.genes$Transcript.ID, final.seq[[2]])  # order same as 'final.genes'
+    for (i in 1:2) final.seq[[i]] <- final.seq[[i]][seq.ord]     # order same as 'final.genes'
+    out.fasta <- final.seq[[1]]   # initialize fasta object
+    names(out.fasta) <- final.genes[,1]  # switch to final fasta headers
+    final.lens <- sapply(final.seq[[1]],nchar)  # transcript lengths
+    lengths.mismatch <- sum(final.lens!=final.genes$Length)
+    if (lengths.mismatch>0) message(paste(lengths.mismatch,"transcript lengths were mismatched!"))
+    
+    
+    
+    
+    
+    ## Set checkpoint
+    checkpoint <- 3
+    save.image(tmp)
+    
+}
+message("*****  Passed Checkpoint 3  *****")
+
+
+
+
+
+if (checkpoint < 4) {
+    
+    ## Fetch/parse tRNAScan-SE data, if specified in config file
+    if ("TRNA_DATA" %in% names(cfg)) {
+        
+        ## Entirely dependent on systematic tRNA names used in listings on tRNAScan-SE website
+        ## Config file tRNAScan-SE URLs must point to pages from the online database at http://gtrnadb.ucsc.edu/
+        message("Downloading tRNA data...")
+        library(RCurl)
+        
+        process.trnascan.header <- function(x) {
+            ## process fasta headers from http://gtrnadb.ucsc.edu/ tRNA fastas
+            ## starting with systematic header strings: # "Danio_rerio_chr3.trna585-AlaAGC (37610669-37610597)  Ala (AGC) 73 bp  Sc: 54.34"
+            x <- sub(" bp.*$","",x)                     # "Danio_rerio_chr3.trna585-AlaAGC (37610669-37610597)  Ala (AGC) 73"
+            x <- gsub(" \\("," {",gsub("\\) ","} ",x))  # "Danio_rerio_chr3.trna585-AlaAGC {37610669-37610597}  Ala {AGC} 73"   # cannot get split() to work on parentheses, so replace them with braces
+            geneid <- unlist(strsplit(x," "))[1]        # "Danio_rerio_chr3.trna585-AlaAGC"
+            org.chr <- sub("\\..*$","",geneid)          # "Danio_rerio_chr3"
+            chr <- sub("^chr","",sub(paste0("^",org,"_"),"",org.chr))  # the most direct way to get chromosomes with underscores in their names, e.g. "Zv9_scaffold2563"
+            remainder <- sub("^.*\\.","",x)                     # "trna585-AlaAGC {37610669-37610597}  Ala {AGC} 73"
+            y <- unlist(strsplit(remainder,"[- _\\.\\{\\}]+"))  # c("trna585","AlaAGC","37610669","37610597","Ala","AGC","73")
+            y[1] <- sub("^trna","",y[1])  # tRNA number only
+            if (y[5] == "SeC(e") y[5] <- "SeC(e)"  # selenocysteine isotype repair
+            symbol <- paste(c(y[5:6],chr,y[1]),collapse="_")  # template for tRNAScan-SE gene "symbols": isotype_codon_chrom_trna-number
+            coord <- as.numeric(y[3:4])   # char->numeric for start, end
+            if (coord[1] > coord[2]) {
+                coord <- rev(coord)       # start > end?  Reverse.
+                strand <- "-"             # gene is (-) strand
+            } else {
+                strand <- "+"             # otherwise (+) strand
+            }
+            ## finally, headers are reformatted to match first 11 columns of final.genes table
+            data.frame(HEADER=paste0("tRNA|tRNAScan-SE|",symbol),BIO=trna.biotype,NBIO="tRNA",SYMB="",NSYMB=symbol,GENE=geneid,TRANS=geneid,CHR=chr,START=coord[1],END=coord[2],STR=strand)  
+        }
+        
+        trnascan.spliced <- function(x) {
+            ## detect spliced tRNA entries in a http://gtrnadb.ucsc.edu/ tRNA table
+            y <- x[(grep("^<PRE>",x)[1]+1):(grep("^</PRE>",x)[1]-1)]  # extract table body from page
+            if (grepl("^-",y[3])) y <- y[4:length(y)]   # table has text header -- not all of them do
+            sapply(y, function(r){ as.numeric(unlist(strsplit(r,"[ \t]+"))[9])>0 })  # parse web table for nonzero intron starts.  Returns T/F for intron.
+        }
+        
+        trna.raw <- list()
+        message(paste0(" Trying ",cfg$TRNA_DAT[1],"..."))
+        trna.raw[[1]] <- getURL(cfg$TRNA_DAT[1])  # get raw page data
+        message(paste(length(trna.raw[[1]]),"lines read,",sum(nchar(trna.raw[[1]])),"bytes."))
+        message(paste0(" Trying ",cfg$TRNA_DAT[2],"..."))
+        trna.raw[[2]] <- getURL(cfg$TRNA_DAT[2])  # get raw page data
+        message(paste(length(trna.raw[[2]]),"lines read,",sum(nchar(trna.raw[[2]])),"bytes."))
+        trna.fa <- as.fasta(unlist(strsplit(trna.raw[[1]],"\n")))  # read fasta from data
+        trna.gcp <- as.numeric(sprintf("%0.02f", 100*sapply(trna.fa, function(x) sum(unlist(strsplit(toupper(x),"")) %in% c("G","C"))/nchar(x) )))  # GC percent of sequences
+        trna.dat <- do.call(rbind, lapply(names(trna.fa), process.trnascan.header))  # parse annotations from header entries
+        old.trna.names <- names(trna.fa)  # the original fasta headers -- will become "Description" field in final.genes table
+        names(trna.fa) <- trna.dat[,1]  # replace with new headers
+        exons <- trnascan.spliced(unlist(strsplit(trna.raw[[2]],"\n")))+1  # return T/F for intron, add 1 -> "F" becomes 1 and "T" becomes 2, now = number of exons!
+        trna.genes <- data.frame(trna.dat,exons,sapply(trna.fa,nchar),trna.gcp,trna.biotype,trna.biotype,trna.biotype,old.trna.names)  # in 'final.genes' format
+        colnames(trna.genes) <- colnames(final.genes)
+        if (refine) {
+            trna.redundant.fin <- final.genes$Gene.ID %in% trna.genes$Gene.ID  # these trnas are already in 'final.genes'
+            trna.redundant.fin <- trna.redundant.fin[!is.na(trna.redundant.fin)] 
+            if (sum(trna.redundant.fin)>0) final.genes <- final.genes[!trna.redundant.fin,]  # so remove them
+            trna.redundant.all <- all.genes$Gene.ID %in% trna.genes$Gene.ID  # these trnas are already in 'all.genes'
+            trna.redundant.all <- trna.redundant.all[!is.na(trna.redundant.all)] 
+            if (sum(trna.redundant.all)>0) all.genes <- all.genes[!trna.redundant.all,]  # so remove them
+        } else {
+            final.genes <- rbind(final.genes, trna.genes)  # add all tRNA data to final.genes table
+            all.genes <- rbind(all.genes, trna.genes)  # add all tRNA data to all.genes table
+        }
+        out.fasta <- c(out.fasta, trna.fa)  # add tRNAs to fasta
+        trna.biotype.stats <- data.frame(STATUS="Included",BIOTYPE=trna.biotype,GENES=length(trna.fa),TRANSCRIPTS=length(trna.fa))  # gene biotypes
+        trna.biotype.stats2 <- trna.biotype.stats[,c(1,2,2,3,4)]  # gene + faked transcript biotypes
+        colnames(trna.biotype.stats2)[2:3] <- paste0(c("GENE","TRANS"),".BIOTYPE")
+        message(paste(length(trna.fa),"tRNAScan-SE genes imported."))
+        
+    }
+    
+    
+    
+    
+    
+    ## Set checkpoint
+    checkpoint <- 4
+    save.image(tmp)
+    
+}
+message("*****  Passed Checkpoint 4  *****")
+
+
+
+
+
+if (checkpoint < 5) {
+    
+    ## Fetch/parse NCBI ribosome data, if specified in config file
+    
+    if ("NCBI_RIBO" %in% names(cfg)) {
+        
+        message("Downloading NCBI ribosome data...")
+        library(RCurl)
+
+        ribo.raw <- getURLContent(paste0("http://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=nucleotide&rettype=fasta&retmode=text&id=",paste(cfg$NCBI_RIBO[,1],collapse="+")))  # get raw sequence(s) from NCBI using eutils query.
+        message(paste(length(ribo.raw),"lines read,",sum(nchar(ribo.raw)),"bytes."))
+        ## OLD VERSION OF CALL -- when script first written, ribo.raw downloaded as a length-1 vector of type 'raw' (behavior of old version of RCurl?)
+        ##ribo.fa <- as.fasta(unlist(strsplit( paste0(sapply(ribo.raw,rawToChar),collapse=""), "\n")))  # raw->char conversion, concat->single-string, then split into individual lines and read as fasta format.
+        ## NEW VERSION OF CALL -- while upgrading years later, ribo.raw has become a length-1 vector of type 'character'
+        ribo.fa <- as.fasta(unlist(strsplit(ribo.raw,"\n")))  # split into individual lines and read as fasta format.
+        ribo.gcp <- as.numeric(sprintf("%0.02f", 100*sapply(ribo.fa, function(x) sum(unlist(strsplit(toupper(x),"")) %in% c("G","C"))/nchar(x) )))  # GC percent of sequences
+        old.ribo.names <- names(ribo.fa)  # NCBI fasta headers -- will become "Description" field in final.genes table
+        names(ribo.fa) <- paste0("rRNA|",sub(" .*$","",names(ribo.fa)),cfg$NCBI_RIBO[,2])  # slightly modified into final fasta headers
+        ribo.ver <- nameless(do.call(rbind, sapply(old.ribo.names, strsplit, "\\|"))[,4])  # extract accession.version -- used for transcript id (and accession for gene id)
+        ribo.genes <- data.frame(names(ribo.fa),ribo.biotype,"rRNA","",cfg$NCBI_RIBO[,2],cfg$NCBI_RIBO[,1],ribo.ver,NA,NA,NA,NA,1,sapply(ribo.fa,nchar),ribo.gcp,ribo.biotype,ribo.biotype,ribo.biotype,old.ribo.names)  # in 'final.genes' format
+        colnames(ribo.genes) <- colnames(final.genes)
+        if (refine) {
+            ribo.redundant.fin <- final.genes$Gene.ID %in% ribo.genes$Gene.ID  # these ribos are already in 'final.genes'
+            ribo.redundant.fin <- ribo.redundant.fin[!is.na(ribo.redundant.fin)] 
+            if (sum(ribo.redundant.fin)>0) final.genes <- final.genes[!ribo.redundant.fin,]  # so remove them
+            ribo.redundant.all <- all.genes$Gene.ID %in% ribo.genes$Gene.ID  # these ribos are already in 'all.genes'
+            ribo.redundant.all <- ribo.redundant.all[!is.na(ribo.redundant.all)] 
+            if (sum(ribo.redundant.all)>0) all.genes <- all.genes[!ribo.redundant.all,]  # so remove them
+        } else {
+            final.genes <- rbind(final.genes, ribo.genes)  # add rRNA data to final.genes table
+            all.genes <- rbind(all.genes, ribo.genes)  # add rRNA data to all.genes table
+        }
+        out.fasta <- c(out.fasta, ribo.fa)  # add rRNAs to fasta
+        ribo.biotype.stats <- data.frame(STATUS="Included",BIOTYPE=ribo.biotype,GENES=length(ribo.fa),TRANSCRIPTS=length(ribo.fa))  # gene biotypes
+        ribo.biotype.stats2 <- ribo.biotype.stats[,c(1,2,2,3,4)]  # gene + faked transcript biotypes
+        colnames(ribo.biotype.stats2)[2:3] <- paste0(c("GENE","TRANS"),".BIOTYPE")
+        message(paste(length(ribo.fa),"NCBI ribosomes imported."))
+        
+    }
+    
+    
+    
+    
+    
+    ## Set checkpoint
+    checkpoint <- 5
+    save.image(tmp)
+    
+}
+message("*****  Passed Checkpoint 5  *****")
+
+
+
+
+
+if (checkpoint < 6) {
+    
+    ## This will eventually become host/neighbor processing
+    message("Processing hosts and neighbors...")
+    source("/n/projects/apa/R/apa_tools.R")
+    
+    
+    
+    
+    
+    ## Set checkpoint
+#    checkpoint <- 6
+#    save.image(tmp)
+    
+}
+message("*****  Passed Checkpoint 6  *****")
+
+
+
+
+
+if (checkpoint < 7) {
+    
+    ## Merge summary tables for gene biotypes and transcript-by-gene biotypes
+    biotype.stats <- do.call(rbind, lapply(c("final","nc","trna","ribo","obsolete","ignored","excluded"), function(n) {
+        this.stats <- paste0(n,".biotype.stats")
+        if (exists(this.stats)) get(this.stats)
+    }))
+    biotype.stats2 <- do.call(rbind, lapply(c("final","nc","trna","ribo","obsolete","ignored","excluded"), function(n) {
+        this.stats <- paste0(n,".biotype.stats2")
+        if (exists(this.stats)) get(this.stats)
+    }))
+    
+    ## Reorganize biotype.stats/2 and output
+    biotype.stats <- lapply(mat.split(biotype.stats, biotype.stats[,1]), function(x) x[order(x[,2]),] )  # split by status, sort by biotype ascending (within each status)
+    biotype.stats <- do.call(rbind, biotype.stats[match(c("Final","Included","Obsolete","Excluded"),names(biotype.stats))])  # reorder by status and rbind back into single data.frame
+    write.table(biotype.stats, paste0(out.path,"/",orgver,".gene_biotype_stats.txt"), sep="\t", quote=FALSE, row.names=FALSE)  # write biotype status table (gene biotypes only)
+    
+    biotype.stats2 <- lapply(mat.split(biotype.stats2, biotype.stats2[,1]), function(x) x[order(x[,2],x[,3]),] )  # split by status, sort by gene then trans biotype ascending (within each status)
+    biotype.stats2 <- do.call(rbind, biotype.stats2[match(c("Final","Included","Obsolete","Excluded"),names(biotype.stats2))])  # reorder by status and rbind back into single data.frame
+    write.table(biotype.stats2, paste0(out.path,"/",orgver,".trans_biotype_stats.txt"), sep="\t", quote=FALSE, row.names=FALSE)  # write biotype status table #2 (gene + transcript biotypes)
+    
+    message(paste(nrow(biotype.stats), "initial and final gene biotypes accounted for."))
+    
+    ## Separate transcript lengths by gene biotype
+    len.by.bio <- vector("list", length=nrow(biotype.stats))  # this will hold transcript length distributions for each row of 'biotype.stats'
+    names(len.by.bio) <- biotype.stats[,2]  # biotypes only; status will be indicated by color
+    for (s in unique(biotype.stats$STATUS)) {   # for each status 's'
+        for (b in biotype.stats$BIOTYPE[biotype.stats$STATUS==s]) {   # for each gene biotype 'b' with status 's'
+            wsb <- which(biotype.stats$STATUS==s & biotype.stats$BIOTYPE==b)
+            if (s=="Final") {
+                len.by.bio[[wsb]] <- final.genes$Length[final.genes$Alt.Biotype==b]
+            } else if (s=="Included" & b==trna.biotype) {
+                len.by.bio[[wsb]] <- trna.genes$Length
+            } else if (s=="Included" & b==ribo.biotype) {
+                len.by.bio[[wsb]] <- ribo.genes$Length
+            } else if (s=="Included") {
+                len.by.bio[[wsb]] <- nc.genes$Length[nc.genes$Biotype==b]
+            } else if (s=="Obsolete") {
+                len.by.bio[[wsb]] <- obsolete.genes$Length[obsolete.genes$Biotype==b]
+            } else if (s=="Excluded") {
+                len.by.bio[[wsb]] <- c(excluded.genes$Length[excluded.genes$Biotype==b], ignored.genes$Length[ignored.genes$Biotype==b])
+            }
+        }
+    }
+    
+    ## Set colors for biotype statuses
+    lbb.cols <- data.frame(STATUS=c("Final","Included","Obsolete","Excluded"),COLOR=c("red","green","grey","blue"))
+    if (length(obsolete.biotypes)==0) lbb.cols <- lbb.cols[c(1,2,4),]
+    nrlbb <- nrow(lbb.cols)
+    
+    ## Determine x-axis limits for transcript length plots
+    ## Only need to use initial biotypes, since transcript-lengths set is the same for initial and final biotypes
+    xmin <- log2(min(unlist(len.by.bio),na.rm=TRUE))  # log2 min value
+    xmin <- ifelse (abs(xmin-trunc(xmin))>0.67, ceiling(xmin), trunc(xmin))  # if less than n.67, ceiling to n+1, else truncate to n
+    if (xmin%%2==1) xmin <- xmin-1  # if rounded xmin is odd, drop to the next even number
+    xmax <- log2(max(unlist(len.by.bio),na.rm=TRUE))  # log2 max value
+    xmax <- ifelse (xmax-trunc(xmax)>0.33, ceiling(xmax), trunc(xmax))  # if greater than n.33, ceiling to n+1, else truncate to n
+    if (xmax%%2==1) xmax <- xmax+1  # if rounded xmax is odd, raise to the next even number
+    
+    ## Plot transcript lengths by gene biotypes
+    legx <- "topright"  # isolate this param, because sometimes (as with Drosophila) png must be remade with "right" not "topright"
+    png(paste0(out.path,"/",orgver,".biotype_lengths.png"), 700, 300+20*length(len.by.bio))
+    par(mar=c(4,16,4,2), cex=1.2, las=1, yaxs="i")
+    boxplot(rev(lapply(len.by.bio,log2)), horizontal=TRUE, ylim=c(xmin,xmax), xaxt="n", border=rev(lbb.cols[match(biotype.stats[,1],lbb.cols[,1]),2]), xlab="Log2 Transcript Length", ylab="", main="Transcript Lengths per Gene Biotype")
+    axis(1, at=seq(xmin,xmax,2))
+    legend(legx, bty="n", pch=c(rep(22,nrlbb),NA,NA), lty=c(rep(NA,nrlbb),1,2), col=c(lbb.cols[,2],1,1), legend=c(paste(lbb.cols[,1],"Biotype"),"Band 1 Max","Band 2 Max"))
+    adapter.length <- 120    # in a finished Illumina sRNA library molecule, how many bp come from adapters (at both ends)
+    low.band.length <- 160   # size-selection upper bound for standard Illumina sRNA prep
+    high.band.length <- 300  # size-selection upper bound for SIMR-customized 2-band Illumina sRNA prep
+    band.pos <- c(low.band.length,high.band.length)-adapter.length
+    abline(v=log2(band.pos), lty=1:2)   # DNA fragment upper bounds for standard, 2-band sRNA libraries
+    mtext(paste0(band.pos,"bp"),3,0,FALSE,log2(band.pos))
+    dev.off()
+    
+    
+    ## Output datasets
+    message("Writing outputs...")
+    
+    ## Sort output fasta and final.genes in same order; add fasta-header column to final.genes
+    out.fasta <- out.fasta[order(names(out.fasta))]   # sorts by biotype (first header field), then lexico by rest of header.
+    final.genes <- final.genes[match(names(out.fasta),final.genes$Fasta.Header),]  # order final.genes in fasta order.
+    
+    ## Fasta and gene data table same length?
+    message(paste("Sequences:", length(out.fasta)))
+    message(paste("Gene Table Genes:",nrow(final.genes)))
+    
+    ## Write fasta and gene table
+    ignored <- final.genes$Alt.Biotype=="IGNORE"
+    final.genes$Fasta.Header[ignored] <- ""  # zap fasta header entries for ignorable transcripts
+    gd.drop <- match(c("Biotype","Symbol"), colnames(final.genes))
+    genedata <- final.genes[!ignored,-gd.drop]  # genedata.txt file: gene_master lite (single columns for biotype, symbol; no ignorable records: fasta companion dataset)
+    genedata[is.na(genedata)] <- ""  # no NAs
+    gd.repl <- match(c("Alt.Biotype","Use.Symbol"), colnames(final.genes))
+    colnames(genedata)[gd.repl] <- qw(Biotype,Symbol)   # genedata.txt file "Alt.Biotype" and "Use.Symbol" will not be referred to as such
+    write.table(genedata, paste0(out.path,"/",orgver,".genedata.txt"), sep="\t", quote=FALSE, row.names=FALSE)  # write genedata.txt file
+    write.fasta(out.fasta[!grepl("^IGNORE",names(out.fasta))], paste0(out.path,"/",orgver,".fa"))  # write final fasta
+    
+    ## Write gene_master table
+    masterdata <- final.genes  # regenerate gene_master dataset 
+    masterdata[is.na(masterdata)] <- ""  # no NAs
+    masterdata[masterdata[,3]==masterdata[,2],3] <- ""  # if alt biotype = old biotype, zap it (in the output file only!); we still have old-biotype column, and want entries with modified biotypes to stand out
+    masterdata[masterdata[,5]==masterdata[,4],5] <- ""  # ditto for symbols
+    masterdata <- masterdata[order(masterdata$Symbol),]       # sorted tertiarily by Symbol...
+    masterdata <- masterdata[order(masterdata$Alt.Biotype),]  # ...secondarily by Alt.Biotype...
+    masterdata <- masterdata[order(masterdata$Biotype),]      # ...and primarily by original Biotype
+    write.table(masterdata, paste0(out.path,"/",orgver,".gene_master.txt"), sep="\t", quote=FALSE, row.names=FALSE)  # write gene_master table
+    
+    ## Set checkpoint
+    checkpoint <- 7
+    save.image(tmp)
+    
+}
+message("*****  Passed Checkpoint 7  *****")
+
+
+
+
+
+if (checkpoint < 8) {
+    
+    ## Fasta indexing etc.
+    orgpref <- paste0(out.path,"/",org)           # e.g. "/n/projects/apa/stuff/bowtie_building/ncRNA_builds/Mus_musculus/Ens80/Mus_musculus"
+    orgfa <- paste0(orgpref,".fa")                # e.g. "/n/projects/apa/stuff/bowtie_building/ncRNA_builds/Mus_musculus/Ens80/Mus_musculus.fa"
+    btblog <- paste0(orgpref,".bowtie2_build.log")
+    system(paste("samtools faidx",orgfa))         # index fasta
+    system(paste("bowtie2-build",orgfa,orgpref,"&>",btblog))  # create bowtie2 indexes, send ALL screen output to log file
+    
+    if (file.exists(paste0(orgfa,".fai"))) {
+        
+        ## Set checkpoint
+        checkpoint <- 8
+        save.image(tmp)
+        
+    } else {
+        
+        stop(paste("Failed fasta postprocessing!"))
+        
+    }    
+}
+message("*****  Passed Checkpoint 8  *****")
+
+message(paste("ncrnaBuild",org,"complete!"))
+quit()
+
+
+
+
+
+
+
+
+
+
+##### CONFIG FILE DOCUMENTATION:
+
+## File must have the name "config.Genus_species.txt" and be in the default, or specified-by-argument-2, location.
+## File consists of 2 columns, tab-separated: 1=field type, 2=field data.
+## There are 4 mandatory field types: ORGANISM, BIOMART, DATASET, and BIOTYPES; each may be present only once.
+## There are 2 optional field types: TRNA_DATA and NCBI_RIBO; TRNA_DATA may be present only once, but multiple NCBI_RIBO fields can exist.
+## Fields can appear in any order.
+##
+## Explanation of fields types:
+## ORGANISM: value is "Genus species".  (Not actually used for anything; just to make it obvious what organism this is during editing.)
+## BIOMART: name for Ensembl biomart handle, as required by biomaRt R package.
+##   For vertebrates: use "ensembl".
+##   For non-vertebrate marts use specific name, e.g. for Ensembl Fungi use "fungi_mart_*".  The * wildcard will select for the latest-version mart possible, e.g. "fungi_mart_19".
+## DATASET: dataset name within the given biomart, as required by biomaRt R package.
+##   For vertebrates: first letter of genus, then species, then "_gene_ensembl", all lowercase.  So human would be "hsapiens_gene_ensembl".
+##   For non-vertebrate marts: replace "gene_ensembl" with "eg_gene".  So yeast would be "scerevisiae_eg_gene".
+## BIOTYPES: a space-delimited list of noncoding Ensembl biotypes to retain, e.g. rRNA Mt_rRNA snoRNA etc.
+##   Must match actual biotypes for the organism!  Genes with other biotypes will be discarded.
+## TRNA_DATA: two space-delimited values, which are 2 urls pointing at pages from the Genomic tRNA Database at http://gtrnadb.ucsc.edu/: 1. fasta page, 2. locus table (text version).
+##   This is mainly used for vertebrates, which do not have tRNA annotations in Ensembl.  The website uses tRNAScan-SE predictions.
+##   MAKE SURE THAT THE GENOME USED BY THE CURRENT ENSEMBL VERSION == GENOME USED FOR TRNA PREDICTIONS!  You may have to update the config file if a new genome comes out.
+## NCBI_RIBO: two space-delimited values, which are a nucleotide accession (without version) and a short "symbol" for the ribosomal record.
+##   This is also mainly used for vertebrates, when large ribosomal repeats are left out of the golden path, and thus out of Ensembl.
+##   Find the ribosome records at NCBI (a tedious process) and record them here.
+
+## EXAMPLE CONFIG FILE FOR DANIO RERIO:
+
+## ORGANISM	Danio rerio
+## BIOMART	ensembl
+## DATASET	drerio_gene_ensembl
+## BIOTYPES	rRNA snoRNA snRNA miRNA misc_RNA Mt_rRNA Mt_tRNA
+## NCBI_RIBO	EF417169 large_subunit_RNA_partial
+## NCBI_RIBO	AF398343 28S_RNA_partial
+## NCBI_RIBO	AJ306602 28S_rRNA_clone_DR12b_partial
+## NCBI_RIBO	AJ306603 28S_rRNA_clone_DR15_partial
+## NCBI_RIBO	FJ915075 18S_small_subunit_RNA_partial
+## TRNA_DATA	http://gtrnadb.ucsc.edu/Dreri/danRer7-tRNAs.fa http://gtrnadb.ucsc.edu/Dreri/Dreri-by-locus-txt.html
+
+## EXAMPLE CONFIG FILE FOR SACCHAROMYCES CEREVISIAE:
+
+## ORGANISM	Saccharomyces cerevisiae
+## BIOMART	fungi_mart_*
+## DATASET	scerevisiae_eg_gene
+## BIOTYPES	rRNA snoRNA snRNA tRNA ncRNA
+
+
+
+
+
+##### GENE_MASTER FILE DOCUMENTATION:
+
+## File must have the name "gene_master.Genus_species.<version_tag>.txt" and be in the default, or specified-by-argument-2, location.
+## File currently consists of 16 columns of gene annotations, tab-separated.  More on that below.
+## This is not a necessary file, but your builds will be a lot better for having one.  It enables customization of gene annotations.
+## Chiefly, it enables tracking and blacklisting of non-housekeeping genes which share biotypes with housekeepers (usually from "misc_RNA").
+## Also, Ensembl sometimes makes mistakes, like classifying miRNAs as misc_RNAs or omitting a snoRNA symbol, etc.  Corrections can be specified in the gene_master file.
+## Finally, the gene_master file records a set of genes known to a specific Ensembl (/tRNAScan/NCBI) version.  Any changes to the ncRNA set over time now have a paper trail.
+## The file is read in and regenerated with each run of the pipeline, and appears in the output.
+##   The archival copy, in the default location, is not altered by the pipeline.
+##   A copy of the gene_master gets created even if none existed before.  Now you can modify the new gene master, copy it to an archival location, and re-run the pipeline.
+## Ideally, one would not need to add or edit any NCBI or tRNAScan entries, as these are processed to spec by this script.  The config file takes care of all that.
+## If editing this file in Excel, be sure to strip Windows newlines and double-quotes (") from the file afterwards, like with "perl -i -pe 's/[\r"]//g' gene_master.Danio_rerio.txt".
+## 
+## The 16 columns, in order, are: Fasta Header, Biotype, Alt Biotype, Symbol, Use Symbol, Gene ID, Transcript ID, Chromosome, Start, End, Strand, Exons, Length, GC Percent, Status, Description.
+## Explanation of columns:
+##  1. Fasta Header: The fasta header associated with this transcript.
+##       Leave blank if Alt Biotype is "IGNORE" -- see below -- since these won't be in the fasta.
+##  2. Biotype: The ORIGINAL Ensembl biotype.  Leave blank for NCBI, tRNAScan entries.
+##  3. Alt Biotype: The CORRECTED Ensembl biotype.  Fill in for NCBI, tRNAScan entries.  Also use for corrections.
+##       For non-housekeeping misc_RNA genes which need to be ignored: set Alt Biotype to "IGNORE".
+##       **** NOTE ON ANALYSIS PIPELINE ****: it expects ONLY the chief 8 vertebrate housekeeper biotypes: miRNA, misc_RNA, Mt_rRNA, Mt_tRNA, rRNA, snoRNA, snRNA, tRNA.
+##         Thus, if you are working in an invertebrate or microbe with different biotypes (e.g. yeast's "ncRNA" or fly's "pre_miRNA") these will need to be "corrected" to one of the 8 above.
+##  4. Symbol: The ORIGINAL symbol, a.k.a. "Associated Gene Name" in BioMart.  Leave blank for NCBI, tRNAScan entries.
+##  5. Use Symbol: The CORRECTED symbol.  Fill in for NCBI, tRNAScan entries.  Also use for corrections.
+##  6. Gene ID: Ensembl Gene ID (or unversioned accession for NCBI, or first header field for tRNAScan).
+##  7. Transcript ID: Ensembl Transcript ID (or versioned accession for NCBI, or first header field for tRNAScan).
+##  8. Chromosome: Ensembl-style chromosome name, with NO "chr" prefix.
+##  9. Start: Transcript start coord.
+## 10. End: Transcript end coord.
+## 11. Strand: + or -.
+## 12. Exons: Transcript exon count.
+## 13. Length: Transcript length.
+## 14. GC: Transcript GC percent
+## 15. Transcript Biotype: Ensembl Transcript Biotype
+## 16. Transcript Status: Ensembl Transcript Status
+## 17. Gene Status: Ensembl Gene Status (or "NCBI" for NCBI, "tRNAScan-SE" for tRNAScan)
+## 18. Description: Ensembl Gene Description (or original fasta header for NCBI, tRNAScan)
+
+## See examples of gene_master files in the default archival location, stored in the "master.path" variable in this script.
+
+
+       
+##### HOST_NEIGHBOR FILE DOCUMENTATION:
+
+## A file still in development.  It will hold host-gene and nearest-neighbor data for all final ncRNAs
+
+
+## 15. Host ID: Transcript host gene ID (if any)
+## 16. Host Symbol: Transcript host gene symbol (if any)
+## 17. Host Relation: Relationship of ncRNA to host gene (if any)
+
+
+## Work for another three columns: host-gene ID, host-gene symbol, host-gene relationship
+
+if (FALSE) {
+    
+library(GenomicRanges)
+
+all.biotypes <- suniq(all.genes$Biotype)
+pc.biotypes <- c("protein_coding","pseudogene","polymorphic_pseudogene",all.biotypes[mgrep(qw(IG,TR),all.biotypes)])
+pc.genes <- all.genes[mgrep(pc.biotypes,all.genes$Biotype),]    # select all other transcripts
+pc.gr <- bed2gr(pc.genes[,c(7:9,6,11,10)])
+
+for (i in 9:10) final.genes[,i] <- as.numeric(final.genes[,i])  # for some reason
+use <- which(!is.na(final.genes[,9])&final.genes[,3]!="IGNORE")
+nc.gr <- bed2gr(final.genes[use,c(8:10,7,12,11)])
+
+ol <- suppressWarnings(as.matrix(findOverlaps(nc.gr, pc.gr)))  # ignore differences in chromosome content
+ol2 <- as.data.frame(ol)
+ol2[,1] <- final.genes[use[ol[,1]],1]
+ol2[,2] <- paste(pc.genes[ol[,2],1],pc.genes[ol[,2],3],sep="|")
+ol2 <- unique(ol2)
+
+ol2[ol2[,1] %in% ol2[duplicated(ol2[,1]),1],]  # NCs overlapped by < 1 PC
+# drop pseudos if a true PC is one of the overlappers
+
+
+pc.exons <- getBM(attributes=c("ensembl_transcript_id","chromosome_name","exon_chrom_start","exon_chrom_end","ensembl_exon_id"), filters="ensembl_transcript_id", values=pc.genes[ol[,2],6], mart=mart)  # get exons per overlapping PC transcript
+pc.x.gr <- bed2gr(pc.exons[,2:5])
+
+ol <- suppressWarnings(as.matrix(findOverlaps(nc.gr, pc.gr)))  # ignore differences in chromosome content
+ol2 <- as.data.frame(ol)
+ol2[,1] <- final.genes[use[ol[,1]],1]
+ol2[,2] <- paste(pc.genes[ol[,2],1],pc.genes[ol[,2],3],sep="|")
+ol2 <- unique(ol2)
+
+
+}

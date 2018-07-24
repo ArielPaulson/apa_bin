@@ -1,0 +1,40 @@
+#!/bin/bash
+
+out=$1
+shift
+bt2s=($*)
+
+total=0
+unpair=0
+align0=0
+align1=0
+alignM=0
+
+for bt2 in ${bt2s[@]}
+do
+    echo $bt2
+    T=$(grep -P "^\d+ reads;" $bt2 | awk '{ print $1 }')
+    U=$(grep -P "^  \d+ .[\d.]+%. were unpaired" $bt2 | awk '{ print $1 }')
+    N=$(grep -P "^    \d+ .[\d.]+%. aligned 0" $bt2 | awk '{ print $1 }')
+    S=$(grep -P "^    \d+ .[\d.]+%. aligned exactly" $bt2 | awk '{ print $1 }')
+    M=$(grep -P "^    \d+ .[\d.]+%. aligned \>1" $bt2 | awk '{ print $1 }')
+    total=$(echo "$total+$T" | bc)
+    unpair=$(echo "$unpair+$U" | bc)
+    align0=$(echo "$align0+$N" | bc)
+    align1=$(echo "$align1+$S" | bc)
+    alignM=$(echo "$alignM+$M" | bc)
+done
+
+pctU=$(printf "%0.2f" $(echo "scale=3; 100*$unpair/$total" | bc))
+pct0=$(printf "%0.2f" $(echo "scale=3; 100*$align0/$total" | bc))
+pct1=$(printf "%0.2f" $(echo "scale=3; 100*$align1/$total" | bc))
+pctM=$(printf "%0.2f" $(echo "scale=3; 100*$alignM/$total" | bc))
+rate=$(printf "%0.2f" $(echo "scale=3; 100*($align1+$alignM)/$total" | bc))
+
+echo -e "$total reads; of these:
+  $unpair ($pctU%) were unpaired; of these:
+    $align0 ($pct0%) aligned 0 times
+    $align1 ($pct1%) aligned exactly 1 time
+    $alignM ($pctM%) aligned >1 times
+$rate% overall alignment rate" > $out
+

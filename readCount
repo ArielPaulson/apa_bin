@@ -1,0 +1,129 @@
+#!/usr/bin/env perl
+require '/home/apa/local/bin/apa_routines.pm';
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## Counts read sequences in fasta or fastq format
+## PRINTS TO OUTPUT FILE AND STDERR AT SAME TIME -- your redirect is not broken
+
+my $sort_u = '/home/apa/local/bin/sort_u';
+my $uniq_c = '/home/apa/local/bin/uniq_c';
+my $fasta2tab = '/home/apa/local/bin/fasta2tab';
+
+my @files;    # post-getopt @ARGV
+my $type;     # file format, if not inferrable from extension (ALL FILES MUST HAVE SAME FORMAT)
+my $unique;   # count unique reads in addition to totals?
+my $uhisto;   # count read uniqueness histogram? (incompatible with --unique)
+my $crop;     # CSV list of quoted regexes to strip from filenames, e.g. "^../data/fastq/",".fastq.gz$" -- WILL BE MATCHED AS-IS
+my $outfile;  # optional
+
+GetOptions("t=s"=>\$type, "o=s"=>\$outfile, "unique"=>\$unique, "uhisto"=>\$uhisto, "crop=s"=>\$crop);
+@files = @ARGV;
+
+my %types = map {($_=>1)} qw/ fasta fastq sam bam /;
+my $typestr = join ', ', map { "'$_'" } sort keys %types;
+
+unless ($type) {
+    $type = 'fasta' if ($files[0] =~ /fasta$/i || $files[0] =~ /fa$/i || $files[0] =~ /fasta.gz$/i || $files[0] =~ /fa.gz/i);
+    $type = 'fastq' if ($files[0] =~ /fastq$/i || $files[0] =~ /fq$/i || $files[0] =~ /fastq.gz$/i || $files[0] =~ /fq.gz/i);
+    $type = 'sam' if ($files[0] =~ /sam$/i);
+    $type = 'bam' if ($files[0] =~ /bam$/i);
+}
+die "$0: Unknown file type '$type': must be one of: $typestr\n" unless $types{$type};
+die "Cannot specify --unique and --uhisto at the same time!\n" if $unique && $uhisto;
+
+my @crop;
+if ($crop) {
+    $crop =~ s/^"//;  # remove leading quote
+    $crop =~ s/"$//;  # remove trailing quote
+    @crop = split /","/, $crop;  # isolate strings/regexes
+}
+
+my $width;
+foreach my $file (@files) {
+    $width = length($file) if length($file) > $width;
+}
+
+my $OUT;
+if ($outfile) {
+    open $OUT, '>', $outfile or die "$0: Cannot open output file '$outfile': $!\n";
+} else {
+    $OUT = *STDOUT;
+}
+
+my $uhisto_head = join("\t", (map { "N.${_}x" } 1..10), (map { "PCT.${_}x" } 1..10));
+$uhisto_head =~ s/10/10+/g;
+
+my $header = "FILE\tREADS\tUNQSEQ\tUNQPCT";
+$header .= "\t$uhisto_head" if $uhisto;
+$header .= "\n"; 
+print STDERR $header;
+print $OUT $header;
+
+foreach my $file (@files) {
+    
+    ## 1. get total N reads
+    ## 2A. stream in read-sequences from a pipe
+    ## 2B. hand off sequence stream to counting subroutine that returns count, pct strings
+    
+    my ($cmd, $R, $S, $SP, $U, $UP);
+    my $open = $file =~ /\.gz$/ ? 'zcat' : 'cat';  # for non-BAM files only
+    if ($type eq 'fasta') {
+        $cmd = "$open $file | $fasta2tab - | cut -f2";
+    } elsif ($type eq 'fastq') {
+        $cmd = "$open $file | paste - - - - | cut -f2";
+    } elsif ($type eq 'sam') {
+        $cmd = "$open $file | grep -v \"^@\" | cut -f10";
+    } elsif ($type eq 'bam') {
+        $cmd = "samtools view $file | cut -f10";
+    }
+    
+    if ($unique) {
+        ($R, $S, $SP) = &unique_UP("$cmd | $uniq_c | cut -f1");
+    } elsif ($uhisto) {
+        ($R, $S, $SP, $U, $UP) = &uhisto_UP("$cmd | $uniq_c | awk '{ print \$1 }' | $uniq_c");
+    }
+    
+    my $name = $file;
+    $name =~ s/$_// foreach @crop;
+    my $line = $unique||$uhisto ? "$name\t$R\t$S\t$SP\t$U\t$UP\n" : "$name\t$R\t$S\t$SP\n";
+    print STDERR $line;
+    print $OUT $line;
+}
+exit;
+
+
+
+sub unique_UP {
+    my $cmd = shift;
+    my ($r, $s, $sp);
+    chomp(my @u = split /\n/, `bash -c '$cmd'`);
+    $s = scalar @u;
+    $r += $_ foreach @u;  # $_ is N times some sequence occurred; one value per unique sequence
+    $sp = sprintf("%0.2f", 100*$s/($r||1));
+    return($r, $s, $sp);
+}
+
+
+sub uhisto_UP {
+    my $cmd = shift;
+    my ($r, $s);
+    my @UH = my @UP = map {0} (0..10);
+    chomp(my @uh = split /\n/, &backticks_bash($cmd));
+    ## &backticks_bash is like backticks, but ensures the shell is bash, and can handle complex commands including quotes, which `"bash -c 'cmd'"` cannot
+    
+    foreach (@uh) {
+        my ($seen, $freq) = split;   # observed sequence $freq and how many times sequences with that $freq were $seen
+        $s += $seen;          # unique sequences
+        $r += $seen * $freq;  # total reads
+        $freq = 10 if $freq > 10;  # truncate to '1'..'10+'
+        $UH[$freq] += $seen;  # N times a unique sequence occurred with given frequency
+    }
+    my $sp = sprintf("%0.2f", 100*$s/($r||1));
+    my @UP = map { sprintf("%0.2f", 100*$_/($s||1)) } @UH;
+    my $u  = join("\t", @UH[1..10]);
+    my $up = join("\t", @UP[1..10]);
+    return($r, $s, $sp, $u, $up);
+}
+

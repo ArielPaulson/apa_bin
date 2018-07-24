@@ -1,0 +1,73 @@
+#!/bin/bash
+
+a=$1
+b=$2
+s=$3
+
+fixBed=/home/apa/local/bin/fixBed
+bedLengths=/home/apa/local/bin/bedLengths
+tmp=/tmp/overlapBed.$$
+mkdir -p $tmp
+
+intersectBed=/n/local/stage/bedtools/bedtools2-2.19.0/bin/intersectBed
+subtractBed=/n/local/stage/bedtools/bedtools2-2.19.0/bin/subtractBed
+mergeBed=/n/local/stage/bedtools/bedtools2-2.19.0/bin/mergeBed
+if [ "$s" == "-s" ]; then 
+    intersectBed="$intersectBed -s"
+    subtractBed="$subtractBed -s"
+    mergeBed="$mergeBed -s"
+fi
+
+$fixBed -i $a | sort -k1,1d -k2,2n > $tmp/a
+$fixBed -i $b | sort -k1,1d -k2,2n > $tmp/b
+$mergeBed -i $tmp/b > $tmp/ub
+$fixBed -i $tmp/ub | sort -k1,1d -k2,2n > $tmp/x
+mv -f $tmp/x $tmp/ub
+$subtractBed -a $tmp/a -b $tmp/b > $tmp/a_not_b
+$subtractBed -a $tmp/b -b $tmp/a > $tmp/b_not_a
+$subtractBed -A -a $tmp/a -b $tmp/b > $tmp/a_not_b_hard
+$subtractBed -A -a $tmp/b -b $tmp/a > $tmp/b_not_a_hard
+$intersectBed -wa -u -a $tmp/a -b $tmp/b > $tmp/a_and_b
+$intersectBed -wo -a $tmp/a -b $tmp/ub > $tmp/a_and_b_full
+
+coords=()
+bases=()
+
+coords+=($(cat $tmp/a | wc -l))             # A TOTAL
+coords+=($(cat $tmp/a_not_b_hard | wc -l))  # A UNIQUE
+coords+=($(cat $tmp/b | wc -l))             # B TOTAL
+coords+=($(cat $tmp/b_not_a_hard | wc -l))  # B UNIQUE
+coords+=($(cat $tmp/a_and_b | wc -l))       # COMMON
+
+N=$(paste -s -d+ <($bedLengths -b $tmp/a | cut -f7) | bc)              # A TOTAL
+if [ -z $N ] || [ $N == "" ]; then N=0; fi
+bases+=($N)
+N=$(paste -s -d+ <($bedLengths -b $tmp/a_not_b | cut -f7) | bc)        # A UNIQUE
+if [ -z $N ] || [ $N == "" ]; then N=0; fi
+bases+=($N)
+N=$(paste -s -d+ <($bedLengths -b $tmp/b | cut -f7) | bc)              # B TOTAL
+if [ -z $N ] || [ $N == "" ]; then N=0; fi
+bases+=($N)
+N=$(paste -s -d+ <($bedLengths -b $tmp/b_not_a | cut -f7) | bc)        # B UNIQUE
+if [ -z $N ] || [ $N == "" ]; then N=0; fi
+bases+=($N)
+N=$(paste -s -d+ <($bedLengths -b $tmp/a_and_b_full | cut -f13) | bc)  # COMMON
+if [ -z $N ] || [ $N == "" ]; then N=0; fi
+bases+=($N)
+
+rm -rf $tmp
+cline="COORDS"
+for i in {0..4}; do if [ -z ${coords[$i]} ] || [ ${coords[$i]} == "" ]; then coords[$i]=0; fi; cline="$cline\t${coords[$i]}"; done
+bline="BASES"
+for i in {0..4}; do if [ -z ${bases[$i]} ] || [ ${bases[$i]} == "" ]; then bases[$i]=0; fi; bline="$bline\t${bases[$i]}"; done
+
+#echo -e "\tA-TOT\tA-UNQ\tB-TOT\tB-UNQ\tCOMMON\n$cline\n$bline"
+
+echo -e "\tCOORDS\tBASES"
+echo -e "A-TOT\t${coords[0]}\t${bases[0]}"
+echo -e "A-UNQ\t${coords[1]}\t${bases[1]}"
+echo -e "B-TOT\t${coords[2]}\t${bases[2]}"
+echo -e "B-UNQ\t${coords[3]}\t${bases[3]}"
+echo -e "COMMON\t${coords[4]}\t${bases[4]}"
+
+

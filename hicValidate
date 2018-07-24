@@ -1,0 +1,429 @@
+#!/usr/bin/env perl
+use Storable qw/ retrieve /;
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+### 1. Make true-to-ref digest BED file
+### 2. Make true+1-off digest BED file
+### 3. Drop all half-aligned read pairs
+### 4. IntersectBed remaining SAM with digest BEDs > output all fields
+### 5. Read results; split off SAM fields from BED -> instant fragment mapping
+### 6. Test for validity given true-to-ref fragments
+### 7. If failing, test for validity given 1-off fragments (classify separately)
+### 8. Tally classification stats -> output
+### 9. Tally inter-fragment connectivities -> output
+### 10. Output valid-pairs SAM file
+
+my %enzymes = ('HindIII'=>'A^AGCTT');
+
+my $enz = 'HindIII';  # restriction enzyme name; must be found in %enzymes above
+my $geno;    # indexed genome id, e.g. 'dm3', 'mm9'; must be a directory name in /n/data1/genomes/bowtie-index
+my $inbam1;  # input BAM file (end 1)
+my $inbam2;  # input BAM file (end 2)
+my $prefix;  # output filename prefix
+my $off1;    # perform 1-off restriction site testing as well?
+
+GetOptions("e=s" => \$enz, "g=s" => \$geno, "b1=s" => \$inbam1, "b2=s" => \$inbam2, "p=s" => \$prefix, "1-off" => \$off1);
+
+die "Inputs SAM/BAM file '$inbam1' unreadable!\n" unless -e $inbam1;
+die "Inputs SAM/BAM file '$inbam2' unreadable!\n" unless -e $inbam2;
+die "Output prefix not specified!\n" unless $prefix;
+die "Unknown enzyme specified!\n" if ($enz && ! $enzymes{$enz});
+
+my $ref = "/n/data1/genomes/bowtie-index/$geno/$geno.fa";
+die "Genome fasta '$ref' not found!\n" unless -e $ref;
+
+chomp(my @chrs = split /\n/, `cut -f1 /n/data1/genomes/bowtie-index/$geno/$geno.chrom.sizes`);
+die "Unable to load chromosomes list!\n" unless @chrs;
+
+my (%sites, %seq, %oneoffs, @samheader, %aligns, %classified, @lens);
+
+my @types = $off1 ? qw/ true 1off / : qw/ true /;
+my %inbams = (1,$inbam1, 2,$inbam2);
+my %int = (
+    'true' => {1,"$prefix.intersect.true.1.txt", 2,"$prefix.intersect.true.2.txt"},
+    '1off' => {1,"$prefix.intersect.1off.1.txt", 2,"$prefix.intersect.1off.2.txt"}
+);
+my %ovr = (
+    'true' => {1,"$prefix.overlaps.true.1.txt", 2,"$prefix.overlaps.true.2.txt"},
+    '1off' => {1,"$prefix.overlaps.1off.1.txt", 2,"$prefix.overlaps.1off.2.txt"}
+);
+my %bed = ('true',"$geno.$enz.fragments.true.bed", '1off',"$geno.$enz.fragments.1off.bed");
+my $valid_name = "$prefix.valid";
+my $almost_name = "$prefix.almost";
+my $tmp = "tmp.validateHiC.$$";
+
+&make_restriction_bed if (!-s $bed{true} || !-s $bed{'1off'});
+
+## Intersect BAM/BED
+
+my $script = <<EOF;
+#!/usr/bin/env perl
+use Storable qw/ nstore /;
+use strict;
+
+my \%aligns;
+my (\$file, \$tmp, \$type, \$end, \$chr) = \@ARGV;
+
+print "  Running: 'grep -P '^\$chr\\t' \$file': ".`date`;
+open IN, '-|', "grep -P '^\$chr\\t' \$file";
+while (<IN>) {
+    \$_ =~ s/[\\n\\r]+\$//;
+    my \@data = split /\\t/, \$_;  # "chr1	3029121	3029171	SEB9BZKS1:118:C1TN6ACXX:1:2113:10912:57113	1	+	3029121	3029171	0,0,0	1	50,	0,	chr1	3029115	3029127	1OFF:chr1:41	6"
+    push \@{ \$aligns{\$data[3]}{\$end} }, [\@data[0..2,4,5,10,12..16]];  # chr start end score? strand readlen frag_chr frag_start frag_end fragment overlap
+}
+close IN;
+
+nstore(\\%aligns, "\$tmp.\$type.\$end.\$chr.dat");
+exit;
+
+EOF
+
+open my $SAT, '>', "$tmp.pl";
+print $SAT $script;
+close $SAT;
+
+## Classify aligments:
+#  1. VALID:  As in Fig 3A
+#  2. DANGLE: As in Fig 3A
+#  3. SELF:   As in Fig 3A
+#  4. SAME_V: Valid fragment arrangement, except reads face same way
+#  5. SAME_I: Invalid fragment arrangement, also reads face same way
+#  6. CROSS:  At least one read crosses a restriction site
+#  7. MULTI:  At least one read aligned to more than one fragment (CROSS reads excluded)
+#  8. HALF:   Only one read aligned
+
+my @classes = qw/ VALID SAME_V SELF DANGLE SAME_I CROSS MULTI HALF /;
+
+foreach my $type (@types) {
+    
+    my %aligns;
+    
+    foreach my $end (1,2) {
+	print "Processing $type end $end: ".`date`;
+	
+	unless (-e $ovr{$type}{$end}) {
+	    &execute("intersectBed -split -wo -bed -abam $inbams{$end} -b $bed{$type} > $int{$type}{$end}");
+	    &execute("cut -f17 $int{$type}{$end} | sort -n | uniq -c > $ovr{$type}{$end}");
+	}
+	
+	foreach my $chr (@chrs) {
+	    my $cmd = "perl $tmp.pl $int{$type}{$end} $tmp $type $end $chr";
+	    print "$cmd\n"; system $cmd;
+	    sleep 1;  # killability
+	}
+    }
+    
+    print "Compiling $type alignments: ".`date`;
+    foreach my $end (1,2) {
+	foreach my $chr (@chrs) {
+	    my %tmp = %{ retrieve("$tmp.$type.$end.$chr.dat") };  # @{ $tmp{$idx}{$end} }
+	    foreach my $idx (keys %tmp) {
+		push @{ $aligns{$idx}{$end} }, @{ $tmp{$idx}{$end} };  # build up chr by chr
+	    }
+	}
+    }
+
+    print "Classifying $type alignments: ".`date`;
+    my $total;
+    
+#    foreach my $idx (keys %{ $aligns }) {
+    foreach my $idx (keys %aligns) {
+	$total++;
+	my $Nends = scalar keys %{ $aligns{$idx} };
+	
+	if ($Nends == 2) {
+	    
+	    my %Naligns = (1 => scalar @{ $aligns{$idx}{1} }, 2 => scalar @{ $aligns{$idx}{2} });
+	    
+	    if ($Naligns{1}>1 || $Naligns{2}>1) {
+		
+		my $class = 'CROSS';
+		foreach my $end (1,2) {
+		    next unless $Naligns{$end} > 1;  # we only want the multi-aligned end
+		    my ($readlen, $totalign);
+		    foreach my $i (0..$#{ $aligns{$idx}{$end} }) {
+			$readlen = $aligns{$idx}{$end}->[$_][5] if $aligns{$idx}{$end}->[$_][5] > $readlen;
+			$totalign += $aligns{$idx}{$end}->[$_][10];
+		    }
+		    $class = 'MULTI' if $totalign > $readlen;
+		}
+		$classified{$class}{$idx} = 1;
+		
+	    } else {
+		
+		my ($chr1, $start1, $end1, $score1, $strand1, $rlen1, $fchr1, $fstart1, $fend1, $frag1, $over1) = @{ $aligns{$idx}{1}->[0] };
+		my ($chr2, $start2, $end2, $score2, $strand2, $rlen2, $fchr2, $fstart2, $fend2, $frag2, $over2) = @{ $aligns{$idx}{2}->[0] };
+		if ($frag1 eq $frag2) {  # invalid
+		    if ($strand1 eq '-' && $strand2 eq '+') {
+			$classified{SELF}{$idx} = 1;
+		    } elsif ($strand1 eq '+' && $strand2 eq '-') {
+			$classified{DANGLE}{$idx} = 1;
+		    } elsif ($strand1 eq $strand2) {
+			$classified{SAME_I}{$idx} = 1;
+		    } else {
+			print "$idx $type unknown arrangement!\n @{ $aligns{$idx}{1} }\n @{ $aligns{$idx}{2} }\n";
+		    }
+		} else {   # valid (potentially)
+		    if ($strand1 eq $strand2) {
+			$classified{SAME_V}{$idx} = 1;
+		    } else {
+			$classified{VALID}{$idx} = 1;
+		    }
+		}
+		
+	    }
+	} else {
+	    $classified{HALF}{$idx} = 1;
+	}
+    }
+    
+    my $outcls = "$prefix.classified.$type.txt";
+    open CLS, "> $outcls" or die "Output file '$outcls' unwriteable: $!\n";
+    print CLS "CLASS\tPAIRS\n";
+    print CLS "$_\t".scalar(keys %{ $classified{$_} }),"\n" foreach @classes;
+    print CLS "TOTAL\t$total\n";
+    close CLS;
+    
+    foreach my $class (@classes) {
+	next if ($class eq 'MULTI' || $class eq 'HALF');
+	
+	my $outtxt = "$prefix.$type.$class.pairdata.txt";
+	open TXT, "> $outtxt" or die "Output file '$outtxt' unwriteable: $!\n";
+	print TXT "Header\tChr1\tStart1\tEnd1\tMapq1\tStrand1\tChr2\tStart2\tEnd2\tMapq2\tStrand2\n";
+	foreach my $idx (keys %{ $classified{$class} }) {
+	    my ($chr1, $start1, $end1, $score1, $strand1, $rlen1, $fchr1, $fstart1, $fend1, $frag1, $over1) = @{ $aligns{$idx}{1}->[0] };
+	    my ($chr2, $start2, $end2, $score2, $strand2, $rlen2, $fchr2, $fstart2, $fend2, $frag2, $over2) = @{ $aligns{$idx}{2}->[0] };
+	    print TXT join "\t", ($idx, $chr1, $start1, $end1, $score1, $strand1, $chr2, $start2, $end2, $score2, "$strand2\n");
+	}
+	close TXT;
+	
+	my $outsam = "$prefix.$type.$class";
+	system "samtools view -H $inbam1 > $outsam.sam";  # initialize with header
+	
+	my %sam;
+	foreach my $end (1,2) {
+	    open IN, "samtools view $inbams{$end}|";
+	    while (<IN>) {
+		my @data = split /\t/, $_;
+		$sam{$data[0]}{$end} = \@data if exists $classified{$class}{$data[0]};
+	    }
+	    close IN;
+	}
+	
+	open SAM, ">> $outsam.sam" or die "Output sam '$outsam.sam' unwriteable: $!\n";  # APPEND HANDLE
+	foreach my $idx (keys %sam) {
+	    my @data1 = @{ $sam{$idx}{1} };
+	    my @data2 = @{ $sam{$idx}{2} };
+	    $data1[1] += 64;
+	    $data2[1] += 128;
+	    $data1[6] = $data1[2] eq $data2[2] ? '=' : $data2[2];
+	    $data2[6] = $data2[2] eq $data1[2] ? '=' : $data1[2];
+	    $data1[7] = $data2[3];
+	    $data2[7] = $data1[3];
+	    print SAM join("\t", @data1);
+	    print SAM join("\t", @data2);
+	}
+	close SAM;
+	
+	system "samtools view -bS $outsam.sam | samtools sort -m 20G -o $outsam.bam -"; 
+	system "rm -f $outsam.sam";
+    }
+}
+
+#system "rm -f $tmp.*";
+print "validateHiC complete: ".`date`;
+system "kill $$";
+
+
+
+sub execute {
+    my $cmd = shift;
+    print "$cmd\n";
+    system $cmd;
+}
+
+
+sub make_restriction_bed {
+    
+    my @ends = split /\^/, $enzymes{$enz};
+    my $site = join '', @ends;
+    my @lens = ( length($ends[0]), length($ends[1]), length($site) );
+    
+    ## Read reference sequence
+    
+    print "Reading reference: ".`date`;
+    open IN, $ref or die "Reference fasta '$ref' unreadable: $!\n";
+    my $chr;
+    while (<IN>) {
+	$_ =~ s/[\n\r]+$//;
+	if ($_ =~ /^>(.*)/) {
+	    $chr = $1;
+	} else {
+	    $seq{$chr} .= $_;
+	}
+    }
+    close IN;
+    
+    ## Map all true-to-ref fragments
+    
+    unless (-e $bed{true}) {
+	print "true-to-reference fragmentation...\n";
+	open OUT, "> $bed{true}";
+	foreach my $chr (@chrs) {
+	    my ($start, $end);
+	    my @frags = split /$site/, $seq{$chr};
+	    foreach my $i (0..$#frags) {
+		if ($i == 0) {
+		    $start = 0;
+		    $end = length($frags[$i])+$lens[0];
+		} elsif ($i == $#frags) {
+		    $start = $end;
+		    $end = $start+length($frags[$i])+$lens[1];
+		} else {
+		    $start = $end;
+		    $end = $start+length($frags[$i])+$lens[2];
+		}
+		print OUT "$chr\t$start\t$end\tREF:$chr:$i\n";
+	    }
+	}
+	close OUT;
+    }
+    
+    if ($off1) {
+	
+	## Make 1-off variants of restriction site
+	
+	my @pos = split //, $site;
+	for (my $i = 0; $i <= $#pos; $i++) {
+	    foreach my $base (qw/ A C G T /) {
+		next if $base eq $pos[$i];
+		my @off = @pos;
+		$off[$i] = $base;
+		$oneoffs{ join('', @off) } = 1;
+	    }
+	}
+	print scalar(keys %oneoffs), " unique one-off versions of '$site' generated.\n";
+	$oneoffs{$site} = 1;  # add correct site as well
+	
+	## Map all 1-off fragments
+	
+	unless (-e $bed{'1off'}) {
+	    print "true + 1-off fragmentation...\n";
+	    open OUT, "> $bed{'1off'}";
+	    my $oneoff_regexp = '('.join('|',(keys %oneoffs)).')';
+	    print " $oneoff_regexp\n";
+	    foreach my $chr (@chrs) {
+		my ($start, $end);
+		my @frags = split /$oneoff_regexp/, $seq{$chr};
+		foreach my $i (0..$#frags) {
+		    if ($i == 0) {
+			$start = 0;
+			$end = length($frags[$i])+$lens[0];
+		    } elsif ($i == $#frags) {
+			$start = $end;
+			$end = $start+length($frags[$i])+$lens[1];
+		    } else {
+			$start = $end;
+			$end = $start+length($frags[$i])+$lens[2];
+		    }
+		    print OUT "$chr\t$start\t$end\t1OFF:$chr:$i\n";
+		}
+	    }
+	    close OUT;
+	}
+    }
+    
+}
+
+
+sub make_restriction_bed2 {   # deprecated
+    
+    my @ends = split /\^/, $enzymes{$enz};
+    my $site = join '', @ends;
+    my @lens = ( length($ends[0]), length($ends[1]), length($site) );
+    
+    ## Make 1-off variants of restriction site
+    
+    my @pos = split //, $site;
+    for (my $i = 0; $i <= $#pos; $i++) {
+	foreach my $base (qw/ A C G T /) {
+	    next if $base eq $pos[$i];
+	    my @off = @pos;
+	    $off[$i] = $base;
+	    $oneoffs{ join('', @off) } = 1;
+	}
+    }
+    print scalar(keys %oneoffs), " unique one-off versions of '$site' generated.\n";
+    $oneoffs{$site} = 1;  # add correct site as well
+    
+    ## Read reference sequence
+    
+    print "Reading reference: ".`date`;
+    open IN, $ref or die "Reference fasta '$ref' unreadable: $!\n";
+    my ($chr, @chrs);
+    while (<IN>) {
+	$_ =~ s/[\n\r]+$//;
+	if ($_ =~ /^>(.*)/) {
+	    $chr = $1;
+	    push @chrs, $chr;
+	} else {
+	    $seq{$chr} .= $_;
+	}
+    }
+    close IN;
+    
+    ## Map all true-to-ref fragments
+    
+    unless (-e $bed{true}) {
+	print "true-to-reference fragmentation...\n";
+	open OUT, "> $bed{true}";
+	foreach my $chr (@chrs) {
+	    my ($start, $end);
+	    my @frags = split /$site/, $seq{$chr};
+	    foreach my $i (0..$#frags) {
+		if ($i == 0) {
+		    $start = 0;
+		    $end = length($frags[$i])+$lens[0];
+		} elsif ($i == $#frags) {
+		    $start = $end;
+		    $end = $start+length($frags[$i])+$lens[1];
+		} else {
+		    $start = $end;
+		    $end = $start+length($frags[$i])+$lens[2];
+		}
+		print OUT "$chr\t$start\t$end\tREF:$chr:$i\n";
+	    }
+	}
+	close OUT;
+    }
+    
+    ## Map all 1-off fragments
+    
+    unless (-e $bed{'1off'}) {
+	print "true + 1-off fragmentation...\n";
+	open OUT, "> $bed{'1off'}";
+	my $oneoff_regexp = '('.join('|',(keys %oneoffs)).')';
+	print " $oneoff_regexp\n";
+	foreach my $chr (@chrs) {
+	    my ($start, $end);
+	    my @frags = split /$oneoff_regexp/, $seq{$chr};
+	    foreach my $i (0..$#frags) {
+		if ($i == 0) {
+		    $start = 0;
+		    $end = length($frags[$i])+$lens[0];
+		} elsif ($i == $#frags) {
+		    $start = $end;
+		    $end = $start+length($frags[$i])+$lens[1];
+		} else {
+		    $start = $end;
+		    $end = $start+length($frags[$i])+$lens[2];
+		}
+		print OUT "$chr\t$start\t$end\t1OFF:$chr:$i\n";
+	    }
+	}
+	close OUT;
+    }
+    
+}

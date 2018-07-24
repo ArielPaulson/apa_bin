@@ -1,0 +1,88 @@
+#!/usr/bin/env perl
+require '/home/apa/local/bin/apa_routines.pm';  # &blockify
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my $infa;
+my $outfa;
+my $stdio;
+my $arom;
+
+GetOptions("i=s" => \$infa, "o=s" => \$outfa, "aromatic" => \$arom, "" => \$stdio);
+
+my %quals = %{ &qualities };
+
+my ($header, @headers, %inseq, %outseq);
+
+if ($infa) {
+    open my $IN, '<', $infa or die "$0: Cannot read from input fasta '$infa': $!\n";
+    while (<$IN>) {
+	$_ =~ s/[\n\r]+$//;
+	if ($_ =~ /^>(.*)/) {
+	    $header = $1;
+	    push @headers, $header;
+	} else {
+	    $inseq{$header} .= $_;
+	}
+    }
+    close $IN;
+} elsif ($stdio) {
+    while (<>) {
+	$_ =~ s/[\n\r]+$//;
+	if ($_ =~ /^>(.*)/) {
+	    $header = $1;
+	    push @headers, $header;
+	} else {
+	    $inseq{$header} .= $_;
+	}
+    }
+}
+
+my $OUT;
+if ($outfa) {
+    open $OUT, '>', $outfa or die "$0: Cannot write to output fasta '$outfa': $!\n";
+} else {
+    $OUT = *STDOUT;
+}
+
+foreach my $header (@headers) {
+    foreach my $aa (split //, $inseq{$header}) {
+	my $new = $quals{$aa}->[0];
+	$new = $quals{$aa}->[1] if ($arom && $quals{$aa}->[1]);
+	$outseq{$header} .= $new;
+    }
+    print $OUT ">$header\n", ${ &blockify(\$outseq{$header}) }, "\n";
+}
+close $OUT if $outfa;
+exit;
+
+
+sub qualities {
+
+    return {  # letter => [polarity, aromaticity]
+	'A' => ['N',''],	
+	'C' => ['P',''],	
+	'D' => ['A',''],	
+	'E' => ['A',''],	
+	'F' => ['N','R'],
+	'G' => ['N',''],	
+	'H' => ['B','R'],
+	'I' => ['N',''],	
+	'K' => ['B',''],	
+	'L' => ['N',''],	
+	'M' => ['N',''],	
+	'N' => ['P',''],	
+	'P' => ['N',''],	
+	'Q' => ['P',''],	
+	'R' => ['B',''],	
+	'S' => ['P',''],	
+	'T' => ['P',''],	
+	'V' => ['N',''],	
+	'W' => ['N','R'],
+	'Y' => ['N','R'],
+	'U' => ['P',''],	
+	'O' => ['P','']
+    };	
+
+}

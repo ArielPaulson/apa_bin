@@ -1,0 +1,73 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+# Deps: (grep cat)
+
+## Inputs:
+my $greplist;
+my @inputs;
+my $count;
+my $invert;
+my $number;
+my $grepargs;
+my ($help, $man, $version);
+
+GetOptions(
+    "g=s" => \$greplist, 
+    "c" => \$count,
+    "n" => \$number,
+    "v" => \$invert,
+    "a=s" => \$grepargs,
+    "help" => \$help,
+    "man" => \$man,
+    "version" => \$version
+);
+
+@inputs = @ARGV;
+
+$grepargs .= ' -v' if $invert;
+$grepargs .= ' -n' if $number;
+
+## Grepping...
+chomp(my $lines = `cat $greplist | wc -l`);
+my (%filter, %output);
+
+open my $IN, '<', $greplist or die "$0: Cannot read grep list file '$greplist': $!\n";
+while (my $exp = <$IN>) {
+	$exp =~ s/[\n\r]+$//;
+	(my $exp2 = $exp) =~ s/([\*\+\?\(\)\[\]\{\}\.\$\@\%\\])/\\$1/g;
+	$filter{$exp2} = $exp;
+	print "$exp => $exp2\n";
+}
+close $IN;
+
+foreach my $file (@inputs) {
+	my $label = $#inputs > 0 ? "$file: " : '';
+	open my $IN2, '<', $file or print "$0: Input file '$file' cannot be read: $!\n";
+	while (my $line = <$IN2>) {
+		my $matched;
+		foreach my $exp2 (keys %filter) {
+			if ($line =~ /$exp2/) {
+				$matched = $filter{$exp2};
+				last;
+			}
+		}
+		if (defined $matched) {
+			if ($count) {
+				$output{$matched}++;
+			} elsif ($number) {
+				print "$label$. $line";
+			} elsif ($invert) {
+			} else {
+				print "$label $line";
+			}
+		} elsif ($invert) {
+			print "$label $line";
+		}
+	}
+	close $IN2;
+}
+exit;
+

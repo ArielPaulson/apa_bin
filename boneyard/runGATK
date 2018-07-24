@@ -1,0 +1,342 @@
+#!/usr/bin/env perl
+use Excel::Writer::XLSX;
+use Getopt::Long;
+use Pod::Usage;
+use Cwd;
+use strict;
+
+
+# inputs: 
+# targets file (fastqs -> samples)
+# config file (output dir, executables, snpEff db, known-variant VCFs, genome fasta, chr subset, GATK genotyper + various settings)
+# java cores
+
+# Pipeline launch directory must reside on /home or /n/projects (or other lepus-accessible path)
+# All FASTQ and SAMPLE stages run as array jobs on lepus
+# All EXPER stages run locally (server you launch pipeline on)
+
+# Based on http://wiki.stowers-institute.org/research/Bioinformatics/Analysis/SNPs
+# Stage 0:  EXPER:  accessory file / db acquisition, preparation, and validation
+# Stage 1A: FASTQ:  BWA each fastq/pair > sorted BAM (array job, ssh'ed to lepus: bynode, 11GB, 8CPU per; synced) (optional trimming done first???)
+# Stage 1B: FASTQ:  Output completeness check; off-cluster reruns for anything that failed on-cluster
+# Stage 2A: SAMPLE: Samtools BAM merge/sort/rmdup
+# Stage 2B: SAMPLE: Picard read-groups and reordering
+# Stage 3A: EXPER:  GATK realigner intervals
+# Stage 3B: SAMPLE: GATK realignment
+# Stage 4A: EXPER:  GATK base recalibrator settings
+# Stage 4B: SAMPLE: GATK base recalibration
+# Stage 5:  SAMPLE: GATK variant calling
+# Stage 6A: EXPER:  GATK variant recalibrator settings
+# Stage 6B: SAMPLE: GATK variant recalibration
+# Stage 7:  SAMPLE: snpEff variant typing and effect prediction
+# Stage 8:  SAMPLE: Arrange output
+
+# should non-essential files from stage N be deleted upon successful completion of stage N+1?  Output files+sizes logged at each step?
+
+
+
+
+## Inputs
+my $targets;  # targets.txt file describing sample arrangement and contrasts
+my $genome;   # bowtie-index built genome name, usually a UCSC build name ('mm9', 'dm3', ...)
+my $annot;    # annotation build, e.g. "Ens_72".  *** MUST RESOLVE THIS PATH: /n/data1/genomes/bowtie-indexes/$genome/$annot/ ***
+my $outdir;   # output directory, die if exists
+my $clobber;  # output directory, clobber
+my $cluster;  # a cluster-accessible staging directory; if given, stage 1 will run on the cluster (currently lepus)
+my $trimlen;  # trimmed read length; triggers read trimming
+my $restart;  # restart run that died?
+
+GetOptions("t=s" => \$targets, "g=s" => \$genome, "a=s" => \$annot, "o=s" => \$outdir, "oc=s" => \$clobber, "t=i" => \$trimlen, "cluster=s" => \$cluster, "restart=s" => \$restart);
+
+$outdir = undef if $outdir eq '.';   # if for some reason someone explicitly indicated "-o .", erase the flag
+$clobber = undef if $clobber eq '.';
+$restart = undef if $restart eq '.';
+if ($restart) {
+    # restart from this directory
+    die "$0: restart-from directory '$restart' not found!\n" unless -d $restart;
+    $outdir = $restart;
+} elsif ($clobber) {
+    # write to this directory; destroy if exists
+    system "rm -Rf $clobber";
+    system "mkdir -p $clobber";
+    $outdir = $clobber;
+} elsif ($outdir) {
+    # write to this directory, unless already exists
+    die "$0: output directory '$outdir' already exists!\n" if -d $outdir;
+    system "mkdir -p $outdir";
+} else {
+    # no dir specified: write to here
+    $outdir = '.';
+}
+die "$0: Unable to create output directory '$outdir'!\n" unless -d $outdir;
+$results = "$outdir/Results";
+mkdir $results;
+
+## Paths Etc
+my $bwti = '/n/data1/genomes/bowtie-index';           # base directory for genome/annot builds
+my $gprefix = "$bwti/$genome/$genome";                # prefix for files in this genome build (e.g. $gprefix.fa)
+my $aprefix = "$bwti/$genome/$annot/$genome.$annot";  # prefix for files in this genome-annotation build (e.g. $aprefix.genes.bed)
+my $picard = '/n/local/stage/picard/picard_1.96';                  # latest local Picard
+my $GATK = '/n/local/stage/gatk/gatk_2.7-4/GenomeAnalysisTK.jar';  # at the moment, latest GATK (20131101)
+my $java = '/usr/lib/jvm/jre-1.7.0-openjdk.x86_64/bin/java';       # java 1.7, needed for GATK 2.7-4
+my $javatemp = "$outdir/gatk.$$";                     # GATK/Picard temp dir
+my $javaflags = "-Xmx10g -Djava.io.tmpdir=$javatemp"; # java flags
+my $ldir = cwd();  # launch dir
+
+## Global Objects
+my %samples;       # sample data
+my %contrasts;     # contrast data
+my $qarray = "$ldir/$outdir/bwa.array";  # qsub array-job file, if using cluster
+my $qscript = "$ldir/$outdir/bwa.sh";    # script called by array jobs
+
+system "mkdir $javatemp";
+print "JAVA TEMP DIR = $javatemp\n";
+
+my %stages = ('',0, '',1, '',2, '',3, '',4, '',5, '',6);
+
+open IN, $targets or die "$0: Failed to read targets '$file': $!\n";
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    my ($field, $name, $values) = split /\t/, $_, 3;
+    if ($field eq 'SAMPLE') {
+	push @{ $samples{$name}{FQ} }, (split /;/, $values);
+	$samples{$name}{LOG} = "$outdir/$name/stage.log";
+    } elsif ($field eq 'CONTRAST') {
+	$contrasts{$name} = [split /;/, $values];
+	die "$0: Targets file line $.: Must have exactly 2 samples per contrast!\n" if $#{ $contrasts{$name} } != 1;
+    } else {
+	die "$0: Unrecognized field type '$field' in targets file!\n";
+    }
+}
+close IN;
+
+&write_qscript;
+
+open OUT, "> $qarray";
+foreach my $name (sort keys %samples) {
+    system "mkdir $outdir/$name";
+    unless ($restart) {
+	open OUT "> $samples{$name}{LOG}";  # reboot log file, unless restarting
+	close OUT;
+    }
+    print OUT "$qscript $name @{ $samples{$name}{FQ} }\n";
+}
+close OUT;
+
+
+#### GENERATE COMMANDS
+
+
+## Samtools BAM Prep
+
+my $mergebam_call = "samtools merge -f $alias.sort.bam $alias*/*.reliable.sorted.bam";
+
+my $rmdup_call = "samtools rmdup $alias.sort.bam $alias.sort.rmdup.bam";
+
+my $index_call = "samtools index $alias.sort.rmdup.bam";
+
+## Picard BAM Prep
+
+my $addrg_call = "$java $javaflags -jar $picard/AddOrReplaceReadGroups.jar ".
+    "I=$alias.rmdup.bam ".
+    "O=$alias.rmdup.group.bam ".
+    "SORT_ORDER=coordinate ".
+    "RGLB=1 ".
+    "RGPL=illumina ".
+    "RGPU=1 ".
+    "RGSM=$alias ".
+    "VALIDATION_STRINGENCY=LENIENT";
+
+my $reorder_call = "$java $javaflags -jar $picard/ReorderSam.jar ".
+    "I=$alias.rmdup.group.bam  ".
+    "O=$alias.rmdup.group.reorder.bam  ".
+    "REFERENCE=$genome  ".
+    "VALIDATION_STRINGENCY=LENIENT  ".
+    "CREATE_INDEX=TRUE";
+
+## GATK BAM Prep
+
+my $pre_realign_call = "$java $javaflags -jar $GATK ".
+    "-T RealignerTargetCreator  ".
+    "-I $alias.rmdup.group.reorder.bam  ".
+    "-R $genome  ".
+    "-o $alias/forIndelRealigner.intervals";
+
+my $realign_call = "$java $javaflags -jar $GATK ".
+    "-T IndelRealigner ".
+    "-I $alias.rmdup.group.reorder.bam ".
+    "-R $genome ".
+    "-o $alias/realign.bam ".
+    "-targetIntervals $alias/forIndelRealigner.intervals";
+
+## GATK Recalibration
+
+
+## GATK Variant Calling
+
+my $snp_call = "$java $javaflags -jar $GATK ".
+    "-T UnifiedGenotyper ".
+    "-R $genome ".
+    "-I $alias.rmdup.group.reorder.bam ".
+#    "-I $alias.rmdup.group.reorder.bam ".
+    "-o $alias/snps.raw.vcf ".
+    "-stand_call_conf 30.0 ".
+    "-stand_emit_conf 30.0 ".
+    "-A Coverage ".
+    "-A FisherStrand ".
+    "-A ReadPosRankSumTest";
+
+my $indel_call = "$snp_call -glm INDEL";
+
+my $mergevar_call = "/n/local/stage/vcftools/current/vcf-concat";
+my $sortvar_call = "/n/local/stage/vcftools/current/vcf-sort";
+
+## snpEff / snpSift
+
+my $type_call = "$java $javaflags -jar $snpsift varType ".
+    "${ROOT}.raw.variants.vcf ".
+    "> ${ROOT}.snps.dbsnp.vcf";
+
+my $annot_call = "$java $javaflags -jar $snpsift annotate ".
+    "-id ".
+    "${DBSNPS} ".
+    "${ROOT}.raw.variants.vcf ".
+    "> ${ROOT}.snps.dbsnp.vcf";
+
+my $eff_call = "$java $javaflags -jar $snpeff eff ".
+    "-c ${SNPEFF}/snpEff.config ".
+    "-v Zv9.71 ${ROOT}.snps.dbsnp.vcf ".
+    "> ${ROOT}.snps.snpeff.vcf";
+
+
+
+
+
+#### RUN COMMANDS
+
+print "\n";  # push off prompt, if running in background
+
+print "Merging component BAMs: ".`date` && system $mergebam_call;
+print "Removing duplicate reads: ".`date` && system $rmdup_call;
+print "Indexing: ".`date` && system $index_call;
+
+print "Adding read groups: ".`date` && system $addrg_call;
+print "Reordering BAM: ".`date` && system $reorder_call;
+
+print "Preparing for local realignment: ".`date` && system $pre_realign_call;
+print "Locally realigning: ".`date` && system $realign_call;
+
+...
+
+print "Calling SNPs: ".`date` && system $snp_call;
+print "Calling Indels: ".`date` && system $indel_call;
+print "Merging SNPs + Indels".`date` && system $mergevar_call && system $sortvar_call;
+
+print "Typing Variants".`date` && system $type_call;
+print "Annotating Variants".`date` && system $annot_call;
+print "Predicting Variant Effects".`date` && system $eff_call;
+
+
+
+
+
+&execute("rm -Rf $javatemp");
+print "GATK pipeline complete: ",`date`;
+chomp(my $user = `whoami`);
+system "mail -s '$alias complete' $user\@stowers.org < /dev/null";
+
+#bowtie2 --very-sensitive --un-gz $prefix.unmapped.fastq.gz -p 20 -x $dr7 -1 $fastq1 -2 $fastq2 -S $prefix.sam 2> $prefix.bowtie2.err.txt
+#samtools view -F 4 -Sb $prefix.sam | samtools sort -m 50G - $prefix
+#samtools index $prefix.bam
+
+#/home/apa/local/bin/bam2bw $prefix.bam mm10
+
+
+
+
+
+
+
+
+
+sub execute {  
+    
+    # print and run command
+    
+    my $cmd = shift;
+    print "$cmd\n" if $verbose; 
+    system $cmd;
+}
+
+
+sub readlog {
+    
+    # read alias log file to see which was the last successful run stage
+    
+    my $log = shift;
+    my $last;
+    if (-e $log) {
+	open IN, $log;
+	while (<IN>) {
+	    $_ =~ s/[\n\r]+$//;  # in case anyone has altered the logs in windows
+	    $last = $_;
+	}
+	close IN;
+    }
+    return $last;
+}
+
+
+sub writelog {
+    
+    # write each successful stage to alias log file
+    
+    my ($log, $stage) = @_;
+    open OUT, ">> $log" or die "$0: Cannot open logfile '$log' for writing: $!\n";
+    print OUT "$stage\n";
+    close OUT;
+}
+
+
+sub write_qscript {
+    
+    # write stage-1 script
+    
+    open OUT, "> $qscript";
+    print OUT "#!/bin/bash\n\n";
+    print OUT 'alias=$1'."\n";
+    print OUT 'aligned=$alias/aligned'."\n\n";
+    if ($ends == 1) {
+	print OUT 'fastq=$2'."\n";
+	if ($trim) {
+	    print OUT 'trimfq=${fastq/fastq/fastq.trim}'."\n";
+	    print OUT 'gunzip -c $fastq | fastx_trimmer -Q 33 -l '.$trimlen.' | gzip > $trimfq'."\n";
+	    print OUT "bwa aln $gprefix.fa ".'$trimfq > $alias/read.sai'."\n";
+	    print OUT "bwa samse $gprefix.fa ".'$alias/read.sai $trimfq | gzip > $aligned.sam.gz'."\n";
+	} else {
+	    print OUT "bwa aln $gprefix.fa ".'$fastq > $alias/read.sai'."\n";
+	    print OUT "bwa samse $gprefix.fa ".'$alias/read.sai $fastq | gzip > $aligned.sam.gz'."\n";
+	}
+    } elsif ($ends == 2) {
+	print OUT 'fastq1=$2'."\n";
+	print OUT 'fastq2=$3'."\n";
+	if ($trim) {
+	    print OUT 'trimfq1=${fastq1/fastq/fastq.trim}'."\n";
+	    print OUT 'trimfq2=${fastq2/fastq/fastq.trim}'."\n";
+	    print OUT 'gunzip -c $fastq1 | fastx_trimmer -Q 33 -l '.$trimlen.' | gzip > $trimfq1'."\n";
+	    print OUT 'gunzip -c $fastq2 | fastx_trimmer -Q 33 -l '.$trimlen.' | gzip > $trimfq2'."\n";
+	    print OUT "bwa aln $gprefix.fa ".'$trimfq1 > $alias/read1.sai'."\n";
+	    print OUT "bwa aln $gprefix.fa ".'$trimfq2 > $alias/read2.sai'."\n";
+	    print OUT "bwa samse $gprefix.fa ".'$alias/read1.sai $alias/read2.sai $trimfq1 $trimfq2 | gzip > $aligned.sam.gz'."\n";
+	} else {
+	    print OUT "bwa aln $gprefix.fa ".'$fastq1 > $alias/read1.sai'."\n";
+	    print OUT "bwa aln $gprefix.fa ".'$fastq2 > $alias/read2.sai'."\n";
+	    print OUT "bwa samse $gprefix.fa ".'$alias/read1.sai $alias/read2.sai $fastq1 $fastq2 | gzip > $aligned.sam.gz'."\n";
+	}
+    }
+    print OUT 'samtools view -uSb -q 2 $aligned.sam.gz > $aligned.reliable.bam'."\n";
+    print OUT 'samtools sort $aligned.reliable.bam $aligned.reliable.sorted'."\n";
+    close OUT;
+}
+
+

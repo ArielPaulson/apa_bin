@@ -1,0 +1,93 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## Merges multiple Picard CollectRnaSeqMetrics outputs into one tabular file
+
+# Deps:
+
+## Inputs
+my $out;       # output file
+my @inputs;    # list of dataset files (arguments left over from GetOptions)
+my $dirname;   # use dataset file directory for column name? (otherwise, filename as given)
+my $nodirname; # remove dataset file directory from file name to create column name? (otherwise, filename as given)
+my $strip;     # any other substring (regexp) to remove from dataset file name during column name conversion
+# and @ARGV = list of "samtools idxstats" outputs
+
+
+GetOptions(
+    "o=s" => \$out, 
+    "strip=s" => \$strip, 
+    "dirname" => \$dirname, 
+    "nodirname" => \$nodirname
+    );
+
+@inputs = @ARGV;
+
+
+## Globals
+my @names;    # filenames
+my %matrix;   # data matrix
+my @header;   # output header
+
+
+## Output handles
+my $OUT;
+if ($out) {
+    open $OUT, '>', $out or die "$0: Cannot write to output file '$out': $!\n";
+} else {
+    $OUT = *STDOUT;
+}
+
+
+## Main
+foreach my $i (0..$#inputs) {
+    my $file = $inputs[$i];
+    
+    ## decide on sample name
+    my $name;
+    if ($dirname) {
+	($name) = ($file =~ /([^\/]+)\/[^\/]+$/);  # only the file's parent directory
+    } elsif ($nodirname) {
+	($name) = ($file =~ /([^\/]+)$/);  # only the file's name
+    } else {
+	$name = $file;  # file's path as given
+    }
+    $name =~ s/$strip//;
+    push @names, $name;
+    
+    ## read matrix; extract key=>value pairs
+    open my $IN, '<', $file or die "$0: Cannot read matrix file '$file': $!\n";
+    my (@iheader, $stats, $histo);
+    while (<$IN>) {
+	next if /^#/;
+	next unless /\S+/;
+	s/[\n\r]+$//;
+	if (/^PF_BASES/) {
+	    @iheader = split;
+	    @header = @iheader unless $i;   #### all files assumed to be same
+	    $stats = 1;
+	} elsif ($stats) {
+	    @{ $matrix{$file} } = map {0} @iheader;
+	    my @data = split /\t/, $_;
+	    $matrix{$file}->[$_] = $data[$_] foreach (0..$#data);  # only way to control for all the potentially-missing fields
+	    $stats = 0;
+	} elsif (/^normalized_position/) {
+	    $histo = 1;
+	} elsif ($histo) {
+	    my ($pos, $val) = split;
+	    push @{ $matrix{$file} }, $val;
+	    push @header, "POS_$pos" unless $i;   #### all files assumed to be same
+	}
+    }
+    close $IN;
+    unshift @{ $matrix{$file} }, $name;
+}
+
+
+## write all-sample matrix
+print $OUT join("\t", 'NAME', @header), "\n";
+print $OUT join("\t", @{ $matrix{$_} }), "\n" foreach @inputs;
+close $OUT;
+exit;

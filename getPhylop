@@ -1,0 +1,40 @@
+#!/usr/bin/env Rscript
+
+source("/home/apa/apa_tools.R")
+
+ca <- commandArgs(trailing=TRUE)
+bed <- ca[1]
+geno <- ca[2]
+prefix <- ca[3]
+
+if (is.na(prefix)) prefix <- paste0(bed,".phyloP")
+if (!grepl("\\.$",prefix)) prefix <- paste0(prefix,".")
+phylodir <- paste0("/n/projects/apa/stuff/phylop/",geno,"/")
+if (!dir.exists(phylodir)) stop(paste0("Expected phyloP dir '",phylodir,"' does not exist!"))
+
+bed <- read.bed(bed)
+chrs <- sort(unique(bed[,1]))
+files <- lapply(paste0(chrs,".RData"), function(x) grep(x,dir(phylodir),value=TRUE) )
+nfiles <- listLengths(files)
+if (any(nfiles!=1)) {
+    print(files[nfiles!=1])
+    stop("Chromosomes and files are no 1:1!")
+}
+
+cons <- new.list(bed[,4])
+for (i in 1:length(chrs)) {
+    message(paste0("Loading ",chrs[i],"..."))
+    load(paste0(phylodir,files[i]))  # 'phyloP'
+    w <- which(bed[,1]==chrs[i])
+    message(paste("Extracting",length(w),"coordinates"))
+    for (j in w) cons[[j]] <- list(coordinates=bed[j,], conservation=phyloP[(bed[j,2]+1):bed[j,3],])
+}
+
+bed2 <- cbind(bed, do.call(rbind, lapply(cons, function(x) colMeans(x$conservation) )))
+
+save(cons, file=paste0(prefix,"RData"))
+write.table(bed2, paste0(prefix,"average_conservation.txt"), sep="\t", quote=FALSE, row.names=FALSE)
+message("getPhylop complete!\n")
+
+
+

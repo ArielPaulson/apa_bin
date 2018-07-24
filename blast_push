@@ -1,0 +1,81 @@
+#!/usr/bin/perl
+use strict;
+use Getopt::Long;
+
+my $blastdbdir = '/n/data1/blast/db';
+
+my ($cluster, $nodes, $start, $end, $db, $remove, $verbose);
+GetOptions("c=i" => \$cluster, "n=s" => \$nodes, "d=s" => \$db, "remove" => \$remove, "verbose" => \$verbose);	# cluster flag not ready yet
+
+#die "-c must be 1 or 4!" if ($cluster != 1 && $cluster != 4);
+die "-d must be 'nr' or 'nt'!" if ($db ne 'nr' && $db ne 'nt');
+
+if ($nodes =~ /[^-\d]/) {
+	die "Nodes must be nonnegative integers; range must be given as 'start-end' where 'start' and 'end' are nodes\n";
+} elsif ($nodes =~ /-/) {
+	($start, $end) = split /-/, $nodes;
+	die "End node number must be > start node number!\n" unless $start < $end;
+} else {
+	die "Nodes must be nonnegative integers!\n" if $nodes < 0;
+	$start = $end = $nodes;
+}
+my @nodelist = ($start..$end);
+
+my @files = split /\n/, `ls -la $blastdbdir/$db.*`;
+push @files, `ls -la $blastdbdir/$db`;
+my $nfiles = scalar @files;
+my ($sum, $humansum, $action);
+$sum += (split /\s+/, $_)[4] foreach @files;
+($remove) ? ($action = "deleted from") : ($action = "transferred to");
+
+my $nnodes = scalar @nodelist;
+#print "$sum : $nnodes : $nfiles\n";
+my $totalsum = $sum * $nnodes;
+if ($totalsum > 1E12) {
+	$humansum = sprintf("%0.2f TB", $totalsum / 1024 ** 4);
+} elsif ($totalsum > 1E9) {
+	$humansum = sprintf("%0.2f GB", $totalsum / 1024 ** 3);
+} elsif ($totalsum > 1E6) {
+	$humansum = sprintf("%0.2f MB", $totalsum / 1024 ** 2);
+} elsif ($totalsum > 1E3) {
+	$humansum = sprintf("%0.2f KB", $totalsum / 1024);
+} else {
+	$humansum = $totalsum . " bytes";
+}
+
+my $time1 = time();
+foreach my $i (@nodelist) {
+	my $gap = 4 - length($i);
+	my $zeroes = '0' x $gap;
+	my $node = "node$zeroes$i";
+	if ($remove) {
+		chomp(my $now = `date`);
+		print "$node: $now\n";
+		print "rsh $node rm -f /tmp/$db*\n" if $verbose;
+		system "rsh $node rm -f /tmp/$db*";
+	} else {
+		chomp(my $now = `date`);
+		print "$node: $now\n";
+		print "rsh $node cp $blastdbdir/$db /tmp/\n" if $verbose;
+		system "rsh $node cp $blastdbdir/$db /tmp/";
+		print "rsh $node cp $blastdbdir/$db.* /tmp/\n" if $verbose;
+		system "rsh $node cp $blastdbdir/$db.* /tmp/";
+	}
+}
+
+my $time2 = time();
+my $totaltime = $time2-$time1+1;
+my $days = int($totaltime / 86400);
+my $dayrem = $totaltime % 86400;
+my $hours = int($dayrem / 3600);
+my $hourrem = $dayrem % 3600;
+my $minutes = int($hourrem / 60);
+my $seconds = $hourrem % 60;
+print "$humansum $action $nnodes nodes in";
+print " $days days" if $days;
+print " $hours hours" if $hours;
+print " $minutes minutes" if $minutes;
+print " $seconds seconds" if $seconds;
+print "\n";
+exit;
+

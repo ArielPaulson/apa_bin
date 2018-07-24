@@ -1,0 +1,90 @@
+#!/usr/bin/env perl
+
+=pod
+
+=head1 SYNOPSIS
+
+=head1 OPTIONS
+
+=head2 MANDATORY PARAMETERS
+
+=over
+
+=item B<>
+
+=item B<>
+
+=back
+
+=head2 OTHER PARAMETERS
+
+=over
+
+=item B<>
+
+=item B<>
+
+=back
+
+=head2 HELP
+
+=over
+
+=item B<--help>
+
+Display command line usage with options.
+
+=item B<--man>
+
+Display complete manual page and exit.
+
+=item B<--version> 
+
+Display the scripts version number and exit.
+
+=back
+
+=head1 RUNNING
+
+=head1 OUTPUTS
+
+=over
+
+=item B<>
+
+=item B<>
+
+=back
+
+=head1 EXAMPLES
+
+=over
+
+=item C<>
+
+=item C<>
+
+=back
+
+=head1 AUTHOR
+
+Ariel Paulson
+
+=head1 DEPENDENCIES
+
+Perl >= 5.8
+
+=cut
+
+use Getopt::Long;
+use Pod::Usage;
+use FindBin;
+use strict;
+
+my ($help, $man, $ver)
+GetOptions() or pod2usage(1);
+
+pod2usage(1) if $help;
+pod2usage(-exitstatus => 0, -verbose => 2) if $man;
+if ($ver) {print "$FindBin::Script: $VERSION\n"; exit(0)};
+

@@ -1,0 +1,75 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use strict;
+
+
+## Show NCBI taxon IDs for various Stowers model orgs
+
+
+my $NO_sprintf = $ARGV[0] eq '--no-sprintf';
+
+my $build_dir = '/n/data1/genomes/indexes';
+
+my %taxon_ids = (
+    # ncbiTaxonId = [sci name, com name, genome prefix, [transcriptome prefixes]]  # genome, txome prefs from $build_dir
+      7994 => ['Astyanax mexicanus','Cave Fish / Mexican Tetra',['astMex'],['Ens_']],
+      6500 => ['Aplysia californica','California Sea Hare',['aplCal'],['']],
+     52180 => ['Aspidoscelis tigris','Whiptail Lizard',[''],['']],
+      7739 => ['Branchistoma floridae','Florida Lancelet',['braFlo'],['']],
+      6239 => ['Caenorhabditis elegans','The Elegant Worm',['ce'],['Ens_']],
+      7955 => ['Danio rerio','Zebrafish',['danRer'],['Ens_']],
+      7227 => ['Drosophila melanogaster','Fruit Fly',['dm'],['Ens_','BDGP_']],
+      9031 => ['Gallus gallus','Chicken',['galGal'],['Ens_']],
+      9606 => ['Homo sapiens','Human',['hg'],['Ens_']],
+     27923 => ['Mnemiopsis leidyi','Sea Walnut',[''],['']],
+     10090 => ['Mus musculus','Mouse',['mm'],['Ens_']],
+     45351 => ['Nematostella vectensis','Starlet Sea Anemone',['nemVec'],['EnsGen_']],
+    105023 => ['Nothobranchius furzeri','African Turquoise Killifish',['nfu'],['genes_']],
+     46514 => ['Patiria (Asterina) miniata','Bat Star',[''],['']],
+      7757 => ['Petromyzon marinus','Sea Lamprey',['petMar'],['Ens_']],
+    400727 => ['Pomacea canaliculata','Channeled Applesnail',[''],['']],
+     10116 => ['Rattus norvegicus','Norway Rat',['rn'],['Ens_']],
+      4932 => ['Saccharomyces cerevisiae',"Brewer's Yeast (BEFORE March 2014)",['sacCer'],['Ens_']],
+    559292 => ['Saccharomyces cerevisiae S288c',"Brewer's Yeast (AFTER March 2014)",['sacCer'],['Ens_']],
+      4896 => ['Schizosaccharomyces pombe','Pombe / Fission Yeast',['pombe'],['EnsGen_']],
+     79327 => ['Schmidtea mediterranea','Planarian',['smed'],['smed_']],
+      7668 => ['Strongylocentrotus purpuratus','Purple Sea Urchin',['strPur'],['EnsGen_']],
+     10228 => ['Trichoplax adhaerens','Trichoplax',['Trichoplax'],['EnsGen_']],
+      8355 => ['Xenopus tropicalis','Western Clawed Frog',['xenTro'],['Ens_']]
+);
+
+my @headers = ('Taxon ID', 'Scientific Name', 'Common Name', 'Latest Genome / Transcriptome');
+my @widths = map {length($_)} @headers;
+my %latest;
+my @taxon_data;
+
+open my $GB, '-|', '/home/apa/local/bin/showGenomes';
+while (<$GB>) {
+    chomp;
+    my @fields = split;  # split on all whitespace
+    my ($gpref, $tpref) = @fields[0,1];
+    $latest{$fields[5]} = "$gpref / $tpref" if $fields[4] eq 'LATEST';
+}
+close $GB;
+
+foreach my $id (sort {$taxon_ids{$a}->[0] cmp $taxon_ids{$b}->[0]} keys %taxon_ids) {  # sort by sci name ascending
+    my ($sciname, $comname, $gpref_ref, $tpref_ref) = @{ $taxon_ids{$id} };
+    my @ilatest;
+    
+    foreach my $gpref (@$gpref_ref) {  # available genome prefixes
+        next unless $gpref;  # may not have any!
+        push @ilatest, $latest{$gpref};
+    }
+    
+    my @tmp = ($id, $sciname, $comname, join(';', @ilatest));
+    foreach my $i (0..$#tmp) {
+        $widths[$i] = length($tmp[$i]) if length($tmp[$i]) > $widths[$i];
+    }
+    push @taxon_data, \@tmp;
+}
+
+my @OUT = (\@headers, @taxon_data);
+print "\n";
+&print_table(\@OUT, !$NO_sprintf);
+print "\nLatest genome / transcriptome are from $build_dir/\n\n";
+exit;

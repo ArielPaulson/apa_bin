@@ -1,0 +1,373 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Getopt::Long;
+use File::Spec;
+use Pod::Usage;
+use strict;
+use Storable qw/ nstore retrieve /;
+
+### Finds and classifies kmers which occur in a genome more than a minimum number of times.
+### HIGH RAM USAGE: run on cypress, if counting long kmers on genomes
+
+### FUTURE ADDITIONS: final summary report, instances bigBed(s), kmer-associations report (list genes, repeats), by-gene and by-repeat reports?
+### drop final 'Repeat' field in kmer_detail.txt
+
+
+
+### Dependencies
+
+my $bin = '/home/apa/local/bin';
+my $subunit = "$bin/kmerCountMulti_subunit";
+my $gtf2beds = "$bin/gtf2beds";
+my $sortBedCoord = "$bin/sortBedCoord";
+my $tab2fasta = "$bin/tab2fasta";
+my $intersectBed = 'intersectBed';
+my $jellyfish = '/n/local/stage/jellyfish/jellyfish-2.2.4/bin/jellyfish';
+
+
+
+### Inputs
+
+## Start Mode 1
+my $geno;       # genome to search
+## Start Mode 1 annotations (optional)
+my $anno;       # MUST BE A TRANSCRIPTOME LABEL (e.g. 'Ens_80') will classify each kmer as to % exonic, intronic, genic, intergenic, etc.
+## Start Mode 2
+my $fasta;      # sequences to search
+## Start Mode 2 annotations (optional)
+my $exonsbed;   # exons (per gene) bed file; names must be "gene:exon#"
+my $genesbed;   # genes bed file
+my $genedata;   # gene annotations file (should have at least one column named 'Symbol', 'Name', or 'gene_name', not case sensitive)
+# -- OR --
+my $gtf;        # gtf file (which will generate $exonsbed and $genesbed, also $genedata if there is sufficient annotation)
+## Other annotations (optional)
+my $repeatsbed; # repeats bed file; names can be "name" or "name:instance"
+## Other mandatory Start Mode params
+my $k;          # kmer size
+## Other optional Start Mode params
+my $minN;       # minimum frequency
+my $maxN;       # maximum frequency (if any)
+my $threads;    # cores to use for jellyfish (default 1)
+my $outdir;     # output directory, if NOT allowed to clobber
+my $clobber;    # output directory, if allowed to clobber
+my $batchsize;  # process kmers in batches of $batch (all batches deployed in parallel)
+my $keep_N;     # allow kmers with Ns
+my $restart;    # restarting from existing output location (with intact 'temp' subdirectory)
+## Finish Mode params
+my $collect;    # output directory to compile results from
+
+
+
+### Get, test arguments
+
+GetOptions("k=i"=>\$k, "n=i"=>\$minN, "x=i"=>\$maxN, "t=i"=>\$threads, "f=s"=>\$fasta, "g=s"=>\$geno, "a=s"=>\$anno, "b=i"=>\$batchsize, "o=s"=>\$outdir, "oc=s"=>\$clobber, "keep-N"=>\$keep_N, "collect=s"=>\$collect, "gtf=s"=>\$gtf, "gb=s"=>\$genesbed, "xb=s"=>\$exonsbed, "rb=s"=>\$repeatsbed, "gd=s"=>\$genedata, "restart"=>\$restart);
+
+unless ($collect) {
+    die "$0: Kmer size must be > 0!\n" unless $k > 0;
+    die "$0: Minimum kmer frequency must be at least 2!\n" if $minN < 2;
+    die "$0: Maximum kmer frequency ($maxN) is less than minimum ($minN)!\n" if $maxN && $maxN > $minN;
+    $threads = 1 unless $threads;
+    die "$0: Threads must be > 0!\n" unless $threads > 0;
+    $batchsize = 1000 unless $batchsize;
+    die "$0: Batch size must be > 0!\n" unless $batchsize > 0;
+    
+    if ($geno) {
+	die "$0: Specify EITHER -g OR -f, not both!\n" if $fasta;
+	my $gdir = "/n/data1/genomes/indexes/$geno";
+	$fasta = "$gdir/$geno.fa";
+	$repeatsbed = "$gdir/$geno.repeats.bed";
+	if ($anno) {
+	    $exonsbed = "$gdir/$anno/$geno.$anno.exons.bed";
+	    $genesbed = "$gdir/$anno/$geno.$anno.genes.bed";
+	    $genedata = "$gdir/$anno/$geno.$anno.genedata.txt";
+	}
+    }
+    $fasta = &validate('file', $fasta, 'Sequence fasta', 1);
+    $gtf = &validate('file', $gtf, 'Features GTF');
+    $exonsbed = &validate('file', $exonsbed, 'Exons BED');
+    $genesbed = &validate('file', $genesbed, 'Genes BED');
+    $repeatsbed = &validate('file', $repeatsbed, 'Repeats BED');
+    $genedata = &validate('file', $genedata, 'Gene data table');
+    die "$0: Do not use -eb, -gb, or -gd when using -gtf!\n" if $gtf && ($exonsbed|$genesbed|$genedata);
+}
+my $annotate = ($gtf|$exonsbed|$genesbed|$repeatsbed) ? 1 : 0;
+$restart=1 unless $collect;
+
+
+
+### Output location, files
+
+chomp(my $basedir = `pwd`);
+my $tmpname = "temp";
+my ($tmpdir, $sgedir, $batchdir);
+if ($collect) {
+    $outdir = File::Spec->rel2abs($collect);
+    $tmpdir = "$outdir/$tmpname";
+    $sgedir = "$tmpdir/sge";
+    $batchdir = "$tmpdir/batches";
+} else {
+    if ($restart) {
+	$outdir = File::Spec->rel2abs($outdir) if $outdir;
+	$outdir = File::Spec->rel2abs($clobber) if $clobber;
+	die "$0: Output directory '$outdir' does not exist!\n" unless -d $outdir;
+	$tmpdir = "$outdir/$tmpname";
+	$sgedir = "$tmpdir/sge";
+	$batchdir = "$tmpdir/batches";
+    } else {
+	$outdir = &create_writedir($outdir, $clobber, 'Output directory', '.');
+	$tmpdir = &validate('dir', "$outdir/$tmpname", 'Temp location');
+	$sgedir = &validate('dir', "$tmpdir/sge", 'SGE output location', 1);
+	$batchdir = &validate('dir', "$tmpdir/batches", 'Batch output location', 1);
+    }
+}
+
+my $jdb = "$tmpdir/jellyfish.db";
+my $jdt = "$tmpdir/jellyfish.txt";
+my $batchdat = "$tmpdir/batch.dat";
+my $qarray = "$tmpdir/qsub.array";
+my $ksum = "$outdir/kmer_summary.txt";
+my $kdet = "$outdir/kmer_detail.txt";
+my $kbed = "$outdir/kmer_locations.bed";
+my $kdrop = "$outdir/kmers_dropped.txt";
+
+
+
+### Other Globals
+
+my @headers;  # Fasta headers, in order
+my %seq;      # Fasta sequences
+my %kmers;    # Kmer data
+my %stats;    # run statistics
+my @kmer_table; # usable kmer table
+my @kmer_drop;  # dropped kmers (due to non-ACGT)
+my %batchdata;  # batch-related data
+
+
+
+### Main
+
+if ($collect) {
+    
+} else {
+    
+    ### Read fasta
+    
+    print STDERR "Reading fasta: ",`date`;
+    my $FA = &open2('R', $fasta, 'Sequence fasta');
+    my $header;
+    while (<$FA>) {
+	s/[\n\r]+$//;
+	if (/^>(.*)/) {
+	    $header = $1;
+	    push @headers, $header;
+	} else {
+	    $seq{$header}{S} .= uc($_);
+	    $seq{$header}{L} += length($_);
+	}
+    }
+    close $FA;
+    
+    
+    
+    ### Prepare GTF fractions, if necessary
+    
+    if ($gtf) {
+	chdir $tmpdir;
+	system "$gtf2beds $gtf" unless $restart;  # writes to current location, $tmpdir
+	chdir $basedir;
+	
+	(my $gtfname) = ($gtf =~ /([^\/]+).gtf$/i);
+	my $tmpgtf = "$tmpdir/$gtfname";
+	$exonsbed = &validate('file', "$tmpgtf.gene_exons.bed", 'Exons BED', 1);
+	$genesbed = &validate('file', "$tmpgtf.genes.bed", 'Genes BED', 1);
+	$genedata = &validate('file', "$tmpgtf.gene_data.txt", 'Gene data table', 1);
+    }
+    
+    
+    ### Count kmers
+    
+    my $Gtotal;
+    $Gtotal += $seq{$_}{L} foreach @headers;
+    my @Gmem = $Gtotal > 1E9 ? (sprintf("%0.1f",$Gtotal/1024**3),'G') : 
+	$Gtotal > 1E6 ? (sprintf("%0.1f",$Gtotal/1024**2),'M') : (sprintf("%0.1f",$Gtotal/1024**1),'K');
+    $Gmem[0] = int($Gmem[0])+1 if int($Gmem[0]) < $Gmem[0];  # ceiling 
+    my $Gmem = join('',@Gmem);  # Jellyfish
+    my $Gmem2 = join('',$Gmem[0]*2,$Gmem[1]);  # qsub
+    my $jdb_cmd = "$jellyfish count -o $jdb -m $k -t $threads -s $Gmem $fasta";
+    
+    my $jdt_cmd = "$jellyfish dump";
+    if ($minN && $maxN) {
+	$jdt_cmd .= " -L $minN -U $maxN";
+    } elsif ($minN) {
+	$jdt_cmd .= " -L $minN";
+    } elsif ($maxN) {
+	$jdt_cmd .= " -U $maxN";
+    }
+    $jdt_cmd .= " -c -t -o $jdt $jdb";
+    
+    unless ($restart) {
+	print STDERR "Running jellyfish: ",`date`;
+	print "$jdb_cmd\n";
+	system $jdb_cmd;    
+	print STDERR "Exporting jellyfish: ",`date`;
+	print "$jdt_cmd\n";
+	system $jdt_cmd;
+    }
+    
+    
+    
+    ### Read kmer table
+    
+    $stats{KEEP} = $stats{DROP} = 0;
+    print STDERR "Reading kmer table: ",`date`;
+    my $JDT = &open2('R', $jdt, 'Kmer table');
+    while (<$JDT>) {
+	s/[\n\r]+$//;
+	my ($kmer, $N) = split /\t/, $_;
+	my $kmer_id = $. . "_${N}";
+	(my $rc = reverse $kmer) =~ tr/ACGT/TGCA/;
+	my $pal = $kmer eq $rc ? 1 : 0;
+	if ($kmer =~ /[^ACGT]/ && !$keep_N) {  # ignores not just N, but any non-ACGT
+	    print STDERR " ignoring kmer $. which contains non-ACGT chars.";
+	    $stats{DROP}++;
+	    push @kmer_drop, [$kmer_id, $., $N, $pal, $kmer, $rc];
+	    next;
+	} else {
+	    push @kmer_table, [$kmer_id, $., $N, $pal, $kmer, $rc];
+	    $stats{KEEP}++;
+	}
+    }
+    close $JDT;
+    
+    my $KD = &open2('W', $kdrop, 'Dropped kmers table');
+    print $KD join("\t", @$_),"\n" foreach @kmer_drop;
+    close $KD;
+    
+    print STDERR "$stats{KEEP} kmers kept | $stats{DROP} kmers dropped.\n";
+    
+    
+    
+    ### Prepare batches and store batch data object
+    
+    print STDERR "Storing batch data: ".`date`;
+    chomp(my $nk = `cat $jdt | wc -l`);
+    my $nbatches = $nk/$batchsize;
+    $nbatches = int($nbatches)+1 if int($nbatches) < $nbatches;
+    
+    %batchdata = (
+	'k'=>$k, 'minN'=>$minN, 'maxN'=>$maxN, 'keep_N'=>$keep_N, 'nk'=>$nk, 'nbatches'=>$nbatches, 'annotate'=>$annotate, 
+	'genesbed'=>$genesbed, 'exonsbed'=>$exonsbed, 'repeatsbed'=>$repeatsbed, 'genedata'=>$genedata, 
+	'basedir'=>$basedir, 'outdir'=>$outdir, 'tmpdir'=>$tmpdir, 
+	'stats'=>{%stats}, 'seq'=>{%seq}, 'headers'=>[@headers], 'perbatch'=>{} 
+	);
+    
+    my $batch = 0;
+    my $ndig = length($nbatches);
+    my $QA = &open2('W', $qarray, "Qsub array");
+    my $run_name = "kmerCountMulti.$$";
+    system "rm -rf $batchdir/*" unless $restart;   #### ZAP EXISTING SUBUNIT OUTPUT DIRS (unless $restart)
+    for (my $b = 0; $b <= $nk; $b += $batchsize) {
+	$batch++;
+	my $zbatch = sprintf("%0${ndig}i",$batch);
+	my $ki = $b + 1;
+	my $kf = $b+$batchsize > $nk ? $nk : $b + $batchsize;
+	my $ktmpdir = "$batchdir/$zbatch";   ##### subunit jobs will create these
+	my $klog = "$ktmpdir/subunit.log";
+	
+	$batchdata{perbatch}{$batch}{ki} = $ki;
+	$batchdata{perbatch}{$batch}{kf} = $kf;
+	$batchdata{perbatch}{$batch}{log} = $klog;
+	$batchdata{perbatch}{$batch}{ktmpdir} = $ktmpdir;
+	$batchdata{perbatch}{$batch}{gint} = "$ktmpdir/genes.int";
+	$batchdata{perbatch}{$batch}{xint} = "$ktmpdir/exons.int";
+	$batchdata{perbatch}{$batch}{rint} = "$ktmpdir/repts.int";
+	$batchdata{perbatch}{$batch}{outdat} = "$ktmpdir/batchout.dat";
+	$batchdata{perbatch}{$batch}{ksum} = "$ktmpdir/kmer_summary.txt";
+	$batchdata{perbatch}{$batch}{kdet} = "$ktmpdir/kmer_detail.txt";
+	$batchdata{perbatch}{$batch}{kbed} = "$ktmpdir/kmer_locations.bed";
+	$batchdata{perbatch}{$batch}{kmer_table} = [@kmer_table[$ki-1..$kf-1]];
+	
+	my $subcall = join(' ', $subunit, $batch, $batchdat);
+	my $batch_name = "$batch.$run_name";
+	$batchdata{perbatch}{$batch}{qsub} = "qsub -l h_pmem=$Gmem2 -q all.q -b y -cwd -N b$batch_name -o $sgedir/$batch_name.out -e $sgedir/$batch_name.err '$subcall'\n";
+	print $QA $batchdata{perbatch}{$batch}{qsub};
+	last if $kf == $nk;
+    }
+    close $QA;
+    nstore(\%batchdata, $batchdat);
+    
+    print STDERR "Ready to analyze $nk kmers in $batch batches of $batchsize each: ".`date`;
+    print STDERR "kmerCountMulti 'Start' mode complete: ",`date`,"\nWhat to do now:\n";
+    print STDERR " 1. Go execute the script '$qarray' on a cluster.\n 2. When finished, run '$0 --collect=$outdir'\n";
+    exit(0);
+}
+
+
+
+if ($collect) {
+    
+    print STDERR "Retrieving batch data: ".`date`;
+    %batchdata = %{ retrieve($batchdat) };
+    my $nbatches = $batchdata{nbatches};
+    
+    ### Collect stats
+    
+    foreach my $batch (1..$nbatches) {
+	if (-e $batchdata{perbatch}{$batch}{outdat}) {
+	    my %kstats = %{ retrieve($batchdata{perbatch}{$batch}{outdat}) };
+	    foreach my $key (qw/ D A /) {
+		$stats{$key} += $kstats{$key};
+	    }
+	    foreach my $key (qw/ DO DA /) {
+		foreach my $subkey (keys %{ $kstats{$key} }) {
+		    $stats{$subkey} += $kstats{$subkey};
+		}
+	    }
+	}
+    }
+    
+    
+    
+    ### Merge outputs
+    
+    print STDERR "Merging batch data: ".`date`;
+    my @lost_qsub;
+    foreach my $batch (1..$nbatches) {
+	unless (-s $batchdata{perbatch}{$batch}{log}) {
+	    print STDERR "WARNING: batch $batch failed to produce output!\n";
+	    push @lost_qsub, $batchdata{perbatch}{$batch}{qsub};
+	}
+    }
+    if (@lost_qsub) {
+	print STDERR "\nPlease re-qsub the following failed batches, then re-run '$0 --collect=$outdir':\n\n";
+	print STDERR @lost_qsub;
+	print STDERR "\n";
+	exit(0);
+    } else {
+	my $ksum1 = $batchdata{perbatch}{1}{ksum};
+	my $kdet1 = $batchdata{perbatch}{1}{kdet};
+	my $kbed1 = $batchdata{perbatch}{1}{kbed};
+	system "head -1 $ksum1 > $ksum";
+	system "head -1 $kdet1 > $kdet";
+	system "rm -f $kbed";
+	foreach my $batch (1..$nbatches) {
+	    system "tail -n +2 $batchdata{perbatch}{$batch}{ksum} >> $ksum";
+	    system "tail -n +2 $batchdata{perbatch}{$batch}{kdet} >> $kdet";
+	    system "cat $batchdata{perbatch}{$batch}{kbed} >> $kbed";
+	}
+	system "gzip -f $_" foreach ($ksum, $kdet, $kbed);
+    }
+    
+    
+    ### Cleanup & Exit
+    
+    #####system "rm -rf $tmpdir";
+    system "rm -f $jdb";
+    print "$_\t$stats{$_}\n" foreach sort keys %stats;
+    print STDERR "kmerCountMulti complete!\n";
+    exit(0);
+    
+}
+
+
+# apa@lepus ~$ for node in $(qconf -sq all.q | grep -A 17 slots | awk '{ print $1 }' | tail -n +2 | sed 's/,/\n/g' | grep "\[" | sed 's/\[//' | cut -f1 -d'.'); do echo $node; ssh $node 'killall -u apa' & done

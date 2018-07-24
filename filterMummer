@@ -1,0 +1,39 @@
+#!/usr/bin/perl
+use strict;
+
+my (@lines, @filtered, $more);
+open IN, $ARGV[0];
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    $_ =~ s/^\s+//;
+    push @lines, [split /\s+/, $_];
+}
+close IN;
+
+$more = 1 if $ARGV[1] eq '--more';
+
+print "Ref\tQuery\tLength\tRefGap\tQueryGap\n" if $more;
+my $j = -1;
+foreach my $i (0..$#lines) {
+    my ($ref, $qry, $len) = @{ $lines[$i] };
+    my $refgap = my $qrygap = 0;
+    if ($i > 1 && $j > -1) {
+	my ($ref0, $qry0, $len0) = @{ $filtered[$j] };
+	next if ($qry < $qry0+$len0-1);
+	next if ($ref < $ref0);
+	$refgap = $ref-($ref0+$len0);
+	$qrygap = $qry-($qry0+$len0);
+    }
+    if ($i < $#lines) {
+	my ($ref1, $qry1, $len1) = @{ $lines[$i+1] };
+	next if ($qry+$len-1 > $qry1);
+	next if ($ref > $ref1);
+    }
+    print "$ref\t$qry\t$len";
+    print "\t$refgap\t$qrygap" if $more;
+    print "\n";
+    push @filtered, [$ref, $qry, $len];
+    $j++;
+}
+
+

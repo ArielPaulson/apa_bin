@@ -1,0 +1,50 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+die;  ## UNDER CONSTRUCTION ##
+
+my ($input, $reference, $optimize);
+
+GetOptions("i=s" => \$input, "r=s" => \$reference, "o=s" => \$optimize);
+
+my $bin = '/home/apa/local/bin';
+my $tmp = "sequence2model.$$.tmp";
+system "mkdir $tmp";
+die "$0: Failed to create temp dir '$tmp'!\n" unless -d $tmp;
+my ($inputName) = ($input =~ /([^\/]+)$/);
+
+my ($optBlat, $optExon);
+if ($optimize) {
+    $optBlat = '-fine';
+    $optExon = '--refine full --refineboundary 1000';
+}
+
+my $exonOut = "$tmp/$inputName.exonerate";
+my $blatOut = "$tmp/$inputName.psl";
+my %aligns;
+
+system "/n/site/inst/Linux-x86_64/bioinfo/bin/exonerate --model est2genome --showtargetgff --dnawordlen 11 --minintron 10 --maxintron 750000 --subopt FALSE $optExon $input $reference > $exonOut";
+
+open IN, $exonOut or warn "$0: Failed to open exonerate output '$exonOut' for reading: $!\n";
+my ($stage1, $stage2);
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    if ($_ =~ /^vulgar: /) {
+	$stage1 = 1;
+    } elsif ($stage 1 && $_ =~ /^#/) {
+	$stage2 = 1;
+    } elsif ($stage2 && $_ !~ /^#/) {  # aiming for GFF output, here
+	$stage1 = $stage2 = 0;
+	($seqName, $x, $y, ) = split /\t/, $_;
+	
+	$aligns{$inputName}{$seqName} = $_;
+    }
+}
+close IN;
+
+
+system "blat $optBlat $reference $input $blatOut";
+
+

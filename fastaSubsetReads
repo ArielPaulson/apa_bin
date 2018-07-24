@@ -1,0 +1,113 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my ($fasta, $outprefix, $stranded) = @ARGV;
+
+my (%headers, %seq, %blat, %dat);
+my ($input, $exact, $subset, $lost, $singleton, $deletes);
+
+#my $tmp = "fastaSubsetReads.$$.tmp";
+#mkdir $tmp;
+#die "Unable to create temp directory '$tmp'!\n" unless -d $tmp;
+
+my $tmp = 'fastaSubsetReads.19901.tmp';
+
+print "Reading fasta...\n";
+open my $IN, '<', $fasta or die "$0: Cannot read fasta '$fasta': $!\n";
+my $header;
+while (<$IN>) {
+    if (/^>(.*)/) {
+	$header = (split /\s+/, $1)[0];
+	$headers{$header} = $1;
+    } else {
+	$seq{$header} .= $_;
+    }
+}
+close $IN;
+
+#system "cp $fasta $tmp/fa";
+#system "perl -i -pe 's/^(>.*)N/$1#/g' $tmp/fa";
+#system "perl -i -pe 's/N/A/ig' $tmp/fa";
+#system "perl -i -pe 's/#/N/g' $tmp/fa";
+
+print "Blatting to self...\n";
+#system "blat -noHead -fastMap -extendThroughN $tmp/fa $tmp/fa $tmp/psl";
+
+print "Analyzing blat output...\n";
+open my $IN2, '-|', "cut -f1,3,4,9,10,11,14,15,18 $tmp/psl" or die "$0: Cannot open psl file '$tmp/psl': $!\n";
+while (<$IN2>) {
+    chomp;
+    my ($match, $repmatch, $Nmatch, $strand, $query, $qlen, $subj, $slen, $blocks) = split;
+    next if $query eq $subj;
+    next if $blocks > 1;  ######## LATER: 454-homopolymer strategy
+    next if $stranded && $strand ne '+';
+    my $allmatch = $match+$repmatch+$Nmatch;
+    if ($allmatch == $qlen) {
+	## query is subset of subject
+	next if exists $dat{$subj}{S}{$qlen}{$query};  # exact-match; reciprocal relation already recorded
+	$dat{$query}{L} = $qlen;
+	$dat{$query}{S}{$slen}{$subj} = 1;
+    } elsif ($allmatch == $slen) {
+	## subject is subset of query
+	next if exists $dat{$query}{S}{$slen}{$subj};  # exact-match; reciprocal relation already recorded
+	$dat{$subj}{L} = $slen;
+	$dat{$subj}{S}{$qlen}{$query} = 1;
+    }
+}
+close $IN2;
+
+print "Writing...\n";
+open my $SFA, '>', "$outprefix.subset-reads.fa" or die "$0: Cannot write to fasta '$outprefix.subset-reads.fa': $!\n";
+open my $NFA, '>', "$outprefix.not-subset-reads.fa" or die "$0: Cannot write to fasta '$outprefix.not-subset-reads.fa': $!\n";
+open my $TXT, '>', "$outprefix.subset-report.txt" or die "$0: Cannot write to report '$outprefix.subset-report.txt': $!\n";
+print $TXT "Header\tLength\tLongestContainingBp\tLongestContainingHeaders\n";
+foreach my $header (sort { length($seq{$b}) <=> length($seq{$a}) } keys %headers) {
+    $input++;
+    if (exists $dat{$header}{S}) {
+	## read is a subset of some other read
+	print $SFA ">$headers{$header}\n$seq{$header}";
+	{
+	    my $longest_bp = (sort {$b <=> $a} keys %{ $dat{$header}{S} })[0];
+	    my @longest_reads; 
+	    foreach my $header2 (sort keys %{ $dat{$header}{S}{$longest_bp} }) {
+		if ($dat{$header}{L} == $dat{$header2}{L}) {  # identical reads
+		    push @longest_reads, $header2;
+		    delete $dat{$header2}{S}{ $dat{$header}{L} }{$header};  # remove this read's entry in the other read's hash (make other read sole container, not co-container)
+		    $exact++;
+		} else {
+		    push @longest_reads, $header2 unless exists $dat{$header2}{S};  # show only largest containing read, not containers that are themselves contained
+		}
+	    }
+	    if (@longest_reads) {
+		my $longest_reads = join ',', @longest_reads;
+		print $TXT "$header\t$dat{$header}{L}\t$longest_bp\t$longest_reads\n";
+		$subset++;
+	    } elsif ($longest_bp) {
+#		print STDERR "WARNING: $header $longest_bp being deleted!\n";
+		delete $dat{$header}{S}{$longest_bp};
+		$deletes++;
+		redo;
+	    } else {
+#		print STDERR "WARNING: $header has been lost!\n";
+		$lost++;
+	    }
+	}
+    } else {
+	## read is not a subset of any other read
+	print $NFA ">$headers{$header}\n$seq{$header}";
+	print $TXT "$header\t$dat{$header}{L}\t\t\n";
+	$singleton++;
+    }
+}
+close $_ foreach ($SFA, $NFA, $TXT);
+
+my $unknown = $input-$exact-$subset-$singleton-$lost;
+
+print "$deletes deletions\n";
+print "INPUT\t$input\nEXACT\t$exact\nSUBSET\t$subset\nSINGLE\t$singleton\nLOST\t$lost\nUNKNOWN\t$unknown\n";
+print "$0 $fasta complete.\n";
+system "kill $$ &> /dev/null";
+
+

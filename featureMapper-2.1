@@ -1,0 +1,656 @@
+#!/usr/bin/perl
+use strict;
+no strict 'refs';
+
+my $flagread;
+#$flagread = 'SEB9BZKS1:70:D1FTPACXX:4:1104:10263:62604';
+
+my ($alias, $gbuild, $abuild) = @ARGV;
+die "No alias specified!\n" unless $alias;
+die "No genome build specified!\n" unless $gbuild;
+die "No annotation build specified!\n" unless $abuild;
+
+my $gb_prefix = "/n/data1/genomes/bowtie-index/$gbuild/$gbuild";
+my $ab_prefix = "/n/data1/genomes/bowtie-index/$gbuild/$abuild/$gbuild.$abuild";
+
+die "Genome and/or Annotation build is invalid!\n" unless -d $ab_prefix;
+
+my $fai = "$gb_prefix.fa.fai";
+my $gtf = "$ab_prefix.gtf";
+my $exonbed = "$ab_prefix.exons.bed";
+my $uxonbed = "$ab_prefix.uxons.bed";
+my $iintbed = "$ab_prefix.iintrons.bed";
+my $genebed = "$ab_prefix.genes.bed";
+my $itgnbed = "$ab_prefix.intergenes.bed";
+
+my $prombp = 0;  # promoter region length (upstream of genes, strand-specific) -- subtracted from intergenic space
+my $tailbp = 0;  # tail region length (downstream of genes, strand-specific) -- subtracted from intergenic space
+my $nutrbp = 0;  # ENSURE THIS PLAYS WELL WITH PROMOTER/TAILREGION DEFS!!!
+my $uibobp = 0;  # uxon/iintron boundary window -- NOT YET IMPLEMENTED
+
+my $f = "0.999999";
+my $tmp = "featureMapper.tmp.$$";
+
+my $iint_CON = "$tmp.hits_to_iintrons.CONT.txt";
+my $itgc_ALL = "$tmp.hits_to_intergenes.ALL.txt";
+my $uxon_ALL = "$tmp.hits_to_uxons.ALL.txt";
+my $gene_ALL = "$tmp.hits_to_genes.ALL.txt";
+my $bam_splc = "$tmp.hits_to_splicejuncs.txt";
+my $nj2gene = "$tmp.noveljunc2gene.ALL.txt";
+my $genebed1 = "$tmp.genesPlus1.bed";
+my $njbed = "$tmp.noveljuncs.bed";
+my $kjtxt = "$tmp.knownjuncs.txt";
+
+my $prombed = "$tmp.promoters.bed";
+my $tailbed = "$tmp.tailregions.bed";
+my $prom_ALL = "$tmp.hits_to_promoters.ALL.txt";
+my $tail_ALL = "$tmp.hits_to_tailregions.ALL.txt";
+
+execute("intersectBed -bed -split -wo -f $f -abam $alias/$alias.bam -b $iintbed | cut -f4,16 > $iint_CON") unless -e $iint_CON;
+execute("intersectBed -bed -split -wo -abam $alias/$alias.bam -b $itgnbed | cut -f2-4,14-16 > $itgc_ALL") unless -e $itgc_ALL;
+execute("intersectBed -bed -split -wo -abam $alias/$alias.bam -b $uxonbed | cut -f2-4,14-16 > $uxon_ALL") unless -e $uxon_ALL;
+execute("intersectBed -bed -split -wo -abam $alias/$alias.bam -b $genebed | cut -f2-4,14-16 > $gene_ALL") unless -e $gene_ALL;
+execute("samtools view $alias/$alias.bam | awk '\$6 ~ \"N\"' | cut -f1,3,4,6 > $bam_splc") unless -e $bam_splc;
+execute("slopBed -b 1 -i $genebed -g $fai > $genebed1") unless -e $genebed1;  # for pulling out novel junctions which bookend with genes
+
+if ($prombp) {
+    execute("flankBed -s -l $prombp -i $genebed -g $fai > $prombed") unless -e $prombed;
+    execute("intersectBed -bed -split -wo -abam $alias/$alias.bam -b $prombed | cut -f2-4,14-16 > $prom_ALL") unless -e $prom_ALL;
+}
+if ($tailbp) {
+    execute("flankBed -s -r $tailbp -i $genebed -g $fai > $tailbed") unless -e $tailbed;
+    execute("intersectBed -bed -split -wo -abam $alias/$alias.bam -b $tailbed | cut -f2-4,14-16 > $tail_ALL") unless -e $tail_ALL;
+}
+
+my ($readlen, $totalns, $alnreads);
+open IN, "$alias/$alias.bamreads.txt" or die;
+while (<IN>) {
+    next if $. == 1;
+    $_ =~ s/[\n\r]+$//;
+    ($readlen, $totalns, $alnreads) = (split /\t/, $_)[1,2,6];
+}
+close IN;
+$nutrbp = $readlen-1 unless $nutrbp;
+$uibobp = $readlen-1 unless $uibobp;
+
+my (%allchrs, %allfeats, %allfeats2, %allitgn, %GTE, %knowntmp, %knownjunc, @kj, $J);
+print "Parsing annot files...\n";
+open IN, $gtf or die;
+while (<IN>) {
+    chomp;
+    my ($chr, $src, $type, $start, $end, $score, $strand, $phase, $annot) = split /\t/, $_;
+    next unless $type eq 'exon';
+    my ($gene) = ($annot =~ /gene_id \"(.*?)\"/);
+    my ($trans) = ($annot =~ /transcript_id \"(.*?)\"/);
+    $allfeats2{GENE}{$gene} = [$chr, $start-1, $end, $strand];  # $start-1 to match bed files
+    $allchrs{$chr} = $.;  # overwrites but maintains chr rank (if GTF is sorted)
+    push @{ $GTE{$gene}{$trans}{S} }, $start;
+    push @{ $GTE{$gene}{$trans}{E} }, $end;
+}
+close IN;
+my @allchrs = sort {$allchrs{$a} <=> $allchrs{$b}} keys %allchrs;
+
+foreach my $gene (keys %GTE) {
+    my $chr = $allfeats2{GENE}{$gene}->[0];
+    foreach my $trans (keys %{ $GTE{$gene} }) {
+	my @starts = sort {$a <=> $b} @{ $GTE{$gene}{$trans}{S} };
+	my @ends = sort {$a <=> $b} @{ $GTE{$gene}{$trans}{E} };
+	foreach my $i (1..$#starts) {
+	    my $coord = join "\t", ($ends[$i-1], $starts[$i]-1);
+	    $knowntmp{"$chr\t$coord"}{$gene} = 1;
+	}
+    }
+}
+foreach my $jcoord (sort {$a <=> $b} keys %knowntmp) {
+    my ($chr, $start, $end) = split /\t/, $jcoord;
+    $knownjunc{$jcoord}{J} = ++$J;
+    $knownjunc{$jcoord}{L} = $end-$start;
+    $knownjunc{$jcoord}{G}{$_} = 1 foreach keys %{ $knowntmp{$jcoord} };
+    push @kj, "$jcoord\t$J\n";
+}
+
+my @beds = ($uxonbed, $iintbed, $genebed, $itgnbed);
+my @btypes = qw/ UXON IINT GENE ITGC /;
+foreach my $i (0..$#beds) {
+    my $type = $btypes[$i];
+    open IN, $beds[$i] or die;
+    while (<IN>) {
+	chomp;
+	my @data = split /\t/, $_;
+	my ($chr, $start, $end, $id) = @data[0..3];
+	my $strand = $data[5];
+	$allfeats{$chr}{"$start\t$end"}{$type}{$id} = $strand;
+	$allfeats2{$type}{$id} = [$chr, $start, $end, $strand];
+	$allitgn{$id} = [$chr, $start, $end, ''] if $type eq 'ITGC';
+    }
+    close IN;
+}
+
+#jj
+my (%alljunc, $kjhits, $njhits, %juncreads, %noveljunc, %noveltmp, %allreads);
+open IN, $bam_splc or die;
+while (<IN>) {
+    chomp;
+    my ($read, $chr, $start, $cigar) = split /\t/, $_;
+    $allreads{$read}++;
+    $start--;  # 0-based
+    my ($h1, $gap, $h2) = ($cigar =~ /(.*\D+)(\d+N)(\d+.*)/);
+    my ($bp1, $bp2);
+    $bp1 += $_ foreach (split /\D+/, $h1);
+    $bp2 += $_ foreach (split /\D+/, $h2);
+    my $jstart = $start + $bp1;
+    my $jend = $jstart + $gap;
+    my $len = $jend - $jstart;
+    my $jcoord = "$chr\t$jstart\t$jend";
+    $alljunc{$jcoord} = 1;
+    $juncreads{$read} = 1 unless exists $juncreads{$read};
+    if (exists $knownjunc{$jcoord}) {
+	$knownjunc{$jcoord}{N}++;
+	push @{ $knownjunc{$jcoord}{R} }, $read;
+	$juncreads{$read}{$_} = 1 foreach keys %{ $knownjunc{$jcoord}{G} };  # track genes for known junction reads, too
+	$kjhits++;
+	print "$read: known!\n" if $read eq $flagread;
+    } else {
+	$noveljunc{$jcoord}{N}++;
+	$noveljunc{$jcoord}{L} = $len;
+	push @{ $noveljunc{$jcoord}{R} }, $read;
+	$njhits++;
+	print "$read: novel!\n" if $read eq $flagread;
+    }
+}
+close IN;
+my $juncpass0 = scalar keys %juncreads;
+#print "$kjhits kjhits | $njhits njhits\n";
+
+#unless (-e $njbed) {
+    open OUT, "> $njbed" or die;
+    foreach my $jcoord (sort {$a <=> $b} keys %noveljunc) {
+	$noveljunc{$jcoord}{J} = ++$J;  # global $J continuing on from the knownjunc loop above
+	print OUT "$jcoord\t$J\t$noveljunc{$jcoord}{N}\n";
+    }
+    close OUT;
+    my $jchars = length($J);
+    execute("/home/apa/local/bin/sortBedCoord -i $njbed --overwrite");
+    execute("intersectBed -wo -a $njbed -b $genebed1 | cut -f1-4,7-9,11 > $nj2gene") unless -e $nj2gene;
+#}
+
+#unless (-e $kjtxt) {
+    open OUT, "> $kjtxt";
+    print OUT @kj;
+    close OUT;
+    system "/home/apa/local/bin/sortBedCoord -i $kjtxt --overwrite";
+#}
+
+my (%chim, %chimeratmp, %chimera_genes);
+open IN, $nj2gene or die;
+while (<IN>) {
+    chomp;
+    my ($chr, $start, $end, $j, $gstart, $gend, $gene, $gstrand) = split /\t/, $_;
+    my $jcoord = "$chr\t$start\t$end";
+    $chim{0}++;
+    if ($start < $gstart || $end > $gend) {
+	$chim{1}++;
+	my $gside = ($start >= $gstart && $start <= $gend) ? 5 :
+	    ($end >= $gstart && $end <= $gend) ? 3 : 0;
+	if ($gside) {
+	    $chim{2}++;
+	    $chimeratmp{$jcoord}{$gside}{$gene} = 1;
+#	    $juncreads{$_}{$gene} = 1 foreach @{ $noveljunc{$jcoord}{R} };
+	    foreach (@{ $noveljunc{$jcoord}{R} }) {
+		$juncreads{$_}{$gene} = 1;
+		print "$_: chimeric!\n" if $_ eq $flagread;
+	    }
+	} else {
+	    $chim{X}++;  # gene-eclipsing junctions -> intergenic junctions
+	}
+    } else {
+	$noveltmp{$jcoord}{$gene} = 1;
+#	$juncreads{$_}{$gene} = 1 foreach @{ $noveljunc{$jcoord}{R} };
+	foreach (@{ $noveljunc{$jcoord}{R} }) {
+	    $juncreads{$_}{$gene} = 1;
+	    print "$_: still novel!\n" if $_ eq $flagread;
+	}
+   }
+}
+close IN;
+
+my (%assignments, %x, %isplice_reads, @junctest, %juncpass, @read2junc);
+foreach my $jcoord (sort {$a <=> $b} keys %alljunc) {
+    my ($chr, $coord) = split /\t/, $jcoord, 2;
+    my ($start, $end) = split /\t/, $coord;
+    my $junc;
+    if (exists $knownjunc{$jcoord}) {
+	$junc = sprintf("JUNC%0${jchars}i",$knownjunc{$jcoord}{J});
+	foreach my $gene (keys %{ $knownjunc{$jcoord}{G} }) {
+	    foreach (@{ $knownjunc{$jcoord}{R} }) {
+		$assignments{$_}{$gene}{KJUN}{$junc} = 1;
+		$juncpass{$_} = 1;
+		print "$_: final=known!\n" if $_ eq $flagread;
+		push @read2junc, "$_\t$junc\tKNOWN\n";
+	    }
+	}
+	$x{KJUN} += $knownjunc{$jcoord}{N};
+	$allfeats{$chr}{$coord}{KJUN}{$junc} = '.';
+	$allfeats2{KJUN}{$junc} = [$chr, $start, $end, '.'];
+    } else {
+	$junc = sprintf("JUNC%0${jchars}i",$noveljunc{$jcoord}{J});
+	if (exists $noveltmp{$jcoord}) {
+	    foreach my $gene (keys %{ $noveltmp{$jcoord} }) {
+		foreach (@{ $noveljunc{$jcoord}{R} }) {
+		    $assignments{$_}{$gene}{NJUN}{$junc} = 1;
+		    $juncpass{$_} = 1;
+		    print "$_: final=novel!\n" if $_ eq $flagread;
+		    push @read2junc, "$_\t$junc\tNOVEL\n";
+		}
+	    }
+	    $x{NJUN} += $noveljunc{$jcoord}{N};
+	    $allfeats{$chr}{$coord}{NJUN}{$junc} = '.';
+	    $allfeats2{NJUN}{$junc} = [$chr, $start, $end, '.'];
+ 	} elsif (exists $chimeratmp{$jcoord}) {
+	    $chim{3}++;
+	    my %genes;
+	    foreach my $side (keys %{ $chimeratmp{$jcoord} }) {
+		$genes{$_} = 1 foreach keys %{ $chimeratmp{$jcoord}{$side} };
+	    }
+	    foreach my $gene (keys %genes) {
+		foreach (@{ $noveljunc{$jcoord}{R} }) {
+		    $assignments{$_}{$gene}{CJUN}{$junc} = 1;
+		    $juncpass{$_} = 1;
+		    print "$_: final=chimera!\n" if $_ eq $flagread;
+		    push @read2junc, "$_\t$junc\tCHIM\n";
+		}
+	    }
+	    $x{CJUN} += $noveljunc{$jcoord}{N};
+	    $allfeats{$chr}{$coord}{CJUN}{$junc} = '.';
+	    $allfeats2{CJUN}{$junc} = [$chr, $start, $end, '.'];
+	    my $g5 = join ',', sort keys %{ $chimeratmp{$jcoord}{5} };
+	    my $g3 = join ',', sort keys %{ $chimeratmp{$jcoord}{3} };
+	    $g5 = '?' unless $g5;
+	    $g3 = '?' unless $g3;
+	    $chimera_genes{$junc} = "$g5-$g3";
+	} else {    # unassigned in $tmp.noveljunc2gene.ALL.txt
+	    $allfeats{$chr}{$coord}{TJUN}{$junc} = '.';
+	    $allfeats2{TJUN}{$junc} = [$chr, $start, $end, '.'];  # 'TJUN': temp junc
+	    foreach (@{ $noveljunc{$jcoord}{R} }) {
+		$isplice_reads{$_}{$junc} = 1;  ## DO NOT positively ID an intergenic junction here -- that happens later
+		$juncpass{$_} = 1;
+		print "$_: itgc candidate!\n" if $_ eq $flagread;
+		push @read2junc, "$_\t$junc\tTJUN\n";
+	    }
+	}
+    }
+    push @junctest, "$jcoord\t$junc\n";
+}
+
+open OUT, "> $tmp.testjuncs.txt";
+print OUT @junctest;
+close OUT;
+system "/home/apa/local/bin/sortBedCoord -i $tmp > $tmp.testjuncs.txt";
+
+my $juncpass1 = scalar keys %juncpass;
+
+my (@multiplicity, %internal, %external, %opinion2);
+my $genefail = my $uxonfail = my $nutrfail = 0;
+foreach my $read (keys %juncreads) {
+    if ($juncreads{$read} == 1) {
+	push @multiplicity, 1;  # intergenic
+    } else {
+	push @multiplicity, scalar keys %{ $juncreads{$read} };
+    }
+}
+
+open IN, $gene_ALL or die;
+while (<IN>) {
+    chomp;
+    my ($start, $end, $read, $gstart, $gend, $gene) = split /\t/, $_;
+    $allreads{$read}++;
+
+
+
+
+
+### LOGIC CASES YET TO BE IMPLEMENTED:
+### 1. READ ECLIPSES WHOLE GENE
+### 2. READ ECLIPSES IINTRON
+### 3. READ ECLIPSES TERMINAL EXON
+### 4. JUNCTION HANDLING TO THESE AS WELL?
+
+
+
+
+
+    if ($start < $gstart) {
+	my ($dir, $edge) = $allfeats2{GENE}{$gene}->[3] eq '+' ? (5,$gstart) : (3,$gstart);
+	if (exists $juncreads{$read}) {
+	    $opinion2{$read}{$gene} = [$dir, $edge];
+	} else {
+	    $external{$read}{$gene} = [$dir, $edge];
+	}
+    } elsif ($end > $gend) {
+	my ($dir, $edge) = $allfeats2{GENE}{$gene}->[3] eq '+' ? (3,$gend) : (5,$gend);
+	if (exists $juncreads{$read}) {
+	    $opinion2{$read}{$gene} = [$dir, $edge];
+	} else {
+	    $external{$read}{$gene} = [$dir, $edge];
+	}
+    } else {
+	$internal{$read}{$gene} = 1;
+    }
+}
+print "genes A: $.\n";
+close IN;
+
+open IN, $uxon_ALL or die;
+while (<IN>) {
+    chomp;
+    my ($start, $end, $read, $ustart, $uend, $uxon) = split /\t/, $_;
+    $allreads{$read}++;
+    next if exists $juncreads{$read};
+    my $gene = (split /:/, $uxon)[0];
+    my ($chr, $gstart, $gend, $strand) = @{ $allfeats2{GENE}{$gene} };
+    my ($dir, $edge);
+    ($dir, $edge) = @{ $external{$read}{$gene} } if exists $external{$read}{$gene};
+    if ($edge == $ustart || $edge == $uend) {  # externally aligning read, which is also external WRT this uxon hit
+	my $id = "$gene-$dir";
+	my $nutrcoord;
+	if ($dir == 5) {   # NUTR-5
+	    $nutrcoord = $strand eq '+' ? join("\t", ($edge-$readlen, $edge-1)) : join("\t", ($edge+1, $edge+$readlen));
+	} elsif ($dir == 3) {  # NUTR-3
+	    $nutrcoord = $strand eq '+' ? join("\t", ($edge+1, $edge+$readlen)) : join("\t", ($edge-$readlen, $edge-1));
+	} else {
+	    print "NUTR FAIL: $read $start-$end $uxon $ustart-$uend\n";
+	    $nutrfail++;
+	}
+	$assignments{$read}{$gene}{NUTR}{$id} = 1;  # contiguous alignment, hits gene but not contained
+	$allfeats{$chr}{$nutrcoord}{NUTR}{$id} = $strand;
+	$x{NUTR}++;
+    } elsif ($internal{$read}{$gene}) {
+	if ($start >= $ustart && $end <= $uend) {   # UXON
+	    $assignments{$read}{$gene}{UXON}{$uxon} = 1;  # contiguous alignment, contained by uxon
+	    $x{UXON}++;
+	} else {
+	    my ($id, $uibocoord);
+	    if ($start < $ustart && $end > $uend) {  # UIBO-X
+		$id = "$uxon-X";
+		$uibocoord = join "\t", ($ustart-$readlen, $uend+$readlen);
+	    } elsif ($start < $ustart) {  # UIBO-5
+		$id = $strand eq '+' ? "$uxon-5" : "$uxon-3";
+		$uibocoord = join "\t", ($ustart-$readlen, $ustart-1);
+	    } elsif ($end > $uend) {  # UIBO-3
+		$id = $strand eq '+' ? "$uxon-3" : "$uxon-5";
+		$uibocoord = join "\t", ($uend+1, $uend+$readlen);
+	    } else {
+		print "UXON FAIL: $read $start-$end $uxon $ustart-$uend\n";
+		$uxonfail++;
+	    }
+	    $assignments{$read}{$gene}{UIBO}{$id} = 1;  # contiguous alignment, hits uxon but not contained
+	    $allfeats{$chr}{$uibocoord}{UIBO}{$id} = $strand;
+	    $x{UIBO}++;
+	}
+    } else {
+	print "GENE FAIL: $read $start-$end, $uxon $ustart-$uend | $dir, $edge\n";
+	$genefail++;
+    }
+}
+print "uxons A: $.\n";
+close IN;
+print "$genefail genefail, $uxonfail uxonfail, $nutrfail nutrfail\n";
+
+open IN, $iint_CON or die;
+while (<IN>) {
+    chomp;
+    my ($read, $iint) = split /\t/, $_;
+    $allreads{$read}++;
+    my $gene = (split /:/, $iint)[0];
+    next if exists $juncreads{$read};
+    $assignments{$read}{$gene}{IINT}{$iint} = 1;  # contiguous alignment, contained by iintron and no uxons
+    $x{IINT}++;
+}
+print "iintrons: $.\n";
+close IN;
+
+open IN, $prom_ALL or die;
+while (<IN>) {
+    chomp;
+    my ($start, $end, $read, $pstart, $pend, $gene) = split /\t/, $_;
+    $allreads{$read}++;
+    next if exists $juncreads{$read};
+    if ($start >= $pstart && $end <= $pend) {   # contained by promoter space
+	$assignments{$read}{$gene}{PROM}{$gene} = 1;
+	$x{PROM}++;
+    } else {
+	## ignore -- NUTR or other stuff already assigned
+    }
+}
+print "promoters: $.\n";
+close IN;
+
+open IN, $tail_ALL or die;
+while (<IN>) {
+    chomp;
+    my ($start, $end, $read, $tstart, $tend, $gene) = split /\t/, $_;
+    $allreads{$read}++;
+    next if exists $juncreads{$read};
+    if ($start >= $tstart && $end <= $tend) {   # contained by promoter space
+	$assignments{$read}{$gene}{TAIL}{$gene} = 1;
+	$x{TAIL}++;
+    } else {
+	## ignore -- NUTR or other stuff already assigned
+    }
+}
+print "tail regions: $.\n";
+close IN;
+
+my %chimeratmp2;
+open IN, $itgc_ALL or die;
+while (<IN>) {
+    chomp;
+    my ($start, $end, $read, $istart, $iend, $itgn) = split /\t/, $_;
+    $allreads{$read}++;
+    if (exists $isplice_reads{$read}) {
+	if (exists $opinion2{$read}) {  # the rarest reads around: junction span doesn't hit any genes, but the full read alignment does
+	    print "$read: final=ichimera!\n" if $read eq $flagread;
+	    $juncpass{$read} = 1;
+	    $chim{4}++;
+	    foreach my $gene (keys %{ $opinion2{$read} }) {
+		my ($dir, $edge) = @{ $opinion2{$read}{$gene} };
+		my $gside = $dir == 5 ? 3 : 5;  # flip 5/3
+		foreach my $junc (keys %{ $isplice_reads{$read} }) {
+		    my ($chr, $jstart, $jend, $strand) = @{ $allfeats2{TJUN}{$junc} };
+		    my $coord = "$jstart\t$jend";
+		    my $jcoord = "$chr\t$coord";
+		    $chimeratmp2{$jcoord}{$gside}{$gene} = 1;
+		    $juncreads{$read}{$gene} = 1;
+		    $allfeats{$chr}{$coord}{CJUN}{$junc} = $strand;   # $strand should be '.'
+		    $allfeats2{CJUN}{$junc} = [$chr, $jstart, $jend, $strand];
+		    $assignments{$read}{$gene}{CJUN}{$junc} = 1;
+		    push @read2junc, "$read\t$junc\tCHIM\n";
+		}
+	    }
+	    $x{CJUN}++;
+	} elsif ($start => $istart && $end <= $iend) {   # contained by intergene
+	    print "$read: final=ijunc!\n" if $read eq $flagread;
+	    foreach my $junc (keys %{ $isplice_reads{$read} }) {
+		my ($chr, $jstart, $jend, $strand) = @{ $allfeats2{TJUN}{$junc} };
+		my $coord = "$jstart\t$jend";
+		my $jcoord = "$chr\t$coord";
+		$assignments{$read}{$itgn}{IJUN}{$junc} = 1;
+		$allfeats{$chr}{$coord}{IJUN}{$junc} = $strand;   # $strand should be '.'
+		$allfeats2{IJUN}{$junc} = [$chr, $jstart, $jend, $strand];
+	    }
+	    $x{IJUN}++;
+	} else {
+	    print "TJUN FAIL: $read $start-$end, $itgn $istart-$iend\n";
+	}
+    } elsif ($start >= $istart && $end <= $iend) {   # contained by intergene
+	next if exists $juncreads{$read};  # chimeras
+	print "$read: final=itgc!\n" if $read eq $flagread;
+	push @multiplicity, 1;  # only 1 annot per read in intergenic space!
+	$assignments{$read}{$itgn}{ITGC}{$itgn} = 1;
+	$x{ITGC}++;
+    } else {
+	print "$read: final=ifail! $start-$end, $istart-$iend, $itgn\n" if $read eq $flagread;
+	## ignore -- NUTR or other stuff already assigned
+    }
+}
+print "intergenes: $.\n";
+close IN;
+
+foreach my $jcoord (keys %chimeratmp2) {
+    my $g5 = join ',', sort keys %{ $chimeratmp2{$jcoord}{5} };
+    my $g3 = join ',', sort keys %{ $chimeratmp2{$jcoord}{3} };
+    $g5 = '?' unless $g5;
+    $g3 = '?' unless $g3;
+    my $junc = sprintf("JUNC%0${jchars}i",$noveljunc{$jcoord}{J});
+    $chimera_genes{$junc} = "$g5-$g3";
+}
+
+open OUT, "> $tmp.reads2juncs.txt";
+print OUT @read2junc;
+close OUT;
+
+print "Chimeric filter: $chim{0}, $chim{1}, $chim{2}, $chim{3} ($chim{X}), + $chim{4}\n";
+
+
+
+my @ranked = qw/ UXON KJUN UIBO NJUN IINT NUTR CJUN PROM TAIL ITGC IJUN /;   # feature types in order or precedence
+
+
+
+my (%fullhits, %genehits, $fail, $multi, $mono, $lost, $juncpass2, $xSum, $ySum, $zSum, $rSum, $multisum, %y, %z, @readfail);
+foreach my $read (keys %allreads) {
+    unless ($assignments{$read}) {
+	push @readfail, $read;
+	next;
+    }
+    my @genes = keys %{ $assignments{$read} };
+    push @multiplicity, scalar @genes; 
+    if (scalar (@genes) == 0) {  # FAIL
+	$fail++;
+#	print "$read: @genes\n";
+    } elsif (scalar (@genes) > 1) {  # > 1 gene: multiread or overlapping annotations
+	$multi++;
+	my %ftypes;
+	foreach my $gene (@genes) {
+	    $ftypes{$_}{$gene} = 1 foreach keys %{ $assignments{$read}{$gene} };
+	}
+	my $assign;
+	foreach my $type (@ranked) {
+	    next if $assign;  # already assigned to highest possible feature-type rank -- skip rest
+	    if ($ftypes{$type}) {
+		foreach my $gene (keys %{ $ftypes{$type} }) {
+		    foreach my $component (keys %{ $assignments{$read}{$gene}{$type} }) {
+			$fullhits{$type}{$component}{N}++;
+			$fullhits{$type}{$component}{G}{$gene} = 1;
+			$genehits{$type}{$gene}++;
+			$z{$type}++;
+		    }
+		}
+		$assign = $type;
+	    }
+	}
+	if ($assign) {
+	    $y{$assign}++;
+	} else {
+	    my $fstr = join ' ', sort keys %ftypes;
+#	    print "Assigned but no feature types! $read ($fstr, @genes)\n";
+	    $lost++;
+	}
+    } else {
+	$mono++;
+	my $gene = (keys %{ $assignments{$read} })[0];
+	my $type = (keys %{ $assignments{$read}{$gene} })[0];
+#	print "$read: $gene, $type, $id\n";
+	my $id = (keys %{ $assignments{$read}{$gene}{$type} })[0];
+	my $Nids = scalar(keys %{ $assignments{$read}{$gene}{$type} });
+#	if ($Nids > 1) {
+#	    print "Too many IDs ($Nids): $gene $type $read!\n";
+#	    print " $_\n" foreach keys %{ $assignments{$read}{$gene}{$type} };
+#	}
+	$fullhits{$type}{$id}{N}++;
+	$fullhits{$type}{$id}{G}{$gene} = 1;
+	$genehits{$type}{$gene}++;
+	$y{$type}++;
+	$z{$type}++;
+    }
+    $juncpass2++ if exists $juncreads{$read};
+}
+print "$multi multi, $mono mono, $fail failed, $lost lost\n";
+print "junction reads: $juncpass0, $juncpass1, $juncpass2\n";
+my %fcount;
+$fcount{$_} = scalar(keys %{ $allfeats2{$_} }) foreach keys %x;
+print "TYPE\tFREQ\tRAW\tRDS\n";
+print "$_\t$fcount{$_}\t$x{$_}\t$y{$_}\n" foreach keys %x;
+$xSum += $x{$_} foreach keys %x;
+$ySum += $y{$_} foreach keys %y;
+$zSum += $z{$_} foreach keys %z;
+print "TOTAL RAW ASSIGNMENTS: $xSum\n";
+
+open OUT, "> $alias/$alias.featureMapper.genesPerRead.txt";
+foreach (@multiplicity) {
+    print OUT "$_\n";
+    $multisum += $_;
+}
+close OUT;
+
+open OUT, "> $tmp.unassigned.reads.txt";
+print OUT "$_\n" foreach @readfail;
+close OUT;
+
+my $Nmult = scalar @multiplicity;
+my $obsreads = scalar keys %allreads;
+$rSum += $allreads{$_} foreach keys %allreads;
+print "READS OBSERVED: $obsreads, vs bamreads $alnreads (diff ",($obsreads-$alnreads),")\n";
+print "READS ASSIGNED: $ySum (lost ",($obsreads-$ySum),")\n";
+print "TOTAL ASSIGNMENTS: $zSum, vs bamreads $totalns (diff ",($zSum-$totalns),")\n";
+
+my %summ;
+foreach my $gene (keys %{ $allfeats2{GENE} }) {
+    my ($chr, $start, $end, $strand) = @{ $allfeats2{GENE}{$gene} };
+    my $coord = "$start\t$end\t$strand";
+    push @{ $summ{G}{$chr}{$coord} }, join("\t",($gene,$chr,$coord,map {$genehits{$_}{$gene}} @ranked)),"\n";
+}
+foreach my $itgn (keys %allitgn) {
+    my ($chr, $start, $end, $strand) = @{ $allitgn{$itgn} };
+    my $coord = "$start\t$end\t$strand";
+    push @{ $summ{I}{$chr}{$coord} }, join("\t",($itgn,$chr,$coord,map {$genehits{$_}{$itgn}} @ranked)),"\n";
+}
+open OUT, "> $alias/$alias.featureMapper.summary.txt";
+print OUT join("\t", ("OBJECT\tCHR\tSTART\tEND\tSTRAND",@ranked)), "\n";
+foreach my $GI (qw/ G I /) {
+    foreach my $chr (@allchrs) {
+	print OUT @{ $summ{$GI}{$chr}{$_} } foreach sort {$a <=> $b} keys %{ $summ{$GI}{$chr} };
+    }
+}
+close OUT;
+
+my %ignored = map {($_=>1)} qw/ GENE TJUN /;
+my %ignorable = map {($_=>1)} qw/ UIBO NUTR /;
+open OUT, "> $alias/$alias.featureMapper.full.txt";
+print OUT "CHR\tSTART\tEND\tSTRAND\tTYPE\tID\tREADS\tGENE(S)\n";
+foreach my $chr (@allchrs) {
+    foreach my $coord (sort {$a <=> $b} keys %{ $allfeats{$chr} }) {
+	foreach my $type (sort keys %{ $allfeats{$chr}{$coord} }) {
+	    next if $ignored{$type};
+	    foreach my $id (sort keys %{ $allfeats{$chr}{$coord}{$type} }) {
+		my $strand = $allfeats{$chr}{$coord}{$type}{$id};
+		my $genes = $type eq 'CJUN' ? $chimera_genes{$id} : 
+		    $type =~ /JUN$/ ? join(',', sort keys %{ $fullhits{$type}{$id}{G} }) : '';
+		my $N = $fullhits{$type}{$id}{N} || '0';  # guarantee printable
+		next if ($N == 0 && $ignorable{$type});
+		print OUT "$chr\t$coord\t$strand\t$type\t$id\t$N\t$genes\n";
+	    }
+	}
+    }
+}
+close OUT;
+
+system "rm -f $tmp.*";
+print "featureMapper $alias complete!\n";
+$| = 1;
+kill $$;
+
+
+sub execute {
+    print "$_[0]\n"; system $_[0];
+}

@@ -1,0 +1,76 @@
+#!/usr/bin/perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+# for a set of BED coords, extract UCSC vertebrate phyloP30way scores from preformatted files
+
+my $phylodir = '/n/projects/apa/stuff/mm9_phyloP';  # directory of formatted UCSC phyloP files
+my $phylofile = 'phyloP30way.master.txt';  # phyloP files must by <chromosome>.$phylofile
+my @phylonames = qw/ Euarchontoglires Placental Vertebrate /;  # names for the columns in the phyloP files, in order
+my $phylonames1;  # input for new phylonames, CSV string
+my $bed;          # BED file of locations
+my $ncols;        # number of bed columns
+my $outfile;      # output
+my %coords;       # coord storage
+my @ordchr;       # chromosomes in input order
+
+GetOptions("b=s" => \$bed, "o=s" => \$outfile, "d=s" => \$phylodir, "f=s" => \$phylofile, "n=s" => \$phylonames1);
+
+die "$0: No output file specified!\n" unless $outfile;
+@phylonames = split /,/, $phylonames1 if $phylonames1;
+
+open IN, $bed or die "$0: Failed to open '$bed' for reading: $!\n";
+while (<IN>) {
+    next if ($_ =~ /^track/ || $_ =~ /^#/);
+    $_ =~ s/[\n\r]+$//;
+    my @data = split /\t/, $_;
+    $data[1]++;  # now in 1-based
+    $ncols = scalar @data unless $ncols;
+    my ($chr, $start, $end, $id) = @data[0..3];
+    my $strand = $data[5] ? $data[5] : '+';
+    $id = $. unless $id;   # line number, if no IDs
+    push @ordchr, $chr unless $coords{$chr};
+    push @{ $coords{$chr} }, [@data[0..5]];  # store only first 6 cols, if that many
+}
+close IN;
+
+$ncols = 4 if $ncols < 4;  # ID guaranteed
+$ncols = 6 if $ncols > 6;  # won't print more than 6 cols to output
+
+open OUT, "> $outfile" or die "$0: Failed to open '$outfile' for writing: $!\n";
+print OUT "Chr\tStart\tEnd\tID";
+print OUT "\tScore" if $ncols >= 5;
+print OUT "\tStrand" if $ncols >= 6;
+print OUT "\t",join("\t",@phylonames),"\n";
+foreach my $chr (@ordchr) {
+    print "Extracting $chr...\n" if $coords{$chr};
+    my %targets;   # target coords for this chromosome
+    my %cons;      # conservation scores
+    foreach my $entry (@{ $coords{$chr} }) {
+	my ($start, $end, $id) = @$entry[1..3];
+	$targets{$_}{$id} = 1 foreach ($start..$end);  # allowing for > 1 entry to have some bp in common
+    }
+    my $pfile = "$phylodir/$chr.$phylofile";
+    open IN, $pfile or die "$0: Failed to open '$pfile' for reading: $!\n";
+    while (<IN>) {
+	next unless $targets{$.};
+	$_ =~ s/[\n\r]+$//;
+	my @scores = split /\t/, $_;
+	foreach my $id (keys %{ $targets{$.} }) {
+	    push @{ $cons{$id}{ $phylonames[$_] } }, $scores[$_] foreach (0..$#scores);
+	}
+    }
+    close IN;
+    foreach my $entry (@{ $coords{$chr} }) {
+	my ($chr, $start, $end, $id, $score, $strand) = @$entry;
+	if ($strand eq '-') {
+	    @{ $cons{$id}{$_} } = reverse(@{ $cons{$id}{$_} }) foreach keys %{ $cons{$id} };
+	}
+	print OUT join("\t", @$entry[0..$ncols-1]);
+	print OUT "\t",join(',', @{ $cons{$id}{$_} }) foreach @phylonames;
+	print OUT "\n";
+    }
+}
+close OUT;
+exit;

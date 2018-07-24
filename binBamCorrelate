@@ -1,0 +1,175 @@
+#!/usr/bin/env Rscript
+
+source("/home/apa/apa_tools.R")
+
+ca <- commandArgs(TRUE)
+outdir <- ca[1]
+ca <- ca[2:length(ca)]
+savedata <- ca[grepl("^--save-rdata",ca,ignore.case=TRUE)]
+alreadylog <- any(ca=="--already-in-log")  # generally, input data will NOT already be in log
+bedfile <- ca[grepl("^--bed=",ca)]
+rdatas <- ca[!grepl("^--",ca)]
+
+if (!grepl("/$",outdir)) outdir <- paste0(outdir,"/")
+system(paste("mkdir",outdir))
+outprefix <- paste0(outdir,"binBamCorrelate.")
+
+if (length(rdatas)<2) stop("Cannot specify < 2 input RData files!\n")
+
+savedata <- ifelse(length(savedata)==0, FALSE, TRUE)
+
+if (length(bedfile)>1) {
+    stop("Cannot specify > 1 bed file!\n")
+} else if (length(bedfile)>0) {
+    bedfile <- sub("--bed=","",bedfile)
+    bed <- read.bed(bedfile)
+} else {
+    bed <- NULL
+}
+
+R <- length(rdatas)
+rdatas <- do.call(rbind, strsplit(rdatas,"="))
+if (ncol(rdatas)==1) rdatas <- data.frame(NAME=NA,ORIGIN="",FILE=rdatas)
+lost <- !file.exists(rdatas$FILE)
+if (any(lost)) stop(paste0("Some input files do not exist:\n ",paste(rdatas[lost],collapse="\n "),"\n"))
+for (i in 1:R) rdatas$FILE[i] <- system(paste("readlink -f",rdatas$FILE[i]), intern=TRUE)
+if (any(is.na(rdatas$NAME))) {
+    samples <- extract.names.from.paths(rdatas$FILE)
+    if (length(samples)==0) stop("Unable to find a uniquely-identifying directory level or combination thereof!  Please specify names manually\n  I.e. specify \"name1=file1 name2=file2\" instead of just \"file1 file2\"\n")
+    rdatas$NAME <- samples
+}
+
+## Test if expected RData types FIRST, before attempting to load...
+for (i in 1:R) {
+    if (grepl("binMeans",rdatas$FILE[i])) {
+        ## binBamCoverage output
+        rdatas$ORIGIN[i] <- "binBamCoverage"
+    } else if (grepl("RChipQC",rdatas$FILE[i])) {
+        ## RChipQC.R output
+        rdatas$ORIGIN[i] <- "RChipQC.R"
+    } else {
+        stop(paste0("Unknown RData type '",rdatas$FILE[i],"': expecting 'binMeans' or 'RChipQC'!\n"))
+    }    
+}
+print(rdatas)
+if (length(unique(rdatas$ORIGIN))>1) stop("All RDatas must have the same origin!\n");
+
+suppressMessages(require(GenomicRanges))
+
+gr.list <- vector("list",length=R)
+names(gr.list) <- rdatas$NAME
+metaname <- NULL
+for (binBamCorrelate.this.i in 1:R) {
+    ## ####### WARNING: DO NOT USE 'i' (or anything else simple), AS LOADED OBJECTS BELOW MAY CONTAIN THEIR OWN 'i' !!!!!!!!!!!!!!
+    message("Loading ",rdatas$NAME[binBamCorrelate.this.i])
+    if (rdatas$ORIGIN[binBamCorrelate.this.i]=="binBamCoverage") {
+        ## Expecting 'bins.gr'; scale is indicated in the RData name
+        load(rdatas$FILE[binBamCorrelate.this.i])   
+        gr.list[[binBamCorrelate.this.i]] <- bins.gr
+        metaname <- "mean"
+    } else if (rdatas$ORIGIN[binBamCorrelate.this.i]=="RChipQC.R") {
+        ## Expecting 'bin.sums.1000' (although .100 and .10000 may also exist)
+        load(rdatas$FILE[binBamCorrelate.this.i])
+        gr.list[[binBamCorrelate.this.i]] <- bin.sums.1000
+        metaname <- "sum"
+    } else {
+        stop(paste0("No handlers for RData origin '",rdatas$ORIGIN[binBamCorrelate.this.i],"'!\n"))
+    }
+}
+
+## Whole-genome means matrix, initially
+means <- do.call(cbind, lapply(gr.list, function(x) attributes(x)$elementMetadata[[metaname]] ))   # should all be identical length: identical genome binning
+if (!alreadylog) means <- log2(means+1)
+overlaps <- NULL
+
+if (length(bedfile)>0) {
+    
+    ## Subsetting 'means' on bed regions
+    
+    bed.gr <- bed2gr(bed)
+    bed.w <- width(bed.gr)
+    
+    ## Overkill...
+    ##ol.list <- lapply(gr.list, function(x) {
+    ##    y <- findOverlaps2(bed.gr, x, ignore.strand=TRUE)[,c(1,2,3,3,3,3,3)]
+    ##    colnames(y)[4:7] <- c("queryWidthPct","subjectWidthPct","Keep","Mean")
+    ##    y[,4] <- y[3]/bed.w[y[,1]]
+    ##    y[,5] <- y[3]/width(x)[y[,2]]
+    ##    y[,6] <- apply(y[,4:5]>=0.25,1,any)
+    ##    y[,7] <- attributes(x)$elementMetadata$means[y[,2]]
+    ##    y
+    ##})
+    ##means <- do.call(cbind, lapply(ol.list, function(x) x$Mean[x$Keep] ))   # should all be identical length: single bed file vs identical genome binning
+    
+    x <- findOverlaps2(bed.gr, gr.list[[1]], ignore.strand=TRUE)[,c(1,2,3,3,3,3)]
+    colnames(x)[4:6] <- c("queryWidthPct","subjectWidthPct","Keep")
+    x[,4] <- x[3]/bed.w[x[,1]]
+    x[,5] <- x[3]/width(gr.list[[1]])[x[,2]]
+    x[,6] <- apply(x[,4:5]>=0.25,1,any)  # only retain bed-bin overlaps where either interval is overlapped by at least 25%
+    means <- means[x[x$Keep,2],]  # bed.gr match positions to every member of gr.list should be identical...
+    
+    gr.bed <- gr2bed(gr.list[[1]])
+    overlaps <- cbind(bed[x[,1],1:4], gr.bed[x[,2],1:3], x[,4:6])
+    
+    
+    ## FUTURE: write overlaps table (a la intersectBed -wo)
+    
+    
+}
+
+
+mw <- calculate.margin.width(rdatas$NAME)
+rs <- rowSums(means)
+trs <- which(rs>=quantile(rs,0.9))
+
+png(paste0(outprefix,"all.ord.png"), 700, 600)
+cm <- corr.mat(means, pmar=c(mw,mw), view=TRUE, cex=1.2, main="Pearson Correlations (All), Ordered")
+dev.off()
+
+png(paste0(outprefix,"all.clust.png"), 700, 600)
+corr.mat(means, pmar=c(mw,mw), view=TRUE, cex=1.2, reorder=TRUE, main="Pearson Correlations (All), Clustered")
+dev.off()
+
+png(paste0(outprefix,"top.ord.png"), 700, 600)
+tcm <- corr.mat(means[trs,], pmar=c(mw,mw), view=TRUE, cex=1.2, main="Pearson Correlations (Top), Ordered")
+dev.off()
+
+png(paste0(outprefix,"top.clust.png"), 700, 600)
+corr.mat(means[trs,], pmar=c(mw,mw), view=TRUE, cex=1.2, reorder=TRUE, main="Pearson Correlations (Top), Clustered")
+dev.off()
+
+system(paste0("convert ",outprefix,"all.ord.png ",outprefix,"all.clust.png +append ",outprefix,"all.png"))
+system(paste0("convert ",outprefix,"top.ord.png ",outprefix,"top.clust.png +append ",outprefix,"top.png"))
+
+system(paste0("rm -f ",outprefix,"all.ord.png ",outprefix,"all.clust.png"))
+system(paste0("rm -f ",outprefix,"top.ord.png ",outprefix,"top.clust.png"))
+
+if (nrow(means)>1E5) {
+    drows <- sample(1:nrow(means),1E5)
+    dtitle <- "Density Histogram, All (100k sample)"
+} else {
+    drows <- 1:nrow(means)
+    dtitle <- "Density Histogram, All"
+}
+
+if (length(trs)>1E5) {
+    drows2 <- sample(trs,1E5)
+    dtitle2 <- "Density Histogram, Top (100k sample)"
+} else {
+    drows2 <- trs
+    dtitle2 <- "Density Histogram, Top"
+}
+
+png(paste0(outprefix,"histos.png"), 1200, 600)
+par(mfrow=c(1,2), cex=1.2, las=1)
+dhist(means[drows,], main=dtitle)
+dhist(means[drows2,], main=dtitle2)
+dev.off()
+
+write.table2(cm,  paste0(outprefix,"all.txt"), row.head="Sample")
+write.table2(tcm, paste0(outprefix,"top.txt"), row.head="Sample")
+
+if (savedata) save(rdatas, means, mw, cm, tcm, rs, trs, drows, drows2, dtitle, dtitle2, outprefix, bed, overlaps, alreadylog, file=paste0(outprefix,"RData"))
+
+quit()
+

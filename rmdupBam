@@ -1,0 +1,21 @@
+#!/usr/bin/env perl
+use strict;
+
+my ($PE, @bams);
+foreach (@ARGV) {
+    if ($_ eq '--PE') {
+	$PE = 1;
+    } elsif (-e $_) {
+	push @bams, $_;
+    } else {
+	die "BAM file '$_' not found!\n";
+    }
+}
+
+my $switch = $PE ? '-S' : '-s';
+
+foreach my $bam (@bams) {
+    (my $rmdup = $bam) =~ s/bam$/rmdup.bam/i;
+    system "samtools rmdup $switch $bam $rmdup";
+    system "samtools index $rmdup";
+}

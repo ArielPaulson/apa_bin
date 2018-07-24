@@ -1,0 +1,3 @@
+#!/bin/sh
+
+ypcat passwd | sed -n -e 's/^\(...:\).*$/\1/p' > user.list

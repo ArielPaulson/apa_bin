@@ -1,0 +1,89 @@
+#!/usr/bin/env Rscript
+
+source("/home/apa/apa_tools.R")
+
+ca <- commandArgs(trailing=TRUE)
+xls.file <- ca[1]
+geno <- ca[2]
+
+if (grepl(".gz$",xls.file)) {
+    prefix <- sub("xls.gz","",xls.file)
+    header <- system(paste("zcat",xls.file,"| head -100 | grep \"^#\""), intern=TRUE)
+    xls <- read.delim(gzfile(xls.file), as.is=TRUE, skip=length(header)+1)
+} else {
+    prefix <- sub("xls","",xls.file)
+    header <- system(paste("cat",xls.file,"| head -100 | grep \"^#\""), intern=TRUE)
+    xls <- read.delim(xls.file, as.is=TRUE, skip=length(header)+1)
+}
+prefix <- paste0(prefix,"macs2PeakStats.")
+
+chrdat <- read.delim(paste0("/n/data1/genomes/indexes/",geno,"/",geno,".chrom_data.txt"), as.is=TRUE)
+provs <- grep("\\.Name$",colnames(chrdat))
+w.prov <- provs[sapply(provs, function(i) all(xls[,1] %in% chrdat[,i]))][1]
+if (length(w.prov)==0) stop(paste0("Wrong genome: no provider for genome '",geno,"' contains all the chromosomes from the peaks xls!"))
+fullchr <- chrdat$Assembly=="chromosome"
+noncirc <- !chrdat$Circular
+somchr <- if (any(fullchr)) { fullchr & noncirc } else { noncirc }  # full somatic chrs, or, whatever is non-MT
+barchr <- chrdat[somchr,w.prov]  # chrs to use for barplots
+
+chrbars <- table(xls[xls[,1] %in% barchr,1])
+chrbars <- c(chrbars, sum(!(xls[,1] %in% barchr)))
+names(chrbars)[length(chrbars)] <- "Others"
+png(paste0(prefix,"chr_bars.png"), 600, 600)
+par(cex=1.2, las=ifelse(length(chrbars)>10,2,1))
+barplot(chrbars, main="Peaks per Chromosome")
+dev.off()
+
+bed <- nameless(cbind(xls[,c(1:3,10,5)],"+"))
+write.bed(bed, paste0(prefix,"bed"))
+dat <- xls[,c(4,6,8,7,9)]
+colnames(dat) <- c("width","height","FC","pvalue","qvalue")
+ldat <- dat; for (i in 1:3) ldat[,i] <- log2(dat[,i])
+colnames(ldat)[3] <- "LFC"
+
+
+pseq <- c( 1*10^-seq(300,100,-50), 1*10^-seq(90,10,-10), 1*10^-seq(9,2,-1), 0.05, 0.1, 0.25, 0.5, 0.99, 1 )
+pseq.counts <- data.frame(SIG=c(format(pseq[1:19],sci=TRUE),format(pseq[20:28],sci=FALSE)), NLOG10=round(-log10(pseq),4), t(sapply(-log10(pseq),function(i)c(P=sum(ldat$pvalue>=i),Q=sum(ldat$qvalue>=i)))))
+write.table(pseq.counts, paste0(prefix,"significance.txt"), sep="\t", quote=FALSE, row.names=FALSE)
+
+histos <- as.list(dat)
+histos[[1]] <- ldat[,1]
+logs <- c("log2","","","-log10","-log10")
+png(paste0(prefix,"histograms.png"), 1500, 1000)
+par(mfrow=c(2,3), cex=1.2, las=1)
+for (i in 1:5) dhist(histos[[i]], points=TRUE, legend=NA, main=paste(logs[i],colnames(dat)[i]))
+dev.off()
+
+phistos <- histos
+names(phistos)[c(1,4,5)] <- paste(c("log2","nlog10","nlog10"),names(histos)[c(1,4,5)])
+png(paste0(prefix,"scatterplots.png"), 800, 800)
+par(cex=1.5, las=1)
+pairs(phistos, pch=".")
+dev.off()
+
+png(paste0(prefix,"corrs.png"), 600, 500)
+cm <- corr.mat(as.matrix(ldat), plot=TRUE, pal="Reds")
+dev.off()
+
+pqtl <- quantile(ldat$pvalue, seq(0,1,length.out=256))
+w.pqtl <- nearest(ldat$pvalue, pqtl, index=TRUE)
+pcol <- palettizer("rainblo.k", 256)
+
+png(paste0(prefix,"p-h-fc.png"), 600, 600)
+par(cex=1.2, las=1)
+plot(dat$height, dat$FC, col=pcol[w.pqtl], xlab="Height", ylab="FC", main="Height vs FC, colored by P-value")
+legend("topleft", bty="n", pch=1, col=2:1, legend=paste(c("Max =","Min ="),rev(range(ldat$pvalue))))
+dev.off()
+
+png(paste0(prefix,"summit_centrality.png"), 600, 600)
+par(cex=1.2, las=1)
+dhist(100*(xls[,5]-xls[,2])/xls[,4], points=TRUE, main="Summit Position as % Peak Width", legend=NA)
+abline(v=50, col=4, lty=3)
+dev.off()
+
+png(paste0(prefix,"sorted_p.png"), 600, 600)
+par(cex=1.2, las=1)
+plot(sort(ldat$pvalue), xlab="N Peaks", ylab="-Log10(p)", main="Sorted Peak P-Magnitudes")
+abline(h=-log10(0.05), col=2)
+text(nrow(ldat), -log10(0.05), "0.05", col=2, adj=c(0.5,-0.3))
+dev.off()

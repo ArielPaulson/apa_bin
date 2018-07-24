@@ -1,0 +1,108 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+# Matches a query bed file to multiple subject bed files (via intersectBed) and tabulates the results by query.
+#
+# takes a query bed (-q), an output filename (-o), and 1+ subject beds (list after all other args).
+# returns a table, with the query bed as the first few columns, then N more columns, one for each subject bed.
+# each cell in row i, subject-bed col j indicates the overlap(s) between query bed entry # i and the entire subject bed j.
+# entries per cell may be: semicolon-delim list of matched IDs (default), a semicolon-delim list of "ID(overlap_bp)" strings (--overlaps), or the number of hits only (--counts).
+# matches are no strand-specific unless using -s or -S; these toggle the same behaviors as in 'intersectBed' (same-only and opposite-only, respectively).
+# use of '--noblank' drops queries with no matches in any subject.
+#
+# future: match to expanded queries; minimum-overlap thresholds (e.g. intersectBed's -f, -r); overlap type reporting (eclipses, identity, 5'/3' overhang)
+
+my ($querybed, $outfile, $samestrand, $oppstrand, $withoverlaps, $counts, $noblank, @subjects);
+GetOptions("q=s" => \$querybed, "o=s" => \$outfile, "s" => \$samestrand, "S" => \$oppstrand, "overlap" => \$withoverlaps, "count" => \$counts, "noblank" => \$noblank);
+my @subjects = @ARGV;
+die "No subject beds specified!\n" unless @subjects;
+die "Cannot specify both -s and -S!\n" if $samestrand && $oppstrand;
+die "Cannot request --overlap if using --counts\n" if $withoverlaps && $counts;
+
+my $tmp = "bedOverlaps.$$.tmp";
+
+my %qbed;
+open IN, $querybed or die "Cannot open query bed '$querybed': $!\n";
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    $qbed{$_} = $.;  # for print ordering, and in case no ID
+}
+close IN;
+
+my $qmax = scalar (split /\t/, (keys %qbed)[0]) - 1;
+if ($qmax < 5) {
+    if ($samestrand || $oppstrand) {
+	die "Query bed has no strand information.  Cannot use -s or -S\n";
+    }
+}
+
+my $ib_params = '-wao -split';
+$ib_params .= ' -s' if $samestrand;
+$ib_params .= ' -s' if $oppstrand;
+
+my (%master, @bednames);
+foreach my $bed (@subjects) {
+    my (%sbed, $smax);
+    my ($name) = ($bed =~ /([^\/]+)$/);
+    push @bednames, $name;
+    if (open IN, $bed) {
+	while (<IN>) {
+	    $_ =~ s/[\n\r]+$//;
+	    $sbed{$_} = $.;   # just in case no ID
+	}
+	close IN;
+	$smax = scalar (split /\t/, (keys %sbed)[0]) - 1;
+	die "Subject bed '$bed' has no strand data: cannot use -s or -S!\n" if ($smax < 4 && ($samestrand || $oppstrand));
+    } else {
+	print "Subject bed '$bed' not found!\n";
+	next;
+    }
+    print " $bed\n";
+    system "intersectBed $ib_params -a $querybed -b $bed > $tmp";
+    if (open IN, $tmp) {
+	while (<IN>) {
+	    chomp;
+	    my @data = split /\t/, $_;
+	    my $query = join "\t", @data[0..$qmax];
+	    my $subject = join "\t", @data[$qmax+1..$qmax+$smax];
+	    my $overlap = $data[-1];
+	    my $subjid = scalar(@data) < $qmax+4+1 ? $sbed{$subject} : $data[$qmax+4];   # no subject IDs?  use line numbers
+	    next if $subjid eq '.';   # no match
+	    $master{$query}{$name}{$subjid} = $overlap;
+	}
+	close IN;
+	unlink $tmp;
+    } else {
+	print "Failed to open intersectBed results for '$bed': $!\n";
+    }
+}
+
+
+my @bedfields = qw/ CHR START END NAME SCORE STRAND /;   # fields beyond this will have blank header entries
+my $header = join "\t", (@bedfields[0..$qmax], @bednames);
+
+open OUT, "> $outfile";
+print OUT "$header\n";
+foreach my $query (sort { $qbed{$a} <=> $qbed{$b} } keys %qbed) {
+    next if $noblank && !defined $master{$query};
+    print OUT $query;
+    foreach my $bed (@bednames) {
+	my @subjs = keys %{ $master{$query}{$bed} };
+	my @overs = values %{ $master{$query}{$bed} };
+	my @out;
+	if ($withoverlaps) {
+	    push @out, "$subjs[$_]($overs[$_])" foreach (0..$#subjs);
+	} elsif ($counts) {
+	    push @out, $#subjs+1;
+	} else {
+	    push @out, @subjs;
+	}
+	my $string = join ';', @out;
+	print OUT "\t$string";
+    }
+    print OUT "\n";
+}
+close OUT;
+exit;

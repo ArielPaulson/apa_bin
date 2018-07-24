@@ -1,0 +1,291 @@
+#!/usr/bin/env perl
+use Excel::Writer::XLSX;
+use Data::Dumper;
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+$| = 1;
+my ($inprefix, $outprefix, $genedata, $genes, $inter, $dropmap, $notrim);
+my $minwith = 1;  # min genes with term for term to be retained
+GetOptions("i=s" => \$inprefix, "o=s" => \$outprefix, "g=s" => \$genedata, "m=i" => \$minwith, "genes" => \$genes, "intermediate" => \$inter, "drop-map" => \$dropmap, "no-trim" => \$notrim);
+
+(my $pname = $inprefix) =~ s!^.*/!!;
+$outprefix = $pname unless $outprefix;
+my %set_names = ('T','terms', 'G','genes', 'I','intermediate');
+my %bkg_names = ('g','genome', 'c','complement', 'o','opposite');
+my %rawGO = map {($_=>1)} qw/ BP CC MF /;
+my (%data, %all, %headers, %pairs, %symbols, %counts, $useopp, $flagenrich);
+my $mindrop = 0;
+
+if ($genedata) {
+    open my $GD, '<', $genedata or die "$0: Cannot open gene data file '$genedata': $!\n";
+    while (<$GD>) {
+	my ($gid, $symb) = (split /\t/, $_)[0,1];
+	$symbols{$gid} = $symb;
+    }
+    close $GD;
+}
+
+foreach my $dir (glob "$inprefix*") {
+    next unless -d $dir;
+    my $tfile = (glob "$dir/*_significant_terms.txt")[0];
+    my $gfile = (glob "$dir/*_significant_genelist.txt")[0];
+    my $ifile = (glob "$dir/*_output.txt")[0];
+    next unless -e $tfile;
+    
+    (my $dname = $dir) =~ s!^.*/!!;
+    my ($name, $tdb, $bkg) = split /\./, $dname;
+    $all{bkg}{$bkg} = 1;
+    print "$dir => $dname: $name, $tdb, $bkg_names{$bkg}\n";
+    
+    print "Reading $tfile...";
+    open my $TIN, '<', $tfile;
+    while (<$TIN>) {
+	$_ =~ s/[\n\r]+$//;
+	my @fields = split /\t/, $_;
+	unless ($. == 1) {
+	    $fields[$_] /= 100 foreach (6,7,9);  # percent fields
+	}
+	if ($fields[23] && !$fields[24]) {  # basically for KEGG: add missing symbols field for Ensembl IDs
+	    $fields[24] = join('; ', map { $symbols{$_} } split '; ', $fields[23]);
+	}
+	if ($. == 1) {
+	    @fields = @fields[0..12,16..20,23..25] unless $notrim;
+	    @fields = @fields[1..$#fields] if $dropmap;
+	    $headers{T} = \@fields;
+	    next;
+	}
+	if ($bkg eq 'o') {
+	    if ($fields[10] =~ /^OVER/ && $fields[16] < $minwith) {
+		$mindrop++;
+		next;
+	    } elsif ($fields[10] =~ /^UNDER/ && $fields[18] < $minwith) {
+		$mindrop++;
+		next;
+	    }
+	} elsif ($fields[16] < $minwith) {  # not enough genes with term to take seriously
+	    $mindrop++;
+	    next;
+	}
+	$fields[2] = "GO-$fields[2]" if exists $rawGO{$fields[2]};
+	my ($map, $clust, $db, $fgpct, $enrich) = @fields[0..2,6,10];
+	@fields = @fields[0..12,16..20,23..25] unless $notrim;
+	@fields = @fields[1..$#fields] if $dropmap;
+	push @{ $data{T}{$bkg}{$map}{$clust}{$enrich}{$db}{$fgpct} }, \@fields;
+	$all{mapclust}{$map}{$clust} = 1;
+	$all{db}{$db} = 1;
+    }
+    print "  $. terms read\n";
+    close $TIN;
+    
+    if ($genes) {
+	print "Reading $gfile...";
+	open my $GIN, '<', $gfile;
+	while (<$GIN>) {
+	    $_ =~ s/[\n\r]+$//;
+	    my @fields = split /\t/, $_;
+	    if ($. == 1) {
+		@fields = @fields[1..$#fields] if $dropmap;
+		$headers{G} = \@fields;
+		next;
+	    }
+	    my ($map, $clust, $db, $lev, $acc, $gene) = @fields[0..4,7];
+	    @fields = @fields[1..$#fields] if $dropmap;
+	    push @{ $data{G}{$bkg}{$map}{$clust}{$acc}{$gene} }, \@fields;
+	    $all{mapclust}{$map}{$clust} = 1;
+	    $all{dblevacc}{$db}{$lev}{$acc} = 1;
+	    $all{gene}{$gene} = 1;
+	}
+	print "  $. genes read\n";
+	close $GIN;
+    }
+    
+    if ($inter) {
+	print "Reading $ifile...";
+	open my $IIN, '<', $ifile;
+	while (<$IIN>) {
+	    $_ =~ s/[\n\r]+$//;
+	    my @fields = split /\t/, $_;
+	    @fields = @fields[1..$#fields];  # drop numeric rowname
+	    if ($. == 1) {
+		@fields = @fields[1..$#fields] if $dropmap;
+		$headers{I} = \@fields;
+		next;
+	    }
+	    my ($map, $clust, $db, $lev, $acc) = @fields[0..4];
+	    @fields = @fields[1..$#fields] if $dropmap;
+	    push @{ $data{I}{$bkg}{$map}{$clust}{$db}{$lev}{$acc} }, \@fields;
+	    $all{mapclust}{$map}{$clust} = 1;
+	    $all{dblevacc}{$db}{$lev}{$acc} = 1;
+	}
+	print "  $. intermediate records read\n";
+	close $IIN;
+    }
+}
+
+if ($all{bkg}{o}) {  # clusters expected in "name", "-name" pairs
+    foreach my $map (sort keys %{ $all{mapclust} }) {
+	next unless $data{T}{o}{$map};
+	foreach my $clust (sort keys %{ $all{mapclust}{$map} }) {
+	    (my $pair = $clust) =~ s/^-//;
+	    $pairs{$map}{$pair}{$clust} = $pair eq $clust ? "$pair UP" : "$pair DOWN";
+	}
+    }
+}
+
+foreach my $set (qw/ T G I /) {  # Terms Genes Intermediate
+    next unless $data{$set};
+    print "Excel: $outprefix.$set_names{$set}.xlsx\n";
+    my $outxlsx = "$outprefix.$set_names{$set}.xlsx";
+    my $workbook = Excel::Writer::XLSX->new($outxlsx) or die "Failed to open output xlsx file '$outxlsx': $!\n";
+    my $header_format = $workbook->add_format();
+    $header_format->set_bold();
+    foreach my $bkg (qw/ g c o /) {  # background models: Genome Complement Opposite
+	next unless $data{$set}{$bkg};
+	my $worksheet = $workbook->add_worksheet($bkg_names{$bkg});
+	$worksheet->activate();
+	$worksheet->write_row(0, 0, $headers{$set}, $header_format);
+	$worksheet->freeze_panes(1, 0);
+	my $row = 0;
+	if ($set eq 'T') {
+	    foreach my $map (sort keys %{ $all{mapclust} }) {
+		my (@clusters, $opp);
+		if ($pairs{$map}) {
+		    $opp = 1;
+		    push @clusters, ($_,"-$_") foreach sort keys %{ $pairs{$map} };
+		} else {
+		    @clusters = sort keys %{ $all{mapclust}{$map} }
+		}
+		foreach my $clust (@clusters) {
+		    (my $pair = $clust) =~ s/^-//;
+		    foreach my $enrich (qw/ OVER* OVER UNDER UNDER* /) {
+			$flagenrich = 1 if $enrich =~ /\*/;
+			foreach my $db (sort keys %{ $data{T}{$bkg}{$map}{$clust}{$enrich} }) {
+			    foreach my $fgpct (sort {$b <=> $a} keys %{ $data{T}{$bkg}{$map}{$clust}{$enrich}{$db} }) {
+				foreach my $line (@{ $data{T}{$bkg}{$map}{$clust}{$enrich}{$db}{$fgpct} }) {
+				    my ($clust2, $enrich2);
+				    if ($opp) {
+					my $cl = $dropmap ? 0 : 1;
+					$line->[$cl] = $pairs{$map}{$pair}{$clust};
+					$clust2 = $enrich =~ /OVER/ ? $clust : "-$clust";
+					($enrich2 = $enrich) =~ s/UNDER/OVER/;
+				    } else {
+					$clust2 = $clust;
+				    }
+				    $worksheet->write_row(++$row, 0, $line);
+				    $enrich2 = $enrich2 =~ /\*$/ ? 'SP' : 'MS';   # only record sig-parent or most-specific
+				    $counts{$map}{$bkg}{$pair}{$clust2}{$db}{$enrich2}++;
+				}
+			    }
+			}
+		    }
+		}
+	    }
+	} elsif ($set eq 'G') {
+	    foreach my $map (sort keys %{ $all{mapclust} }) {
+		my (@clusters, $opp);
+		if ($pairs{$map}) {
+		    $opp = $useopp = 1;
+		    push @clusters, ($_,"-$_") foreach sort keys %{ $pairs{$map} };
+		} else {
+		    @clusters = sort keys %{ $all{mapclust}{$map} }
+		}
+		foreach my $clust (@clusters) {
+		    (my $pair = $clust) =~ s/^-//;
+		    foreach my $acc (sort keys %{ $data{G}{$bkg}{$map}{$clust} }) {
+			foreach my $gene (sort keys %{ $data{G}{$bkg}{$map}{$clust}{$acc} }) {
+			    foreach (@{ $data{G}{$bkg}{$map}{$clust}{$acc}{$gene} }) {
+				$_->[1] = $pairs{$map}{$pair}{$clust} if $opp;
+				$worksheet->write_row(++$row, 0, $_);
+			    }
+			}
+		    }
+		}
+	    }
+	} elsif ($set eq 'I') {
+	    foreach my $map (sort keys %{ $all{mapclust} }) {
+		my (@clusters, $opp);
+		if ($pairs{$map}) {
+		    $opp = 1;
+		    push @clusters, ($_,"-$_") foreach sort keys %{ $pairs{$map} };
+		} else {
+		    @clusters = sort keys %{ $all{mapclust}{$map} }
+		}
+		foreach my $clust (@clusters) {
+		    (my $pair = $clust) =~ s/^-//;
+		    foreach my $db (sort keys %{ $all{dblevacc} }) {
+			foreach my $lev (sort {$a <=> $b} keys %{ $all{dblevacc}{$db} }) {
+			    foreach my $acc (sort keys %{ $all{dblevacc}{$db}{$lev} }) {
+				foreach (@{ $data{I}{$bkg}{$map}{$clust}{$db}{$lev}{$acc} }) {
+				    $_->[1] = $pairs{$map}{$pair}{$clust} if $opp;
+				    $worksheet->write_row(++$row, 0, $_);
+				}
+			    }
+			}
+		    }
+		}
+	    }
+	}
+#	$worksheet->set_column($_, $_, $colWidths[$_]) foreach (0..16);
+    }
+    $workbook->close();
+    
+    
+    
+    next;   # CODE BELOW NOT READY YET
+    
+    
+    
+    open my $OUT, '>', "$outprefix.$set_names{$set}.counts.txt";
+    my ($header1, $header2);
+    unless ($dropmap) {
+	$header1 .= "\t";
+	$header2 .= "Map\t";
+    }
+    $header1 .= "\t";
+    $header2 .= "Cluster\tDB";
+    if ($flagenrich) {
+	foreach my $enrich2 (qw/ MS SP /) {
+	    if ($useopp) {
+		$header1 .= "\t$enrich2";
+		$header2 .= "\tOpp";
+	    }
+	    $header1 .= "\t$enrich2\t$enrich2";
+	    $header2 .= "\tComp\tGen";
+	}
+	print $OUT "$header1\n$header2\n";
+    } else {
+	$header2 .= "\tOpp" if $useopp;
+	$header2 .= "\tComp\tGen";
+	print $OUT "$header2\n";
+    }
+    foreach my $map (sort keys %{ $all{mapclust} }) {
+	my @clusters;
+	if ($useopp) {
+	    push @clusters, ("$_","-$_") foreach sort keys %{ $pairs{$map} };
+	} else {
+	    @clusters = sort keys %{ $all{mapclust}{map} };
+	}
+	foreach my $clust (@clusters) {
+	    foreach my $db (sort keys %{ $all{db} }) {
+		print $OUT "$map\t" unless $dropmap;
+		print $OUT "$clust\t$db";
+		foreach my $enrich2 (qw/ MS SP /) {
+		    foreach my $bkg (qw/ o c g /) {
+			next unless $counts{$map}{$bkg};
+			
+			
+			
+			
+			
+#			$counts{$map}{$bkg}{$clust2}{$db}{$enrich2};
+		    }
+		}
+	    }
+	}
+    }
+    close $OUT;
+}
+
+print "$mindrop terms dropped due to insufficient representation\n" if $minwith > 1;

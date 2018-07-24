@@ -1,0 +1,46 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my $delim = "\t";  # make this a param in the future
+my ($dataset, $filterfile, $col, $header, $filtord, $nodrop);
+GetOptions("d=s"=>\$dataset, "f=s"=>\$filterfile, "c=i"=>\$col, "h=i"=>\$header, "filter-order"=>\$filtord, "nodrop"=>\$nodrop);
+$col--;  # now an array index
+
+my (%filter, @filtered);
+open IN, $filterfile or die "Cannot open filter list '$filterfile': $!\n";
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    $filter{$_} = $.;
+}
+close IN;
+
+my %output;
+open IN, $dataset or die "Cannot open dataset '$dataset': $!\n";
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    if ($. == 1) {
+	$nodrop ? (print "$_\tFILTER-MATCH\n") : (print "$_\n");
+    } elsif ($. <= $header) {
+	print "$_\n";
+    } else {
+	my @data = split /$delim/, $_;
+	my $match = $filter{ $data[$col] };
+	if ($match) {
+	    if ($filtord) {
+		push @{ $output{$match} }, "$_\n";   # enables ranked storage of multiple matches
+	    } elsif ($nodrop) {
+		print "$_\t1\n";
+	    } else {
+		print "$_\n";
+	    }
+	}
+    }
+}
+close IN;
+
+if ($filtord) {
+    print @{ $output{$_} } foreach sort {$a<=>$b} keys %output;
+}
+exit;

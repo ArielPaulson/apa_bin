@@ -1,0 +1,20 @@
+#!/bin/bash
+
+## ASSUMES: split bam files with names like: path/sample.W.bam, path/sample.C.bam
+
+path_sample=$1   # this should be "path/sample", such that "$path_sample.W.bam" and "$path_sample.C.bam" both exist
+GTF=$2           # GTF to use with cufflinks
+
+path=${path_sample%/*};
+
+for str in W C
+do
+    tmp=$path/cufflinksStranded.$$.$str.tmp
+    cufflinks -u -G $GTF -o $tmp $path_sample.$str.bam --max-bundle-frags 1000000
+    for file in genes.fpkm_tracking isoforms.fpkm_tracking skipped.gtf transcripts.gtf
+    do
+	mv $tmp/$file $path_sample.$str.$file
+    done
+    rm -R $tmp
+done
+

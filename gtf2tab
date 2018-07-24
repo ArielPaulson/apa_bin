@@ -1,0 +1,28 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+my $gtf = $ARGV[0];
+my (%master, %allkeys);
+
+open my $IN, '<', $gtf or die "$0: Cannot read input gtf '$gtf': $!\n";
+while (<$IN>) {
+    s/[\n\r]+$//;
+    my @data = split /\t/, $_;
+    $master{$.}{CORE} = join "\t", @data[0..7];
+    $data[8] =~ s/;\s*$//;
+    foreach my $field (split /;/, $data[8]) {
+	my ($key, $value) = ($field =~ /(\S+) "([^"]+)"/);
+	$master{$.}{ANNOT}{$key} = $value;
+	$allkeys{$key} = 1;
+    }
+}
+
+my @keys = sort keys %allkeys;
+print join("\t", qw/ Chrom Source Feature Start End Score Strand Phase /, @keys), "\n";
+foreach my $i (1..$.) {
+    print $master{$i}{CORE};
+    print "\t$master{$i}{ANNOT}{$_}" foreach @keys;
+    print "\n";
+}

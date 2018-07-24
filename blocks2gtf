@@ -1,0 +1,71 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use strict;
+
+my ($file, $one, $type, $startend);   # input file (bed or psl) | "--one" for 1-based coords not 0-based
+GetOptions("f=s"=>\$file, "one"=>\$one, "t=s"=>\$type);  #, "SE"=>\$startend);
+
+my ($bed, $psl);
+my %ktypes = map {($_=>1)} qw/ bed psl /;
+my %kstrands = map {($_=>1)} qw/ + - /;
+
+if ($type) {
+    if ($type eq 'bed') {
+	$bed = 1;
+    } elsif ($type eq 'psl') {
+	$psl = 1;
+    }
+} else {
+    if ($file =~ /\.bed\d*$/i) {
+	$type = 'bed';
+	$bed = 1;
+    } elsif ($file =~ /\.psl$/i) {
+	$type = 'psl';
+	$psl = 1;
+    }
+}
+die "Unknown type '$type': specify '-t bed' or '-t psl', or file must be .bed or .psl!\n" unless $ktypes{$type};
+
+open IN, $file or die "Cannot open '$file': $!\n";
+while (<IN>) {
+    $_ =~ s/[\n\r]+$//;
+    my @data = split /\t/, $_;
+    my ($chr, $start, $end, $id, $strand, $blocksize, $blockstart, @starts);
+    if ($bed) {
+	($chr, $start, $end, $id, $strand, $blocksize, $blockstart) = @data[0..3,5,10,11];
+	$blocksize =~ s/,$//;
+	$blockstart =~ s/,$//;
+	if ($startend) {
+	    @starts = $one ? (map {$_-1} split /,/, $blocksize) : (split /,/, $blocksize);   # convert 1-based to 0-based, if 1-based
+	} else {
+	    @starts = $one ? (map {$_+$start-1} split /,/, $blockstart) : (map {$_+$start} split /,/, $blockstart);   # convert 1-based to 0-based, if 1-based
+	}
+    } elsif ($psl) {
+	($chr, $start, $end, $id, $strand, $blocksize, $blockstart) = @data[13,15,16,9,8,18,20];
+	print "Unknown strand '$strand': skipping...\n" unless $kstrands{$strand};  # esp. to avoid UCSC's coord systems involving '+-', e.g.
+	$blocksize =~ s/,$//;
+	$blockstart =~ s/,$//;
+	@starts = $one ? (map {$_-1} split /,/, $blockstart) : (split /,/, $blockstart);
+    }
+    if ($startend) {
+	my @ends = split /,/, $blockstart;
+	my $Nends = scalar @ends;
+	my $Nstarts = scalar @starts;
+	print "Line $.: Differing number of Starts ($Nstarts) and Ends ($Nends)!\n" if $Nends != $Nstarts;
+	foreach (0..$#starts) {
+	    my ($xstart, $xend) = ($starts[$_]+1, $ends[$_]);   # since all are 0-based now
+	    print "$chr\t$file\texon\t$xstart\t$xend\t.\t$strand\t.\tgene_id \"$id\"; transcript_id \"$id\";\n";
+	}
+    } else {
+	my @sizes = split /,/, $blocksize;
+	my ($xstart, $xend);
+	foreach (0..$#sizes) {
+	    ($xstart, $xend) = ($starts[$_]+1, $starts[$_]+$sizes[$_]);   # since all are 0-based now
+	    print "$chr\t$file\texon\t$xstart\t$xend\t.\t$strand\t.\tgene_id \"$id\"; transcript_id \"$id\";\n";
+	}
+	print "Line $.: Miscalculated end for $id: $xend != $end\n" unless $xend == $end;
+    }
+}
+close IN;
+exit;
+

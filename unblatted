@@ -1,0 +1,28 @@
+#!/usr/bin/env perl
+
+my ($fasta, $blat) = @ARGV;  # fasta file and its -m 8 blat output file
+die "Fasta '$fasta' not found\n" unless -e $fasta;
+die "Blat file '$blat not found!\n" unless -e $blat;
+
+open IN, $fasta or die "Cannot read '$fasta': $!\n";
+while (<IN>) {
+      if ($_ =~ /^>(.*)/) {
+      	 $header = $1;
+	 push @headers, $header;
+      } else {
+	  $seq{$header} .= $_;
+      }
+}
+close IN;
+
+open IN, $blat or die "Cannot read '$blat': $!\n";
+while (<IN>) {
+    $blatted{ (split /\t/, $_)[9] } = 1;
+}
+close IN;
+
+foreach my $header (@headers) {
+    next if $blatted{$header};
+    print ">$header\n$seq{$header}";
+}
+exit;

@@ -1,0 +1,241 @@
+#!/usr/bin/env perl
+use strict;
+
+my $tmp = "stripMultireads.$$";
+system "mkdir $tmp";
+die unless -d $tmp;
+my $sam = "$tmp/sam";
+my $fsam = "$tmp/fsam";
+my $fbam = "$tmp/fbam";
+my $fsam2 = "$tmp/fsam2";
+my $fbam2 = "$tmp/fbam2";
+my $idx = "$tmp/idx";
+
+my ($mode, $dedup, $aligner, $PE, $bowtie, $tophat, $sort, $index, $staysam, @bams);
+foreach (@ARGV) {
+    if ($_ =~ /^--mode(\d)/) {
+	$mode = $1;
+        # $1 is run-mode may be: 
+	# 1 = bam contains multiple alignments per read (Tophat), or 
+	# 2 = bam contains multireads but only one alignment for each (Bowtie2, noted by "XS:i:#" tag)
+    } elsif ($_ =~ /^--PE/) {
+	$PE = 1;   # paired-end -- only works in mode 1
+    } elsif ($_ =~ /^--dedup/) {
+	$dedup = 1;  # NOT PE-AWARE
+    } elsif ($_ =~ /^--sort/) {
+	$sort = 1;
+    } elsif ($_ =~ /^--index/) {
+	$index = 1;
+    } elsif ($_ =~ /^--sam/) {
+	$staysam = 1;
+    } elsif ($_ =~ /^--(bowtie|tophat)/) {
+	$aligner = 1;
+	$bowtie = 1 if $1 eq 'bowtie';
+	$tophat = 1 if $1 eq 'tophat';
+    } else {
+	push @bams, $_;
+    }
+}
+
+die "No mode was specified!\n" unless $mode;
+die "Cannot use mode 2 unless an aligner was specified!\n" if $mode == 2 && !$aligner;
+
+foreach my $bam (@bams) {
+    system "rm -f $tmp/*";
+    (my $tmpbam = $bam) =~ s/bam$/stripMultireads.tmp.bam/i;
+    (my $newbam = $bam) =~ s/bam$/stripMultireads.bam/i;
+    (my $newsam = $newbam) =~ s/bam$/sam/i;
+    print "Processing $bam...\n";
+    my $now = `date`;
+    if ($bam =~ /\.bam$/i) {
+	print "  BAM -> SAM: $now";
+	system(("bash","-c","samtools view -h $bam > $sam"));
+    } else {
+	$sam = $bam;
+    }
+    my (%filter, $pass);
+    my $alignments = my $removed = my $retained = 0;
+    
+    if ($mode == 1) {
+	
+	my $now = `date`;
+	print "  Extracting indexes: $now";
+	if (open IN, $sam) {
+	    while (<IN>) {
+		next if $_ =~ /^@/;   # DO NOT filter the header lines
+		$alignments++;
+		my ($idx, $flag) = (split /\t/, $_, 3)[0,1];
+#		my $dir = $flag & 16;  # 0 or 1
+#		$filter{$idx}{$dir}++;
+		if ($PE) {
+		    my $end = $flag & 64 ? 1 : $flag & 128 ? 2 : 0;
+		    $filter{$idx}{$end}++;
+		} else {
+		    $filter{$idx}++;
+		}
+	    }
+	    close IN;
+	    if (open IN, $sam) {
+		my $now = `date`;
+		print "  Filtering for multireads: $now";
+		if (open OUT, "> $fsam") {
+		    $pass = 1;
+		    while (<IN>) {
+			my ($idx, $flag) = (split /\t/, $_, 3)[0,1];
+#			my $dir = $flag & 16;  # 0 or 1
+#			if ($filter{$idx}{$dir} > 1) {
+			if ($PE) {
+			    my $end = $flag & 64 ? 1 : $flag & 128 ? 2 : 0;
+			    if ($filter{$idx}{$end} > 1) {
+				$removed++;
+			    } else {
+				$retained++ unless $_ =~ /^@/;
+				print OUT $_;   # should allow header lines to pass
+			    }
+			} elsif ($filter{$idx} > 1) {
+			    $removed++;
+			} else {
+			    $retained++ unless $_ =~ /^@/;
+			    print OUT $_;   # should allow header lines to pass
+			}
+		    }
+		    close IN;
+		    close OUT;
+		} else {
+		    print "  Failed to open sam file '$sam'!\n";
+		}
+	    } else {
+		print "  Failed to open sam file '$sam'!\n";
+	    }
+	} else {
+	     print "  Cannot read from index temp file 1 '$idx': $!\n";
+	}
+	
+    } elsif ($mode == 2) {
+	
+	if (open IN, $sam) {
+	    if (open OUT, "> $fsam") {
+		my $now = `date`;
+		print "  Filtering for multireads: $now";
+		$pass = 1;
+		if ($bowtie) {
+		    my $good = my $bad = my $subpe = my $unq = 0;
+		    while (<IN>) {
+			$alignments++ unless $_ =~ /^@/;
+			if ($_ =~ /\tAS:i:([-\d]+)\tXS:i:([-\d]+)/) {   # should allow header lines to pass
+			    if ($1-$2 > 1) {  # best secondary align not as good as primary, REQUIRING A DIFFERENCE > 1
+#				print "$2 < $1\n";
+				$retained++;
+				print OUT $_;
+				$good++;
+			    } elsif ($2 > $1) {  # likely from paired-end, where a better single-end align exists for an optimal-pair align
+#				print "$2 > $1\n";
+#				print "QUALITY: $_\n";
+#				<>;
+				$retained++;
+				print OUT $_;
+				$subpe++;
+			    } else {
+#				print "$2 == $1\n";
+				$removed++;
+#				print "DROPPED: $_\n";
+#				<>;
+				$bad++;
+			    }
+			} else {
+#			    print "unique\n";
+			    $retained++ unless $_ =~ /^@/;
+			    print OUT $_;
+			    $unq++;
+			}
+		    }
+		    print "$unq unique | $good good | $bad bad | $subpe subpe\n";
+		} elsif ($tophat) {
+		    while (<IN>) {
+			$alignments++ unless $_ =~ /^@/;
+			if ($_ =~ /NH:i:(\d+)/) {   # should allow header lines to pass
+			    if ($1 > 1) {
+				$removed++;
+			    } else {
+				$retained++;
+				print OUT $_;
+			    }
+			} else {
+			    $retained++ unless $_ =~ /^@/;
+			    print OUT $_;
+			}
+		    }
+		}
+		close IN;
+		close OUT;
+	    } else {
+		print "  Failed to open sam file '$sam'!\n";
+	    }
+	} else {
+	    print "  Failed to open sam file '$sam'!\n";
+	}
+	
+    } else {
+	
+	die "Run mode $mode not supported!  Use 1|2\n";
+	
+    }
+    
+    print " $alignments alignments | $removed removed | $retained retained\n";
+    
+    if ($pass) {
+	my $now = `date`;
+	print "  SAM -> BAM: $now";
+	if ($sort) {
+	    if ($staysam) {
+		system(("bash","-c","sort -k3,3d -k4,4n $fsam > $fsam2"));
+	    } else {
+		system(("bash","-c","samtools view -bS $fsam > $fbam"));
+		system(("bash","-c","samtools sort -o $fbam.sorted.bam $fbam"));
+		system(("bash","-c","mv $fbam.sorted.bam $fbam2"));
+	    }
+	} elsif ($staysam) {
+	    system(("bash","-c","mv $fsam $fsam2"));
+	} else {
+	    system(("bash","-c","samtools view -bS $fsam > $fbam2"));
+	}
+	if ($dedup) {
+	    my $now = `date`;
+	    print "  samtools rmdup: $now";
+	    if ($staysam) {
+		open my $IN, '<', $fsam2;
+		open my $OUT, '>', $newsam;
+		my ($prev_chr, $prev_pos);
+		while (<$IN>) {
+		    if (/^@/) {
+			print $OUT $_;
+		    } else {
+			my ($header, $flags, $chr, $pos, $else) = split /\t/, $_, 5;
+			if ($chr eq $prev_chr && $pos == $prev_pos) {
+			    next;
+			} else {
+			    print $OUT $_;
+			}
+			($prev_chr, $prev_pos) = ($chr, $pos);
+		    }
+		}
+		close $IN;
+		close $OUT;
+	    } else {
+		system(("bash","-c","samtools rmdup -s $fbam2 $newbam"));
+	    }
+	} elsif ($staysam) {
+	    system(("bash","-c","mv $fsam2 $newsam"));
+	    print "  Wrote $newsam\n";
+	} else {
+	    system(("bash","-c","mv $fbam2 $newbam"));
+	    system(("bash","-c","samtools index $newbam")) if $index;
+	    print "  Wrote $newbam\n";
+	}
+    }
+}
+
+system "rm -Rf $tmp";
+my $now = `date`;
+print "Complete: $now";
+kill $$;

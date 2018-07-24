@@ -1,0 +1,24 @@
+#!/usr/bin/env perl
+use Net::SSH qw/ ssh /;
+
+## #!/n/local/stage/perlbrew/perlbrew-0.43/perls/perl-5.16.0/bin/perl
+
+my ($server, $tmp, $debug);
+foreach my $arg (@ARGV) {
+    if ($arg eq '--tmp') {
+	$tmp = $arg;
+    } elsif ($arg eq '--debug') {
+	$debug = 1;
+    } else {
+	$server = $arg;
+    }
+}
+
+my $cmd = "/home/apa/local/bin/scratchspace-2.0 $tmp";
+$cmd .= " 2> /dev/null" unless $debug;
+if ($server) {
+    my $results = ssh($server, $cmd);
+} else {
+    system $cmd;
+}
+

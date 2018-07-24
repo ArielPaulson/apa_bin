@@ -1,0 +1,117 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+
+## Runs unguided Cufflinks on a specific region of the genome
+
+
+## Inputs
+my $genome;      # bowtie-indexed genome name, e.g. 'mm10'
+my $annot;       # annotation build for $genome, e.g. 'Ens_75'
+my $bam;         # input BAM file
+my $region;      # a region string, i.e. to samtools view: 'chr7', 'chr7:1000-2000', etc, OR BED FILE WITH MULTIPLE REGIONS
+my $intergenic;  # if used, only intergenic space (according to annot build) will be used
+my $outfile;     # output GTF file name for Cufflinks denovo models
+my $keep;        # keep temp files?
+my $cores = 1;   # number of threads to run Cufflinks with
+
+GetOptions("b=s" => \$bam, "o=s" => \$outfile, "g=s" => \$genome, "a=s" => \$annot, "r=s" => \$region, "c=i" => \$cores, "keep" => \$keep, "intergenic" => \$intergenic);
+
+## Paths & Files
+my $idxpath = '/n/data1/genomes/bowtie-index';
+my $genpath = "$idxpath/$genome";
+my $annpath = "$genpath/$annot";
+my $chrsizes = "$genpath/$genome.chrom.sizes";
+my $genebed = "$annpath/$genome.$annot.genes.bed";
+my $intergenebed = "$annpath/$genome.$annot.intergenes.bed";
+my $tmpdir = "cufflinksTargetedAssembly.$$.tmp";
+my $targets = "$tmpdir/targets";
+my $tmpint = "$tmpdir/targets.reads.txt";
+($outfile = $tmpdir) =~ s/tmp$/gtf/ unless $outfile;
+
+die "$0: BAM file '$bam' not found!\n" unless -e $bam;
+die "$0: Genome path '$genpath' could not be resolved!\n" unless -d $genpath;
+die "$0: Annotation path '$annpath' could not be resolved!\n" unless -d $annpath;
+
+&execute("mkdir $tmpdir");
+die "$0: Failed to create temp directory!\n" unless -d $tmpdir;
+print "Using temp directory '$tmpdir'\n";
+
+##### Main
+
+
+## Get chrom list
+my %chrLens; 
+open my $CHR, '<', $chrsizes or die "$0: Failed to read chrom.sizes file '$chrsizes': $!\n";
+while (<$CHR>) {
+    $_ =~ s/[\n\r]+$//;
+    my ($chr, $len) = split /\t/, $_;
+    $chrLens{$chr} = $len;
+}
+close $CHR;
+
+## Decipher $region entry -> slice BAM file
+my ($isChr, @BED1, @BED2);
+if (exists $chrLens{$region}) {  # targeting entire chromosome
+    $isChr = 1;
+    @BED1 = [$region, 0, $chrLens{$region}];
+} elsif ($region =~ /:/ && $region =~ /-/) {  # single region within a chromosome, hopefully
+    my ($chr, $coord) = (split /:/, $region);
+    my ($start, $end) = split /-/, $coord;
+    @BED1 = [$chr, $start, $end];
+} elsif (-e $region) {  # BED file with regions
+    @BED1 = @{ &readBed($region) };
+} else {
+    die "$0: Failed to parse region entry '$region': not a file or coordinate string!\n";
+}
+
+if ($intergenic) {
+    if ($isChr) {
+	&execute("grep -P \"^$region\t\" $intergenebed | cut -f1-3 > $targets.bed");
+    } else {
+	open my $TBED, '>', "$targets.bed" or die "$0: Failed to write '$targets.bed': $!\n";
+	print $TBED join("\t",@$_),"\n" foreach @BED1;
+	close $TBED;
+	&execute("subtractBed -a $targets.bed -b $genebed > $targets.sub.bed");
+	&execute("mv $targets.sub.bed $targets.bed");
+    }
+    @BED2 = @{ &readBed("$targets.bed") };
+} else {
+    @BED2 = @BED1;
+}
+
+&execute("samtools index $bam") unless -e "$bam.bai";
+&execute("samtools view -H $bam > $targets.sam");  # initialize SAM with header
+foreach (@BED2) {
+    my $coord = "$$_[0]:$$_[1]-$$_[2]";
+    print "Extracting '$coord'...\n";
+#    &execute("samtools view $bam $coord >> $targets.sam");  # build up SAM region by region
+    system "samtools view $bam $coord >> $targets.sam";
+}
+&execute("samtools view -Sb $targets.sam | samtools sort -m 50G -o $targets.bam -");  # convert to sorted BAM
+&execute("cufflinks -u -p $cores -o $tmpdir --max-bundle-frags=1000000 $targets.bam");
+&execute("mv $tmpdir/transcripts.gtf $outfile");
+&execute("rm -Rf $tmpdir") unless $keep;
+print "$0 Complete!\n";
+exit;
+
+
+sub execute {
+    my $CMD = shift;
+    print STDERR "$CMD\n";
+    system $CMD;
+}
+
+sub readBed {
+    my $FILE = shift;
+    my @OUT;
+    open my $BED, '<', $FILE or die "$0: Failed to read bed file '$FILE': $!\n";
+    while (<$BED>) {
+	$_ =~ s/[\n\r]+$//;
+	push @OUT, [(split /\t/, $_)[0..2]];
+    }
+    close $BED;
+    return \@OUT;
+}

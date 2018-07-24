@@ -1,0 +1,18 @@
+#!/bin/bash
+
+## cats a list of VCFs, but outputs the header ONLY from the first.
+## VCFs may be compressed or not.
+
+files=($@)
+
+## print entire first file; assume it has a sufficient header
+if [[ ${files[0]} =~ ".gz"$ ]]; then rcmd=zcat; else rcmd=cat; fi
+$rcmd ${files[0]}
+
+## print headerless files 2-N
+N=${#files[@]}
+((N=$N-1))
+for i in $(seq 1 $N); do
+    if [[ ${files[$i]} =~ ".gz"$ ]]; then rcmd=zcat; else rcmd=cat; fi
+    $rcmd ${files[$i]} | grep -v "^#"
+done

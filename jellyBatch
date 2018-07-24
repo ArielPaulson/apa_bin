@@ -1,0 +1,117 @@
+#!/usr/bin/env perl 
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+use Cwd;
+
+# Deps: jellyfish, R, apa_tools.R, (rm, gunzip, date)
+
+my $jellyfish = '/n/site/inst/Linux-x86_64/bioinfo/jellyfish/current/bin/jellyfish';
+my @krange = qw/ 15 18 21 24 27 30 /;
+
+my ($fqa, $outdir, $single, $overwrite);   # $fqa can be fastq, fasta
+my $threads = 1;
+GetOptions("f=s"=>\$fqa, "t=i"=>\$threads, "o=s"=>\$outdir, "single"=>\$single, "overwrite"=>\$overwrite);
+
+die "$0: Input '$fqa' not found!\n" unless -e $fqa;
+my ($fname) = ($fqa =~ /([^\/]+)$/);
+$fqa = cwd() . "/$fqa" unless $fqa =~ /^\//;  # root path unless already pathed
+
+$outdir = "jellyfish_${fname}" unless $outdir;
+system "rm -Rf $outdir" if $overwrite;
+mkdir $outdir or die "$0: Cannot create output dir '$outdir': $!\n";
+chdir $outdir;
+
+my $strands = $single ? '' : '--both-strands';
+
+my $fqa2;
+if ($fqa =~ /gz$/) {
+    $fqa2 = 'temp';
+    my $cmd = "gunzip -c $fqa > $fqa2";
+    print " $cmd\n"; system $cmd;
+} else {
+    $fqa2 = $fqa;
+}
+
+open my $OUT, '>', "jellyBatch.log";
+foreach my $k (@krange) {
+    
+    my $cmd = "$jellyfish count -o ${k}mers -m $k -t $threads -c 3 -s 10000000 $strands $fqa2";
+    print $OUT `date`, "$cmd\n";
+    print " $cmd\n"; system $cmd;
+
+    my $cmd = "$jellyfish merge -o ${k}mer_counts_merged.jf ${k}mers*";
+    print $OUT `date`, "$cmd\n";
+    print " $cmd\n"; system $cmd;
+
+    my $cmd = "$jellyfish stats -o ${k}mer_stats ${k}mer_counts_merged.jf";
+    print $OUT `date`, "$cmd\n";
+    print " $cmd\n"; system $cmd;
+
+    my $cmd = "$jellyfish histo -o ${k}mer_histo ${k}mer_counts_merged.jf";
+    print $OUT `date`, "$cmd\n";
+    print " $cmd\n"; system $cmd;
+
+#    my $cmd = "gzip -9 ${k}mer_counts_merged.jf &";
+#    print OUT `date`, "$cmd\n";
+#    print " $cmd\n"; system $cmd;
+
+    my $cmd = "rm -f ${k}mers* &";
+    print $OUT `date`, "$cmd\n";
+    print " $cmd\n"; system $cmd;
+}
+    
+print $OUT `date`;
+close $OUT;
+
+system "rm -f $fqa2" if $fqa =~ /gz$/;   ### CAREFUL WITH THIS!!!!
+
+my $Nk = scalar @krange;
+my $krange = join ',', @krange;
+
+open my $R, '>', "histos.R";
+print $R "source('/n/projects/apa/R/apa_tools.R')  # modes\n";
+print $R "k.range <- c($krange)\n";
+print $R "k.hist <- list(\n";
+print $R "\tk$_=read.delim('${_}mer_histo', sep=' ', header=F),\n" foreach @krange[0..$#krange-1];
+print $R "\tk$_=read.delim('${_}mer_histo', sep=' ', header=F)\n" foreach ($krange[$#krange]);
+print $R ")\n\n";
+print $R "hist.mat <- matrix(0, $Nk, 199, F, list(names(k.hist),2:200))  # no singletons, no overrep>200\n";
+print $R "for (i in 1:$Nk) { hist.mat[i,] <- k.hist[[i]][match(2:200,k.hist[[i]][,1]),2] }\n";
+print $R "hist.mat <- log2(hist.mat)\n\n";
+print $R "err.cov <- function(x, k) {\n";
+print $R "x[,2] <- x[,2] / 1000    # prevent integer overflow\n";
+print $R "\tm <- modes(x[,2],use.dens=F)\n";
+print $R "\tneg <- m\$neg[1]\n";
+print $R "\tpos <- m\$pos[1]\n";
+print $R "\tnegN <- m\$x[neg,1]\n";
+print $R "\tposN <- m\$x[pos,1]\n";
+print $R "\tall <- sum(x[,2])*1000\n";
+print $R "\tbad <- sum(x[1:neg,2])*1000\n";
+print $R "\tgood <- sum(x[(neg+1):nrow(x),2])*1000\n";
+print $R "\terr <- round(100*bad/(all*k),8)\n";
+print $R "\tsize <- round(good/pos,0)\n";
+print $R "\treturn(c(posN,negN,good,bad,err,size))\n";
+print $R "}\n\n";
+print $R "stats <- t(sapply(1:$Nk, FUN=function(i){err.cov(k.hist[[i]],k.range[i])}))\n";
+print $R "dimnames(stats) <- list(names(k.hist),c('K\tPeak','Trough','Good.Kmers','Bad.Kmers','Err.Rate.%','Genome.Bp'))  # tab to cover for rownames\n";
+print $R "write.table(stats, 'err.rate_gen.size.txt', sep='\t', quote=F)\n\n";
+print $R "ymax <- max(hist.mat,na.rm=T)\n";
+print $R "png('histograms.png', 800, 600)\n";
+print $R "par(cex=1.2, las=1)\n";
+print $R "plot(hist.mat[1,], type='l', ylim=c(0,ymax), main='Jellyfish Kmer Multiplicity Histogram', xlab='Log2(Kmer Multiplicity)', ylab='Distinct Kmers @ Multiplicity', yaxt='n')\n";
+print $R "for (i in 2:$Nk) { lines(hist.mat[i,], col=i) }\n";
+print $R "axis(2, at=seq(0,ymax,4), labels=2^seq(0,ymax,4))\n";
+print $R "legend('topright', bty='n', col=1:$Nk, lty=1, legend=rownames(hist.mat))\n";
+print $R "dev.off()\n";
+close $R;
+
+my $cmd = "R --vanilla < histos.R > histos.Rout";
+print " $cmd\n"; system $cmd;
+
+print "jellyBatch $fqa complete!\n";
+exit;
+
+
+
+

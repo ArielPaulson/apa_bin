@@ -1,0 +1,93 @@
+#!/usr/bin/env perl
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+# This script takes a directory of chromosome fastas -OR- a genome toplevel fasta and generates a bed file describing all blocks of > 1 consecutive Ns.
+# Second argument is the output name
+
+my $source;
+my $minN = 2;
+my $output;
+
+GetOptions("s=s"=>\$source, "o=s"=>\$output, "n=i"=>\$minN);
+
+my (@fastas, @headers);
+my $ERR = \*STDERR;
+
+if (-d $source) {  # directory
+    @fastas = glob ("$source/chr*.fa");
+    die "No detectable chromosome fastas in '$source'!\n" unless @fastas;
+} elsif (-e $source) {  # toplevel fasta
+    @fastas = ($source);
+} else {
+    die "Fasta source '$source' not readable: $!\n";
+}
+
+my @bed;
+foreach my $fasta (@fastas) {
+    print $ERR "Reading $fasta...\n";
+    my ($header, $seq);
+    open my $IN, '<', $fasta;
+    while (<$IN>) {
+        $_ =~ s/[\n\r]+$//;
+        if ($_ =~ /^>(.*)/) {
+			print $ERR $header;   # NO newline
+            analyze($header, \$seq) if $seq;  # multifasta
+            ($header, $seq) = ($1, '');
+            push @headers, $header;
+        } else {
+            $seq .= $_;
+        }
+    }
+    close $IN;
+    analyze($header, \$seq);    # monofasta or final multifasta entry
+}
+if ($output) {
+    open my $OUT, '>', $output or die "$0: Cannot open '$output' for writing: $!\n";
+    print $OUT @bed;
+    close $OUT;
+} else {
+    print @bed;
+}
+exit;
+
+
+sub analyze {
+    my ($HEAD, $SEQREF) = @_;
+    my @bases = split //, $$SEQREF;
+    print $ERR ": analyzing ", scalar @bases, " bases: ";
+	$| = 1;
+    my ($pending, $start);
+    my $allN = my $singletons = my $tooshort = my $blocks = my $blocksum = 0;
+    foreach my $i (0..$#bases) {
+        if ($bases[$i] eq 'N') {    # in a run
+            $allN++;
+            $start = $i unless $pending;
+            $pending = 1;
+        } elsif ($pending) {    # just completed a run
+            $pending = 0;
+            if ($i - $start == 1) {  # run of length 1
+                $singletons++;
+			} elsif ($i - $start < $minN) {  # run > 1, but < $minN
+				$tooshort++;
+            } else {            # run must have been long enough
+                $blocks++;
+                $blocksum += $i - $start;
+                my $end = $i;   # end+1 in 0-based = end+0 in 1-based
+                $start++;       # 1-based
+				push @bed, "$HEAD\t$start\t$end\n";
+            }
+        }
+    }
+    if ($bases[$#bases] eq 'N') {   # Ns ran to end of sequence
+        $blocks++;
+        $blocksum += $#bases - $start + 1;  # because end pos is still in Ns
+        my $end = $#bases + 1;   # end in 0-based = end-1 in 1-based
+        $start++;           # 1-based
+        push @bed, "$HEAD\t$start\t$end\n";
+    }
+    my $allsum = $singletons + $blocksum;
+    print $ERR "$allN Ns identified in $singletons singletons + $tooshort undersized blocks + $blocks passing blocks ($blocksum) = $allsum\n";
+}
+

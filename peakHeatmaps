@@ -1,0 +1,250 @@
+#!/usr/bin/env Rscript
+
+
+## THIS SCRIPT EXPECTS THAT YOU HAVE ALREADY CREATED SAMPLE HEATMAP MATRICES WITH /home/apa/local/bin/prepareHeatmapMatrices.
+
+## SETUP
+
+## ca <- c( "A1_All_4FC/recipes/comparison.k5.txt" )
+
+## ca <- c( "ABX1_All_4FC/recipes/comparison.k5.txt" )
+
+
+
+source("/home/apa/local/git/ChipseqTertiary/tools/chipseq-tertiary_functions.R")  # also sources apa_tools.R
+
+rdata.suffix <- ".coverage_matrix_data.RData"    ## MUST MATCH SUFFIX USED BY apa_tools.R::coverage.matrix.generate()
+
+if (!exists("ca")) ca <- commandArgs(trailing=TRUE)
+
+## NEW PARADIGM
+message("Preparing objects...")
+recipe <- parse.recipe(ca[1])
+ymax <- as.numeric(ca[2])      # max height of PNGs
+clobber <- as.logical(ca[3])   # T|F
+
+if (is.na(ymax)) ymax <- 2000  # default max image height
+if (is.na(clobber)) {
+    clobber <- FALSE
+    clobber2 <- "ignore"
+} else if (clobber) {
+    clobber2 <- "yes"
+} else {
+    clobber2 <- "no"
+}
+
+samples <- sapply(recipe$SAMPLES,"[[","name")
+samp.dirs <- sapply(recipe$SAMPLES,"[[","home")
+samp.clust <- sapply(recipe$SAMPLES,"[[","cluster")
+S <- length(recipe$SAMPLES)
+is.merge <- recipe$multi.sample
+rdata.dir <- recipe$window.dir
+source.RData <- recipe$source.RData
+load(source.RData)   ## 'source.data'
+if (all(samples %in% names(source.data))) {
+    source.data <- source.data[match(samples,names(source.data))]
+    source.data <- lapply(source.data, "[[", recipe$window.name)   # only need data for this window size
+} else {
+    stop()
+}
+
+outdir <- fixpath(recipe$heatmap.dir, clobber=clobber2)
+outpref <- recipe$out.prefix
+phm.RData <- paste0(outpref,"peakHeatmaps.RData")
+## load(phm.RData)
+
+
+message("Processing bed files...")
+hm.bed.files <- unique(sapply(source.data,"[[","heatmap.bed"))
+if (length(hm.bed.files)>1) stop(paste0("ERROR: the specified RDatas were not all created from the same heatmap bed file!  Cannot compile into a single heatmap.\nBed files:\n ",paste(hm.bed.files,collapse="\n ")))
+
+in.bed.files <- unique(sapply(source.data,"[[","input.peaks"))
+if (length(in.bed.files)>1) stop(paste0("ERROR: the specified RDatas were not all created from the same input bed file!  Cannot compile into a single heatmap.\nBed files:\n ",paste(in.bed.files,collapse="\n ")))
+
+hm.bed <- read.bed(hm.bed.files[1])[,1:6]
+orig.bed <- read.bed(in.bed.files[1])[,1:6]
+orig.bed <- orig.bed[match(hm.bed[,4],orig.bed[,4]),]
+orig.bed[,6] <- hm.bed[,6] <- "+"
+
+hm.gr <- bed2gr(hm.bed)
+orig.gr <- bed2gr(orig.bed)
+hol <- as.matrix(findOverlaps(hm.gr,orig.gr))
+remove <- sort(unique(c( setdiff(1:nrow(hm.bed),hol[,1]), setdiff(1:nrow(orig.bed),hol[,2]) )))
+if (length(remove)>0) {
+    message("Removing ",length(remove)," non-overlapping coordinates!\n")
+    orig.bed <- orig.bed[-remove,]
+    hm.bed <- hm.bed[-remove,]
+}
+
+sample.peaks <- lapply(recipe$SAMPLES,"[[","peaks")
+for (i in 1:S) {
+    if (!is.na(sample.peaks[[i]])) {
+        sample.peaks[[i]] <- read.bed(sample.peaks[[i]])[,1:6]
+        sample.peaks[[i]][,6] <- "+"
+    } else {
+        sample.peaks[i] <- list(c())
+    }
+}
+listLengths(sample.peaks,nrow)
+
+
+## matrix compiling from external RDatas
+## source("/home/apa/local/bin/apa_tools/code/coverage_matrix/coverage.matrix.compile.R")
+message("Compiling matrix list...")
+rdatas <- sapply(source.data, function(x) nameless(x$ip$rdata) )
+has.inp <- sapply(source.data, function(x) length(x$inp)>0 )
+mats <- new.list(samples)
+if (any(has.inp)) mats[which(has.inp)] <- lapply(coverage.matrix.compile(rdatas[has.inp], format="normLFC", adjust=TRUE, positive.only=TRUE), zerofy)
+if (any(!has.inp)) mats[which(!has.inp)] <- lapply(coverage.matrix.compile(rdatas[!has.inp], format="logrpm", adjust=TRUE), zerofy)
+mats <- lapply(mats, function(x) x[match(hm.bed[,4],rownames(x)),] )
+
+
+## matrix normalization/thresholding/rescaling for visualization purposes
+message("Thresholding matrices (this may take a long time, especially if many samples)...")
+get.nzr <- function(x) unlist(lapply(x, function(y){ w=!is.infinite(y)&y!=0; w[is.na(w)]=FALSE; y[w] }))
+
+if (any(has.inp)) {
+    message("Calculating normLFC>0 99th percentile: ",Sys.time())
+    nzr <- get.nzr(mats[which(has.inp)])
+    has.inp.q99 <- quantile(nzr,0.99)     # find group 99th pctl of normLFC0 matrices
+    message("Capping normLFC>0 matrices at normLFC>0 99th percentile: ",Sys.time())
+    mats[which(has.inp)] <- lapply(mats[which(has.inp)], threshold, has.inp.q99, "gt")
+}
+if (any(!has.inp)) {
+    message("Calculating logrpm 99th percentile: ",Sys.time())
+    nzr2 <- get.nzr(mats[which(!has.inp)])
+    no.inp.q99 <- quantile(nzr2,0.99)     # find group 99th pctl of logrpm matrices
+    message("Capping logrpm matrices at logrpm 99th percentile: ",Sys.time())
+    mats[which(!has.inp)] <- lapply(mats[which(!has.inp)], threshold, no.inp.q99, "gt")
+    if (any(has.inp)) {
+        message("Rescaling logrpm matrices to fit normLFC>0 99th percentile: ",Sys.time())
+        ## for each matrix, rescale range as a subset of 0:no.inp.q99 (even if this matrix data range is below no.inp.q99)
+        mats[which(!has.inp)] <- lapply(mats[which(!has.inp)], function(x) rescale(x, from=c(min(x),no.inp.q99), to=c(0,has.inp.q99)) )
+    }
+}
+
+
+## Clustering prep
+message("Preparing for clustering: ",Sys.time())
+cent.col <- c(41:60)
+cltypes <- c("bclust","hclust")
+row.ord <- new.list(cltypes)
+##cent.rs  <- sapply(mats[samp.clust], function(x) rowSums(x[,cent.col]) )  # 1 column per sample; cells = central signal sum
+cmats.a <- coverage.matrix.compress(mats, reduce=10)  # per matrix: expecting 100 input columns -> averaged down to 10 output columns 
+if (any( samp.clust)) cmats.c <- coverage.matrix.cbind(cmats.a[ samp.clust], spacer=0)   # cbind compressed matrices, with no spacers
+##if (any(!samp.clust)) cmats.x <- coverage.matrix.cbind(cmats.a[!samp.clust], spacer=0)
+cmats.a <- coverage.matrix.cbind(cmats.a, spacer=0)
+
+
+clusterize <- function(cm) {
+    nr <- nrow(cm)
+    rownames(cm) <- 1:nr
+    if (nr<=5E4) {
+        ## technically this could be 65536, but 50k is still insane and smaller matrices cluster faster
+        B <- 1
+        x <- list(cm)
+    } else {
+        ## too large to reasonably cluster: sort by rowSum, split into tranches, cluster tranches, reassemble
+        B <- ceiling(nr/5E4)  # clustering blocks
+        message("Clustering ",nr,"-row matrix in ",B," blocks...")
+        x <- row.tranches( cm[rev(order(rowSums(cm))),], B )
+    }
+    rhn <- as.numeric(unlist(lapply(x, function(y) rownames(y)[reorder.hclust2(hclust(dist(y),"average"), y, mean)$order] )))
+    match(rhn, 1:nr)
+}
+
+
+## always load row.ord$hclust
+if (any(samp.clust)) {
+    message("Full sample clustering, ",nrow(cmats.c)," rows: ",Sys.time())
+    row.ord$hclust <- clusterize(cmats.c)
+}
+
+
+## load row.ord$bclust if is.merge
+if (is.merge) {
+    message("Combinatorial clustering: ",Sys.time())
+    merge.data <- read.mergePeaks(recipe$out.root)
+    ## merge.data$venn
+    by.grp <- mat.split(merge.data$peaks, merge.data$peaks$Group)
+    G <- length(by.grp)
+    row.ord$bclust <- unlist(lapply(1:G, function(i) {
+        x <- by.grp[[i]]
+        x <- x[x[,4] %in% rownames(cmats.a),]
+        cm <- cmats.a[match(x[,4],rownames(cmats.a)),,drop=FALSE]
+        if (nrow(cm)>=3) {
+            message("Clustering group ",i,"/",G," (",nrow(cm)," rows)...")
+            ord.i <- clusterize(cm)
+        } else {
+            ord.i <- rev(order(rowSums(cm)))
+        }
+        x[ord.i,4]
+    }))
+    row.ord$bclust <- match(row.ord$bclust, rownames(cmats.a))
+}
+
+
+message("Creating called and binary matrices: ",Sys.time())
+## source("/home/apa/local/bin/apa_tools/code/coverage_matrix/coverage.matrix.bound.R")
+call.mats <- bin.mats <- new.list(samples)
+for (i in 1:S) {
+    message(samples[i]," ",length(sample.peaks[[i]]))
+    if (length(sample.peaks[[i]])>0) {
+        bin.mats[[i]] <- coverage.matrix.bound(mats[[i]], orig.bed, sample.peaks[[i]], hm.bed, 500, ignore=TRUE)   #, meta.data=NULL
+        call.mats[[i]] <- coverage.matrix.boundcolor(mats[[i]], bin.mats[[i]]$heatmap)
+    } else {
+        bin.mats[[i]] <- list(heatmap=mats[[i]])
+        call.mats[[i]] <- mats[[i]] * -1
+    }
+}
+
+message("Cbinding final heatmap matrices: ",Sys.time())
+hm.call <- coverage.matrix.cbind(call.mats)
+hm.bin <- coverage.matrix.cbind(lapply(bin.mats,"[[","heatmap"))
+hm.full <- coverage.matrix.cbind(mats)
+hm.fbin <- hm.full; hm.fbin[falsify(hm.bin==0)] <- 0
+
+message("Imaging...")
+RWB.limits <- c(-1,1) * ifelse(any(has.inp), has.inp.q99, no.inp.q99)
+imght <- min(c( ymax, round(nrow(hm.call)/10,0) ))
+if (imght<600) imght <- 500
+imgwd <- max(c( 600, ncol(hm.bin)+200 ))
+xasp <- ifelse(S<=4, S*1.5, S)
+message(imgwd," ",imght," (",xasp[1],")")
+
+for (cltype in cltypes) {
+    if (length(row.ord[[cltype]])>0) {
+        
+        ## bclust only exists if is.merge
+        ## hclust only exists if any(samp.clust)
+        
+        message("full, ",cltype," order: ",Sys.time())
+        png(paste0(outpref,"full.",cltype,".png"), imgwd, imght)
+        mipu(hm.full[row.ord[[cltype]],], pal="Reds0",      cex=1.2, pmar=c(1,1), x.aspect=xasp, col.names=samples, stagger=2)
+        dev.off()
+        
+        message("called, ",cltype," order: ",Sys.time())
+        png(paste0(outpref,"called.",cltype,".png"), imgwd, imght)
+        mipu(hm.call[row.ord[[cltype]],], pal="RWB",        cex=1.2, pmar=c(1,1), x.aspect=xasp, col.names=samples, stagger=2, col.center=0)
+        dev.off()
+        
+        message("binary, ",cltype," order: ",Sys.time())
+        png(paste0(outpref,"binary.",cltype,".png"), imgwd, imght)
+        mipu(hm.bin[row.ord[[cltype]],],  pal=c("white",2), cex=1.2, pmar=c(1,1), x.aspect=xasp, col.names=samples, stagger=2)
+        dev.off()
+        
+        message("full-binary, ",cltype," order: ",Sys.time())
+        png(paste0(outpref,"full-binary.",cltype,".png"), imgwd, imght)
+        mipu(hm.fbin[row.ord[[cltype]],], pal="Reds0",      cex=1.2, pmar=c(1,1), x.aspect=xasp, col.names=samples, stagger=2)
+        dev.off()
+        
+    }
+}
+
+
+## save and exit
+suppressWarnings(rm(cmats.a, cmats.c, cmats.x, cent.rs, call.mats, bin.mats, hm.full, hm.call, hm.bin, hm.fbin))
+save.image(phm.RData)
+message("peakHeatmaps complete!\n")
+quit()
+

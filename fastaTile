@@ -1,0 +1,62 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+## Takes a fasta and a tile size, and breaks every input sequence into tiles of that size (or smaller, for last tiles). 
+
+my $verbose = 0;
+my ($fasta, $K, $output, $delim) = @ARGV;
+die "Tile size not specified!\n" unless $K;
+$delim = '|' unless $delim;
+
+my $zip;
+unless ($output) {
+    $output = $fasta;
+    if ($fasta =~ /\.(gz|bz2)$/) {
+	$zip = $1;
+	$output =~ s/\.$1//;
+    }
+    $output =~ s/\.[fast]{2,5}$//;
+    $output .= ".fastaTile$K.fa";
+    $output .= ".$zip" if $zip;
+}
+
+my (@headers, $header, %seq, %len);
+print STDERR "Reading fasta...\n";
+my $IN = &open2('R', $fasta, 'Input fasta');
+while (<$IN>) {
+    s/[\n\r]+$//;
+    if (/^>(.*)/) {
+	$header = $1;
+	push @headers, $header;
+    } else {
+	$seq{$header} .= $_;
+    }
+}
+close $IN;
+
+%len = map {($_=>length($seq{$_}))} %seq;
+
+print STDERR "Writing tiles...\n";
+my $bz2 = $zip eq 'bz2' ? 1 : 0;
+my $OUT = &open2('W', $output, 'Output fasta', $bz2);
+foreach my $header (@headers) {
+    my $T = $len{$header}/$K;
+    $T = int($T)+1 if $T > int($T);
+    my $twidth = length($T);
+    my $pos = 0;
+    print " $header: $T tiles\n" if $verbose;
+    my $format = join($delim, ">%s","T%0${twidth}i","%i-%i\n%s\n");
+    for (my $t=1; $t<=$T; $t++) {
+	my $k = $t==$T ? $len{$header}-$pos : $K;
+	my $tile = substr($seq{$header}, $pos, $k);
+	printf $OUT $format, $header, $t, $pos+1, $pos+$k, ${&blockify($tile)};
+	$pos += $k;
+    }
+}
+close $OUT;
+
+print STDERR "$0 complete!\n";
+exit;

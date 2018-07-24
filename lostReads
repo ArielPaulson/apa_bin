@@ -1,0 +1,140 @@
+#!/usr/bin/env Rscript
+
+source("/home/apa/apa_tools.R")
+
+ca <- commandArgs(trailing=TRUE)
+infile <- ca[1]
+format <- ca[2]  # 'fasta' or 'fastq'
+thresh <- as.numeric(ca[3])  # threshold for Gs in 'lost-read' fasta: flags 'bad' as >= thresh
+thresh.pct <- as.logical(ca[4])  # threshold is N-bp (FALSE) or read-length-% (TRUE) ?
+collapse <- as.logical(ca[5])  # collapse output read sets? (FASTA ONLY; write unique sequences only; headers become "<prevalence>_<count>")
+nextseq <- as.logical(ca[6])  # reads are from the NextSeq instrument?  (i.e. 'N' is 'G')
+
+if (is.na(format)) stop("Input file format must be either 'fasta' or 'fastq'!\n")
+if (is.na(thresh)) stop(paste0(N,"-threshold must be specified, either as N bp or as pct read length!\n"))
+if (is.na(thresh.pct)) thresh.pct <- FALSE
+if (is.na(collapse)) collapse <- FALSE
+if (is.na(nextseq)) nextseq <- FALSE
+
+N <- ifelse(nextseq, "G", "N")
+
+if (thresh.pct && thresh > 1) stop(paste0(N,"-threshold percent must be given on [0,1] NOT [0,100]!\n"))
+if (!thresh.pct && thresh < 1) stop(paste0(N,"-threshold looks like a percent, but 'thresh.pct' was not indicated!\n"))
+
+
+
+message("Reading...\n")
+
+if (format == "fastq") {
+    
+    if (collapse) {
+        message("'collapse' argument only meaningful for fasta files!  Ignoring...\n")
+        collapse <- FALSE
+    }
+    
+    if (grepl("\\.gz$",infile)) {
+        fname <- sub("\\.gz$","",infile)
+        dat <- read.fastq(gzfile(infile))
+        ext <- "fq.gz"
+    } else {
+        fname <- infile
+        dat <- read.fastq(infile)
+        ext <- "fq"
+    }
+    
+} else if (format == "fasta") {
+    
+    if (grepl("\\.gz$",infile)) {
+        fname <- sub("\\.gz$","",infile)
+        dat <- read.fasta(gzfile(infile))
+        ext <- "fa.gz"
+    } else {
+        fname <- infile
+        dat <- read.fasta(infile)
+        ext <- "fa"
+    }
+    
+} else {
+    
+    stop("Unknown file format!  Must be 'fasta' or 'fastq'.\n")
+    
+}
+
+
+
+message("Analyzing...\n")
+
+if (format == "fastq") {
+    
+    len <- sapply(dat[,2],nchar)
+    if (nextseq) {
+        Ns <- sapply(strsplit(dat[,2],""),function(x) sum(x=="G"|x=="N"))  # actually, NextSeq reads can and do have Ns (just very few)
+    } else {
+        Ns <- sapply(strsplit(dat[,2],""),function(x) sum(x=="N"))
+    }
+    
+} else if (format == "fasta") {
+    
+    len <- sapply(dat,nchar)
+    if (nextseq) {
+        Ns <- sapply(strsplit(dat,""),function(x) sum(x=="G"|x=="N"))  # actually, NextSeq reads can and do have Ns (just very few)
+    } else {
+        Ns <- sapply(strsplit(dat,""),function(x) sum(x=="N"))
+    }
+    
+}
+
+if (thresh.pct) {
+    good <- Ns/len<thresh
+} else {
+    good <- Ns<thresh
+}
+
+NnonN <- sapply(0:10, function(i) sum(len-Ns==i))  # N reads having non-N counts from 0-10
+NnonN2 <- c(sum(len-Ns>10),sum(Ns/len<=0.5))  # N reads having non-N counts > 10; N reads which are at least half non-N bp
+
+ntotal <- length(good)
+ngood <- sum(good)
+nbad <- sum(!good)
+
+stats <- c(
+    paste0(N,"-threshold:\t",ifelse(thresh.pct,paste0(100*thresh,"%"),paste0(thresh,"bp")),"\t"),
+    paste0("Total Reads:\t",ntotal,"\t100.00%"),
+    paste0("Good Reads (",N,"<thresh):\t",ngood,"\t",round(100*ngood/ntotal,2),"%"),
+    paste0("Bad Reads (",N,">=thresh):\t",nbad,"\t",round(100*nbad/ntotal,2),"%"),
+    paste0("\nN OK bp\tReads with N OK bp\tPct with N OK bp"),
+    sapply(1:11, function(i) paste0(i-1,":\t",NnonN[i],"\t",round(100*NnonN[i]/ntotal,2),"%") ),
+    paste0(">10:\t",NnonN2[1],"\t",round(100*NnonN2[1]/ntotal,2),"%"),
+    paste0(">=Half:\t",NnonN2[2],"\t",round(100*NnonN2[2]/ntotal,2),"%")
+)
+
+
+
+message("Writing...\n")
+
+if (format == "fastq") {
+    if (ngood>0) write.fastq(dat[good,], paste0(fname,".lostReads.good.",ext))
+    if (nbad>0) write.fastq(dat[!good,], paste0(fname,".lostReads.bad.",ext))
+} else if (format == "fasta") {
+    if (collapse) {
+        if (ngood>0) {
+            good <- table(dat[good])
+            good <- cbind(c(good),names(good))
+            good <- good[rev(order(good[,1])),]
+            good[,1] <- paste0(1:length(good[,1]),"_",good[,1])
+            write.fasta(named.vector(good[,2],good[,1]), paste0(fname,".lostReads.good.",ext))
+        }
+        if (nbad>0) {
+            bad <- table(dat[!good])
+            bad <- cbind(c(bad),names(bad))
+            bad <- bad[rev(order(bad[,1])),]
+            bad[,1] <- paste0(1:length(bad[,1]),"_",bad[,1])
+            write.fasta(named.vector(bad[,2],bad[,1]), paste0(fname,".lostReads.bad.",ext))
+        }
+    } else {
+        if (ngood>0) write.fasta(dat[good], paste0(fname,".lostReads.good.",ext))
+        if (nbad>0) write.fasta(dat[!good], paste0(fname,".lostReads.bad.",ext))
+    }
+}
+write.vector(stats, paste0(fname,".lostReads.log"))
+message(paste("lostReads",fname,"complete!\n"))

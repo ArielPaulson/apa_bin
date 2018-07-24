@@ -1,0 +1,189 @@
+#!/usr/bin/env perl
+require '/home/apa/apa_routines.pm';
+use Term::ANSIColor;
+use strict;
+
+## Aligns a stack of read sequences based on a single kmer
+
+## Future: autodetect kmers and recursively stack (in order of kmer frequency) to stack as many as possible
+
+my ($input, $filetype, $kmer, $unmatched, $header) = @ARGV;
+
+my $colorize = 1;
+my ($red, $yel, $grn, $blu, $cya) = qw/  bright_red  bright_yellow  bright_green  bright_blue  bright_cyan  /;
+my %colors = ('A',$red,'a',$red, 'C',$yel,'c',$yel, 'G',$grn,'g',$grn, 'T',$blu,'t',$blu, 'N',$cya,'n',$cya);  # ANSIColor codes
+my %degens = ('R'=>'[AG]', 'Y'=>'[CT]', 'S'=>'[CG]', 'W'=>'[AT]', 'K'=>'[GT]', 'M'=>'[AC]', 'B'=>'[CGT]', 'D'=>'[AGT]', 'H'=>'[ACT]', 'V'=>'[ACG]', 'N'=>'[ACGT]');
+
+my $IN = &open2('R', $input, 'input file');
+my (@kmers, $ksize, %seq, $tot, $hwidth);
+if ($kmer =~ /^\d+$/) {
+    $ksize = $kmer;
+} else {
+    @kmers = split /,/, $kmer;
+}
+$kmer = undef;
+
+if ($filetype eq 'fasta') {
+    ## Fasta file
+    my ($h, $x);
+    while (<$IN>) {
+        next if $. <= $header;
+        s/[\n\r]+$//;
+        if (/^>(.*)/) {
+            if ($x) {
+                $seq{$x}{C}++;
+                $seq{$x}{H}{$h} = 1;
+                my $lh = length($h);
+                $hwidth = $lh if $lh > $hwidth;
+            }
+            $x = undef;
+            $h = $1;
+        } else {
+            $x .= $_ if $_;
+        }
+    }
+} elsif ($filetype eq 'tab') {
+    ## fasta2tab output (col 1 = header, col 2 = seq)
+    while (<$IN>) {
+        next if $. <= $header;
+        s/[\n\r]+$//;
+        my ($h, $x) = split /\t/, $_;
+        $seq{$x}{C}++;
+        $seq{$x}{H}{$h} = 1;
+        my $lh = length($h);
+        $hwidth = $lh if $lh > $hwidth;
+    }
+} elsif ($filetype eq 'list') {
+    ## col 1 = sequence
+    while (<$IN>) {
+        next if $. <= $header;
+        s/[\n\r]+$//;
+        $seq{$_}{C}++;
+    }
+} elsif ($filetype eq 'list1') {
+    ## col 1 = sequence, col 2 = copy count
+    while (<$IN>) {
+        next if $. <= $header;
+        s/[\n\r]+$//;
+        my @x = split /\t/, $_;
+        $seq{$x[0]}{C} = $x[1];
+    }
+}
+close $IN;
+
+$tot += $seq{$_}{C} foreach keys %seq;
+my (%kpos, %already);
+my $runtot = my $non = 0;
+
+## search for kmers
+if ($ksize) {
+    
+    ## size-based kmer enumeration
+    foreach my $x (keys %seq) {
+        for (my $i=0; $i<=length($x)-$ksize; $i++) {
+            my $kmer = substr($x,$i,$ksize);
+            next if exists $kpos{$kmer}{X}{$x};  # keep only first instance per sequence
+            $kpos{$kmer}{X}{$x} = $i;
+            $kpos{$kmer}{N}++;
+        }
+    }
+    
+} else {
+    
+    ## convert kmers to regexes
+    my %tmp;
+    foreach my $kmer (@kmers) {
+        if ($kmer =~ /[^ACGT]/i) {
+            foreach my $deg (keys %degens) {
+                my $reg = $degens{$deg};
+                $kmer =~ s/$deg/$reg/ig;
+            }
+        }
+        $tmp{$kmer} = 1;
+    }
+    @kmers = sort keys %tmp;  ### REBOOT @KMERS ARRAY
+    
+    ## locate specific kmers
+    foreach my $kmer (@kmers) {
+        print "$kmer\n";
+        foreach my $x (keys %seq) {
+            if ($x =~ /$kmer/i) {  # match first pos for literals AND regexps
+                my $pos = length($`);
+                print "$kmer $pos $x\n";
+                $kpos{$kmer}{X}{$x} = $pos;
+                $kpos{$kmer}{N}++;
+            }
+        }
+    }
+    
+}
+
+
+print "\n";  # visual break after command line
+{
+    foreach my $kmer (keys %kpos) {
+        ## deplete already-assembled sequence before proceeding
+        foreach my $x (keys %{ $kpos{$kmer}{X} }) {
+            delete $kpos{$kmer}{X}{$x} if $already{$x};
+        }
+        $kpos{$kmer}{N} = scalar keys %{ $kpos{$kmer}{X} };
+    }
+    my $kmer = (sort { $kpos{$b}{N} <=> $kpos{$a}{N} } keys %kpos)[0];  # next-highest-ranked kmer
+    
+    if ($kpos{$kmer}{N} > 1) {
+        #print STDERR "$kmer = $kpos{$kmer}{N}\n";
+        $runtot += $kpos{$kmer}{N};
+        my ($minpos, $maxpos) = (sort {$a <=> $b} values %{ $kpos{$kmer}{X} })[0,-1];
+        my $label = $ksize ? $kmer : "$kmer-MATCHING";
+        printf("$kpos{$kmer}{N} $label SEQUENCES (%0.2f"."%):\n", 100*$kpos{$kmer}{N}/$tot);
+        foreach my $x (sort { $kpos{$kmer}{X}{$b} <=> $kpos{$kmer}{X}{$a} || length($a) <=> length($b) || $a cmp $b } keys %{ $kpos{$kmer}{X} }) {
+            #next if $already{$x};
+            $already{$x} = 1;  # already assembled
+            &print_seq($x, $maxpos-$kpos{$kmer}{X}{$x});
+        }
+        delete $kpos{$kmer};  # done with this kmer
+        print "\n";
+        redo;
+    }
+}
+
+$non = $tot - $runtot;
+my $label = $ksize ? 'LEFTOVER' : 'NON-MATCHING';
+printf("$non $label SEQUENCES (%0.2f"."%):\n", 100*$non/$tot);
+if ($unmatched) {
+    foreach my $x (sort keys %seq) {
+        next if $already{$x};
+        &print_seq($x);
+    }
+}
+
+
+sub print_seq {
+    my ($X, $gaplen) = @_;
+    my (@header, @count);
+    my $spacer = ' ' x $gaplen;
+    if ($hwidth) {
+        foreach my $h (sort keys %{ $seq{$X}{H} }) {
+            push @header, sprintf("%-${hwidth}s $spacer", $h);
+        }
+    } else {
+        push @header, $spacer;
+        push @count, "     ($seq{$X}{C}x)" if $seq{$X}{C} > 1;
+    }
+    foreach my $i (0..$#header) {
+        print $header[$i];
+        if ($colorize) {
+            foreach my $char (split //, $X) {
+                if (exists $colors{$char}) {
+                    print color($colors{$char});
+                    print $char;
+                } else {
+                    print color('reset');
+                    print $char;  # do not colorize unknown chars
+                }
+            }
+            print color('reset');  # reset to default
+        }
+        print "$count[$i]\n";
+    }
+}

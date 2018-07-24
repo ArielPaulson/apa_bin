@@ -1,0 +1,20 @@
+#!/bin/bash
+
+gtf=$1
+
+if [ -z $gtf ]
+then
+    echo "No input!";
+    exit 1
+fi
+
+if [[ $gtf =~ ".gz"$ ]]; then rcmd=zcat; else rcmd=cat; fi
+
+echo "Feature types:"
+$rcmd $gtf | grep -v "^#" | cut -f3 | /home/apa/local/bin/uniq_c -
+
+echo "Unique genes:"
+$rcmd $gtf | grep -oP "gene_id \S+" | /home/apa/local/bin/uniq_c | wc -l
+echo "Unique transcripts:"
+$rcmd $gtf | grep -oP "transcript_id \S+" | /home/apa/local/bin/uniq_c | wc -l
+
